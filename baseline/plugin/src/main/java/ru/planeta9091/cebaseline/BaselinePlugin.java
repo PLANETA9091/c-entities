@@ -124,11 +124,11 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     }
 
     private static int intEnv(String k, int d) {
-        try { return Integer.parseInt(env(k, d)); } catch (Exception e) { return d; }
+        try { return Integer.parseInt(env(k, String.valueOf(d))); } catch (Exception e) { return d; }
     }
 
     private static double doubleEnv(String k, double d) {
-        try { return Double.parseDouble(env(k, d)); } catch (Exception e) { return d; }
+        try { return Double.parseDouble(env(k, String.valueOf(d))); } catch (Exception e) { return d; }
     }
 
     @EventHandler
