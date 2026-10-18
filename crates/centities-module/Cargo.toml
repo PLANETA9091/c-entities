@@ -1,0 +1,16 @@
+[package]
+name = "centities-module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "c-entities CRUSSTY module: weave + JNI bridge for the exact entity index"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cplug-abi = { path = "../../../CRUSSTY/cplug-abi" }
+cplug-sdk = { path = "../../../CRUSSTY/cplug-sdk" }
+jvmti-bindings = "2"
+centities-core = { path = "../centities-core" }

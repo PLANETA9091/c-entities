@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/centities-core"]
+members = ["crates/centities-core", "crates/centities-module"]
 
 [workspace.package]
 version = "0.1.0"

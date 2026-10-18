@@ -15,3 +15,4 @@ __pycache__/
 /tiles-100k/
 target/
 Cargo.lock
+/bundle/

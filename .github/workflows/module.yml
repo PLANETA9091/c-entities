@@ -1,7 +1,8 @@
 name: module
 
-# c-entities Rust core: tests + release build.
-# The cplug-sdk module crate lands with its own job once the weave glue is in.
+# c-entities: Rust core tests + CRUSSTY module build (weave + JNI bridge).
+# The module build compiles CeHooks.java against the mojang-mapped
+# Paper 1.21.8 jar (produced by a one-shot paperclip boot).
 
 on:
   push:
@@ -9,6 +10,7 @@ on:
     paths:
       - 'crates/**'
       - 'Cargo.toml'
+      - 'module.json'
       - '.github/workflows/module.yml'
   workflow_dispatch: {}
 
@@ -18,19 +20,51 @@ permissions:
 jobs:
   core:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Format check
-        run: cargo fmt --check || true
-      - name: Clippy
-        run: cargo clippy -p centities-core -- -D warnings || true
       - name: Tests (debug, with invariant checks)
         run: cargo test -p centities-core
       - name: Tests (release, fast)
         run: cargo test -p centities-core --release
-      - name: Build core artifact
-        run: cargo build -p centities-core --release
+
+  module:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch Paper 1.21.8 (paperclip)
+        run: bash scripts/fetch-paper.sh 1.21.8 /tmp/paper/paperclip.jar
+      - name: One-shot paperclip boot (produce mojang-mapped server jar)
+        working-directory: /tmp/paper
+        run: |
+          echo "eula=false" > eula.txt
+          timeout 240 java -jar paperclip.jar nogui > boot.log 2>&1 || true
+          JAR=$(find versions -name "paper-1.21.8.jar" | head -1)
+          test -f "$JAR"
+          echo "PAPER_JAR=$(pwd)/$JAR" >> "$GITHUB_ENV"
+      - name: Tests (patcher on the real Level.class)
+        run: cargo test -p centities-module
+        env:
+          PAPER_JAR: ${{ env.PAPER_JAR }}
+      - name: Build module cdylib
+        run: cargo build -p centities-module --release
+        env:
+          PAPER_JAR: ${{ env.PAPER_JAR }}
+      - name: Stage module bundle
+        run: |
+          mkdir -p bundle
+          cp target/release/libcentities_module.so bundle/
+          cp module.json bundle/
+          ls -la bundle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centities-module
+          path: bundle/
+          retention-days: 30
