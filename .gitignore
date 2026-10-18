@@ -1,0 +1,9 @@
+bench/
+build/
+server/
+tools/
+node_modules/
+*.jar
+*.jfr
+paper-api.jar
+__pycache__/

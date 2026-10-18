@@ -1,0 +1,103 @@
+name: baseline
+
+# Baseline benchmark of UNMODIFIED Paper 1.21.8 under large entity loads.
+# Every matrix job = one full server run + fake player + JFR profiling.
+# Reports are committed to reports/baseline/ by the publish job.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/baseline.yml'
+      - 'baseline/**'
+      - 'scripts/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: control,    SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: items-25k,  SCALE: 25000,  PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: items-100k, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: mobs-10k,   SCALE: 10000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: mobs-25k,   SCALE: 25000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: mixed-50k,  SCALE: 50000,  PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: mixed-150k, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: tiles-25k,  SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 15000, TILE_F: 10000, MEASURE: 600 }
+          - { name: tiles-100k, SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 60000, TILE_F: 40000, MEASURE: 600 }
+    env:
+      RUN_NAME: ${{ matrix.name }}
+      SCALE: ${{ matrix.SCALE }}
+      PCT_ITEMS: ${{ matrix.PCT_ITEMS }}
+      PCT_STANDS: ${{ matrix.PCT_STANDS }}
+      TILE_HOPPERS: ${{ matrix.TILE_H }}
+      TILE_FURNACES: ${{ matrix.TILE_F }}
+      MEASURE_TICKS: ${{ matrix.MEASURE }}
+      RUN_TIMEOUT: '1100'
+      XMX: '8G'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Fetch Paper 1.21.8
+        run: bash scripts/fetch-paper.sh 1.21.8 server/paper.jar
+      - name: Build baseline plugin
+        run: bash scripts/build-plugin.sh
+      - name: Install mineflayer
+        run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
+      - name: Run baseline
+        run: bash scripts/run-baseline.sh
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-${{ matrix.name }}
+          path: bench/${{ matrix.name }}/results/
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    needs: run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: baseline-*
+          path: bench
+          merge-multiple: true
+      - name: Build summary
+        run: python3 scripts/summarize.py bench > BASELINE_SUMMARY.md
+      - name: Commit reports
+        run: |
+          git config user.name "PLANETA9091"
+          git config user.email "247359227+PLANETA9091@users.noreply.github.com"
+          mkdir -p reports/baseline
+          cp BASELINE_SUMMARY.md reports/baseline/SUMMARY.md
+          for d in bench/*/results; do
+            n=$(basename "$(dirname "$d")")
+            mkdir -p "reports/baseline/$n"
+            cp "$d/REPORT.md" "reports/baseline/$n/" 2>/dev/null || true
+            cp "$d/baseline.json" "reports/baseline/$n/" 2>/dev/null || true
+            cp "$d/hotspots.md" "reports/baseline/$n/" 2>/dev/null || true
+          done
+          git add reports/baseline
+          git diff --cached --quiet || git commit -m "baseline: results [skip ci]"
+          git push
