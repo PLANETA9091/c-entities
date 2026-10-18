@@ -1,0 +1,36 @@
+name: module
+
+# c-entities Rust core: tests + release build.
+# The cplug-sdk module crate lands with its own job once the weave glue is in.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - '.github/workflows/module.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --check || true
+      - name: Clippy
+        run: cargo clippy -p centities-core -- -D warnings || true
+      - name: Tests (debug, with invariant checks)
+        run: cargo test -p centities-core
+      - name: Tests (release, fast)
+        run: cargo test -p centities-core --release
+      - name: Build core artifact
+        run: cargo build -p centities-core --release

@@ -13,3 +13,5 @@ __pycache__/
 /mobs-25k/
 /mixed-150k/
 /tiles-100k/
+target/
+Cargo.lock
