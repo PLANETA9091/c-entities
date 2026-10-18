@@ -82,7 +82,6 @@ jobs:
         with:
           pattern: baseline-*
           path: bench
-          merge-multiple: true
       - name: Build summary
         run: python3 scripts/summarize.py bench > BASELINE_SUMMARY.md
       - name: Commit reports
@@ -91,12 +90,15 @@ jobs:
           git config user.email "247359227+PLANETA9091@users.noreply.github.com"
           mkdir -p reports/baseline
           cp BASELINE_SUMMARY.md reports/baseline/SUMMARY.md
-          for d in bench/*/results; do
-            n=$(basename "$(dirname "$d")")
+          for d in bench/*/; do
+            n=$(basename "$d"); n="${n#baseline-}"
+            src="$d"
+            [ -f "$src/baseline.json" ] || src="$d/results/"
+            [ -f "$src/baseline.json" ] || continue
             mkdir -p "reports/baseline/$n"
-            cp "$d/REPORT.md" "reports/baseline/$n/" 2>/dev/null || true
-            cp "$d/baseline.json" "reports/baseline/$n/" 2>/dev/null || true
-            cp "$d/hotspots.md" "reports/baseline/$n/" 2>/dev/null || true
+            cp "$src/REPORT.md" "reports/baseline/$n/" 2>/dev/null || true
+            cp "$src/baseline.json" "reports/baseline/$n/" 2>/dev/null || true
+            cp "$src/hotspots.md" "reports/baseline/$n/" 2>/dev/null || true
           done
           git add reports/baseline
           git diff --cached --quiet || git commit -m "baseline: results [skip ci]"

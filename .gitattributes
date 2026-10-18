@@ -1,0 +1,6 @@
+# CI tooling, not the project's languages — keep the language bar honest.
+scripts/** linguist-generated
+reports/** linguist-generated
+docs/** linguist-documentation
+*.jfr binary
+*.jar binary

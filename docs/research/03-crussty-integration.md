@@ -1,60 +1,61 @@
-# Интеграция c-entities в Paper 1.21.8 через платформу CRUSSTY
+# c-entities integration into Paper 1.21.8 via the CRUSSTY platform
 
-## База
+## Base
 
-- **Сервер**: Paper 1.21.8 (runtime mojang-маппинги с 1.20.5+), **Java 21**
-  (совпадает с e2e CRUSSTY: java-21-openjdk-amd64).
-- **Платформа**: CRUSSTY — нативные Rust-плагины `c-*`, инжект в JVM,
-  weave-патчи через ASM. Проверенные API (cplug-sdk):
-  - `cplug_sdk::weave::replace_body(...)` — перезапись тела метода
-    (для Java 21+ обязателен корректный StackMapTable-фрейм);
-  - `cplug_sdk::weave::redirect_calls(...)` — перенаправление вызовов;
-  - `cplug_sdk::run_on_main_thread(...)` — исполнение на серверном main-потоке;
-  - реестр телеметрии (`TelemetryRegistry`) — экспорт метрик профиля.
+- **Server**: Paper 1.21.8 (mojang-mapped runtime since 1.20.5), **Java 21**
+  (matches CRUSSTY's own e2e: java-21-openjdk-amd64).
+- **Platform**: CRUSSTY — native Rust plugins `c-*` injected into the JVM,
+  bytecode weaving via ASM. Verified APIs (cplug-sdk):
+  - `cplug_sdk::weave::replace_body(...)` — rewrite a method body
+    (a correct StackMapTable frame is mandatory on Java 21+);
+  - `cplug_sdk::weave::redirect_calls(...)` — redirect call sites;
+  - `cplug_sdk::run_on_main_thread(...)` — execute on the server main thread;
+  - telemetry registry (`TelemetryRegistry`) — profile metric export.
 
-## Точки инжекта в Paper 1.21.8 (по исходникам, см. док 01)
+## Injection points in Paper 1.21.8 (from the sources, see doc 01)
 
-| # | Точка | Зачем |
-|---|-------|-------|
-| 1 | `ServerLevel.tickNonPassenger(Entity)` | главный узел: здесь решается «тикануть целиком или отдать Rust-зеркалу» |
-| 2 | `ServerLevel.tickPassenger(Entity, Entity, boolean)` | пассажиры зеркальных энтити |
-| 3 | `io.papermc.paper.entity.activation.ActivationRange.activateEntities(Level)` | убрать O(N)-скан по зеркальным энтити |
-| 4 | `ActivationRange.checkIfActive(Entity)` | короткое замыкание для зеркальных энтити |
-| 5 | `Level.tickBlockEntities()` | роутинг тайл-энтити в Rust-планировщик |
-| 6 | (опц.) `ItemEntity.tick` / merge | зеркало физики предметов |
+| # | Point | Purpose |
+|---|-------|---------|
+| 1 | `ServerLevel.tickNonPassenger(Entity)` | the main hub: decide "full vanilla tick vs Rust mirror tick" |
+| 2 | `ServerLevel.tickPassenger(Entity, Entity, boolean)` | passengers of mirrored entities |
+| 3 | `io.papermc.paper.entity.activation.ActivationRange.activateEntities(Level)` | remove the O(N) scan over mirrored entities |
+| 4 | `ActivationRange.checkIfActive(Entity)` | short-circuit for mirrored entities |
+| 5 | `Level.tickBlockEntities()` | route block entities into the Rust scheduler |
+| 6 | (opt.) `ItemEntity.tick` / merge | item physics mirror |
 
-Убойный переключатель: любой сбой weave → модуль работает в режиме
-телеметрии, энтити тикает ваниль. Никогда не ломаем сервер.
+Kill switch: any weaving failure → the module runs in telemetry-only mode,
+entities tick vanilla. We never break the server.
 
-## Что делает зеркало
+## What the mirror does
 
-Rust-ядро держит SoA-копию позиций/скоростей/состояний энтити. При тике:
+The Rust core keeps an SoA copy of positions/velocities/states. On tick:
 
-- энтити, **доказуемо статичные** (on_ground, нулевая скорость, нет цели,
-  нет игрока рядом, спокойствие ≥ N тиков, не в воде/огне) — пропускаются
-  (ванилла сама бы дала им `inactiveTick`, а EAR даёт иммунитеты — мы не
-  делаем ничего, что меняло бы наблюдаемое поведение);
-- **всё остальное тикает честной ванильной физикой в Rust** (гравитация,
-  drag, коллизии по BlockSource, merge через пространственный хеш-грид) —
-  без пропусков тиков, с теми же константами;
-- периодическая сверка (выборка) зеркала против Java-состояния + wake-канал
-  (блок-события, игроки, инвентари) — рассинхрон невозможен по построению;
-- для игрока вывод 100% ванильный: трекер видит позиции, которые отправляет
-  ванильный `ServerEntity` от ванильных же полей (зеркало пишет обратно в
-  поля энтити через JNI после своего тика).
+- entities that are **provably static** (on_ground, zero velocity, no goal,
+  no player nearby, calm for ≥ N ticks, not in water/fire) are skipped —
+  vanilla itself would give them `inactiveTick` and EAR grants immunities;
+  we never change observable behavior;
+- **everything else ticks with honest vanilla physics in Rust** (gravity,
+  drag, collisions via BlockSource, merging through a spatial hash grid) —
+  no skipped ticks, same constants;
+- periodic verification (sampling) of the mirror against the Java state +
+  a wake channel (block events, players, inventories) — desync is
+  impossible by construction;
+- for players the output is 100% vanilla: the tracker sends positions from
+  vanilla fields (the mirror writes back into entity fields via JNI).
 
-## Принцип (по требованиям владельца)
+## Principles (owner requirements)
 
-- Заморозка — лишь **один из механизмов**, только для доказуемо-статичных.
-  Основной выигрыш — алгоритмы/структуры/батчинг/параллелизм.
-- Цель: **≤0.5 мс** на тик всех энтити при 100k+ энтити и 100k+ тайл-энтити,
-  20 TPS, без роста потребления RAM/CPU.
-- Совместимость: **100% ванилла-поведение** для игрока; kill-switch fallback.
+- Freezing is **one mechanism among many**, only for provably static
+  entities. The main win comes from algorithms / data structures /
+  batching / parallelism.
+- Target: **≤ 0.5 ms** for the tick of all entities at 100k+ entities and
+  100k+ block entities, 20 TPS, no RAM/CPU growth.
+- Compatibility: **100% vanilla behavior** for players; kill-switch fallback.
 
-## Порядок работ (после базового бенчмарка)
+## Work order (after the baseline)
 
-1. Данные baseline (этот пайплайн) → рейтинг реальных затрат.
-2. Дизайн Rust-ядра под подтверждённые затраты (не по догадкам).
-3. `centities-engine` (чистое ядро, criterion-бенчи на 100k/500k/1M).
-4. `centities-module` (weave-патчи по таблице выше + телеметрия).
-5. A/B на этом же пайплайне: Paper vs Paper+модуль, отчёт в CI.
+1. Baseline data (this pipeline) → ranking of real costs.
+2. Rust core design driven by confirmed costs (not guesses).
+3. `centities-engine` (pure core, criterion benches at 100k/500k/1M).
+4. `centities-module` (weave patches per the table above + telemetry).
+5. A/B on this same pipeline: Paper vs Paper+module, report in CI.

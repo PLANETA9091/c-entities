@@ -1,45 +1,49 @@
 # c-entities
 
-Оптимизация тика энтити и тайл-энтити Minecraft для платформы
-[CRUSSTY](https://github.com/PLANETA9091/CRUSSTY) (Rust-модуль, инжект в Java).
+Entity & block-entity tick optimization for Minecraft, built as a native
+Rust module for the [CRUSSTY](https://github.com/PLANETA9091/CRUSSTY)
+platform (JVM injection via bytecode weaving).
 
-**Цель**: тик всех энтити ≤ 0.5 мс при 100k+ энтити и 100k+ тайл-энтити,
-идеальные 20 TPS, без роста потребления RAM/CPU, **100% ванильное поведение
-для игрока**. База: **Paper 1.21.8**, Java 21.
+**Goal**: tick **all** entities in **≤ 0.5 ms** with 100k+ entities and
+100k+ block entities on the map, rock-solid 20 TPS, no increase in RAM/CPU
+usage — and **100% vanilla behavior for players**. Base server:
+**Paper 1.21.8**, Java 21.
 
-## Фазы (сверху вниз, не наоборот)
+## Phases (top to bottom — no skipping)
 
-| Фаза | Что | Статус |
-|------|-----|--------|
-| 0 | Разбор тик-пайплайна Paper 1.21.8 по исходникам | ✅ `docs/research/01` |
-| 1 | **Базовый бенчмарк нетронутого сервера** на GitHub Actions: что и сколько жрёт | 🚧 `baseline.yml` |
-| 2 | Дизайн Rust-ядра по данным фазы 1 | ⏳ |
-| 3 | `centities-engine` (ядро) + `centities-module` (weave-инжект) | ⏳ |
-| 4 | A/B на этом же пайплайне: Paper vs Paper+модуль | ⏳ |
+| Phase | What | Status |
+|-------|------|--------|
+| 0 | Understand the Paper 1.21.8 tick pipeline from real sources | ✅ `docs/research/01-vanilla-tick-pipeline.md` |
+| 1 | **Baseline benchmark of unmodified Paper** on GitHub Actions: what costs what | 🚧 `baseline.yml` |
+| 2 | Design the Rust core from phase-1 data (not guesses) | ⏳ |
+| 3 | `centities-engine` (core) + `centities-module` (weave injection) | ⏳ |
+| 4 | A/B on the same pipeline: Paper vs Paper+module | ⏳ |
 
-Никакого кода оптимизации, пока фаза 1 не даст цифр.
+No optimization code is written before phase 1 produces numbers.
 
-## Пайплайн бенчмарка
+## Benchmark pipeline
 
-`baseline.yml` поднимает на каждом runner'е:
+Each `baseline.yml` matrix job boots on its own runner:
 
-1. Paper 1.21.8 (Fill API), суперплоский мир, шум выключен.
-2. Фейковый игрок (mineflayer, creative) — без него Paper EAR отправляет
-   всё в `inactiveTick` и замер был бы враньём.
-3. Плагин `ce-baseline` (измерительный): plugin chunk tickets (level 31),
-   плавное заполнение мира нагрузкой из матрицы, замер MSPT через
-   `ServerTickEndEvent`, запись `baseline.json`.
-4. JFR-профиль → топ горячих методов JVM → `hotspots.md` («что как нагружает»).
-5. Сводный отчёт коммитится в `reports/baseline/`.
+1. Paper 1.21.8 (official Fill API), superflat world, noise turned off.
+2. A fake player (mineflayer, creative) — without a player Paper's Entity
+   Activation Range sends everything into `inactiveTick()` and the
+   measurement would lie.
+3. The `ce-baseline` measurement plugin: plugin chunk tickets (level 31),
+   gradual fill from the run matrix, MSPT recorded via
+   `ServerTickEndEvent`, results dumped to `baseline.json`.
+4. Java Flight Recording → top hot methods → `hotspots.md`
+   ("what loads what").
+5. A summary is committed back to `reports/baseline/` by the publish job.
 
-Матрица: control / items 25k-100k / mobs 10k-25k / mixed 50k-150k /
-tiles 25k-100k (воронки+печки).
+Matrix: control / items 25k–100k / mobs 10k–25k / mixed 50k–150k /
+tiles 25k–100k (hoppers + furnaces).
 
-## Структура
+## Layout
 
 ```
-docs/research/     — разбор ванильного пайплайна, план бенчмарка, точки инжекта
-baseline/plugin/   — измерительный Paper-плагин (без оптимизаций)
-scripts/           — fetch/build/run/report утилиты пайплайна
-reports/baseline/  — коммитятся CI после каждого прогона
+docs/research/     — vanilla pipeline analysis, methodology, injection points
+baseline/plugin/   — measurement-only Paper plugin (Maven)
+scripts/           — fetch/build/run/report tooling (CI-only)
+reports/baseline/  — committed by CI after every run
 ```
