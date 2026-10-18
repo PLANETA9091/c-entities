@@ -7,3 +7,9 @@ node_modules/
 *.jfr
 paper-api.jar
 __pycache__/
+.zip
+/control/
+/items-100k/
+/mobs-25k/
+/mixed-150k/
+/tiles-100k/
