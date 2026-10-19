@@ -40,7 +40,7 @@ jobs:
           # A/B: same scenarios with the c-entities module injected (CRUSSTY)
           - { name: items-100k-mod, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 600, MODULE: 'on' }
           - { name: mixed-150k-mod, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, MODULE: 'on' }
-          - { name: spread-100k-mod, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, AREA: 1500, MODULE: 'on' }
+          - { name: spread-100k-mod, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, AREA: 600, MODULE: 'on' }
     env:
       RUN_NAME: ${{ matrix.name }}
       SCALE: ${{ matrix.SCALE }}
@@ -116,4 +116,7 @@ jobs:
           done
           git add reports/baseline
           git diff --cached --quiet || git commit -m "baseline: results [skip ci]"
-          git push
+          # publish races with other pushes to main (reports commit only);
+          # rebase and retry once
+          git pull --rebase origin main || git rebase --abort
+          git push || (git pull --rebase origin main && git push)
