@@ -34,13 +34,13 @@ jobs:
           # Realistic distribution: same population, spread over 600x600 (doc 06 said 1500, but ~38k ticking
           # chunks would swamp the entity signal with chunk overhead) —
           # where a spatial index must WIN (cells actually filter candidates).
-          - { name: spread-100k,  SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, AREA: 600 }
+          - { name: spread-100k,  SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600 }
           - { name: tiles-25k,  SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 15000, TILE_F: 10000, MEASURE: 600 }
           - { name: tiles-100k, SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 60000, TILE_F: 40000, MEASURE: 600 }
           # A/B: same scenarios with the c-entities module injected (CRUSSTY)
-          - { name: items-100k-mod, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 600, MODULE: 'on' }
-          - { name: mixed-150k-mod, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, MODULE: 'on' }
-          - { name: spread-100k-mod, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 600, AREA: 600, MODULE: 'on' }
+          - { name: items-100k-mod, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 1200, MODULE: 'on' }
+          - { name: mixed-150k-mod, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, MODULE: 'on' }
+          - { name: spread-100k-mod, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600, MODULE: 'on' }
     env:
       RUN_NAME: ${{ matrix.name }}
       SCALE: ${{ matrix.SCALE }}
