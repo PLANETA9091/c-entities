@@ -70,11 +70,19 @@ jobs:
           # 55s: boot + module arm; then spawn real entities through the
           # console (probes + queries fire); 100s: soak; stop. The plugin's
           # periodic hooks@ log lines carry the LIVE counters asserted below.
+          # Items spawn at FIXED height 50: a falling item runs a merge scan
+          # (Level.getEntities(Entity,AABB,Predicate) — the replaced body)
+          # every tick of the fall, which guarantees fast-path traffic.
+          # Spawning at "~ ~ ~" (console spawn point) is a traffic flake:
+          # an item placed ON the ground generates zero queries and the
+          # fast>0 assert fails without any module defect (observed 2026-10-19).
           (sleep 55;
            echo "execute in overworld summon minecraft:zombie 8 -59 8 {NoAI:1b,PersistenceRequired:1b}";
            echo "execute in overworld summon minecraft:armor_stand 10 -59 10 {Marker:1b,Gravity:0b}";
            sleep 2;
-           echo "execute in overworld summon minecraft:item ~ ~ ~ {Item:{id:\"minecraft:stone\",Count:1b},PickupDelay:32767}";
+           echo "execute in overworld summon minecraft:item 0 50 0 {Item:{id:\"minecraft:stone\",Count:1b},PickupDelay:32767}";
+           sleep 6;
+           echo "execute in overworld summon minecraft:item 4 55 4 {Item:{id:\"minecraft:dirt\",Count:1b},PickupDelay:32767}";
            sleep 3;
            echo "execute in overworld summon minecraft:zombie -8 -59 -8 {NoAI:1b,PersistenceRequired:1b}";
            sleep 40;
