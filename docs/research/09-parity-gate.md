@@ -72,6 +72,40 @@ windows): the gate's own numbers — which path each bucket chose and at
 what measured price — are the acceptance test for "not slower than
 vanilla".
 
+## First CI A/B on the gate (4a.0, run 39293284393, with player, 1200 ticks)
+
+| pair | vanilla | module | delta | fast/mirror (mod) |
+|---|---:|---:|---:|---|
+| items-100k | 96.95 | 105.52 | +8.9% | 133 / 5 123 |
+| spread-100k | 482.5 | 491.4 | +1.9% | 648k / 18.3M |
+| mixed-150k | 826.7 | 868.3 | **+5.0%** (was **+64.7%**) | 80k / 20.5M |
+
+- The gate collapsed the mixed-150k regression from +64.7% to +5.0% while
+  remaining fully live (`desync=0` everywhere, 19.6M box probes indexed).
+- items +8.9% has NO systematic source: CPU profiles of both runs are
+  identical (no CeHooks/JNI/GC entry in the module profile; the intersects
+  share is even lower), probe+flush arithmetic is < 0.1 ms/tick — runner
+  noise (known ±10% job-to-job spread). To be confirmed by a repeat run.
+- The real defect is visible in mixed-mod: `fast=80429` with
+  `reprobe=80254` — almost every fast query was a 1/256 re-probe, priced
+  at ~307 µs (native query cost on a loaded 2-vCPU runner; also the EMA
+  was bootstrapped on an empty world during fill). 66 probes/tick ×
+  307 µs ≈ 20 ms/tick — almost the whole remaining delta. The 1/8 EMA
+  drift is too slow to escape a bad plateau.
+- Zero-resolve verdict: `resMs=1.2s` over 4.06M resolved candidates =
+  **15 ns/candidate** (was ~210 ns) — the resolve loop is defeated.
+
+## 4a.1 fix: re-probe backoff + EMA unstick
+
+- Per-cell re-probe backoff: when a fast sample lands > 2× the mirror
+  price, the probe step doubles (1/256 → 1/4096) until fast gets cheap
+  again; a sample below mirror restores the granularity.
+- EMA unstick: a sample > 4× the current fast EMA replaces it outright —
+  an EMA trained on an empty world must jump, not creep.
+- Self-review caught an operator-precedence bug in the first draft of the
+  step mask (`256 << min(bk,4) - 1` shifts by bk−1 → shift-by-−1 at bk=0);
+  fixed to an explicit `step = 256 << min(bk,4); mask = step − 1`.
+
 ## What the gate does NOT fix
 
 The fixed ~8.4 µs per-query JNI+native cost is routed around, not

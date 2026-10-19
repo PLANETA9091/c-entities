@@ -100,6 +100,20 @@ public final class CeHooks {
                         if (dt <= 0) dt = 1;
                         ema(FAST_EMA, gi, dt);
                         if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
+                        // Re-probe backoff + EMA unstick (4a.1): a fast sample
+                        // that lands far above the mirror price must not be
+                        // paid at 1/256 forever, and an EMA trained on an
+                        // empty world (bootstrap during fill) must jump to
+                        // the new reality instead of creeping at 1/8.
+                        long me = MIRR_EMA[gi];
+                        int bk = FAST_BACKOFF[gi];
+                        if (me > 0 && dt > 2 * me) {
+                            if (bk < 4) bk++;
+                            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = dt;
+                        } else if (bk > 0 && me > 0 && dt < me) {
+                            bk--; // cheap again — restore probing granularity
+                        }
+                        FAST_BACKOFF[gi] = bk;
                         queriesFast++;
                         return out;
                     }
@@ -270,6 +284,11 @@ public final class CeHooks {
     private static final int[] MIRR_N = new int[GWORLDS * GBUCKETS];
     private static final int[] FAST_SEQ = new int[GWORLDS * GBUCKETS];
     private static final int[] MIRR_SEQ = new int[GWORLDS * GBUCKETS];
+    /** Re-probe backoff per cell (0..4): when a re-probe lands on a much
+     *  more expensive fast sample than mirror, the 1/256 probe rate itself
+     *  becomes a tax (mixed-150k: 66 probes/tick × 307us = 20 ms/tick). The
+     *  step doubles up to 1/4096 until fast gets cheap again. */
+    private static final int[] FAST_BACKOFF = new int[GWORLDS * GBUCKETS];
     private static int gateDecisions = 0, gateFastChosen = 0;
     private static final int GATE_WINDOW = 16_384;
     private static final int GATE_MIN_FAST = 32;   // below: fast is useless
@@ -322,11 +341,14 @@ public final class CeHooks {
         boolean fast;
         if (FAST_N[gi] < 16) {
             fast = true; // bootstrap: a few measured probes per bucket
-        } else if ((++FAST_SEQ[gi] & 255) == 0) {
-            fast = true; // periodic re-probe: EMAs must not go stale
-            fastProbes++;
         } else {
-            fast = MIRR_N[gi] >= 8 && FAST_EMA[gi] * 4 < MIRR_EMA[gi] * 5; // hysteresis
+            int step = 256 << Math.min(FAST_BACKOFF[gi], 4); // 256..4096
+            if ((++FAST_SEQ[gi] & (step - 1)) == 0) {
+                fast = true; // periodic re-probe (backed off): EMAs must not go stale
+                fastProbes++;
+            } else {
+                fast = MIRR_N[gi] >= 8 && FAST_EMA[gi] * 4 < MIRR_EMA[gi] * 5; // hysteresis
+            }
         }
         gateDecisions++;
         if (fast) {
