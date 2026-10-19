@@ -5,7 +5,7 @@
 //!   exact f64 AABB before applying the vanilla predicate) but must never
 //!   return a **false negative**: every entity whose true f64 AABB overlaps
 //!   the query box is always offered.
-//! * Single-homing: each normal entity lives in exactly one 64-block XZ
+//! * Single-homing: each normal entity lives in exactly one 16-block XZ
 //!   cell (the cell of its AABB center). Queries expand by the tracked max
 //!   half-span so no center can be missed. Entities wider than one cell go
 //!   to a tiny oversize list scanned linearly.
@@ -18,8 +18,13 @@
 
 #![forbid(unsafe_code)]
 
-pub const CELL: i32 = 64;
-pub const CELL_SHIFT: u32 = 6; // 64 == 1 << 6
+/// 16-block XZ cells. Cell edge is the density lever: dense populations
+/// (100k+ entities packed tight) scan k entities per query where k scales
+/// with (query_box / cell)^2, so finer cells cut the dense-case candidate
+/// set quadratically. Vanilla's largest entity (ender dragon) stays well
+/// inside the oversize path.
+pub const CELL: i32 = 16;
+pub const CELL_SHIFT: u32 = 4; // 16 == 1 << 4
 /// Query margin in blocks. Bounded below by the max f32 quantization error
 /// of cell-relative coordinates (~7.6e-6) with >100x headroom.
 pub const MARGIN: f32 = 1.0e-3;

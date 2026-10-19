@@ -22,7 +22,7 @@ public final class CeHooks {
     public static volatile boolean ACTIVE = false;
 
     public static volatile long queriesFast = 0, queriesMirror = 0;
-    public static volatile long probesAdd = 0, probesRemove = 0, probesPos = 0, posSkips = 0;
+    public static volatile long probesAdd = 0, probesRemove = 0, probesBox = 0;
 
     // ------------------------------------------------------------------
     // Woven (replace_body): Level.getEntities(Entity, AABB, Predicate)
@@ -83,31 +83,18 @@ public final class CeHooks {
         }
     }
 
-    /** Prefix of Entity.setBoundingBox(AABB): the NEW box arrives as an arg. */
+    /** Prefix of Entity.setBoundingBox(AABB): the NEW box arrives as an arg.
+     *  This is the SINGLE choke point for box changes in 1.21.8:
+     *  setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox
+     *  (javap-verified), so there is no separate setPos probe — every move
+     *  crosses JNI once, with the exact new box. */
     public static void probeBox(Entity e, AABB newBox) {
         try {
             if (ACTIVE && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
+                probesBox++;
                 nativeBox(e.getId(), worldId(e.level()),
                         newBox.minX, newBox.minY, newBox.minZ, newBox.maxX, newBox.maxY, newBox.maxZ);
             }
-        } catch (Throwable t) {
-            ACTIVE = false;
-        }
-    }
-
-    /**
-     * Prefix of Entity.setPos(double,double,double):
-     * args (this, x, y, z). Runs on EVERY setPos — the native side
-     * early-outs on unchanged coordinates in ~tens of ns.
-     */
-    public static void probePos(Entity e, double x, double y, double z) {
-        try {
-            if (!ACTIVE || e == null) return;
-            net.minecraft.world.level.Level l = e.level();
-            if (l == null || l.isClientSide) return;
-            probesPos++;
-            AABB b = e.getBoundingBox(); // OLD box: constant dims assumed, corrected by probeBox
-            nativePos(e.getId(), worldId(l), x, y, z, b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
         } catch (Throwable t) {
             ACTIVE = false;
         }
@@ -135,9 +122,12 @@ public final class CeHooks {
         int resolved = 0;
         for (long id : ids) {
             Entity e = sl.getEntity((int) id); // LevelEntityGetter.byId — id-keyed
-            if (e == null) continue; // stale candidate: filtered by the recheck below
+            if (e == null) continue; // stale candidate (removed before its probe ran)
             resolved++;
-            if (box.intersects(e.getBoundingBox()) && predicate.test(e)) {
+            // NOTE: no per-candidate box.intersects — the Rust index is exact
+            // (property-tested vs brute force in centities-core); the vanilla
+            // predicate still applies, as it must.
+            if (predicate.test(e)) {
                 out.add(e);
             }
         }
@@ -174,6 +164,4 @@ public final class CeHooks {
     public static native void nativeBox(long id, int world, double x0, double y0, double z0,
             double x1, double y1, double z1);
     public static native void nativeRemove(long id);
-    public static native void nativePos(long id, int world, double x, double y, double z,
-            double x0, double y0, double z0, double x1, double y1, double z1);
 }

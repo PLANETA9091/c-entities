@@ -1,11 +1,11 @@
-//! c-entities CRUSSTY module (v0.1): exact entity proximity index.
+//! c-entities CRUSSTY module (v0.2): exact entity proximity index.
 //!
 //! Weave targets (Paper 1.21.8, mojang-mapped):
 //!   1. Level.getEntities(Entity, AABB, Predicate)  — replace_body → CeHooks.getEntities
 //!   2. EntityLookup.addEntity(Entity, boolean, boolean) — prefix probe
 //!   3. EntityLookup.removeEntity(Entity)               — prefix probe
-//!   4. Entity.setPos(double,double,double)             — prefix probe
-//!   5. Entity.setBoundingBox(AABB)                     — prefix probe (exact box)
+//!   4. Entity.setBoundingBox(AABB)                     — prefix probe (exact box;
+//!      single box-change choke point: setPos -> setPosRaw -> setBoundingBox)
 //!
 //! Kill switch: any patch failure leaves the class untouched (vanilla runs);
 //! any runtime anomaly flips CeHooks.ACTIVE=false → bridges take the
@@ -224,8 +224,6 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         n_box as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64));
     push!("nativeRemove", "(J)V",
         n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64));
-    push!("nativePos", "(JIDDDDDDDDD)V",
-        n_pos as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64, f64, f64, f64));
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -331,25 +329,12 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
-    let pos = patch::insert_static_call_at_start(
-        bytes.to_vec(),
-        "setPos",
-        "(DDD)V",
-        HOOKS_CLASS,
-        "probePos",
-        "(Lnet/minecraft/world/entity/Entity;DDD)V",
-        &[(0, b'L'), (1, b'D'), (3, b'D'), (5, b'D')],
-    );
-    let bytes2 = match pos {
-        Ok(b) => b,
-        Err(e) => {
-            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] setPos probe refused: {e}"));
-            return None;
-        }
-    };
+    // setBoundingBox is the SINGLE box-change choke point in 1.21.8
+    // (setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox,
+    // javap-verified on the shipped jar). One probe covers every move with
+    // the EXACT new box — no separate setPos probe, half the JNI traffic.
     match patch::insert_static_call_at_start(
-        bytes2,
+        bytes.to_vec(),
         "setBoundingBox",
         "(Lnet/minecraft/world/phys/AABB;)V",
         HOOKS_CLASS,
@@ -359,7 +344,7 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
     ) {
         Ok(b) => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Entity setPos/setBoundingBox probes");
+            cplug_sdk::log::info("[c-entities] patched Entity setBoundingBox probe");
             Some(b)
         }
         Err(e) => {
@@ -441,29 +426,6 @@ pub extern "system" fn n_box(
 
 pub extern "system" fn n_remove(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i64) {
     let _ = with_index(|idx| idx.remove(id));
-}
-
-/// setPos probe: old box (constant dims) re-anchored to the new position.
-/// Exactness for pose changes is restored by the setBoundingBox probe.
-pub extern "system" fn n_pos(
-    _env: *mut jni::JNIEnv,
-    _cls: jni::jclass,
-    id: i64,
-    world: i32,
-    x: f64,
-    y: f64,
-    z: f64,
-    _ox0: f64,
-    oy0: f64,
-    _oz0: f64,
-    ox1: f64,
-    oy1: f64,
-    _oz1: f64,
-) {
-    let w = (ox1 - _ox0) * 0.5;
-    let h = oy1 - oy0;
-    let new = centities_core::Aabb::new(x - w, y, z - w, x + w, y + h, z + w);
-    let _ = with_index(|idx| idx.upsert(id, world as u16, &new));
 }
 
 // bridge class bytes (compiled by build.rs against the paper jar)
