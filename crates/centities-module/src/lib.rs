@@ -249,6 +249,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         n_box as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64));
     push!("nativeRemoveDirect", "(J)V",
         n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64));
+    push!("nativeReset", "()V",
+        n_reset as extern "system" fn(*mut jni::JNIEnv, jni::jclass));
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -559,4 +561,14 @@ pub extern "system" fn n_box(
 /// Direct remove for rare off-thread probes (worldgen workers).
 pub extern "system" fn n_remove(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i64) {
     let _ = with_index(|idx| idx.remove(id));
+}
+
+/// Full index drop (parity-gate suspend/resume, iteration 4): the Java gate
+/// suspends indexing when the fast path is measurably useless for the current
+/// traffic; on resume it fully re-syncs the index from the live lookups, so
+/// the native side only needs to forget everything it had.
+pub extern "system" fn n_reset(_env: *mut jni::JNIEnv, _cls: jni::jclass) {
+    if let Ok(mut g) = INDEX.lock() {
+        *g = None; // lazily re-created by the next apply/query
+    }
 }

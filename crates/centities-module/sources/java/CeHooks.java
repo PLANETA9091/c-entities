@@ -15,6 +15,23 @@ import java.util.function.Predicate;
  * FALLBACK CONTRACT: when ACTIVE is false every woven path behaves exactly
  * like vanilla (the e2e differential test proves it before arming).
  *
+ * PARITY GATE (iteration 4, the owner's hard requirement: the module must
+ * never be slower than vanilla). The honest A/B (doc 08) proved the fast
+ * path pays a fixed ~8.4us JNI+native cost per query — it can only win on
+ * queries whose vanilla scan is comparable or larger. So the module now
+ * MEASURES both paths per (world, query-volume bucket) with EMAs and routes
+ * each query to whichever path is measured cheaper (hysteresis + a rare
+ * re-probe so EMAs cannot go stale). In steady state every query takes its
+ * cheaper path, which bounds the module at vanilla parity by construction;
+ * the win comes from the dense buckets where the exact Rust index beats the
+ * section scan. If fast queries all but disappear, indexing fully suspends
+ * (probes cost one volatile read) and a full resync re-arms it on demand.
+ *
+ * ZERO-RESOLVE (iteration 4): candidates are resolved through ARENA[id]
+ * — entity refs written directly by the probes (2ns) — with an id-match
+ * check for staleness and a LevelEntityGetter fallback. This removes the
+ * ~190ns/candidate hash-path resolve that made dense queries unwinnable.
+ *
  * PROBE BATCHING (iteration 2b): probes no longer cross JNI per event —
  * a setPos storm of 150k mobs/tick used to cost ~1-2us of JNI EACH. Probes
  * now append into plain Java arrays (multi-producer, atomic cursor); the
@@ -41,6 +58,10 @@ public final class CeHooks {
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
     public static volatile long lastError = 0;
     private static volatile String lastErrorText = "";
+    // Parity-gate counters (diagnostics).
+    public static volatile long arenaMiss = 0, staleCand = 0;
+    public static volatile long suspends = 0, resumes = 0, resyncEnts = 0;
+    public static volatile long fastProbes = 0, mirrorProbes = 0; // re-probe traffic
 
     /** One-line diagnostic snapshot (all counters). */
     public static String stats() {
@@ -53,6 +74,10 @@ public final class CeHooks {
                 + " fastMs=" + fastNanos / 1_000_000 + " qMs=" + queryNanos / 1_000_000
                 + " resMs=" + resolveNanos / 1_000_000
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
+                + " arenaMiss=" + arenaMiss + " stale=" + staleCand
+                + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
+                + " reprobe=" + fastProbes + "/" + mirrorProbes
+                + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
 
@@ -65,13 +90,27 @@ public final class CeHooks {
             Entity source, AABB box, Predicate<? super Entity> predicate) {
         if (ACTIVE) {
             try {
-                long t0 = System.nanoTime();
-                List<Entity> out = fastQuery(level, box, predicate);
-                fastNanos += System.nanoTime() - t0;
-                if (out != null) {
-                    queriesFast++;
-                    return out;
+                int gi = gateCell(level, box);
+                if (gi >= 0 && wantFast(gi)) {
+                    long t0 = System.nanoTime();
+                    List<Entity> out = fastQuery(level, source, box, predicate);
+                    long dt = System.nanoTime() - t0;
+                    fastNanos += dt;
+                    if (out != null) {
+                        if (dt <= 0) dt = 1;
+                        ema(FAST_EMA, gi, dt);
+                        if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
+                        queriesFast++;
+                        return out;
+                    }
+                    // fast refused (notReady/regrow/desync) — mirror is the
+                    // safe answer; no EMA record (this cost is anomaly, not
+                    // the mirror's steady-state price).
+                    queriesMirror++;
+                    return mirror(level, source, box, predicate);
                 }
+                queriesMirror++;
+                return mirrorMaybeTimed(level, source, box, predicate, gi);
             } catch (Throwable t) {
                 lastError = System.nanoTime();
                 lastErrorText = String.valueOf(t);
@@ -82,9 +121,15 @@ public final class CeHooks {
             mDisabled++;
         }
         queriesMirror++;
-        // Vanilla mirror — identical to the replaced body of
-        // Level.getEntities(Entity, AABB, Predicate), Paper 1.21.8
-        // (decompiled from the shipped jar; keep in sync).
+        return mirror(level, source, box, predicate);
+    }
+
+    /** Vanilla mirror — identical to the replaced body of
+     *  Level.getEntities(Entity, AABB, Predicate), Paper 1.21.8
+     *  (decompiled from the shipped jar; keep in sync). */
+    private static List<Entity> mirror(
+            net.minecraft.world.level.Level level,
+            Entity source, AABB box, Predicate<? super Entity> predicate) {
         List<Entity> ret = new ArrayList<>();
         ((net.minecraft.server.level.ServerLevel) level)
                 .moonrise$getEntityLookup().getEntities(source, box, ret, predicate);
@@ -102,8 +147,9 @@ public final class CeHooks {
     /** Prefix of EntityLookup.addEntity(Entity,boolean,boolean): slot 1 = entity. */
     public static void probeAdd(Entity e) {
         try {
-            if (ACTIVE && e != null && e.level() != null && !e.level().isClientSide) {
+            if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide) {
                 probesAdd++;
+                ARENA[e.getId() & AMASK] = e;
                 batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox());
             }
         } catch (Throwable t) {
@@ -117,8 +163,9 @@ public final class CeHooks {
     /** Prefix of EntityLookup.removeEntity(Entity): slot 1 = entity. */
     public static void probeRemove(Entity e) {
         try {
-            if (ACTIVE) {
+            if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
+                ARENA[e.getId() & AMASK] = null;
                 batchRemove(e.getId());
             }
         } catch (Throwable t) {
@@ -136,8 +183,9 @@ public final class CeHooks {
      *  probeAdd — and for no-op positions). */
     public static void probeBox(Entity e, AABB newBox) {
         try {
-            if (ACTIVE && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
+            if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
                 probesBox++;
+                ARENA[e.getId() & AMASK] = e;
                 batchUpsert(e.getId(), worldId(e.level()), newBox);
             }
         } catch (Throwable t) {
@@ -200,6 +248,177 @@ public final class CeHooks {
     }
 
     // ------------------------------------------------------------------
+    // PARITY GATE (iteration 4). Owner's hard requirement: the module must
+    // never be slower than vanilla. Per (world, volume-bucket) we keep an
+    // EMA of measured fast-path and mirror-path nanos; every query is routed
+    // to the measured-cheaper path. Fast wins only in dense buckets (the
+    // exact Rust index skips the section scan's wasted intersects); small
+    // queries stay vanilla. When fast queries all but disappear across the
+    // whole gate window, indexing suspends entirely (probes = 1 volatile
+    // read) and re-arms through a full resync when an expensive query shows
+    // up again. Worst case is therefore vanilla parity minus gate arithmetic.
+    //
+    // Thread-safety: gate state is heuristic — decisions happen on the
+    // server thread; races from other callers degrade to a stale choice,
+    // never to incorrect results (both paths are always correct).
+    // ------------------------------------------------------------------
+    private static final int GBUCKETS = 16; // log2 of query box volume
+    private static final int GWORLDS = 8;   // worlds beyond this stay vanilla
+    private static final long[] FAST_EMA = new long[GWORLDS * GBUCKETS];
+    private static final long[] MIRR_EMA = new long[GWORLDS * GBUCKETS];
+    private static final int[] FAST_N = new int[GWORLDS * GBUCKETS];
+    private static final int[] MIRR_N = new int[GWORLDS * GBUCKETS];
+    private static final int[] FAST_SEQ = new int[GWORLDS * GBUCKETS];
+    private static final int[] MIRR_SEQ = new int[GWORLDS * GBUCKETS];
+    private static int gateDecisions = 0, gateFastChosen = 0;
+    private static final int GATE_WINDOW = 16_384;
+    private static final int GATE_MIN_FAST = 32;   // below: fast is useless
+    private static final long RESUME_NANOS = 15_000; // an expensive query re-arms
+
+    /** INDEXING=false means probes do nothing (suspend). SUSPENDED means the
+     *  gate also refuses fast queries until a full resync re-arms the index. */
+    private static volatile boolean INDEXING = true;
+    private static volatile boolean SUSPENDED = false;
+
+    private static void ema(long[] arr, int i, long sample) {
+        long e = arr[i];
+        arr[i] = e == 0 ? sample : e + ((sample - e) >> 3);
+    }
+
+    private static int bucketOf(AABB box) {
+        double v = (box.maxX - box.minX) * (box.maxY - box.minY) * (box.maxZ - box.minZ);
+        if (v < 1) return 0;
+        int b = 64 - Long.numberOfLeadingZeros((long) v); // double->long saturates
+        return b >= GBUCKETS ? GBUCKETS - 1 : b;
+    }
+
+    /** Returns the gate cell index (>= 0) when this query has a gate cell
+     *  (fast is ALLOWED there), or -1 when it must go vanilla outright
+     *  (non-server level, unknown world, suspended). The cell is needed by
+     *  BOTH paths: fast records its EMA here, mirror samples its price here
+     *  — that feedback is what keeps the routing on the cheaper side. */
+    private static int gateCell(net.minecraft.world.level.Level level, AABB box) {
+        if (!(level instanceof net.minecraft.server.level.ServerLevel)) {
+            mNotServerLevel++;
+            return -1;
+        }
+        int wid = worldId(level);
+        if (wid < 0 || wid >= GWORLDS) {
+            mBadWorld++;
+            return -1; // no gate cell — vanilla, guaranteed parity
+        }
+        if (SUSPENDED) {
+            gateDecisions++;
+            return -1; // resume trigger lives in mirrorMaybeTimed
+        }
+        return wid * GBUCKETS + bucketOf(box);
+    }
+
+    /** The per-cell routing decision. FAST_N < 16 bootstraps with measured
+     *  probes; afterwards a 1/256 re-probe keeps EMAs from going stale and
+     *  the comparison runs with hysteresis (fast must be < 80% of mirror).
+     *  Also feeds the suspend window. */
+    private static boolean wantFast(int gi) {
+        boolean fast;
+        if (FAST_N[gi] < 16) {
+            fast = true; // bootstrap: a few measured probes per bucket
+        } else if ((++FAST_SEQ[gi] & 255) == 0) {
+            fast = true; // periodic re-probe: EMAs must not go stale
+            fastProbes++;
+        } else {
+            fast = MIRR_N[gi] >= 8 && FAST_EMA[gi] * 4 < MIRR_EMA[gi] * 5; // hysteresis
+        }
+        gateDecisions++;
+        if (fast) {
+            gateFastChosen++;
+        } else {
+            maybeSuspend();
+        }
+        return fast;
+    }
+
+    /** Mirror with sampled timing: the EMA needs mirror prices, and while
+     *  suspended a single expensive sample is the resume trigger. gi >= 0
+     *  means the query has a gate cell (per-bucket sampling applies);
+     *  gi < 0 means vanilla outright (sample only for the resume scan). */
+    private static List<Entity> mirrorMaybeTimed(
+            net.minecraft.world.level.Level level,
+            Entity source, AABB box, Predicate<? super Entity> predicate, int gi) {
+        boolean sample;
+        if (gi < 0) {
+            sample = SUSPENDED && (mirrorProbes++ & 63) == 0; // resume scan while asleep
+        } else if (MIRR_N[gi] < 64) {
+            sample = true;
+        } else {
+            sample = (++MIRR_SEQ[gi] & 255) == 0;
+            if (sample) mirrorProbes++;
+        }
+        if (!sample) {
+            return mirror(level, source, box, predicate);
+        }
+        long t0 = System.nanoTime();
+        List<Entity> ret = mirror(level, source, box, predicate);
+        long dt = System.nanoTime() - t0;
+        if (dt <= 0) dt = 1;
+        if (gi >= 0) {
+            ema(MIRR_EMA, gi, dt);
+            if (MIRR_N[gi] < 1_000_000) MIRR_N[gi]++;
+        }
+        if (SUSPENDED && dt >= RESUME_NANOS) {
+            resumeIndexing();
+        }
+        return ret;
+    }
+
+    private static void maybeSuspend() {
+        if (gateDecisions < GATE_WINDOW) return;
+        int chosen = gateFastChosen;
+        gateDecisions = 0;
+        gateFastChosen = 0;
+        if (!SUSPENDED && chosen < GATE_MIN_FAST) {
+            SUSPENDED = true;
+            INDEXING = false;
+            bN = 0; // pending deltas are irrelevant: the index is dropped and
+            nativeReset(); // will be fully rebuilt by resync on resume
+            java.util.Arrays.fill(ARENA, null); // release entity refs for GC
+            suspends++;
+        }
+    }
+
+    /** Full re-sync of the Rust index + ARENA from the live lookups. Runs on
+     *  the calling (server) thread; vanilla's getAllEntities iterates safely.
+     *  Off-thread direct probes racing the resync are harmless: worst case a
+     *  candidate is briefly stale and resolve falls back or skips it. */
+    private static void resumeIndexing() {
+        nativeReset();
+        for (net.minecraft.world.level.Level w : WORLDS.keySet()) {
+            if (!(w instanceof net.minecraft.server.level.ServerLevel sl)) continue;
+            int wid = worldId(sl);
+            int n = 0;
+            for (Entity e : sl.getAllEntities()) {
+                if (e == null || e.isRemoved()) continue;
+                AABB b = e.getBoundingBox();
+                ARENA[e.getId() & AMASK] = e;
+                batchUpsert(e.getId(), wid, b);
+                n++;
+            }
+            resyncEnts += n;
+        }
+        flush();
+        INDEXING = true;
+        SUSPENDED = false;
+        resumes++;
+    }
+
+    // ------------------------------------------------------------------
+    // Zero-resolve candidate arena. Entity ids come from a global monotonic
+    // counter, so id & AMASK is stable for the id's whole lifetime; the
+    // id-match check turns any wrapped/stale slot into a clean fallback.
+    // ------------------------------------------------------------------
+    private static final Entity[] ARENA = new Entity[1 << 22];
+    private static final int AMASK = ARENA.length - 1;
+
+    // ------------------------------------------------------------------
     // Fast query: flush pending probes, Rust exact query -> resolve ids.
     // Returns null => caller takes the mirror path.
     // ------------------------------------------------------------------
@@ -207,7 +426,8 @@ public final class CeHooks {
             ThreadLocal.withInitial(() -> new long[1024]);
 
     private static List<Entity> fastQuery(
-            net.minecraft.world.level.Level level, AABB box, Predicate<? super Entity> predicate) {
+            net.minecraft.world.level.Level level, Entity source,
+            AABB box, Predicate<? super Entity> predicate) {
         if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
             mNotServerLevel++;
             return null;
@@ -251,11 +471,38 @@ public final class CeHooks {
 
         ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
         int resolved = 0;
+        int stale = 0;
+        int srcSkip = 0;
         candidatesSeen += n;
         long t2 = System.nanoTime();
+        int srcId = source == null ? -1 : source.getId();
         for (int k = 0; k < n; k++) {
-            Entity e = sl.getEntity((int) ids[k]); // LevelEntityGetter.byId — id-keyed
-            if (e == null) continue; // stale candidate (removed before its probe ran)
+            int cid = (int) ids[k];
+            if (cid == srcId) {
+                // vanilla excludes exactly the source entity; a self-query
+                // (item merge scans around ITSELF) can legitimately return
+                // nothing but the source — that is not a desync.
+                srcSkip++;
+                continue;
+            }
+            // ZERO-RESOLVE: the probes keep refs in ARENA[id & AMASK]; the
+            // id-match rejects stale/wrapped slots, the getter is only a
+            // fallback (e.g. right after a resync window).
+            Entity e = ARENA[cid & AMASK];
+            if (e == null || e.getId() != cid) {
+                arenaMiss++;
+                e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
+                if (e == null) {
+                    // Not in the arena and not in the world: almost always a
+                    // candidate whose remove-probe is still sitting in the
+                    // batch (item merge storms) — the batch is applied at the
+                    // NEXT query, so the index is momentarily ahead of the
+                    // world. Vanilla never returns such an entity; skipping
+                    // is the correct behavior.
+                    stale++;
+                    continue;
+                }
+            }
             resolved++;
             // NOTE: no per-candidate box.intersects — the Rust index is exact
             // (property-tested vs brute force in centities-core); the vanilla
@@ -266,7 +513,12 @@ public final class CeHooks {
         }
         resolveNanos += System.nanoTime() - t2;
         candidatesResolved += resolved;
-        if (resolved == 0 && n > 0) {
+        staleCand += stale;
+        // Desync means the index disagrees with the WORLD about LIVING
+        // entities. All-stale candidates are the normal batching window, not
+        // a desync — treating them as one falsely mirrored (and could even
+        // suspend indexing) during merge storms.
+        if (resolved == 0 && stale == 0 && srcSkip == 0 && n > 0) {
             mDesync++;
             return null; // desync guard
         }
@@ -274,18 +526,22 @@ public final class CeHooks {
     }
 
     // ------------------------------------------------------------------
-    // World registry
+    // World registry. ConcurrentHashMap of Level keys keeps identity
+    // semantics (Level inherits Object.equals) AND survives probes from
+    // worldgen threads racing a first-time registration (the old
+    // IdentityHashMap could corrupt its buckets under that race).
     // ------------------------------------------------------------------
-    private static final java.util.IdentityHashMap<net.minecraft.world.level.Level, Integer> WORLDS =
-            new java.util.IdentityHashMap<>();
-    private static int nextWorld = 0;
+    private static final java.util.concurrent.ConcurrentHashMap<net.minecraft.world.level.Level, Integer> WORLDS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicInteger NEXT_WORLD =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public static int worldId(net.minecraft.world.level.Level level) {
         Integer w = WORLDS.get(level);
         if (w != null) return w;
-        w = nextWorld++;
-        WORLDS.put(level, w);
-        return w;
+        w = NEXT_WORLD.getAndIncrement();
+        Integer prev = WORLDS.putIfAbsent(level, w);
+        return prev != null ? prev : w;
     }
 
     /** Kill-switch arm/disarm from the native side. */
@@ -310,4 +566,5 @@ public final class CeHooks {
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
+    public static native void nativeReset();
 }
