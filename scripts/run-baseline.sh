@@ -42,12 +42,16 @@ AGENT_ARGS=()
 if [ "${MODULE:-off}" = "on" ]; then
   echo "MODULE=on: building CRUSSTY runtime (from source) + c-entities module"
   # 1. mojang-mapped server jar for javac (one-shot paperclip boot, no world)
+  # Idempotent: reuse the previously produced mapped jar when present.
   PB="$ROOT/build/paperboot"
-  mkdir -p "$PB"
-  cp "$PAPER_JAR" "$PB/paper.jar"
-  echo "eula=false" > "$PB/eula.txt"
-  (cd "$PB" && timeout 300 java -Xmx2G -jar paper.jar nogui > boot.log 2>&1 || true)
-  MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" | head -1)
+  MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" 2>/dev/null | head -1)
+  if [ -z "$MAPPED" ]; then
+    mkdir -p "$PB"
+    cp "$PAPER_JAR" "$PB/paper.jar"
+    echo "eula=false" > "$PB/eula.txt"
+    (cd "$PB" && timeout 300 java -Xmx2G -jar paper.jar nogui > boot.log 2>&1 || true)
+    MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" | head -1)
+  fi
   [ -n "$MAPPED" ] && [ -f "$MAPPED" ] || { echo "FATAL: paperclip boot produced no mapped jar"; tail -20 "$PB/boot.log" || true; exit 1; }
   # 2. module cdylib (CRUSSTY path deps live at repo-parent/CRUSSTY)
   (cd "$ROOT" && PAPER_JAR="$MAPPED" cargo build -p centities-module --release) \
@@ -66,14 +70,17 @@ fi
 cd "$S"
 XMX="${XMX:-8G}"
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off}"
-java -Xms2G -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true" \
   -jar paper.jar nogui > "$R/server.log" 2>&1 &
 JPID=$!
 
+# mineflayer is installed into tools/node_modules (both on CI and locally);
+# bot.js resolves modules from its own directory upward, which never reaches
+# tools/ — pass NODE_PATH explicitly (the require() fallback path).
 cd "$ROOT/tools" 2>/dev/null || cd "$ROOT"
-node "$ROOT/scripts/bot.js" &
+NODE_PATH="$ROOT/tools/node_modules${NODE_PATH:+:$NODE_PATH}" node "$ROOT/scripts/bot.js" &
 BOTPID=$!
 
 JSON_OK=0

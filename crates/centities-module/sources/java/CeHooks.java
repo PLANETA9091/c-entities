@@ -33,6 +33,22 @@ public final class CeHooks {
     public static volatile long queriesFast = 0, queriesMirror = 0;
     public static volatile long probesAdd = 0, probesRemove = 0, probesBox = 0;
     public static volatile long batchesFlushed = 0, batchEntries = 0;
+    // Mirror-reason counters (diagnostics): why the fast path was skipped.
+    public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
+    public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
+    public static volatile long lastError = 0;
+    private static volatile String lastErrorText = "";
+
+    /** One-line diagnostic snapshot (all counters). */
+    public static String stats() {
+        return "fast=" + queriesFast + " mirror=" + queriesMirror
+                + " (nslevel=" + mNotServerLevel + " badWorld=" + mBadWorld
+                + " notReady=" + mNotReady + " regrow=" + mRegrowFail
+                + " desync=" + mDesync + " disabled=" + mDisabled + ")"
+                + " add=" + probesAdd + " rm=" + probesRemove + " box=" + probesBox
+                + " flush=" + batchesFlushed + "/" + batchEntries
+                + " active=" + ACTIVE + " lastErr=" + lastErrorText;
+    }
 
     // ------------------------------------------------------------------
     // Woven (replace_body): Level.getEntities(Entity, AABB, Predicate)
@@ -49,8 +65,13 @@ public final class CeHooks {
                     return out;
                 }
             } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = String.valueOf(t);
+                t.printStackTrace();
                 ACTIVE = false; // never break the server
             }
+        } else {
+            mDisabled++;
         }
         queriesMirror++;
         // Vanilla mirror — identical to the replaced body of
@@ -78,6 +99,9 @@ public final class CeHooks {
                 batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox());
             }
         } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeAdd: " + t;
+            t.printStackTrace();
             ACTIVE = false;
         }
     }
@@ -90,6 +114,9 @@ public final class CeHooks {
                 batchRemove(e.getId());
             }
         } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeRemove: " + t;
+            t.printStackTrace();
             ACTIVE = false;
         }
     }
@@ -106,6 +133,9 @@ public final class CeHooks {
                 batchUpsert(e.getId(), worldId(e.level()), newBox);
             }
         } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeBox: " + t;
+            t.printStackTrace();
             ACTIVE = false;
         }
     }
@@ -170,19 +200,44 @@ public final class CeHooks {
 
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, AABB box, Predicate<? super Entity> predicate) {
-        if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) return null;
+        if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
+            mNotServerLevel++;
+            return null;
+        }
         int wid = worldId(sl);
-        if (wid < 0) return null;
-        if (bN > 0) flush();
+        if (wid < 0) {
+            mBadWorld++;
+            return null;
+        }
 
+        // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is applied
+        // by the SAME native call that runs the query — one JNI crossing and
+        // one index-lock acquisition per query (2b paid two each: a flush
+        // before every query was ~1.7M flushes for ~1.9M queries).
+        // batchN>0 only on the first attempt; retries must NOT re-apply.
         long[] ids = QBUF.get();
-        int n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ, ids);
+        int bn = bN;
+        int n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
+                ids, bn, B_IDS, B_BOX);
+        if (n >= 0 && bn > 0) {
+            bN = 0;
+            batchesFlushed++;
+            batchEntries += bn;
+        }
         for (int tries = 0; n >= 0 && n > ids.length && tries < 3; tries++) {
             ids = new long[n];
             QBUF.set(ids);
-            n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ, ids);
+            n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
+                    ids, 0, B_IDS, B_BOX);
         }
-        if (n < 0 || n > ids.length) return null; // index not ready / regrow failed — mirror
+        if (n < 0) {
+            mNotReady++;
+            return null; // index not ready — mirror
+        }
+        if (n > ids.length) {
+            mRegrowFail++;
+            return null; // regrow failed 3x — mirror
+        }
 
         ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
         int resolved = 0;
@@ -197,7 +252,10 @@ public final class CeHooks {
                 out.add(e);
             }
         }
-        if (resolved == 0 && n > 0) return null; // desync guard
+        if (resolved == 0 && n > 0) {
+            mDesync++;
+            return null; // desync guard
+        }
         return out;
     }
 
@@ -222,16 +280,18 @@ public final class CeHooks {
     }
 
     // ------------------------------------------------------------------
-    // Natives (Rust). queryNative writes into the caller's buffer and
-    // returns the count (or the required capacity as a positive value if
-    // the buffer is too small; -1 = index not ready). nativeFlush applies
-    // a packed batch: entries with bit63 set are removals. The *Direct
-    // variants serve the rare off-thread probes (worldgen workers) — they
-    // apply one change immediately under the index mutex.
+    // Natives (Rust). queryNative applies the caller's pending probe batch
+    // (single lock acquisition) and runs the exact query into the caller's
+    // buffer; returns the count (or the required capacity as a positive
+    // value if the buffer is too small; -1 = index not ready). nativeFlush
+    // applies a packed batch mid-tick when it hits 3/4 capacity: entries
+    // with bit63 set are removals. The *Direct variants serve the rare
+    // off-thread probes (worldgen workers) — they apply one change
+    // immediately under the index mutex.
     // ------------------------------------------------------------------
     public static native int queryNative(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            long[] out);
+            long[] out, int batchN, long[] batchIds, double[] batchBoxes);
     public static native void nativeFlush(int n, long[] ids, double[] boxes);
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);

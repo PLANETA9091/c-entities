@@ -37,6 +37,8 @@ static PATCHES_FAIL: AtomicU64 = AtomicU64::new(0);
 /// (GetLoadedClasses etc.) are restricted — they must NEVER call find_class;
 /// they resolve everything from this cached loader instead.
 static LOADER: AtomicUsize = AtomicUsize::new(0);
+/// Global ref of the DEFINED CeHooks class (the one the woven code calls).
+static HOOKS_CLASS_GLOBAL: AtomicUsize = AtomicUsize::new(0);
 /// Original class bytes seen at boot load (stash — hooks may not do heavy
 /// work inside the ClassFileLoadHook callback).
 static STASH: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
@@ -91,13 +93,20 @@ pub unsafe extern "C" fn cplugin_init(
 // ---------------------------------------------------------------------------
 
 fn arm_module() {
-    // define_bridge returns a GLOBAL ref of the Level class loader (safe to
-    // use from other threads / later attach scopes).
-    let Some(Some(loader)) = cplug_sdk::jni_util::with_attached(define_bridge) else {
+    // define_bridge returns (GLOBAL ref of the Level class loader, GLOBAL ref
+    // of the defined CeHooks class). Arming MUST go through the exact class
+    // object define_class returned: resolving CeHooks again via FindClass can
+    // land on a DIFFERENT loader's copy (kernel/paperclip loader labyrinths),
+    // arming a class the woven code never calls — the module silently stays
+    // vanilla (observed 2026-10-19: ARMED logged, every query mirrored).
+    let Some(Some((loader, hooks_cls))) =
+        cplug_sdk::jni_util::with_attached(define_bridge)
+    else {
         cplug_sdk::log::info("[c-entities] arm: bridge setup failed — staying vanilla");
         return;
     };
     LOADER.store(loader as usize, Ordering::Release);
+    HOOKS_CLASS_GLOBAL.store(hooks_cls as usize, Ordering::Release);
 
     // Precompute the Level.getEntities rewrite OUTSIDE any ClassFileLoadHook
     // callback: replace_body runs the Java ASM helper with COMPUTE_FRAMES,
@@ -119,18 +128,31 @@ fn arm_module() {
     let ok_n = PATCHES_OK.load(Ordering::Acquire);
     let fail_n = PATCHES_FAIL.load(Ordering::Acquire);
     if ok_n >= 3 && fail_n == 0 {
-        // CeHooks.setActive(true)
-        let armed = cplug_sdk::jni_util::with_attached(|env| {
-            let cls = cplug_sdk::classes::find_class(HOOKS_CLASS)?;
-            let mid = env.get_static_method_id(cls.0, "setActive", "(Z)V")?;
-            env.call_static_void_method(cls.0, mid, &[jni::jvalue { z: 1 }]);
-            Some(())
-        })
-        .is_some();
-        if armed {
-            ARMED.store(true, Ordering::Release);
-            cplug_sdk::log::info("[c-entities] ARMED: index fast path active");
-            return;
+        // CeHooks.setActive(true) — on the EXACT class object define_class
+        // returned (global ref), never via find_class (loader mismatch).
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls != 0 {
+            let armed = cplug_sdk::jni_util::with_attached(|env| {
+                let cls = hooks_cls as jni::jclass;
+                let mid = env.get_static_method_id(cls, "setActive", "(Z)V")?;
+                env.call_static_void_method(cls, mid, &[jni::jvalue { z: 1 }]);
+                // call_static_void_method leaves a pending exception
+                // (e.g. ExceptionInInitializerError) unchecked — check and
+                // clear, otherwise the arm would be reported OK while the
+                // flag never flipped.
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                    return None::<()>;
+                }
+                Some(())
+            })
+            .is_some();
+            if armed {
+                ARMED.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] ARMED: index fast path active");
+                return;
+            }
         }
     }
     cplug_sdk::log::info(&format!(
@@ -164,7 +186,7 @@ fn precompute_level(loader: jni::jobject) {
     }
 }
 
-fn define_bridge(env: &JniEnv) -> Option<jni::jobject> {
+fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
     cplug_sdk::log::info("[c-entities] bridge: step 1 claim class");
     if !cplug_sdk::claim(&format!("class:{HOOKS_CLASS}")) {
         cplug_sdk::log::info("[c-entities] bridge class name already claimed");
@@ -191,13 +213,16 @@ fn define_bridge(env: &JniEnv) -> Option<jni::jobject> {
         cplug_sdk::log::info("[c-entities] bridge define_class failed");
         return None;
     };
+    // Keep the EXACT class object: global ref (this attach scope's local ref
+    // dies at scope end) — arm_module uses it for setActive(true).
+    let cls_global = env.new_global_ref(cls);
     cplug_sdk::log::info("[c-entities] bridge: step 5 register_natives");
     if !register_natives(env, cls) {
         return None;
     }
     // Promote the loader to a global ref while we are still attached (the
     // local ref dies with this attach scope).
-    Some(env.new_global_ref(loader))
+    Some((env.new_global_ref(loader), cls_global))
 }
 
 fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
@@ -216,8 +241,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             });
         }};
     }
-    push!("queryNative", "(IDDDDDD[J)I",
-        n_query as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, f64, f64, f64, f64, f64, f64, jni::jlongArray) -> i32);
+    push!("queryNative", "(IDDDDDD[JI[J[D)I",
+        n_query as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, f64, f64, f64, f64, f64, f64, jni::jlongArray, i32, jni::jlongArray, jni::jdoubleArray) -> i32);
     push!("nativeFlush", "(I[J[D)V",
         n_flush as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, jni::jlongArray, jni::jdoubleArray));
     push!("nativeBoxDirect", "(JIDDDDDD)V",
@@ -363,7 +388,10 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
 
 thread_local! {
     /// Scratch for query results (native side); reused across calls.
-    static QSCRATCH: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static QSCRATCH: std::cell::RefCell<Vec<jni::jlong>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Batch-array read buffers (grow-only, one JNI region copy per apply).
+    static BIDBUF: std::cell::RefCell<Vec<jni::jlong>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BBOXBUF: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Returns: n >= 0 — count written into `out`; n > out.len — required
@@ -379,22 +407,64 @@ pub extern "system" fn n_query(
     y1: f64,
     z1: f64,
     out: jni::jlongArray,
+    batch_n: i32,
+    batch_ids: jni::jlongArray,
+    batch_boxes: jni::jdoubleArray,
 ) -> i32 {
-    let ran = QSCRATCH.with(|q| {
-        let mut q = q.borrow_mut();
-        let mut g = INDEX.lock().ok()?;
-        let idx = g.as_ref()?;
-        idx.query(
-            world as u16,
-            &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
-            &mut q,
-        );
-        Some(())
-    });
-    if ran.is_none() {
+    // FLUSH-MERGED QUERY (iteration 3): the caller's pending probe batch is
+    // applied under the SAME lock acquisition right before the query — one
+    // JNI crossing and one lock per query (2b paid a separate flush call).
+    let bn = if batch_n > 0 { batch_n as usize } else { 0 };
+    let n = unsafe {
+        let e = JniEnv::from_raw(env);
+        QSCRATCH.with(|q| {
+            let mut q = q.borrow_mut();
+            let mut g = INDEX.lock().ok()?;
+            let idx = g.as_mut()?;
+            if bn > 0 {
+                BIDBUF.with(|b| {
+                    let mut b = b.borrow_mut();
+                    b.clear();
+                    b.resize(bn, 0);
+                    e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
+                    for l in b.iter() {
+                        if *l < 0 {
+                            idx.remove(*l & 0xFFFF_FFFF);
+                        }
+                    }
+                    BBOXBUF.with(|bx| {
+                        let mut bx = bx.borrow_mut();
+                        bx.clear();
+                        bx.resize(bn * 6, 0.0);
+                        jni_get_double_array_region(&e, batch_boxes, 0, (bn * 6) as i32, &mut bx);
+                        for (i, l) in b.iter().enumerate() {
+                            if *l >= 0 {
+                                let wid = ((*l >> 32) & 0xFFFF) as u16;
+                                let o = i * 6;
+                                idx.upsert(
+                                    *l & 0xFFFF_FFFF,
+                                    wid,
+                                    &centities_core::Aabb::new(
+                                        bx[o], bx[o + 1], bx[o + 2], bx[o + 3], bx[o + 4], bx[o + 5],
+                                    ),
+                                );
+                            }
+                        }
+                    });
+                });
+            }
+            idx.query(
+                world as u16,
+                &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
+                &mut q,
+            );
+            Some(q.len() as i32)
+        })
+        .unwrap_or(-1)
+    };
+    if n < 0 {
         return -1;
     }
-    let n = QSCRATCH.with(|q| q.borrow().len()) as i32;
     if n > 0 {
         unsafe {
             let e = JniEnv::from_raw(env);
@@ -404,8 +474,8 @@ pub extern "system" fn n_query(
             }
             QSCRATCH.with(|q| {
                 let q = q.borrow();
-                let buf: Vec<jni::jlong> = q.iter().map(|v| *v as jni::jlong).collect();
-                e.set_long_array_region(out, 0, buf.len() as i32, &buf);
+                // jlong == i64 — write straight from the scratch buffer.
+                e.set_long_array_region(out, 0, n, &q[..n as usize]);
             });
         }
     }

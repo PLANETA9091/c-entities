@@ -10,3 +10,8 @@
 __pycache__/
 /rec.jfr
 *.log
+/tools/node_modules/
+/node_modules/
+/build/
+/bench/
+baseline/plugin/target/

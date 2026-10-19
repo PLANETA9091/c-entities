@@ -105,6 +105,11 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
 
         getServer().getPluginManager().registerEvents(this, this);
+
+        // Always-on hook diagnostics: every 100 ticks, any phase.
+        Bukkit.getScheduler().runTaskTimer(this,
+                () -> { String h = hookStats(); if (h != null) getLogger().info("hooks@T" + tickNo + ": " + h); },
+                60L, 100L);
         getLogger().info(String.format(Locale.ROOT,
                 "ce-baseline config: run=%s scale=%d items=%.2f stands=%.2f tiles(h=%d,f=%d) measure=%d",
                 runName, scale, pctItems, pctStands, tileHoppers, tileFurnaces, measureTicks));
@@ -282,19 +287,69 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 if (tickNo >= measureEndTick - measureTicks) {
                     phase = "MEASURE";
                     getLogger().info("measure window open");
+                    String hs = hookStats();
+                    if (hs != null) getLogger().info("hooks@measure-open: " + hs);
                 }
             }
             case "MEASURE" -> {
                 tickDurations.add(new double[]{tickNo, e.getTickDuration()});
-                if (tickNo % 100 == 0) {
+                if (tickNo % 200 == 0) {
                     double heapUsed = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1048576.0;
                     samples.add(new double[]{tickNo, Bukkit.getWorlds().get(0).getEntities().size(),
                             placedHoppers, placedFurnaces, heapUsed});
+                    String hs = hookStats();
+                    if (hs != null) getLogger().info("hooks@" + tickNo + ": " + hs);
                 }
                 if (tickDurations.size() >= measureTicks) finish();
             }
             default -> { }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // c-entities hook counters (diagnostics). The CeHooks class lives in the
+    // server/kernel classloader, not in this plugin's — resolve it through
+    // this classloader's parents and read the public static fields via
+    // reflection. Returns null when the module is absent (vanilla runs).
+    // ------------------------------------------------------------------
+    private Class<?> ceHooksClass;
+    private boolean ceHooksTried;
+
+    private Class<?> ceHooks() {
+        if (ceHooksTried) return ceHooksClass;
+        ceHooksTried = true;
+        ClassLoader cl = getClass().getClassLoader();
+        for (int depth = 0; cl != null && depth < 8; depth++, cl = cl.getParent()) {
+            try {
+                ceHooksClass = Class.forName("dev.planeta9091.centities.CeHooks", false, cl);
+                return ceHooksClass;
+            } catch (ClassNotFoundException ignore) { }
+        }
+        // last resort: context loader
+        ClassLoader ctx = Thread.currentThread().getContextClassLoader();
+        if (ctx != null) {
+            try { ceHooksClass = Class.forName("dev.planeta9091.centities.CeHooks", false, ctx); }
+            catch (ClassNotFoundException ignore) { }
+        }
+        return ceHooksClass;
+    }
+
+    private String hookStats() {
+        Class<?> c = ceHooks();
+        if (c == null) return null;
+        try {
+            Object r = c.getMethod("stats").invoke(null);
+            return String.valueOf(r);
+        } catch (Throwable t) {
+            return "stats() failed: " + t;
+        }
+    }
+
+    private long hookField(String name) {
+        Class<?> c = ceHooks();
+        if (c == null) return -1;
+        try { return c.getField(name).getLong(null); }
+        catch (Throwable t) { return -1; }
     }
 
     private static double pct(double[] sorted, double p) {
@@ -342,6 +397,22 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 .append(", \"n\": ").append(ds.length).append("},\n");
         j.append("  \"heap_mb\": {\"used\": ").append(String.format(Locale.ROOT, "%.1f", heapUsed))
                 .append(", \"max\": ").append(String.format(Locale.ROOT, "%.1f", heapMax)).append("},\n");
+        if (ceHooks() != null) {
+            j.append("  \"hooks\": {\"fast\": ").append(hookField("queriesFast"))
+                    .append(", \"mirror\": ").append(hookField("queriesMirror"))
+                    .append(", \"notServerLevel\": ").append(hookField("mNotServerLevel"))
+                    .append(", \"badWorld\": ").append(hookField("mBadWorld"))
+                    .append(", \"notReady\": ").append(hookField("mNotReady"))
+                    .append(", \"regrowFail\": ").append(hookField("mRegrowFail"))
+                    .append(", \"desync\": ").append(hookField("mDesync"))
+                    .append(", \"disabled\": ").append(hookField("mDisabled"))
+                    .append(", \"probesAdd\": ").append(hookField("probesAdd"))
+                    .append(", \"probesRemove\": ").append(hookField("probesRemove"))
+                    .append(", \"probesBox\": ").append(hookField("probesBox"))
+                    .append(", \"batchesFlushed\": ").append(hookField("batchesFlushed"))
+                    .append(", \"batchEntries\": ").append(hookField("batchEntries"))
+                    .append("},\n");
+        }
         j.append("  \"samples\": [\n");
         for (int i = 0; i < samples.size(); i++) {
             double[] s = samples.get(i);

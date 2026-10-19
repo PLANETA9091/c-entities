@@ -51,32 +51,47 @@ jobs:
       - name: Build CRUSSTY runtime from source
         run: cargo build --release -p crussty-runtime
         working-directory: ../CRUSSTY/runtime
+      - name: Build ce-baseline plugin (live-traffic asserts)
+        run: mvn -q -B -f baseline/plugin/pom.xml package -DskipTests && mkdir -p build && cp baseline/plugin/target/ce-baseline.jar build/
       - name: Stage e2e server directory
         run: |
-          mkdir -p e2e/versions e2e/modules/entities
+          mkdir -p e2e/versions e2e/modules/entities e2e/plugins
           cp /tmp/paper/paperclip.jar e2e/versions/paperclip-1.21.8.jar
           cp target/release/libcentities_module.so e2e/modules/entities/
           cp module.json e2e/modules/entities/
+          cp build/ce-baseline.jar e2e/plugins/
           cp ../CRUSSTY/runtime/target/release/libcrussty_runtime.so e2e/
           echo "eula=true" > e2e/eula.txt
           printf 'level-type=minecraft\\:flat\nonline-mode=false\nview-distance=3\nsimulation-distance=3\nmotd=c-entities e2e\n' > e2e/server.properties
-      - name: Boot Paper 1.21.8 + CRUSSTY + c-entities
+      - name: Boot Paper 1.21.8 + CRUSSTY + c-entities (with live entities)
         working-directory: e2e
         run: |
           set -o pipefail
-          (sleep 110; echo stop) | timeout 190 \
+          # 55s: boot + module arm; then spawn real entities through the
+          # console (probes + queries fire); 100s: soak; stop. The plugin's
+          # periodic hooks@ log lines carry the LIVE counters asserted below.
+          (sleep 55;
+           echo "execute in overworld summon minecraft:zombie 8 -59 8 {NoAI:1b,PersistenceRequired:1b}";
+           echo "execute in overworld summon minecraft:armor_stand 10 -59 10 {Marker:1b,Gravity:0b}";
+           sleep 2;
+           echo "execute in overworld summon minecraft:item ~ ~ ~ {Item:{id:\"minecraft:stone\",Count:1b},PickupDelay:32767}";
+           sleep 3;
+           echo "execute in overworld summon minecraft:zombie -8 -59 -8 {NoAI:1b,PersistenceRequired:1b}";
+           sleep 40;
+           echo "execute in overworld summon minecraft:zombie 16 -59 16 {NoAI:1b,PersistenceRequired:1b}";
+           sleep 40; echo stop) | timeout 190 \
             java -Xms1G -Xmx4G \
             "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-1.21.8.jar" \
             -jar versions/paperclip-1.21.8.jar --nogui > e2e.log 2>&1 || true
           echo "## e2e markers" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "pipeline ready|\[c-entities\]|Done \(|crussty-runtime. retransform" e2e.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "pipeline ready|\[c-entities\]|hooks@|Done \(|crussty-runtime. retransform" e2e.log | head -50 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           tail -5 e2e.log >> "$GITHUB_STEP_SUMMARY" || true
-      - name: Assert injection chain
+      - name: Assert injection chain + LIVE hook counters
         working-directory: e2e
         run: |
-          fail() { echo "E2E ASSERT FAILED: $1"; grep -E "\[c-entities\]|pipeline ready|Done \(" e2e.log | head -30; exit 1; }
+          fail() { echo "E2E ASSERT FAILED: $1"; grep -E "\[c-entities\]|hooks@|pipeline ready|Done \(" e2e.log | head -40; exit 1; }
           grep -q  "pipeline ready: 1 module hook(s)"        e2e.log || fail "module pipeline not ready"
           grep -q  "\[c-entities\] natives registered"        e2e.log || fail "natives not registered"
           grep -q  "\[c-entities\] patched Level.getEntities" e2e.log || fail "Level.getEntities not patched"
@@ -86,7 +101,19 @@ jobs:
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
           ! grep -q "FAILED to patch"                         e2e.log || fail "a patch FAILED (vanilla kept)"
-          echo "E2E OK: module armed, all patches applied by the JVM, server booted"
+          ! grep -q "VerifyError"                             e2e.log || fail "a class failed verification"
+          # LIVE traffic: the last hooks@ line must show real probe and fast-path
+          # activity (summoned entities moved/queried). This is the assertion
+          # that catches a silently-inert module (wrong class object armed,
+          # probes dead) — log-marker asserts above CANNOT see that.
+          LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)
+          echo "last hooks: $LAST_HOOKS"
+          echo "$LAST_HOOKS" | grep -q "active=true"           || fail "kill switch is OFF (module disarmed)"
+          echo "$LAST_HOOKS" | grep -Eq "add=[1-9]"            || fail "probeAdd never fired (EntityLookup probe dead)"
+          echo "$LAST_HOOKS" | grep -Eq "box=[1-9]"            || fail "probeBox never fired (Entity probe dead)"
+          echo "$LAST_HOOKS" | grep -Eq "fast=[1-9]"           || fail "fast path never served a query"
+          echo "$LAST_HOOKS" | grep -Eq "desync=0 "            || fail "index desynced from the world"
+          echo "E2E OK: module armed, patches applied, probes + fast path LIVE (add/box/fast counters > 0)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
