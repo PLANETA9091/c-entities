@@ -216,13 +216,13 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             });
         }};
     }
-    push!("queryNative", "(IDDDDDD)[J",
-        n_query as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, f64, f64, f64, f64, f64, f64) -> jni::jlongArray);
-    push!("nativeAdd", "(JIDDDDDD)V",
-        n_add as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64));
-    push!("nativeBox", "(JIDDDDDD)V",
+    push!("queryNative", "(IDDDDDD[J)I",
+        n_query as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, f64, f64, f64, f64, f64, f64, jni::jlongArray) -> i32);
+    push!("nativeFlush", "(I[J[D)V",
+        n_flush as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, jni::jlongArray, jni::jdoubleArray));
+    push!("nativeBoxDirect", "(JIDDDDDD)V",
         n_box as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64));
-    push!("nativeRemove", "(J)V",
+    push!("nativeRemoveDirect", "(J)V",
         n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64));
     match env.register_natives(cls, &methods) {
         Ok(()) => {
@@ -356,9 +356,18 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// natives — all AABB doubles arrive as arguments (no JNI field reads)
+// natives — all AABB doubles arrive as arguments (no JNI field reads).
+// Iteration 2b: queries write into a caller-provided buffer (no per-query
+// jlongArray alloc); probe changes arrive as ONE packed batch per flush.
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Scratch for query results (native side); reused across calls.
+    static QSCRATCH: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Returns: n >= 0 — count written into `out`; n > out.len — required
+/// capacity (caller regrows and retries); -1 — index not ready.
 pub extern "system" fn n_query(
     env: *mut jni::JNIEnv,
     _cls: jni::jclass,
@@ -369,45 +378,98 @@ pub extern "system" fn n_query(
     x1: f64,
     y1: f64,
     z1: f64,
-) -> jni::jlongArray {
-    let mut out: Vec<i64> = Vec::new();
-    let hit = with_index(|idx| {
+    out: jni::jlongArray,
+) -> i32 {
+    let ran = QSCRATCH.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut g = INDEX.lock().ok()?;
+        let idx = g.as_ref()?;
         idx.query(
             world as u16,
             &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
-            &mut out,
+            &mut q,
         );
+        Some(())
     });
-    if hit.is_none() {
-        return std::ptr::null_mut();
+    if ran.is_none() {
+        return -1;
+    }
+    let n = QSCRATCH.with(|q| q.borrow().len()) as i32;
+    if n > 0 {
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            let cap = e.get_array_length(out as jni::jarray);
+            if cap < n {
+                return n; // caller regrows and retries
+            }
+            QSCRATCH.with(|q| {
+                let q = q.borrow();
+                let buf: Vec<jni::jlong> = q.iter().map(|v| *v as jni::jlong).collect();
+                e.set_long_array_region(out, 0, buf.len() as i32, &buf);
+            });
+        }
+    }
+    n
+}
+
+/// jvmti-bindings has no double-array wrapper — call the JNI table directly.
+unsafe fn jni_get_double_array_region(
+    e: &JniEnv,
+    array: jni::jdoubleArray,
+    start: i32,
+    len: i32,
+    buf: &mut [f64],
+) {
+    let env = e.raw();
+    let vtable = *env;
+    ((*vtable).GetDoubleArrayRegion)(env, array, start, len, buf.as_mut_ptr());
+}
+
+/// Apply one packed batch: entries with bit63 set are removals
+/// ([remove:1][world:16][id:32]), the rest are upserts with 6 doubles each.
+pub extern "system" fn n_flush(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    n: i32,
+    ids: jni::jlongArray,
+    boxes: jni::jdoubleArray,
+) {
+    if n <= 0 {
+        return;
     }
     unsafe {
         let e = JniEnv::from_raw(env);
-        let Some(arr) = e.new_long_array(out.len() as i32) else {
-            return std::ptr::null_mut();
-        };
-        let buf: Vec<jni::jlong> = out.iter().map(|v| *v as jni::jlong).collect();
-        e.set_long_array_region(arr, 0, buf.len() as i32, &buf);
-        arr
+        let mut id_buf: Vec<i64> = vec![0; n as usize];
+        let mut box_buf: Vec<f64> = vec![0.0; n as usize * 6];
+        e.get_long_array_region(ids, 0, n, &mut id_buf);
+        jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
+        let _ = with_index(|idx| {
+            for (i, l) in id_buf.iter().enumerate() {
+                let id = *l & 0xFFFF_FFFF;
+                if *l < 0 {
+                    idx.remove(id);
+                } else {
+                    let wid = ((*l >> 32) & 0xFFFF) as u16;
+                    let o = i * 6;
+                    let b = centities_core::Aabb::new(
+                        box_buf[o],
+                        box_buf[o + 1],
+                        box_buf[o + 2],
+                        box_buf[o + 3],
+                        box_buf[o + 4],
+                        box_buf[o + 5],
+                    );
+                    idx.upsert(id, wid, &b);
+                }
+            }
+        });
     }
 }
 
-pub extern "system" fn n_add(
-    _env: *mut jni::JNIEnv,
-    _cls: jni::jclass,
-    id: i64,
-    world: i32,
-    x0: f64,
-    y0: f64,
-    z0: f64,
-    x1: f64,
-    y1: f64,
-    z1: f64,
-) {
-    let b = centities_core::Aabb::new(x0, y0, z0, x1, y1, z1);
-    let _ = with_index(|idx| idx.upsert(id, world as u16, &b));
-}
+// bridge class bytes (compiled by build.rs against the paper jar)
+static HOOKS_CLASS_BYTES: &[u8] = include_bytes!(concat!(env!("CE_HOOKS_CLASS")));
 
+/// Direct upsert for rare off-thread probes (worldgen workers).
 pub extern "system" fn n_box(
     _env: *mut jni::JNIEnv,
     _cls: jni::jclass,
@@ -424,9 +486,7 @@ pub extern "system" fn n_box(
     let _ = with_index(|idx| idx.upsert(id, world as u16, &b));
 }
 
+/// Direct remove for rare off-thread probes (worldgen workers).
 pub extern "system" fn n_remove(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i64) {
     let _ = with_index(|idx| idx.remove(id));
 }
-
-// bridge class bytes (compiled by build.rs against the paper jar)
-static HOOKS_CLASS_BYTES: &[u8] = include_bytes!(concat!(env!("CE_HOOKS_CLASS")));
