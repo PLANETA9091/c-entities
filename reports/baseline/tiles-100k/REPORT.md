@@ -8,29 +8,29 @@ Server: `1.21.8-60-29c8822 (MC: 1.21.8)`
 |---|---|
 | entities spawned | 0 (items 0 / stands 0 / zombies 0) (merge shrink: 1 -> 1) |
 | block entities | 68121 (hoppers 42269 / furnaces 25852) |
-| MSPT p50 / p90 / p99 / max, ms | 21.792 / 22.675 / 30.946 / 47.110 |
-| MSPT mean, ms | 22.144 |
+| MSPT p50 / p90 / p99 / max, ms | 22.748 / 24.221 / 31.907 / 44.496 |
+| MSPT mean, ms | 23.096 |
 | TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 1531.1 / 8192.0 |
+| heap used / max, MB | 877.8 / 8192.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 6.32% | `net.minecraft.world.item.ItemStack.getMaxStackSize() line: 581` |
-| 2 | 5.47% | `net.minecraft.server.level.ServerLevel.moonrise$getChunkTaskScheduler() line: 342` |
-| 3 | 4.87% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1461` |
-| 4 | 4.25% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
-| 5 | 3.72% | `net.minecraft.core.Vec3i.equals(Object) line: 45` |
-| 6 | 2.96% | `net.minecraft.core.NonNullList.get(int) line: 44` |
-| 7 | 2.60% | `ca.spottedleaf.moonrise.patches.starlight.light.StarLightEngine.performLightIncrease(LightChunkGetter) line: 1125` |
-| 8 | 2.47% | `it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet.contains(Object) line: 446` |
-| 9 | 2.11% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 10 | 2.07% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 256` |
-| 11 | 1.88% | `net.minecraft.world.level.chunk.LevelChunk$BoundTickingBlockEntity.tick() line: 929` |
-| 12 | 1.58% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 279` |
-| 13 | 1.58% | `java.util.HashMap.getNode(Object) line: 585` |
-| 14 | 1.45% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.getBlock() line: 641` |
-| 15 | 1.28% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 201` |
+| 1 | 9.26% | `net.minecraft.world.item.ItemStack.getMaxStackSize() line: 581` |
+| 2 | 4.97% | `net.minecraft.core.Vec3i.equals(Object) line: 45` |
+| 3 | 4.05% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
+| 4 | 3.77% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1461` |
+| 5 | 3.46% | `net.minecraft.server.level.ServerLevel.moonrise$getChunkTaskScheduler() line: 342` |
+| 6 | 3.29% | `net.minecraft.world.level.chunk.LevelChunk$BoundTickingBlockEntity.tick() line: 929` |
+| 7 | 3.22% | `java.util.HashMap.getNode(Object) line: 585` |
+| 8 | 3.05% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 256` |
+| 9 | 2.23% | `net.minecraft.core.NonNullList.get(int) line: 44` |
+| 10 | 2.09% | `net.minecraft.world.level.block.entity.BaseContainerBlockEntity.getItem(int) line: 127` |
+| 11 | 1.89% | `net.minecraft.world.level.chunk.LevelChunk.getBlockEntity(BlockPos, LevelChunk$EntityCreationType) line: 474` |
+| 12 | 1.78% | `net.minecraft.world.level.chunk.LevelChunk$RebindableTickingBlockEntityWrapper.isRemoved() line: 1004` |
+| 13 | 1.75% | `ca.spottedleaf.moonrise.patches.starlight.light.SWMRNibbleArray.set(int, int) line: 422` |
+| 14 | 1.68% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.getBlock() line: 641` |
+| 15 | 1.54% | `com.google.common.collect.Iterators$5.computeNext() line: 671` |
 
