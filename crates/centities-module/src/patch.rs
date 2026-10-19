@@ -39,6 +39,104 @@ struct CpInfo {
     end: usize, // offset just past the constant pool
 }
 
+/// Walk the method's bytecode instruction by instruction and report whether
+/// it contains tableswitch (0xaa), lookupswitch (0xab) or wide (0xc4).
+///
+/// Variable-length instructions make a naive byte scan meaningless: any
+/// operand byte can equal 0xaa. Fixed lengths follow the JVM spec (JVMS §6.5).
+fn code_has_switch_or_wide(code: &[u8]) -> bool {
+    fn fixed_len(op: u8) -> Option<usize> {
+        Some(match op {
+            0x00..=0x0f => 1,                  // consts, aconst_null
+            0x10 => 2,                         // bipush
+            0x11 => 3,                         // sipush
+            0x12 => 2,                         // ldc
+            0x13 | 0x14 => 3,                  // ldc_w, ldc2_w
+            0x15..=0x19 => 2,                  // xload n
+            0x1a..=0x35 => 1,                  // xload_n, array loads
+            0x36..=0x3a => 2,                  // xstore n
+            0x3b..=0x56 => 1,                  // xstore_n, array stores
+            0x57..=0x5f => 1,                  // stack ops
+            0x60..=0x83 => 1,                  // arithmetic, bitwise
+            0x84 => 3,                         // iinc
+            0x85..=0x93 => 1,                  // conversions
+            0x94..=0x98 => 1,                  // lcmp, fcmpl..dcmpg
+            0x99..=0xa8 => 3,                  // if*, goto, jsr
+            0xa9 => 2,                         // ret
+            0xac..=0xb1 => 1,                  // returns
+            0xb2..=0xb8 => 3,                  // field/method accesses
+            0xb9 | 0xba => 5,                  // invokeinterface, invokedynamic
+            0xbb => 3,                         // new
+            0xbc => 2,                         // newarray
+            0xbd => 3,                         // anewarray
+            0xbe | 0xbf => 1,                  // arraylength, athrow
+            0xc0 | 0xc1 => 3,                  // checkcast, instanceof
+            0xc2 | 0xc3 => 1,                  // monitor enter/exit
+            0xc5 => 4,                         // multianewarray
+            0xc6 | 0xc7 => 3,                  // ifnull, ifnonnull
+            0xc8 | 0xc9 => 5,                  // goto_w, jsr_w
+            _ => return None,                  // unknown/reserved — refuse
+        })
+    }
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = code[pc];
+        match op {
+            0xaa | 0xab | 0xc4 => return true, // tableswitch/lookupswitch/wide
+            _ => {}
+        }
+        let len = match op {
+            0xaa => {
+                // tableswitch: pad to 4-align (from code start), then
+                // default + low + high + (high-low+1) offsets
+                let operand = pc + 1;
+                let pad = (4 - (operand % 4)) % 4;
+                if operand + pad + 12 > code.len() {
+                    return true;
+                }
+                let low = u32at(code, operand + pad + 4) as i32;
+                let high = u32at(code, operand + pad + 8) as i32;
+                if high < low {
+                    return true;
+                }
+                let count = (high - low + 1) as usize;
+                (pad + 12 + count * 4).saturating_add(1)
+            }
+            0xab => {
+                // lookupswitch: pad, default + npairs + npairs*(match+offset)
+                let operand = pc + 1;
+                let pad = (4 - (operand % 4)) % 4;
+                if operand + pad + 8 > code.len() {
+                    return true;
+                }
+                let npairs = u32at(code, operand + pad + 4) as usize;
+                (pad + 8 + npairs * 8).saturating_add(1)
+            }
+            0xc4 => {
+                // wide: xload/xstore/ret are 4 bytes extra, iinc 6
+                let sub = *code.get(pc + 1).unwrap_or(&0xff);
+                if sub == 0x84 {
+                    6
+                } else if (0x15..=0x19).contains(&sub)
+                    || (0x36..=0x3a).contains(&sub)
+                    || sub == 0xa9
+                {
+                    4
+                } else {
+                    return true; // malformed wide — refuse
+                }
+            }
+            _ => match fixed_len(op) {
+                Some(l) => l,
+                None => return true, // unknown opcode — refuse
+            },
+        };
+        pc += len;
+    }
+    // exact landing = clean walk; overshoot = misaligned/malformed — refuse
+    pc != code.len()
+}
+
 fn parse_cp(bytes: &[u8]) -> Result<CpInfo, String> {
     if bytes.len() < 10 || u32at(bytes, 0) != 0xCAFE_BABE {
         return Err("not a classfile".into());
@@ -152,14 +250,19 @@ fn find_code(bytes: &[u8], cp: &CpInfo, name: &str, desc: &str) -> Result<CodeRe
                 let clen = u32at(bytes, code_len_pos) as usize;
                 let code_start = code_len_pos + 4;
                 let code_end = code_start + clen;
-                let exc_count = u16at(bytes, code_end + 8) as usize;
-                let exc_start = code_end + 8; // absolute of the count u16
+                // JVMS Code layout: [max_stack u16][max_locals u16][code_len u32]
+                // [code..][exc_table_len u16][exc entries 8*N][attr_count u16][attrs..]
+                let exc_start = code_end; // absolute of the exception_table_length u16
+                let exc_count = u16at(bytes, exc_start) as usize;
                 let attr_pos = exc_start + 2 + exc_count * 8;
                 let attr_count = u16at(bytes, attr_pos) as usize;
                 let mut attr_end = attr_pos + 2;
-                for k in 0..attr_count {
-                    let p = attr_pos + 2 + k * 6;
-                    attr_end += 6 + u32at(bytes, p + 2) as usize;
+                let mut p = attr_pos + 2;
+                for _ in 0..attr_count {
+                    // attributes have VARIABLE length — walk sequentially
+                    let a_len = u32at(bytes, p + 2) as usize;
+                    attr_end += 6 + a_len;
+                    p += 6 + a_len;
                 }
                 return Ok(CodeRegion {
                     code_start,
@@ -250,11 +353,13 @@ bytes: Vec<u8>,
     prefix.extend_from_slice(&mref_idx.to_be_bytes());
     let delta = prefix.len();
 
-    // refuse switches conservatively: a naive byte scan may produce false
-    // positives (an immediate byte equal to 0xaa/0xab) — refusing too much
-    // is the safe direction (module falls back to vanilla paths).
+    // refuse switches conservatively — but detect them by real opcode
+    // walking, not a byte scan: a naive `contains(0xaa)` false-positives on
+    // immediate/operand bytes (e.g. EntityLookup.addEntity) and refuses
+    // perfectly patchable methods. Refusing too much is the safe direction
+    // (module falls back to vanilla paths).
     let code = &bytes[region.code_start..region.code_end];
-    if code.contains(&0xaa) || code.contains(&0xab) || code.contains(&0xc4) {
+    if code_has_switch_or_wide(code) {
         return Err("switch/wide opcode in method body refused".into());
     }
 
@@ -305,10 +410,13 @@ bytes: Vec<u8>,
                 let n = u16at(&out, data) as usize;
                 for k in 0..n {
                     let q = data + 2 + k * 10;
+                    // ONLY start_pc shifts: the entry's `length` field is a
+                    // SPAN (how long the variable is live), not an absolute
+                    // offset — shifting it corrupts the table and HotSpot
+                    // rejects the class with ClassFormatError "Invalid
+                    // length ... in LocalVariableTable".
                     let v = u16at(&out, q) + delta as u16; // start_pc
                     w16(&mut out, q, v);
-                    let v2 = u16at(&out, q + 2) + delta as u16; // length
-                    w16(&mut out, q + 2, v2);
                 }
             }
             Some("StackMapTable") => {
@@ -431,15 +539,22 @@ fn utf8_by_index(bytes: &[u8], cp: &CpInfo, idx: u16) -> Option<String> {
 }
 
 fn skip_verification_info(b: &[u8], mut q: usize, n: usize) -> usize {
+    // JVMS §4.7.4 verification_type_info:
+    // 0 Top, 1 Integer, 2 Float, 3 Double, 4 Long, 5 Null,
+    // 6 UninitializedThis — all 1 byte (no payload);
+    // 7 Object — +cpool_index u2; 8 Uninitialized — +offset u2.
     let start = q;
     for _ in 0..n {
         let tag = b[q];
         q += 1;
         match tag {
-            0 | 1 => {}
-            2 => q += 2, // object_variable_info (cpool index)
-            3 | 4 => q += 2, // uninitialized (offset u2)
-            t => { /* 5..8 unreachable types do not exist in tables */ let _ = t; }
+            7 | 8 => q += 2,
+            0..=6 => {}
+            _ => {
+                // invalid tag: payload size unknown. Keep the walk aligned on
+                // the assumption of no payload — only frame 0 is ever written,
+                // so a corrupt later frame cannot cause a bad write.
+            }
         }
     }
     q - start

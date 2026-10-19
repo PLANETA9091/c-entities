@@ -17,9 +17,10 @@ pub mod patch;
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
 use jvmti_bindings::sys::jni as jni;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 const LEVEL_CLASS: &str = "net/minecraft/world/level/Level";
 const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
@@ -31,6 +32,22 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 static PATCHES_OK: AtomicU64 = AtomicU64::new(0);
 static PATCHES_FAIL: AtomicU64 = AtomicU64::new(0);
+/// Global ref of the Level class loader, captured once at arm time. Byte
+/// hooks run inside JVMTI ClassFileLoadHook callbacks where class queries
+/// (GetLoadedClasses etc.) are restricted — they must NEVER call find_class;
+/// they resolve everything from this cached loader instead.
+static LOADER: AtomicUsize = AtomicUsize::new(0);
+/// Original class bytes seen at boot load (stash — hooks may not do heavy
+/// work inside the ClassFileLoadHook callback).
+static STASH: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Precomputed rewrites, produced OUTSIDE any hook callback at arm time.
+/// The Level.getEntities rewrite runs the Java ASM helper with
+/// COMPUTE_FRAMES; ASM resolves common superclasses via loadClass — class
+/// loading inside the callback re-enters the runtime's non-reentrant hook
+/// registry and self-deadlocks. So: rewrite here, the hook just returns it.
+static PRECOMPUTED: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn with_index<R>(f: impl FnOnce(&mut centities_core::EntityIndex) -> R) -> Option<R> {
     let mut g = INDEX.lock().ok()?;
@@ -61,7 +78,11 @@ pub unsafe extern "C" fn cplugin_init(
         std::thread::spawn(arm_module);
     });
 
-    cplug_sdk::log::info("[c-entities] module init: hooks registered, waiting for kernel");
+    // NOTE: never call cplug_sdk::log::info here — cplugin_init may run on a
+    // fresh native thread during Agent_OnLoad, before the VM heap exists;
+    // AttachCurrentThread at that point SIGSEGVs (TLAB init on null heap).
+    // Plain stderr is safe; after kernel-ready the VM is fully initialized.
+    eprintln!("[c-entities] module init: hooks registered, waiting for kernel");
     0
 }
 
@@ -70,11 +91,21 @@ pub unsafe extern "C" fn cplugin_init(
 // ---------------------------------------------------------------------------
 
 fn arm_module() {
-    let ok = cplug_sdk::jni_util::with_attached(define_bridge).unwrap_or(false);
-    if !ok {
+    // define_bridge returns a GLOBAL ref of the Level class loader (safe to
+    // use from other threads / later attach scopes).
+    let Some(Some(loader)) = cplug_sdk::jni_util::with_attached(define_bridge) else {
         cplug_sdk::log::info("[c-entities] arm: bridge setup failed — staying vanilla");
         return;
-    }
+    };
+    LOADER.store(loader as usize, Ordering::Release);
+
+    // Precompute the Level.getEntities rewrite OUTSIDE any ClassFileLoadHook
+    // callback: replace_body runs the Java ASM helper with COMPUTE_FRAMES,
+    // which resolves common superclasses via loadClass — class loading inside
+    // the callback self-deadlocks the runtime's non-reentrant hook registry.
+    // Uses the bytes stashed by the boot-time hook.
+    precompute_level(loader);
+
     BRIDGE_READY.store(true, Ordering::Release);
 
     // Retransform → ClassFileLoadHook → our byte hooks patch the classes.
@@ -107,25 +138,66 @@ fn arm_module() {
     ));
 }
 
-fn define_bridge(env: &JniEnv) -> bool {
+fn precompute_level(loader: jni::jobject) {
+    let stash = STASH.lock().ok().and_then(|mut s| s.remove(LEVEL_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info("[c-entities] precompute Level.getEntities: original bytes not seen at boot");
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            // No PATCHES_OK here: the counter is bumped by the byte hook when
+            // the rewrite is actually APPLIED via retransform.
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(LEVEL_CLASS, b);
+            }
+            cplug_sdk::log::info("[c-entities] precomputed Level.getEntities rewrite");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] FAILED to precompute Level.getEntities — vanilla kept");
+        }
+    }
+}
+
+fn define_bridge(env: &JniEnv) -> Option<jni::jobject> {
+    cplug_sdk::log::info("[c-entities] bridge: step 1 claim class");
     if !cplug_sdk::claim(&format!("class:{HOOKS_CLASS}")) {
         cplug_sdk::log::info("[c-entities] bridge class name already claimed");
-        return false;
+        return None;
     }
+    cplug_sdk::log::info("[c-entities] bridge: step 2 find Level");
     let Some(level_cls) = cplug_sdk::classes::find_class(LEVEL_CLASS) else {
         cplug_sdk::log::info("[c-entities] bridge: Level not found");
-        return false;
+        return None;
     };
-    let Some(mid) = env.get_method_id(level_cls.0, "getClassLoader", "()Ljava/lang/ClassLoader;")
+    cplug_sdk::log::info("[c-entities] bridge: step 3 getClassLoader mid");
+    // level_cls.0 is a jclass == an instance of java.lang.Class: getClassLoader
+    // must be resolved on java.lang.Class, not on ServerLevel itself.
+    let class_class = env.get_object_class(level_cls.0);
+    let Some(mid) =
+        env.get_method_id(class_class, "getClassLoader", "()Ljava/lang/ClassLoader;")
     else {
-        return false;
+        cplug_sdk::log::info("[c-entities] bridge: getClassLoader mid not found");
+        return None;
     };
     let loader = env.call_object_method(level_cls.0, mid, &[]);
+    cplug_sdk::log::info("[c-entities] bridge: step 4 define_class");
     let Some(cls) = env.define_class(HOOKS_CLASS, loader, HOOKS_CLASS_BYTES) else {
         cplug_sdk::log::info("[c-entities] bridge define_class failed");
-        return false;
+        return None;
     };
-    register_natives(env, cls)
+    cplug_sdk::log::info("[c-entities] bridge: step 5 register_natives");
+    if !register_natives(env, cls) {
+        return None;
+    }
+    // Promote the loader to a global ref while we are still attached (the
+    // local ref dies with this attach scope).
+    Some(env.new_global_ref(loader))
 }
 
 fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
@@ -170,11 +242,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
 // byte hooks
 // ---------------------------------------------------------------------------
 
-fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
-    if !BRIDGE_READY.load(Ordering::Acquire) {
-        return None; // boot load stays vanilla; we patch via retransform
-    }
-    let spec = cplug_sdk::asm::ReplaceBody {
+fn level_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
         method_name: "getEntities",
         method_desc: "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
         bridge_owner: HOOKS_CLASS,
@@ -186,21 +255,30 @@ fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
             cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
         ],
-    };
-    let patched = cplug_sdk::jni_util::with_attached(|env| {
-        let level_cls = cplug_sdk::classes::find_class(LEVEL_CLASS)?;
-        let loader = class_loader_of(env, level_cls.0)?;
-        cplug_sdk::asm::replace_body(env, loader, bytes, &spec)
-    });
-    match patched {
-        Some(Some(b)) if !b.is_empty() => {
+    }
+}
+
+fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes and stay vanilla. The actual
+        // rewrite happens at arm time OUTSIDE the hook callback (see
+        // precompute_level) — never inside this callback.
+        let mut st = STASH.lock().ok()?;
+        st.entry(LEVEL_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    // Retransform pass: hand back the precomputed rewrite (no heavy work
+    // allowed in-callback).
+    let pre = PRECOMPUTED.lock().ok()?.get(LEVEL_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Level.getEntities");
+            cplug_sdk::log::info("[c-entities] patched Level.getEntities (precomputed)");
             Some(b)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] FAILED to patch Level.getEntities — vanilla kept");
+            cplug_sdk::log::info("[c-entities] FAILED to patch Level.getEntities — no precomputed rewrite, vanilla kept");
             None
         }
     }
@@ -213,7 +291,7 @@ fn patch_lookup(bytes: &[u8]) -> Option<Vec<u8>> {
     let add = patch::insert_static_call_at_start(
         bytes.to_vec(),
         "addEntity",
-        "(Lnet/minecraft/world/entity/Entity;ZZ)V",
+        "(Lnet/minecraft/world/entity/Entity;ZZ)Z",
         HOOKS_CLASS,
         "probeAdd",
         "(Lnet/minecraft/world/entity/Entity;)V",
@@ -289,16 +367,6 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
             cplug_sdk::log::info(&format!("[c-entities] setBoundingBox probe refused: {e}"));
             None
         }
-    }
-}
-
-fn class_loader_of(env: &JniEnv, cls: jni::jclass) -> Option<jni::jobject> {
-    let mid = env.get_method_id(cls, "getClassLoader", "()Ljava/lang/ClassLoader;")?;
-    let loader = env.call_object_method(cls, mid, &[]);
-    if loader.is_null() {
-        None
-    } else {
-        Some(loader)
     }
 }
 
