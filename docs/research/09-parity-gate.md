@@ -106,6 +106,42 @@ vanilla".
   step mask (`256 << min(bk,4) - 1` shifts by bk−1 → shift-by-−1 at bk=0);
   fixed to an explicit `step = 256 << min(bk,4); mask = step − 1`.
 
+## 4a.1 CI (run 39298866543): the storm appears
+
+| pair | vanilla | module | delta | fast/mirror (mod) | batchEntries |
+|---|---:|---:|---:|---|---:|
+| items-100k | 114.4 | 83.4 | **−27.1%** | 135 / 5 232 | — |
+| mixed-150k | 1091.9 | 649.4 | **−40.5%** | 5 174 / 20.0M | 2.0M |
+| spread-100k | 479.9 | 581.1 | **+21.1%** | 4 488 / 18.4M | **115.7M** |
+
+- Runner-to-runner spread is huge (mixed vanilla 826.7 → 1091.9 between
+  runs; module 868.3 → 649.4) — single-pair deltas are ±30% noise; the
+  internal counters are the only trustworthy signal.
+- **The +21.1% spread delta is a real defect, precisely identified:**
+  `batchEntries = 115.6M` against `16.1M` probes — 65.8k batch entries per
+  tick. That is a suspend↔resync cycle: the 4a.1 hard unstick jumped the
+  fast EMA to a single 307 µs re-probe sample, the gate went mirror
+  forever, `fastChosen` hit 0, the window filled in ~1 tick (17k mirror
+  queries/tick), the index suspended — and the very next sampled mirror
+  (spread's ~30 µs ≥ the 15 µs resume threshold) resumed it with a full
+  100k-entity resync. One resync ≈ 5–8 ms/tick of pure tax, paid every
+  tick. Items and mixed — the same build — were fine (−27%/−40%).
+- Zero-resolve stays proven: 15 ns/candidate.
+
+## 4a.2: storm guards
+
+- Soft unstick: a sample > 4× EMA moves the EMA half-way toward it, not
+  onto it — one expensive re-probe cannot erase a bucket's memory where
+  fast genuinely wins most of the time.
+- Suspend is suppressed while the last sampled mirror price is ≥
+  RESUME_NANOS: a dense world in mirror mode must keep indexing and keep
+  measuring, or the gate guarantees itself a resync storm.
+- Post-resume cooldown: 4 full gate windows must pass with a live index
+  before suspend may fire again.
+- RESUME_NANOS 15 → 30 µs (spread's average mirror price must not wake
+  the index by itself).
+- Local falling-item sanity after the change: `fast=3218 desync=0 ARMED`.
+
 ## What the gate does NOT fix
 
 The fixed ~8.4 µs per-query JNI+native cost is routed around, not
