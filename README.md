@@ -14,10 +14,10 @@ usage — and **100% vanilla behavior for players**. Base server:
 | Phase | What | Status |
 |-------|------|--------|
 | 0 | Understand the Paper 1.21.8 tick pipeline from real sources | ✅ `docs/research/01-vanilla-tick-pipeline.md` |
-| 1 | **Baseline benchmark of unmodified Paper** on GitHub Actions: what costs what | 🚧 `baseline.yml` |
-| 2 | Design the Rust core from phase-1 data (not guesses) | ⏳ |
-| 3 | `centities-engine` (core) + `centities-module` (weave injection) | ⏳ |
-| 4 | A/B on the same pipeline: Paper vs Paper+module | ⏳ |
+| 1 | **Baseline benchmark of unmodified Paper** on GitHub Actions: what costs what | ✅ 9 scenarios, `reports/baseline/SUMMARY.md` |
+| 2 | Design the Rust core from phase-1 data (not guesses) | ✅ `centities-core` (exact XZ grid, property-tested) |
+| 3 | `centities-module` (weave injection) boots on real Paper 1.21.8 via CRUSSTY | ✅ e2e green: all patches applied by the JVM, module ARMED |
+| 4 | A/B on the same pipeline: Paper vs Paper+module | 🚧 iteration 1 done — honest result: module slower in dense scenarios, analysis + iteration-2 plan in `docs/research/06-ab-iteration1.md` |
 
 No optimization code is written before phase 1 produces numbers.
 
