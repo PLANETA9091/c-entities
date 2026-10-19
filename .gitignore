@@ -6,3 +6,7 @@
 /tiles-100k/
 /target/
 /bundle/
+/server/
+__pycache__/
+/rec.jfr
+*.log
