@@ -33,6 +33,9 @@ public final class CeHooks {
     public static volatile long queriesFast = 0, queriesMirror = 0;
     public static volatile long probesAdd = 0, probesRemove = 0, probesBox = 0;
     public static volatile long batchesFlushed = 0, batchEntries = 0;
+    // Phase timings (nanos, cumulative): where the fast path spends time.
+    public static volatile long fastNanos = 0, queryNanos = 0, resolveNanos = 0;
+    public static volatile long candidatesSeen = 0, candidatesResolved = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
@@ -47,6 +50,9 @@ public final class CeHooks {
                 + " desync=" + mDesync + " disabled=" + mDisabled + ")"
                 + " add=" + probesAdd + " rm=" + probesRemove + " box=" + probesBox
                 + " flush=" + batchesFlushed + "/" + batchEntries
+                + " fastMs=" + fastNanos / 1_000_000 + " qMs=" + queryNanos / 1_000_000
+                + " resMs=" + resolveNanos / 1_000_000
+                + " cand=" + candidatesSeen + "/" + candidatesResolved
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
 
@@ -59,7 +65,9 @@ public final class CeHooks {
             Entity source, AABB box, Predicate<? super Entity> predicate) {
         if (ACTIVE) {
             try {
+                long t0 = System.nanoTime();
                 List<Entity> out = fastQuery(level, box, predicate);
+                fastNanos += System.nanoTime() - t0;
                 if (out != null) {
                     queriesFast++;
                     return out;
@@ -217,8 +225,10 @@ public final class CeHooks {
         // batchN>0 only on the first attempt; retries must NOT re-apply.
         long[] ids = QBUF.get();
         int bn = bN;
+        long t1 = System.nanoTime();
         int n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
                 ids, bn, B_IDS, B_BOX);
+        queryNanos += System.nanoTime() - t1;
         if (n >= 0 && bn > 0) {
             bN = 0;
             batchesFlushed++;
@@ -241,6 +251,8 @@ public final class CeHooks {
 
         ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
         int resolved = 0;
+        candidatesSeen += n;
+        long t2 = System.nanoTime();
         for (int k = 0; k < n; k++) {
             Entity e = sl.getEntity((int) ids[k]); // LevelEntityGetter.byId — id-keyed
             if (e == null) continue; // stale candidate (removed before its probe ran)
@@ -252,6 +264,8 @@ public final class CeHooks {
                 out.add(e);
             }
         }
+        resolveNanos += System.nanoTime() - t2;
+        candidatesResolved += resolved;
         if (resolved == 0 && n > 0) {
             mDesync++;
             return null; // desync guard
