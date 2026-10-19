@@ -142,6 +142,30 @@ vanilla".
   the index by itself).
 - Local falling-item sanity after the change: `fast=3218 desync=0 ARMED`.
 
+## 4a.2 CI (run 39304127441): storm dead, spread wins
+
+| pair | vanilla | module | delta | batchEntries (mod) |
+|---|---:|---:|---:|---:|
+| items-100k | 94.2 | 60.8 | **−35.5%** | 2.5M |
+| mixed-150k | 640.9 | 740.9 | +15.6% | 37.8M |
+| spread-100k | 437.3 | 359.6 | **−17.9%** | 22.4M |
+
+- The suspend↔resync storm is gone: spread batchEntries 115.7M → 22.4M
+  (fill-phase volume, no per-tick resync), and spread flips from +21.1%
+  to **−17.9%** — the module is now faster than vanilla there.
+- items −35.5% (mostly mirror = vanilla traffic; the runner delta
+  dominates, direction consistent across runs now: +8.9 → −27 → −35).
+- mixed +15.6% remains unresolved as a *measurement* problem: this
+  run's vanilla (640.9) is 22–41% faster than previous runs' vanilla
+  (826.7, 1091.9) — the matrix places the on/off pair on DIFFERENT
+  runners, so pairs carry ±30% job-to-job noise. Internal counters show
+  no module-side anomaly (fast=5021, mirror=20.0M, desync=0; batch
+  volume ≈ 2× probes = fill phase; tax ≈ ~1 ms/tick). Verdict: mixed
+  needs a paired-same-runner A/B (on/off sequentially in one job,
+  repeated) before any delta is meaningful. That is the 4a.3
+  methodological fix; without it "never slower than vanilla" cannot be
+  *proven* on CI at all.
+
 ## What the gate does NOT fix
 
 The fixed ~8.4 µs per-query JNI+native cost is routed around, not
