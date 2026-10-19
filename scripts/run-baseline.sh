@@ -44,7 +44,7 @@ if [ "${MODULE:-off}" = "on" ]; then
   # 1. mojang-mapped server jar for javac (one-shot paperclip boot, no world)
   # Idempotent: reuse the previously produced mapped jar when present.
   PB="$ROOT/build/paperboot"
-  MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" 2>/dev/null | head -1)
+  MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" 2>/dev/null | head -1 || true)
   if [ -z "$MAPPED" ]; then
     mkdir -p "$PB"
     cp "$PAPER_JAR" "$PB/paper.jar"
