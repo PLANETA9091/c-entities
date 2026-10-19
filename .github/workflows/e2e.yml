@@ -1,0 +1,95 @@
+name: e2e
+
+# End-to-end: boot Paper 1.21.8 under CRUSSTY with the c-entities module,
+# assert the full injection chain (patches applied by the JVM, module armed,
+# server reaches "Done"). The runtime is built FROM SOURCE — the v2.2.5
+# release binary has the non-NUL-terminated hook-name bug (hooks silently
+# missed for some classes).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'module.json'
+      - '.github/workflows/e2e.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CRUSSTY
+        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch Paper 1.21.8 (paperclip)
+        run: bash scripts/fetch-paper.sh 1.21.8 /tmp/paper/paperclip.jar
+      - name: One-shot paperclip boot (produce mojang-mapped server jar)
+        working-directory: /tmp/paper
+        run: |
+          echo "eula=false" > eula.txt
+          timeout 240 java -jar paperclip.jar nogui > boot.log 2>&1 || true
+          JAR=$(find versions -name "paper-1.21.8.jar" | head -1)
+          test -f "$JAR"
+          echo "PAPER_JAR=$(pwd)/$JAR" >> "$GITHUB_ENV"
+      - name: Tests + build module cdylib
+        run: |
+          cargo test -p centities-module
+          cargo build -p centities-module --release
+        env:
+          PAPER_JAR: ${{ env.PAPER_JAR }}
+      - name: Build CRUSSTY runtime from source
+        run: cargo build --release -p crussty-runtime
+        working-directory: ../CRUSSTY
+      - name: Stage e2e server directory
+        run: |
+          mkdir -p e2e/versions e2e/modules/entities
+          cp /tmp/paper/paperclip.jar e2e/versions/paperclip-1.21.8.jar
+          cp target/release/libcentities_module.so e2e/modules/entities/
+          cp module.json e2e/modules/entities/
+          cp ../CRUSSTY/runtime/target/release/libcrussty_runtime.so e2e/
+          echo "eula=true" > e2e/eula.txt
+          printf 'level-type=minecraft\\:flat\nonline-mode=false\nview-distance=3\nsimulation-distance=3\nmotd=c-entities e2e\n' > e2e/server.properties
+      - name: Boot Paper 1.21.8 + CRUSSTY + c-entities
+        working-directory: e2e
+        run: |
+          set -o pipefail
+          (sleep 110; echo stop) | timeout 190 \
+            java -Xms1G -Xmx4G \
+            "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-1.21.8.jar" \
+            -jar versions/paperclip-1.21.8.jar --nogui > e2e.log 2>&1 || true
+          echo "## e2e markers" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "pipeline ready|\[c-entities\]|Done \(|crussty-runtime. retransform" e2e.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -5 e2e.log >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Assert injection chain
+        working-directory: e2e
+        run: |
+          fail() { echo "E2E ASSERT FAILED: $1"; grep -E "\[c-entities\]|pipeline ready|Done \(" e2e.log | head -30; exit 1; }
+          grep -q  "pipeline ready: 1 module hook(s)"        e2e.log || fail "module pipeline not ready"
+          grep -q  "\[c-entities\] natives registered"        e2e.log || fail "natives not registered"
+          grep -q  "\[c-entities\] patched Level.getEntities" e2e.log || fail "Level.getEntities not patched"
+          grep -q  "\[c-entities\] patched Entity setPos"     e2e.log || fail "Entity probes not patched"
+          grep -q  "\[c-entities\] patched EntityLookup"      e2e.log || fail "EntityLookup probes not patched"
+          grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
+          grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
+          ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
+          ! grep -q "FAILED to patch"                         e2e.log || fail "a patch FAILED (vanilla kept)"
+          echo "E2E OK: module armed, all patches applied by the JVM, server booted"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-log
+          path: e2e/e2e.log
+          retention-days: 14
