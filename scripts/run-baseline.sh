@@ -53,7 +53,7 @@ if [ "${MODULE:-off}" = "on" ]; then
   (cd "$ROOT" && PAPER_JAR="$MAPPED" cargo build -p centities-module --release) \
     || { echo "FATAL: module build failed"; exit 1; }
   # 3. CRUSSTY runtime from source (release v2.2.5 binary has the hook-name bug)
-  (cd "$ROOT/../CRUSSTY" && cargo build --release -p crussty-runtime) \
+  (cd "$ROOT/../CRUSSTY/runtime" && cargo build --release -p crussty-runtime) \
     || { echo "FATAL: runtime build failed"; exit 1; }
   # 4. stage into the bench server
   mkdir -p "$S/modules/entities"

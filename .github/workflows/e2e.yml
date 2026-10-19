@@ -50,7 +50,7 @@ jobs:
           PAPER_JAR: ${{ env.PAPER_JAR }}
       - name: Build CRUSSTY runtime from source
         run: cargo build --release -p crussty-runtime
-        working-directory: ../CRUSSTY
+        working-directory: ../CRUSSTY/runtime
       - name: Stage e2e server directory
         run: |
           mkdir -p e2e/versions e2e/modules/entities
