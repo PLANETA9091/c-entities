@@ -14,3 +14,6 @@ cplug-abi = { path = "../../../CRUSSTY/cplug-abi" }
 cplug-sdk = { path = "../../../CRUSSTY/cplug-sdk" }
 jvmti-bindings = "2"
 centities-core = { path = "../centities-core" }
+
+[dev-dependencies]
+zip = { version = "8", default-features = false, features = ["deflate"] }
