@@ -109,7 +109,13 @@ public final class CeHooks {
                         int bk = FAST_BACKOFF[gi];
                         if (me > 0 && dt > 2 * me) {
                             if (bk < 4) bk++;
-                            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = dt;
+                            // Soft unstick: jump half-way toward the sample,
+                            // NOT to the sample. A single expensive re-probe
+                            // must not wipe the EMA's memory of a bucket where
+                            // fast genuinely wins most of the time (4a.1 did
+                            // that and pushed spread-100k into a permanent
+                            // mirror + suspend/resync storm).
+                            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
                         } else if (bk > 0 && me > 0 && dt < me) {
                             bk--; // cheap again — restore probing granularity
                         }
@@ -292,7 +298,17 @@ public final class CeHooks {
     private static int gateDecisions = 0, gateFastChosen = 0;
     private static final int GATE_WINDOW = 16_384;
     private static final int GATE_MIN_FAST = 32;   // below: fast is useless
-    private static final long RESUME_NANOS = 15_000; // an expensive query re-arms
+    private static final long RESUME_NANOS = 30_000; // an expensive query re-arms
+    /** Last sampled mirror price (0 = none). A suspend must not fire while
+     *  mirror queries are this expensive — the world is dense enough that a
+     *  re-synced index may win; suspending then causes a suspend<->resync
+     *  cycle (spread-100k 4a.1: 65.8k batch entries/tick = resync every
+     *  tick). */
+    private static volatile long lastMirrorNanos = 0;
+    /** Gate windows that must pass (with a live index) before suspend is
+     *  allowed again — set by resumeIndexing. Without it the gate drops the
+     *  index and resumes it in the same tick: suspend<->resync storm. */
+    private static volatile int suspendCooldown = 0;
 
     /** INDEXING=false means probes do nothing (suspend). SUSPENDED means the
      *  gate also refuses fast queries until a full resync re-arms the index. */
@@ -382,6 +398,7 @@ public final class CeHooks {
         List<Entity> ret = mirror(level, source, box, predicate);
         long dt = System.nanoTime() - t0;
         if (dt <= 0) dt = 1;
+        lastMirrorNanos = dt;
         if (gi >= 0) {
             ema(MIRR_EMA, gi, dt);
             if (MIRR_N[gi] < 1_000_000) MIRR_N[gi]++;
@@ -397,7 +414,18 @@ public final class CeHooks {
         int chosen = gateFastChosen;
         gateDecisions = 0;
         gateFastChosen = 0;
-        if (!SUSPENDED && chosen < GATE_MIN_FAST) {
+        if (SUSPENDED) return;
+        // Dense world in mirror mode: dropping the index now guarantees a
+        // suspend<->resync cycle (resume re-arms on the very next expensive
+        // sample). Keep indexing and let the gate keep measuring.
+        if (lastMirrorNanos >= RESUME_NANOS) return;
+        // Post-resume cooldown: judge the freshly re-synced index over 4
+        // full windows before suspend may fire again.
+        if (suspendCooldown > 0) {
+            suspendCooldown--;
+            return;
+        }
+        if (chosen < GATE_MIN_FAST) {
             SUSPENDED = true;
             INDEXING = false;
             bN = 0; // pending deltas are irrelevant: the index is dropped and
@@ -430,6 +458,7 @@ public final class CeHooks {
         INDEXING = true;
         SUSPENDED = false;
         resumes++;
+        suspendCooldown = 4;
     }
 
     // ------------------------------------------------------------------
