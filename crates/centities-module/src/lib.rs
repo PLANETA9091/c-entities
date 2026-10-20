@@ -19,7 +19,7 @@ use jvmti_bindings::prelude::*;
 use jvmti_bindings::sys::jni as jni;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 const LEVEL_CLASS: &str = "net/minecraft/world/level/Level";
@@ -27,7 +27,28 @@ const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
 const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
-static INDEX: Mutex<Option<centities_core::EntityIndex>> = Mutex::new(None);
+// ---------------------------------------------------------------------------
+// 4b.2a — zero-JNI steady state: the native side publishes every changed
+// cell's id row into Java-visible arrays (CeHooks.ROWS). Java then serves
+// small queries from those rows without crossing JNI at all.
+//
+// Row layout (one long[] per published cell, lazily allocated):
+//   [0] = cell key (the SAME 64-bit packing centities_core uses)
+//   [1] = (publish stamp << 11) | id_count   (count == ROW_SENTINEL = dense)
+//   [2..] = entity ids homed in the cell at publish time
+// Validity: row[0] == expected key AND row[1] >>> 11 == PUBLISH_SEQ.
+// The stamp changes ONLY on n_reset (index dropped) — everything else keeps
+// the invariant "stamp == seq implies row content is exact", which holds
+// because every index change that alters a cell's id list marks the cell
+// dirty, and dirty cells are republished under the SAME index mutex before
+// the query runs (flush-merged), on the server thread.
+// ---------------------------------------------------------------------------
+
+const ROW_CAP: usize = 510; // cells denser than this are never published
+const ROW_SENTINEL: i64 = 0x7FF; // count-field value marking a killed row
+const DIRECT_CAP: usize = 1 << 16; // off-thread event queue bound
+
+static INDEX: Mutex<Option<CeState>> = Mutex::new(None);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 static PATCHES_OK: AtomicU64 = AtomicU64::new(0);
@@ -51,10 +72,262 @@ static STASH: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
 static PRECOMPUTED: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn with_index<R>(f: impl FnOnce(&mut centities_core::EntityIndex) -> R) -> Option<R> {
+/// JNI surface of the Java row table, resolved once at arm time.
+/// The raw JNI refs live as global refs for the process lifetime and are
+/// dereferenced only inside attach scopes — Send is sound.
+#[derive(Clone, Copy)]
+struct PubInfo {
+    rows: jni::jobject, // global ref of CeHooks.ROWS (long[][])
+    cls: jni::jobject,  // global ref of CeHooks
+    fid_pop: jni::jfieldID,
+}
+unsafe impl Send for PubInfo {}
+
+static PUB_INFO: Mutex<Option<PubInfo>> = Mutex::new(None);
+/// Stamp the next publisher instance uses; n_reset bumps it past everything
+/// ever published so stale rows can never validate again.
+static NEXT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+/// Off-thread probe events (worldgen workers spawning entities). They are
+/// QUEUED and drained by the next server-thread apply (n_query/n_flush) —
+/// the index and the published rows stay single-thread-writer, and the
+/// drain-before-query discipline keeps the flush-in-query window.
+enum DirEv {
+    Upsert { id: i64, wid: u16, b: centities_core::Aabb },
+    Remove { id: i64 },
+}
+static DIRECT_Q: Mutex<Vec<DirEv>> = Mutex::new(Vec::new());
+
+struct Publisher {
+    info: Option<PubInfo>, // None = publishing disabled (arm incomplete / JNI error)
+    dirty: Vec<u32>,
+    in_dirty: Vec<bool>, // parallel to the index's cell ids
+    dense: Vec<bool>,    // sticky: cells that ever exceeded ROW_CAP
+    oversize_changed: bool,
+    buf: Vec<i64>,  // row write scratch (2 + ROW_CAP)
+    ids: Vec<i64>,  // cell_scan scratch
+    seq: i64,       // stamp this publisher instance writes into rows
+}
+
+struct CeState {
+    idx: centities_core::EntityIndex,
+    p: Publisher,
+}
+
+fn new_state() -> CeState {
+    CeState {
+        idx: centities_core::EntityIndex::new(),
+        p: Publisher {
+            info: PUB_INFO.lock().ok().and_then(|g| *g),
+            dirty: Vec::new(),
+            in_dirty: Vec::new(),
+            dense: Vec::new(),
+            oversize_changed: false,
+            buf: Vec::new(),
+            ids: Vec::new(),
+            seq: NEXT_SEQ.load(Ordering::Acquire),
+        },
+    }
+}
+
+impl CeState {
+    fn mark_dirty(&mut self, cell: u32) {
+        let ci = cell as usize;
+        if ci >= self.p.in_dirty.len() {
+            self.p.in_dirty.resize(ci + 1, false);
+            self.p.dense.resize(ci + 1, false);
+        }
+        if !self.p.in_dirty[ci] {
+            self.p.in_dirty[ci] = true;
+            self.p.dirty.push(cell);
+        }
+    }
+
+    fn note_upsert(&mut self, ev: centities_core::UpsertEv) {
+        use centities_core::UpsertEv as E;
+        match ev {
+            E::Same | E::OversizeSame => {}
+            E::New { cell, from_oversize } => {
+                self.mark_dirty(cell);
+                if from_oversize {
+                    self.p.oversize_changed = true;
+                }
+            }
+            E::Moved { old, new } => {
+                self.mark_dirty(old);
+                self.mark_dirty(new);
+            }
+            E::ToOversize { old } => {
+                if let Some(c) = old {
+                    self.mark_dirty(c);
+                }
+                self.p.oversize_changed = true;
+            }
+        }
+    }
+
+    fn note_remove(&mut self, ev: centities_core::RemoveEv) {
+        use centities_core::RemoveEv as E;
+        match ev {
+            E::Absent => {}
+            E::Normal { cell } => self.mark_dirty(cell),
+            E::Oversize => self.p.oversize_changed = true,
+        }
+    }
+
+    fn upsert(&mut self, id: i64, wid: u16, b: &centities_core::Aabb) {
+        let ev = self.idx.upsert(id, wid, b);
+        self.note_upsert(ev);
+    }
+
+    fn remove(&mut self, id: i64) {
+        let ev = self.idx.remove(id);
+        self.note_remove(ev);
+    }
+}
+
+fn push_direct(ev: DirEv) {
+    for _ in 0..20_000 {
+        if let Ok(mut q) = DIRECT_Q.lock() {
+            if q.len() < DIRECT_CAP {
+                q.push(ev);
+                return;
+            }
+        }
+        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    // Queue stuck (server thread not draining): fall back to a direct apply.
+    // Correct for the index; the row may go briefly stale — only reachable
+    // when queries are not happening anyway.
+    let _ = with_state(|st| match ev {
+        DirEv::Upsert { id, wid, b } => st.upsert(id, wid, &b),
+        DirEv::Remove { id } => st.remove(id),
+    });
+}
+
+fn drain_direct(st: &mut CeState) {
+    let taken = match DIRECT_Q.lock() {
+        Ok(mut q) => {
+            if q.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *q)
+        }
+        Err(_) => return,
+    };
+    for ev in taken {
+        match ev {
+            DirEv::Upsert { id, wid, b } => st.upsert(id, wid, &b),
+            DirEv::Remove { id } => st.remove(id),
+        }
+    }
+}
+
+fn with_state<R>(f: impl FnOnce(&mut CeState) -> R) -> Option<R> {
     let mut g = INDEX.lock().ok()?;
-    let idx = g.get_or_insert_with(centities_core::EntityIndex::new);
-    Some(f(idx))
+    let st = g.get_or_insert_with(new_state);
+    Some(f(st))
+}
+
+#[inline]
+fn row_slot(key: u64) -> i32 {
+    // [wid:3][cx:10][cz:10] — must match CeHooks.rowQuery. Folding the world
+    // into the slot keeps another dimension's cell from evicting this one's
+    // row (observed: nether spawn-chunk entities at (0,0) ping-ponged the
+    // overworld's row out of the slot on every publish).
+    let wid = ((key >> 44) & 0xFFFF) as i32;
+    let (cx, cz) = centities_core::key_coords(key);
+    ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10)
+}
+
+unsafe fn set_static_long(env: &JniEnv, cls: jni::jclass, fid: jni::jfieldID, v: i64) {
+    let e = env.raw();
+    let vt = *e;
+    ((*vt).SetStaticLongField)(e, cls, fid, v);
+}
+
+unsafe fn set_static_int(env: &JniEnv, cls: jni::jclass, fid: jni::jfieldID, v: i32) {
+    let e = env.raw();
+    let vt = *e;
+    ((*vt).SetStaticIntField)(e, cls, fid, v);
+}
+
+/// Publish every dirty cell's id row into the Java table. Runs ONLY on the
+/// server thread, under the INDEX mutex, inside an existing JNI call — so
+/// the server-thread Java readers need no synchronization, and no write
+/// ever races a row read.
+fn publish(env: &JniEnv, st: &mut CeState) {
+    let Some(info) = st.p.info else { return };
+    if st.p.dirty.is_empty() && !st.p.oversize_changed {
+        return;
+    }
+    let cells = std::mem::take(&mut st.p.dirty);
+    for c in &cells {
+        let ci = *c as usize;
+        if ci < st.p.in_dirty.len() {
+            st.p.in_dirty[ci] = false;
+        }
+    }
+    st.p.oversize_changed = false;
+    let cls = info.cls as jni::jclass;
+    let pop = st.idx.stats().oversize as i32;
+    unsafe { set_static_int(env, cls, info.fid_pop, pop) };
+
+    for cell in cells {
+        let ci = cell as usize;
+        if st.p.dense.get(ci).copied().unwrap_or(false) {
+            continue; // killed rows stay killed; zero publish cost
+        }
+        let Some(key) = st.idx.cell_key_of(cell) else { continue };
+        let slot = row_slot(key);
+        let (count, overflow) = st.idx.cell_scan(cell, &mut st.p.ids, ROW_CAP);
+        if overflow {
+            // sticky dense: kill any published row (Java sees the sentinel)
+            if st.p.dense.len() <= ci {
+                st.p.dense.resize(ci + 1, false);
+            }
+            st.p.dense[ci] = true;
+            let row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
+            if !row.is_null() {
+                st.p.buf.resize(2 + ROW_CAP, 0);
+                st.p.buf[0] = key as i64;
+                st.p.buf[1] = (st.p.seq << 11) | ROW_SENTINEL;
+                env.set_long_array_region(row as jni::jlongArray, 0, 2, &st.p.buf[..2]);
+            }
+            continue;
+        }
+        st.p.buf.resize(2 + ROW_CAP, 0);
+        st.p.buf[0] = key as i64;
+        st.p.buf[1] = (st.p.seq << 11) | count as i64;
+        for (k, id) in st.p.ids.iter().enumerate() {
+            st.p.buf[2 + k] = *id;
+        }
+        let mut row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
+        if row.is_null() {
+            match env.new_long_array((2 + ROW_CAP) as i32) {
+                Some(narr) => {
+                    env.set_object_array_element(info.rows as jni::jobjectArray, slot, narr);
+                    row = narr;
+                }
+                None => {
+                    st.p.info = None; // OOM: publishing off for good
+                    return;
+                }
+            }
+        }
+        env.set_long_array_region(
+            row as jni::jlongArray,
+            0,
+            (2 + count) as i32,
+            &st.p.buf[..2 + count],
+        );
+    }
+    if env.exception_check() {
+        env.exception_describe();
+        env.exception_clear();
+        st.p.info = None; // any JNI anomaly: publishing off, fast path stays exact
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,9 +493,54 @@ fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
     if !register_natives(env, cls) {
         return None;
     }
+    // 4b.2a: wire the Java row table (forces <clinit> so ROWS is allocated,
+    // resolves field ids, takes a global ref). Failure only disables the
+    // zero-JNI row path — the native fast path and the mirror stay exact.
+    if init_publisher(env, cls) {
+        cplug_sdk::log::info("[c-entities] bridge: publisher wired (ROWS + seq)");
+    } else {
+        cplug_sdk::log::info("[c-entities] bridge: publisher NOT wired — row path disabled");
+    }
     // Promote the loader to a global ref while we are still attached (the
     // local ref dies with this attach scope).
     Some((env.new_global_ref(loader), cls_global))
+}
+
+/// Resolve the CeHooks static row-table surface and stash it for the
+/// publisher. Called once, inside define_bridge's attach scope.
+fn init_publisher(env: &JniEnv, cls: jni::jclass) -> bool {
+    // Force <clinit> (allocates ROWS = new long[1<<20][]): any static method
+    // call initializes the class; setActive(false) is a no-op right now.
+    if let Some(mid) = env.get_static_method_id(cls, "setActive", "(Z)V") {
+        env.call_static_void_method(cls, mid, &[jni::jvalue { z: 0 }]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return false;
+        }
+    }
+    let Some(fid_rows) = env.get_static_field_id(cls, "ROWS", "[[J") else { return false };
+    let Some(fid_seq) = env.get_static_field_id(cls, "PUBLISH_SEQ", "J") else { return false };
+    let Some(fid_pop) = env.get_static_field_id(cls, "OVERSIZE_POP", "I") else { return false };
+    let rows = env.get_static_object_field(cls, fid_rows);
+    if rows.is_null() {
+        return false;
+    }
+    let rows_g = env.new_global_ref(rows);
+    let cls_g = env.new_global_ref(cls);
+    let info = PubInfo { rows: rows_g, cls: cls_g, fid_pop };
+    // Align Java's PUBLISH_SEQ with the stamp this publisher instance writes.
+    let seq = NEXT_SEQ.load(Ordering::Acquire);
+    unsafe { set_static_long(env, cls_g as jni::jclass, fid_seq, seq) };
+    if env.exception_check() {
+        env.exception_clear();
+        return false;
+    }
+    if let Ok(mut g) = PUB_INFO.lock() {
+        *g = Some(info);
+        return true;
+    }
+    false
 }
 
 fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
@@ -432,13 +750,17 @@ pub extern "system" fn n_query(
     // FLUSH-MERGED QUERY (iteration 3): the caller's pending probe batch is
     // applied under the SAME lock acquisition right before the query — one
     // JNI crossing and one lock per query (2b paid a separate flush call).
+    // 4b.2a: after the apply, dirty cells' id rows are published into the
+    // Java table (same lock, same thread) — Java then serves small queries
+    // without ever entering this function.
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
         let e = JniEnv::from_raw(env);
         QSCRATCH.with(|q| {
             let mut q = q.borrow_mut();
             let mut g = INDEX.lock().ok()?;
-            let idx = g.as_mut()?;
+            let st = g.get_or_insert_with(new_state);
+            drain_direct(st);
             if bn > 0 {
                 BIDBUF.with(|b| {
                     let mut b = b.borrow_mut();
@@ -447,7 +769,8 @@ pub extern "system" fn n_query(
                     e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
                     for l in b.iter() {
                         if *l < 0 {
-                            idx.remove(*l & 0xFFFF_FFFF);
+                            let ev = st.idx.remove(*l & 0xFFFF_FFFF);
+                            st.note_remove(ev);
                         }
                     }
                     BBOXBUF.with(|bx| {
@@ -459,19 +782,21 @@ pub extern "system" fn n_query(
                             if *l >= 0 {
                                 let wid = ((*l >> 32) & 0xFFFF) as u16;
                                 let o = i * 6;
-                                idx.upsert(
+                                let ev = st.idx.upsert(
                                     *l & 0xFFFF_FFFF,
                                     wid,
                                     &centities_core::Aabb::new(
                                         bx[o], bx[o + 1], bx[o + 2], bx[o + 3], bx[o + 4], bx[o + 5],
                                     ),
                                 );
+                                st.note_upsert(ev);
                             }
                         }
                     });
                 });
             }
-            idx.query(
+            publish(&e, st);
+            st.idx.query(
                 world as u16,
                 &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
                 &mut q,
@@ -531,11 +856,13 @@ pub extern "system" fn n_flush(
         let mut box_buf: Vec<f64> = vec![0.0; n as usize * 6];
         e.get_long_array_region(ids, 0, n, &mut id_buf);
         jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
-        let _ = with_index(|idx| {
+        let _ = with_state(|st| {
+            drain_direct(st);
             for (i, l) in id_buf.iter().enumerate() {
                 let id = *l & 0xFFFF_FFFF;
                 if *l < 0 {
-                    idx.remove(id);
+                    let ev = st.idx.remove(id);
+                    st.note_remove(ev);
                 } else {
                     let wid = ((*l >> 32) & 0xFFFF) as u16;
                     let o = i * 6;
@@ -547,9 +874,13 @@ pub extern "system" fn n_flush(
                         box_buf[o + 4],
                         box_buf[o + 5],
                     );
-                    idx.upsert(id, wid, &b);
+                    let ev = st.idx.upsert(id, wid, &b);
+                    st.note_upsert(ev);
                 }
             }
+            // Mid-tick cap flush: publish now, or the rows would be
+            // stale-with-valid-stamp until the next native query.
+            publish(&e, st);
         });
     }
 }
@@ -557,7 +888,9 @@ pub extern "system" fn n_flush(
 // bridge class bytes (compiled by build.rs against the paper jar)
 static HOOKS_CLASS_BYTES: &[u8] = include_bytes!(concat!(env!("CE_HOOKS_CLASS")));
 
-/// Direct upsert for rare off-thread probes (worldgen workers).
+/// Off-thread upsert (worldgen workers): queued, drained by the next
+/// server-thread apply so the index and the published rows keep a single
+/// writer thread.
 pub extern "system" fn n_box(
     _env: *mut jni::JNIEnv,
     _cls: jni::jclass,
@@ -571,20 +904,35 @@ pub extern "system" fn n_box(
     z1: f64,
 ) {
     let b = centities_core::Aabb::new(x0, y0, z0, x1, y1, z1);
-    let _ = with_index(|idx| idx.upsert(id, world as u16, &b));
+    push_direct(DirEv::Upsert { id, wid: world as u16, b });
 }
 
-/// Direct remove for rare off-thread probes (worldgen workers).
+/// Off-thread remove (worldgen workers): queued like n_box.
 pub extern "system" fn n_remove(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i64) {
-    let _ = with_index(|idx| idx.remove(id));
+    push_direct(DirEv::Remove { id });
 }
 
 /// Full index drop (parity-gate suspend/resume, iteration 4): the Java gate
 /// suspends indexing when the fast path is measurably useless for the current
 /// traffic; on resume it fully re-syncs the index from the live lookups, so
 /// the native side only needs to forget everything it had.
-pub extern "system" fn n_reset(_env: *mut jni::JNIEnv, _cls: jni::jclass) {
+pub extern "system" fn n_reset(env: *mut jni::JNIEnv, cls: jni::jclass) {
     if let Ok(mut g) = INDEX.lock() {
         *g = None; // lazily re-created by the next apply/query
+    }
+    // Invalidate EVERY published row: PUBLISH_SEQ jumps past all stamps ever
+    // written (rows carry seq << 11, so +2^40 can never collide with an old
+    // stamp). The next publisher instance continues from NEXT_SEQ. Rare path
+    // (suspend/resync) — resolve the field locally.
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        if let Some(fid) = e.get_static_field_id(cls, "PUBLISH_SEQ", "J") {
+            let raw = e.raw();
+            let vt = *raw;
+            let cur = ((*vt).GetStaticLongField)(raw, cls, fid);
+            let next = cur.wrapping_add(1 << 40);
+            ((*vt).SetStaticLongField)(raw, cls, fid, next);
+            NEXT_SEQ.store(next, Ordering::Release);
+        }
     }
 }

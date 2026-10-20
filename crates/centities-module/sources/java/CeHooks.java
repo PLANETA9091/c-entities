@@ -62,6 +62,34 @@ public final class CeHooks {
     public static volatile long arenaMiss = 0, staleCand = 0;
     public static volatile long suspends = 0, resumes = 0, resyncEnts = 0;
     public static volatile long fastProbes = 0, mirrorProbes = 0; // re-probe traffic
+    public static volatile long mOffThread = 0; // fast path refused: off-thread caller
+
+    // ------------------------------------------------------------------
+    // 4b.2a ZERO-JNI ROWS — native-published per-cell id rows. The native
+    // publisher (Rust) writes, for every index cell whose id list changed,
+    // one long[] into ROWS (indexed by a direct cell-coord hash; collisions
+    // simply make both cells' rows invalid — they lose nothing but the row
+    // path). Layout: [0]=cell key, [1]=(publish stamp<<11)|idCount,
+    // [2..]=ids homed in that cell at publish time. PUBLISH_SEQ changes ONLY
+    // on full index reset; between resets the native side keeps the invariant
+    // "stamp == PUBLISH_SEQ implies the row is exact" by republishing every
+    // cell whose id list changed before the next query can read it.
+    // ROW_PATH_ON is a config kill switch (-Dcentities.rowPath=false).
+    // ------------------------------------------------------------------
+    public static final long[][] ROWS = new long[1 << 23][]; // [wid:3][cx:10][cz:10]
+    public static volatile long PUBLISH_SEQ = 0; // native stamps rows + this
+    public static volatile int OVERSIZE_POP = 0; // native oversize population
+    public static final boolean ROW_PATH_ON =
+            !"false".equals(System.getProperty("centities.rowPath", "true"));
+    private static final int ROW_CAP = 510;      // must match the native ROW_CAP
+
+    // Row-path diagnostics: hits and every distinct miss reason.
+    public static volatile long rowFast = 0;
+    public static volatile long rowMulti = 0, rowNoRow = 0, rowKey = 0, rowStale = 0;
+    public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
+    public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
+    // TEMP 4b.2a bring-up diagnostics (first rowKey miss snapshot).
+    public static volatile long dbgExpKey = 0, dbgGotKey = 0, dbgExpSlot = -1, dbgMisses = 0;
 
     /** One-line diagnostic snapshot (all counters). */
     public static String stats() {
@@ -77,6 +105,12 @@ public final class CeHooks {
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
+                + " row=" + rowFast + "/" + rowMulti + "/" + rowStale + "/" + rowPending
+                + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
+                + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
+                + " offT=" + mOffThread
+                + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
+                + "/" + dbgExpSlot + "/" + dbgMisses
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -170,7 +204,7 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide) {
                 probesAdd++;
                 ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox());
+                batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -206,7 +240,16 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
                 probesBox++;
                 ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), worldId(e.level()), newBox);
+                // Row-neutral classification (4b.2a): a box change WITHIN one
+                // home cell cannot alter any row's id list — the row path's
+                // live-box filter covers it — so the row-path pending scan
+                // may skip the entry. Without this, a moving entity's own
+                // pending probe would force its every query onto the native
+                // path (observed: falling items never hit the row path).
+                AABB oldBox = e.getBoundingBox();
+                boolean rowNeutral = oldBox != null
+                        && cellOfBox(oldBox) == cellOfBox(newBox);
+                batchUpsert(e.getId(), worldId(e.level()), newBox, rowNeutral);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -231,18 +274,32 @@ public final class CeHooks {
     private static final ThreadLocal<Boolean> SERVER_THREAD =
             ThreadLocal.withInitial(() -> "Server thread".equals(Thread.currentThread().getName()));
 
-    private static void batchUpsert(int id, int wid, AABB b) {
+    private static void batchUpsert(int id, int wid, AABB b, boolean rowNeutral) {
         if (!SERVER_THREAD.get()) {
             nativeBoxDirect(id, wid,
                     b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
             return;
         }
-        B_IDS[bN] = ((wid & 0xFFFFL) << 32) | (id & 0xFFFF_FFFFL);
+        B_IDS[bN] = ((wid & 0xFFFFL) << 32) | (id & 0xFFFF_FFFFL)
+                | (rowNeutral ? ROW_NEUTRAL : 0L);
         int o = bN * 6;
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
         bN++;
         if (bN >= BATCH_CAP - BATCH_CAP / 4) flush();
+    }
+
+    /** Batch entry flag (bit 62): the upsert keeps the entity's home cell
+     *  (box changed WITHIN one cell) — it cannot change any row's id list,
+     *  so the row-path pending scan may skip it. Bits 32..47 = world,
+     *  0..31 = id, 63 = removal, 62 = row-neutral. */
+    private static final long ROW_NEUTRAL = 1L << 62;
+
+    private static int cellOfBox(AABB b) {
+        // packed home cell (cx & 0x3FF) | ((cz & 0x3FF) << 10) — a cheap
+        // identity for "same 16x16 cell" comparisons (wid is constant per
+        // entity here; the world never changes for a live entity).
+        return (cellFloor(b.minX) & 0x3FF) | ((cellFloor(b.minZ) & 0x3FF) << 10);
     }
 
     private static void batchRemove(int id) {
@@ -440,6 +497,9 @@ public final class CeHooks {
      *  Off-thread direct probes racing the resync are harmless: worst case a
      *  candidate is briefly stale and resolve falls back or skips it. */
     private static void resumeIndexing() {
+        if (!SERVER_THREAD.get()) {
+            return; // the resync writes server-thread state — retry later
+        }
         nativeReset();
         for (net.minecraft.world.level.Level w : WORLDS.keySet()) {
             if (!(w instanceof net.minecraft.server.level.ServerLevel sl)) continue;
@@ -449,7 +509,7 @@ public final class CeHooks {
                 if (e == null || e.isRemoved()) continue;
                 AABB b = e.getBoundingBox();
                 ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), wid, b);
+                batchUpsert(e.getId(), wid, b, false);
                 n++;
             }
             resyncEnts += n;
@@ -483,10 +543,33 @@ public final class CeHooks {
             mNotServerLevel++;
             return null;
         }
+        // The fast path touches server-thread-only state (batch arrays, gate
+        // EMAs, published rows). Off-thread callers (async plugin queries)
+        // take the vanilla mirror — exact parity for them, and it removes a
+        // pre-existing batch-array race.
+        if (!SERVER_THREAD.get()) {
+            mOffThread++;
+            return null;
+        }
         int wid = worldId(sl);
         if (wid < 0) {
             mBadWorld++;
             return null;
+        }
+
+        // 4b.2a ZERO-JNI ROW PATH: single-cell boxes with a fresh published
+        // row are served entirely in Java — no JNI crossing, no index lock,
+        // no flush (the pending-batch scan below makes that exact). Any miss
+        // falls through to the flush-merged native query.
+        if (ROW_PATH_ON && PUBLISH_SEQ != 0) {
+            if (OVERSIZE_POP != 0) {
+                rowOv++; // native oversize entities: exact scan is native-only
+            } else {
+                List<Entity> out = rowQuery(sl, wid, source, box, predicate);
+                if (out != null) return out;
+            }
+        } else if (PUBLISH_SEQ == 0) {
+            rowNoPub++;
         }
 
         // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is applied
@@ -578,6 +661,103 @@ public final class CeHooks {
             mDesync++;
             return null; // desync guard
         }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // 4b.2a zero-JNI row query. Single-cell boxes only (4b.2b widens to
+    // multi-cell). EXACTNESS CONTRACT vs vanilla: a candidate is returned iff
+    // its CURRENT home cell == the query cell AND its live AABB intersects
+    // the query box AND the predicate passes — exactly the set vanilla's
+    // section scan produces. The row only bounds WHICH ids are examined; the
+    // home re-check + live-box filter + ARENA/getter resolve make the answer
+    // exact even for rows shadowed by pending (unflushed) changes:
+    //   moved-out / box-shrunk rows -> home re-check drops them,
+    //   removed (pending) rows     -> ARENA null + getter null -> skipped,
+    //   moved-in / added (pending) -> pending-batch scan -> native path.
+    // Returns null = miss -> caller takes the native path.
+    // ------------------------------------------------------------------
+    private static int cellFloor(double x) {
+        return (int) Math.floor(x) >> 4;
+    }
+
+    private static List<Entity> rowQuery(
+            net.minecraft.server.level.ServerLevel sl, int wid,
+            Entity source, AABB box, Predicate<? super Entity> predicate) {
+        int cx = cellFloor(box.minX);
+        if (cx != cellFloor(box.maxX)) { rowMulti++; return null; }
+        int cz = cellFloor(box.minZ);
+        if (cz != cellFloor(box.maxZ)) { rowMulti++; return null; }
+        int slot = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+        long[] row = ROWS[slot];
+        if (row == null) { rowNoRow++; return null; }
+        long key = ((long) (wid & 0xFFFF) << 44)
+                | (((long) ((cx + (1 << 20)) & 0x3FFFFF)) << 22)
+                | (long) ((cz + (1 << 20)) & 0x3FFFFF);
+        if (row[0] != key) {
+            rowKey++;
+            if (dbgMisses < 3) {
+                dbgMisses++;
+                dbgExpKey = key;
+                dbgGotKey = row[0];
+                dbgExpSlot = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+            }
+            return null;
+        }
+        long hdr = row[1];
+        if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
+        int n = (int) (hdr & 0x7FF);
+        if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
+        // Pending (unflushed) probe batch: an upsert whose NEW home cell is
+        // this cell means the row predates the entity — answering from the
+        // row would be a false negative. Everything else a pending batch can
+        // do to this cell (move out, remove, in-cell box change) is made
+        // exact by the home re-check + live-box filter below.
+        if (bN > 0) {
+            if (bN > 16) { rowPending++; return null; } // bound the scan
+            for (int i = 0; i < bN; i++) {
+                long l = B_IDS[i];
+                if (l < 0) continue;                 // removals resolve to null below
+                if ((l & ROW_NEUTRAL) != 0) continue; // same-cell box change: row id list unchanged
+                if (((l >> 32) & 0xFFFF) != (wid & 0xFFFF)) continue;
+                int o = i * 6;
+                if (cellFloor((B_BOX[o] + B_BOX[o + 3]) * 0.5) == cx
+                        && cellFloor((B_BOX[o + 2] + B_BOX[o + 5]) * 0.5) == cz) {
+                    rowPending++;
+                    return null;
+                }
+            }
+        }
+        if (n == 0) { rowEmpty++; return new ArrayList<>(0); }
+        ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
+        int srcId = source == null ? -1 : source.getId();
+        int stale = 0, homeMiss = 0;
+        int bx = cx << 4, bz = cz << 4;
+        for (int k = 0; k < n; k++) {
+            int cid = (int) row[2 + k];
+            if (cid == srcId) continue;
+            Entity e = ARENA[cid & AMASK];
+            if (e == null || e.getId() != cid) {
+                e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
+                if (e == null) { stale++; continue; }
+            }
+            AABB eb = e.getBoundingBox();
+            // home re-check (exactness): the entity's CURRENT center must
+            // still home this cell; a pending cross-cell move drops out here
+            // exactly like vanilla's section semantics.
+            double mx = (eb.minX + eb.maxX) * 0.5;
+            double mz = (eb.minZ + eb.maxZ) * 0.5;
+            if (mx < bx || mx >= bx + 16.0 || mz < bz || mz >= bz + 16.0) {
+                homeMiss++;
+                continue;
+            }
+            if (eb.intersects(box) && (predicate == null || predicate.test(e))) {
+                out.add(e);
+            }
+        }
+        rowStaleCand += stale;
+        rowHomeMiss += homeMiss;
+        rowFast++;
         return out;
     }
 

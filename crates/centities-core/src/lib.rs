@@ -286,6 +286,38 @@ impl IdMap {
 // Index
 // ---------------------------------------------------------------------------
 
+/// What an upsert changed at the CELL level. The module's Java-row publisher
+/// (4b.2a) uses it to mark exactly the cells whose published id-row is no
+/// longer exact. Same-cell box updates leave the row's ID LIST untouched —
+/// the Java path re-filters on live boxes — so they publish nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsertEv {
+    /// Box update within the same home cell (row id list unchanged).
+    Same,
+    /// Entity gained a normal home cell (new insert, or came back from the
+    /// oversize list). `from_oversize` also means the oversize population
+    /// changed (Java's OVERSIZE_POP must be refreshed).
+    New { cell: u32, from_oversize: bool },
+    /// Home cell changed: both cells' rows changed.
+    Moved { old: u32, new: u32 },
+    /// Entity became oversize (was normal in `old`, or was not tracked).
+    ToOversize { old: Option<u32> },
+    /// Oversize entity's box updated while staying oversize: no row and no
+    /// population change — nothing to publish.
+    OversizeSame,
+}
+
+/// What a remove changed at the CELL level (see UpsertEv).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveEv {
+    /// Id was not tracked.
+    Absent,
+    /// A normal entity left its home cell.
+    Normal { cell: u32 },
+    /// An oversize entity left the oversize list (population changed).
+    Oversize,
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     id: i64,
@@ -355,14 +387,14 @@ impl EntityIndex {
 
     /// Insert or update an entity's AABB. O(1) typical (same-cell update is
     /// 6 stores). `world` is a caller-assigned small id per Level instance.
-    pub fn upsert(&mut self, id: i64, world: u16, b: &Aabb) {
+    /// Returns the cell-level change (see [`UpsertEv`]).
+    pub fn upsert(&mut self, id: i64, world: u16, b: &Aabb) -> UpsertEv {
         let hx = (b.x1 - b.x0) * 0.5;
         let hz = (b.z1 - b.z0) * 0.5;
         let half = hx.max(hz);
 
         if half > MAX_HALF_SPAN {
-            self.upsert_oversize(id, world, *b);
-            return;
+            return self.upsert_oversize(id, world, *b);
         }
         if half > self.max_half_span {
             self.max_half_span = half;
@@ -385,10 +417,11 @@ impl EntityIndex {
                 e.x1 = (b.x1 - ox) as f32;
                 e.y1 = b.y1 as f32;
                 e.z1 = (b.z1 - oz) as f32;
-                return;
+                return UpsertEv::Same;
             }
             // moved cell (or world): unlink, rewrite, relink
             self.unlink(home, slot);
+            let old_home = home;
             {
                 let (ox, oz) = cell_origin(ncx, ncz);
                 let e = &mut self.entries[slot as usize];
@@ -403,11 +436,14 @@ impl EntityIndex {
             let home = self.cell_id(world, ncx, ncz);
             self.link(home, slot);
             self.homes[slot as usize] = home;
+            return UpsertEv::Moved { old: old_home, new: home };
         } else {
             // if it used to be oversize, drop that record
+            let mut from_oversize = false;
             if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
                 self.oversize.swap_remove(p);
                 self.stats.oversize -= 1;
+                from_oversize = true;
             }
             let (ox, oz) = cell_origin(ncx, ncz);
             let e = Entry {
@@ -431,19 +467,24 @@ impl EntityIndex {
             self.homes[slot as usize] = home;
             self.idmap.insert(id, slot);
             self.stats.entities += 1;
+            return UpsertEv::New { cell: home, from_oversize };
         }
     }
 
-    pub fn remove(&mut self, id: i64) {
+    pub fn remove(&mut self, id: i64) -> RemoveEv {
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
             self.unlink(home, slot);
             self.idmap.remove(id);
             self.free_slot(slot);
             self.stats.entities -= 1;
+            RemoveEv::Normal { cell: home }
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
             self.oversize.swap_remove(p);
             self.stats.oversize -= 1;
+            RemoveEv::Oversize
+        } else {
+            RemoveEv::Absent
         }
     }
 
@@ -618,7 +659,7 @@ impl EntityIndex {
         self.homes.pop();
     }
 
-    fn upsert_oversize(&mut self, id: i64, world: u16, b: Aabb) {
+    fn upsert_oversize(&mut self, id: i64, world: u16, b: Aabb) -> UpsertEv {
         if let Some(slot) = self.idmap.find(id) {
             // was a normal entity: detach it first
             let home = self.homes[slot as usize];
@@ -628,14 +669,46 @@ impl EntityIndex {
             self.stats.entities -= 1;
             if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
                 self.oversize[p] = Oversize { id, world, b };
-                return;
+                return UpsertEv::ToOversize { old: Some(home) };
             }
+            self.oversize.push(Oversize { id, world, b });
+            self.stats.oversize += 1;
+            return UpsertEv::ToOversize { old: Some(home) };
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
             self.oversize[p] = Oversize { id, world, b };
-            return;
+            return UpsertEv::OversizeSame;
         }
         self.oversize.push(Oversize { id, world, b });
         self.stats.oversize += 1;
+        UpsertEv::ToOversize { old: None }
+    }
+
+    // ---- 4b.2a Java-row publish helpers (module-side publisher) ----
+
+    /// The cell key of `cell`, or None if out of range.
+    #[inline]
+    pub fn cell_key_of(&self, cell: u32) -> Option<u64> {
+        self.cell_keys.get(cell as usize).copied().filter(|k| *k != 0)
+    }
+
+    /// Walk the chain of `cell`: push up to `cap` ids into `out`, return
+    /// (total_count, overflow) where overflow = total > cap. The full count
+    /// is always computed (the publisher needs it to decide publishability),
+    /// but ids beyond cap are not stored.
+    pub fn cell_scan(&self, cell: u32, out: &mut Vec<i64>, cap: usize) -> (usize, bool) {
+        out.clear();
+        let head = *self.heads.get(cell as usize).unwrap_or(&0);
+        let mut total = 0usize;
+        let mut cur = head;
+        while cur != 0 {
+            let s = cur as usize - 1;
+            if total < cap {
+                out.push(self.entries[s].id);
+            }
+            total += 1;
+            cur = self.entries[s].next;
+        }
+        (total, total > cap)
     }
 }
 
@@ -654,7 +727,7 @@ fn cell_origin(cx: i32, cz: i32) -> (f64, f64) {
 }
 
 #[inline]
-fn key_coords(key: u64) -> (i32, i32) {
+pub fn key_coords(key: u64) -> (i32, i32) {
     const B: i64 = 1 << 20;
     let cx = ((((key >> 22) & 0x3F_FFFF) as i64) - B) as i32;
     let cz = (((key & 0x3F_FFFF) as i64) - B) as i32;
