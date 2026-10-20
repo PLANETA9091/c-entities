@@ -494,12 +494,17 @@ public final class CeHooks {
         // one index-lock acquisition per query (2b paid two each: a flush
         // before every query was ~1.7M flushes for ~1.9M queries).
         // batchN>0 only on the first attempt; retries must NOT re-apply.
+        // 4b.1: the INNER phase splits (query vs resolve nanos) are sampled
+        // 1-in-1024 — two System.nanoTime() calls per query (~40-50ns) were
+        // pure measurement tax on the path the EMA prices; the outer dt in
+        // getEntities stays exact (it is the pricing signal).
         long[] ids = QBUF.get();
         int bn = bN;
-        long t1 = System.nanoTime();
+        boolean prof = (queriesFast & 1023) == 0;
+        long t1 = prof ? System.nanoTime() : 0L;
         int n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
                 ids, bn, B_IDS, B_BOX);
-        queryNanos += System.nanoTime() - t1;
+        if (prof) queryNanos += System.nanoTime() - t1;
         if (n >= 0 && bn > 0) {
             bN = 0;
             batchesFlushed++;
@@ -525,7 +530,7 @@ public final class CeHooks {
         int stale = 0;
         int srcSkip = 0;
         candidatesSeen += n;
-        long t2 = System.nanoTime();
+        long t2 = prof ? System.nanoTime() : 0L;
         int srcId = source == null ? -1 : source.getId();
         for (int k = 0; k < n; k++) {
             int cid = (int) ids[k];
@@ -562,7 +567,7 @@ public final class CeHooks {
                 out.add(e);
             }
         }
-        resolveNanos += System.nanoTime() - t2;
+        if (prof) resolveNanos += System.nanoTime() - t2;
         candidatesResolved += resolved;
         staleCand += stale;
         // Desync means the index disagrees with the WORLD about LIVING
@@ -587,12 +592,33 @@ public final class CeHooks {
     private static final java.util.concurrent.atomic.AtomicInteger NEXT_WORLD =
             new java.util.concurrent.atomic.AtomicInteger();
 
+    // 4b.1: identity memo for worldId — every query (fast AND mirror) pays
+    // gateCell → worldId, and a ConcurrentHashMap.get costs ~40-60ns while an
+    // identity scan over 4 slots is ~3-5ns. Slot w is bound to THE level whose
+    // world id is w, published only AFTER the WORLDS registration completed,
+    // and never rebound (world ids are never reassigned) — so concurrent
+    // first-writers write the same value (benign race, reference writes are
+    // atomic) and a reader can never observe a torn pair: worst case it sees
+    // a not-yet-published slot and takes the map path.
+    private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[4];
+
     public static int worldId(net.minecraft.world.level.Level level) {
-        Integer w = WORLDS.get(level);
-        if (w != null) return w;
-        w = NEXT_WORLD.getAndIncrement();
-        Integer prev = WORLDS.putIfAbsent(level, w);
-        return prev != null ? prev : w;
+        for (int w = 0; w < WID_SLOTS.length; w++) {
+            if (WID_SLOTS[w] == level) return w;
+        }
+        Integer got = WORLDS.get(level);
+        int w;
+        if (got != null) {
+            w = got;
+        } else {
+            int nw = NEXT_WORLD.getAndIncrement();
+            Integer prev = WORLDS.putIfAbsent(level, nw);
+            w = prev != null ? prev : nw;
+        }
+        if (w < WID_SLOTS.length && WID_SLOTS[w] == null) {
+            WID_SLOTS[w] = level;
+        }
+        return w;
     }
 
     /** Kill-switch arm/disarm from the native side. */
