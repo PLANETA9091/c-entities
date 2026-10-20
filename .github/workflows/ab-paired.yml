@@ -1,0 +1,130 @@
+name: ab-paired
+
+# 4a.3 — paired same-runner A/B. Previous runs placed the on/off pair on
+# DIFFERENT runners (up to +-30% job-to-job spread), so a delta could not
+# prove "never slower than vanilla". This workflow runs each off/on pair
+# BACK TO BACK on the SAME runner, repeated, and gates on the medians.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  SCENARIOS: items-100k mixed-150k spread-100k
+  REPEATS: '2'
+  MEASURE: '600'
+  GATE_MARGIN: '1.05'
+
+jobs:
+  paired:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CRUSSTY (runtime + sdk path deps live at repo-parent)
+        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Fetch Paper 1.21.8 (paperclip)
+        run: bash scripts/fetch-paper.sh 1.21.8 server/paper.jar
+      - name: Build ce-baseline plugin
+        run: bash scripts/build-plugin.sh
+      - name: Install mineflayer
+        run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
+
+      - name: Paired off/on runs
+        run: |
+          REP=$REPEATS
+          for r in $(seq 1 "$REP"); do
+            for SC in $SCENARIOS; do
+              case "$SC" in
+                items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0;;
+                mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;;
+                spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600;;
+              esac
+              for ARM in off on; do
+                if [ "$ARM" = "on" ]; then
+                  M='on'
+                else
+                  M='off'
+                fi
+                echo "=== pair r$r $SC arm=$ARM ==="
+                RUN_NAME="abp-r$r-$SC-$ARM" \
+                SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
+                AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
+                MEASURE_TICKS="$MEASURE" RUN_TIMEOUT='1100' XMX='8G' \
+                MODULE="$M" \
+                bash scripts/run-baseline.sh
+                if [ "$M" = "on" ]; then
+                  LOG="bench/abp-r$r-$SC-on/results/server.log"
+                  grep -q "ARMED" "$LOG" || { echo "FATAL: not armed (r$r $SC)"; exit 1; }
+                  if grep -q "NOT armed" "$LOG"; then echo "FATAL: NOT armed (r$r $SC)"; exit 1; fi
+                  if grep -q "FAILED to patch" "$LOG"; then echo "FATAL: patch failed (r$r $SC)"; exit 1; fi
+                  grep -q "desync=0" <(grep "hooks@" "$LOG" | tail -1) || { echo "FATAL: desync (r$r $SC)"; grep "hooks@" "$LOG" | tail -1; exit 1; }
+                fi
+              done
+            done
+          done
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-paired-results
+          path: bench/
+          retention-days: 30
+
+      - name: Gate — paired medians, module must not be slower than vanilla
+        run: |
+          python3 - <<'PY'
+          import json, glob, statistics, sys, os
+          margin = float(os.environ.get("GATE_MARGIN", "1.05"))
+          scen = os.environ["SCENARIOS"].split()
+          reps = int(os.environ["REPEATS"])
+
+          def load(arm, sc):
+              out = []
+              for r in range(1, reps + 1):
+                  p = f"bench/abp-r{r}-{sc}-{arm}/results/baseline.json"
+                  try:
+                      out.append(json.load(open(p))["mspt"]["mean"])
+                  except Exception:
+                      pass
+              return out
+
+          rows, fails = [], []
+          for sc in scen:
+              off, on = load("off", sc), load("on", sc)
+              if not off or not on:
+                  fails.append(sc)
+                  rows.append((sc, off, on, None))
+                  continue
+              mo, mn = statistics.median(off), statistics.median(on)
+              ratio = mn / mo if mo > 0 else float("inf")
+              ok = ratio <= margin
+              if not ok:
+                  fails.append(sc)
+              rows.append((sc, off, on, (mo, mn, ratio, ok)))
+          print("scenario      off-samples            on-samples             med-off  med-on   ratio  verdict")
+          for sc, off, on, res in rows:
+              if res is None:
+                  print(f"{sc:<14}{str(off):<24}{str(on):<24}{'-':>9}{'-':>9}{'-':>7}  FAIL(missing)")
+                  continue
+              mo, mn, ratio, ok = res
+              print(f"{sc:<14}{str([round(x,1) for x in off]):<24}{str([round(x,1) for x in on]):<24}{mo:>9.2f}{mn:>9.2f}{ratio:>7.3f}  {'PASS' if ok else 'FAIL'}")
+          print()
+          print("AB-PAIRED-GATE: " + ("PASS" if not fails else "FAIL: " + ",".join(fails)))
+          sys.exit(1 if fails else 0)
+          PY
+        env:
+          SCENARIOS: items-100k mixed-150k spread-100k
+          REPEATS: '2'
+          GATE_MARGIN: '1.05'
