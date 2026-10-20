@@ -296,10 +296,12 @@ public final class CeHooks {
     private static final long ROW_NEUTRAL = 1L << 62;
 
     private static int cellOfBox(AABB b) {
-        // packed home cell (cx & 0x3FF) | ((cz & 0x3FF) << 10) — a cheap
-        // identity for "same 16x16 cell" comparisons (wid is constant per
-        // entity here; the world never changes for a live entity).
-        return (cellFloor(b.minX) & 0x3FF) | ((cellFloor(b.minZ) & 0x3FF) << 10);
+        // packed home cell (cx & 0x3FF) | ((cz & 0x3FF) << 10), CENTER-based
+        // (the index homes by center, so every home comparison must too — a
+        // min-corner packing would misclassify boxes straddling a cell
+        // boundary whose center is in the other cell).
+        return (cellFloor((b.minX + b.maxX) * 0.5) & 0x3FF)
+                | ((cellFloor((b.minZ + b.maxZ) * 0.5) & 0x3FF) << 10);
     }
 
     private static void batchRemove(int id) {
@@ -665,54 +667,71 @@ public final class CeHooks {
     }
 
     // ------------------------------------------------------------------
-    // 4b.2a zero-JNI row query. Single-cell boxes only (4b.2b widens to
-    // multi-cell). EXACTNESS CONTRACT vs vanilla: a candidate is returned iff
-    // its CURRENT home cell == the query cell AND its live AABB intersects
-    // the query box AND the predicate passes — exactly the set vanilla's
-    // section scan produces. The row only bounds WHICH ids are examined; the
-    // home re-check + live-box filter + ARENA/getter resolve make the answer
-    // exact even for rows shadowed by pending (unflushed) changes:
+    // 4b.2a/4b.2b zero-JNI row query. Boxes spanning up to 2x2 cells are
+    // covered (4b.2b); larger fall to the native path. EXACTNESS CONTRACT vs
+    // vanilla: a candidate is returned iff its CURRENT home cell is one of
+    // the covered cells AND its live AABB intersects the query box AND the
+    // predicate passes — exactly the set vanilla's section scan produces.
+    // The rows only bound WHICH ids are examined; the home re-check +
+    // live-box filter + ARENA/getter resolve make the answer exact even for
+    // rows shadowed by pending (unflushed) changes:
     //   moved-out / box-shrunk rows -> home re-check drops them,
     //   removed (pending) rows     -> ARENA null + getter null -> skipped,
     //   moved-in / added (pending) -> pending-batch scan -> native path.
-    // Returns null = miss -> caller takes the native path.
+    // Rows partition entities by home cell (single-homing), so multi-cell
+    // iteration needs no dedup. Returns null = miss -> native path.
     // ------------------------------------------------------------------
     private static int cellFloor(double x) {
         return (int) Math.floor(x) >> 4;
     }
 
+    // Multi-cell scratch (server-thread only, reused — no per-query alloc).
+    private static final long[][] MQ_ROWS = new long[4][];
+    private static final int[] MQ_CELL = new int[4];
+
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
             Entity source, AABB box, Predicate<? super Entity> predicate) {
-        int cx = cellFloor(box.minX);
-        if (cx != cellFloor(box.maxX)) { rowMulti++; return null; }
-        int cz = cellFloor(box.minZ);
-        if (cz != cellFloor(box.maxZ)) { rowMulti++; return null; }
-        int slot = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
-        long[] row = ROWS[slot];
-        if (row == null) { rowNoRow++; return null; }
-        long key = ((long) (wid & 0xFFFF) << 44)
-                | (((long) ((cx + (1 << 20)) & 0x3FFFFF)) << 22)
-                | (long) ((cz + (1 << 20)) & 0x3FFFFF);
-        if (row[0] != key) {
-            rowKey++;
-            if (dbgMisses < 3) {
-                dbgMisses++;
-                dbgExpKey = key;
-                dbgGotKey = row[0];
-                dbgExpSlot = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+        int cx0 = cellFloor(box.minX);
+        int cx1 = cellFloor(box.maxX);
+        int cz0 = cellFloor(box.minZ);
+        int cz1 = cellFloor(box.maxZ);
+        if (cx1 - cx0 > 1 || cz1 - cz0 > 1) { rowMulti++; return null; }
+        int nr = 0;
+        int total = 0;
+        for (int cx = cx0; cx <= cx1; cx++) {
+            for (int cz = cz0; cz <= cz1; cz++) {
+                int packed = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+                long[] row = ROWS[packed];
+                if (row == null) { rowNoRow++; return null; }
+                long key = ((long) (wid & 0xFFFF) << 44)
+                        | (((long) ((cx + (1 << 20)) & 0x3FFFFF)) << 22)
+                        | (long) ((cz + (1 << 20)) & 0x3FFFFF);
+                if (row[0] != key) {
+                    rowKey++;
+                    if (dbgMisses < 3) {
+                        dbgMisses++;
+                        dbgExpKey = key;
+                        dbgGotKey = row[0];
+                        dbgExpSlot = packed;
+                    }
+                    return null;
+                }
+                long hdr = row[1];
+                if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
+                int n = (int) (hdr & 0x7FF);
+                if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
+                MQ_ROWS[nr] = row;
+                MQ_CELL[nr] = (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+                nr++;
+                total += n;
             }
-            return null;
         }
-        long hdr = row[1];
-        if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
-        int n = (int) (hdr & 0x7FF);
-        if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
         // Pending (unflushed) probe batch: an upsert whose NEW home cell is
-        // this cell means the row predates the entity — answering from the
-        // row would be a false negative. Everything else a pending batch can
-        // do to this cell (move out, remove, in-cell box change) is made
-        // exact by the home re-check + live-box filter below.
+        // ANY covered cell means some row predates the entity — answering
+        // from the rows would be a false negative. Everything else a pending
+        // batch can do to the covered cells (move out, remove, in-cell box
+        // change) is made exact by the home re-check + live-box filter below.
         if (bN > 0) {
             if (bN > 16) { rowPending++; return null; } // bound the scan
             for (int i = 0; i < bN; i++) {
@@ -721,38 +740,44 @@ public final class CeHooks {
                 if ((l & ROW_NEUTRAL) != 0) continue; // same-cell box change: row id list unchanged
                 if (((l >> 32) & 0xFFFF) != (wid & 0xFFFF)) continue;
                 int o = i * 6;
-                if (cellFloor((B_BOX[o] + B_BOX[o + 3]) * 0.5) == cx
-                        && cellFloor((B_BOX[o + 2] + B_BOX[o + 5]) * 0.5) == cz) {
-                    rowPending++;
-                    return null;
+                int home = (cellFloor((B_BOX[o] + B_BOX[o + 3]) * 0.5) & 0x3FF)
+                        | ((cellFloor((B_BOX[o + 2] + B_BOX[o + 5]) * 0.5) & 0x3FF) << 10);
+                for (int r = 0; r < nr; r++) {
+                    if (MQ_CELL[r] == home) {
+                        rowPending++;
+                        return null;
+                    }
                 }
             }
         }
-        if (n == 0) { rowEmpty++; return new ArrayList<>(0); }
-        ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
+        if (total == 0) { rowEmpty++; return new ArrayList<>(0); }
+        ArrayList<Entity> out = new ArrayList<>(Math.min(total, 64));
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
-        int bx = cx << 4, bz = cz << 4;
-        for (int k = 0; k < n; k++) {
-            int cid = (int) row[2 + k];
-            if (cid == srcId) continue;
-            Entity e = ARENA[cid & AMASK];
-            if (e == null || e.getId() != cid) {
-                e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
-                if (e == null) { stale++; continue; }
-            }
-            AABB eb = e.getBoundingBox();
-            // home re-check (exactness): the entity's CURRENT center must
-            // still home this cell; a pending cross-cell move drops out here
-            // exactly like vanilla's section semantics.
-            double mx = (eb.minX + eb.maxX) * 0.5;
-            double mz = (eb.minZ + eb.maxZ) * 0.5;
-            if (mx < bx || mx >= bx + 16.0 || mz < bz || mz >= bz + 16.0) {
-                homeMiss++;
-                continue;
-            }
-            if (eb.intersects(box) && (predicate == null || predicate.test(e))) {
-                out.add(e);
+        for (int r = 0; r < nr; r++) {
+            long[] row = MQ_ROWS[r];
+            int packed = MQ_CELL[r];
+            int n = (int) (row[1] & 0x7FF);
+            for (int k = 0; k < n; k++) {
+                int cid = (int) row[2 + k];
+                if (cid == srcId) continue;
+                Entity e = ARENA[cid & AMASK];
+                if (e == null || e.getId() != cid) {
+                    e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
+                    if (e == null) { stale++; continue; }
+                }
+                AABB eb = e.getBoundingBox();
+                // home re-check (exactness): the entity's CURRENT home must
+                // still be the cell whose row we are reading; a pending
+                // cross-cell move drops out here exactly like vanilla's
+                // section semantics.
+                if (cellOfBox(eb) != packed) {
+                    homeMiss++;
+                    continue;
+                }
+                if (eb.intersects(box) && (predicate == null || predicate.test(e))) {
+                    out.add(e);
+                }
             }
         }
         rowStaleCand += stale;
