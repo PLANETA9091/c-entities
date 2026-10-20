@@ -13,14 +13,14 @@ permissions:
 
 env:
   SCENARIOS: items-100k mixed-150k spread-100k
-  REPEATS: '2'
-  MEASURE: '600'
+  REPEATS: '1'
+  MEASURE: '400'
   GATE_MARGIN: '1.05'
 
 jobs:
   paired:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
       - name: Checkout CRUSSTY (runtime + sdk path deps live at repo-parent)
@@ -50,6 +50,11 @@ jobs:
                 mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;;
                 spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600;;
               esac
+              # mixed-150k on a 2-vCPU runner: fill ~18m + warmup ~9m
+              # (about 5.7 s/tick observed) — a 600-tick window does not
+              # fit the budget; 300 ticks keep the gate meaningful.
+              MEAS="$MEASURE"
+              if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
               for ARM in off on; do
                 if [ "$ARM" = "on" ]; then
                   M='on'
@@ -60,7 +65,7 @@ jobs:
                 RUN_NAME="abp-r$r-$SC-$ARM" \
                 SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
                 AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
-                MEASURE_TICKS="$MEASURE" RUN_TIMEOUT='1100' XMX='8G' \
+                MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
                 MODULE="$M" \
                 bash scripts/run-baseline.sh
                 if [ "$M" = "on" ]; then
@@ -126,5 +131,5 @@ jobs:
           PY
         env:
           SCENARIOS: items-100k mixed-150k spread-100k
-          REPEATS: '2'
+          REPEATS: '1'
           GATE_MARGIN: '1.05'
