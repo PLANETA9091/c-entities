@@ -88,6 +88,147 @@ public final class CeHooks {
     public static volatile long rowMulti = 0, rowNoRow = 0, rowKey = 0, rowStale = 0;
     public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
     public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
+
+    // ------------------------------------------------------------------
+    // L2a RESTING ITEMS — the woven ItemEntity.tick guard calls itemSkip
+    // every tick. true = skip the physics (the woven body jumps straight to
+    // the merge gate at bytecode 432; the vanilla tail — merge scan, age,
+    // despawn event — still runs with full private access), false = run the
+    // full vanilla tick.
+    //
+    // WAKE CONTRACT (exactness): a resting item's physics depend only on
+    // blocks and its own position/velocity. Every block write funnels
+    // through ServerLevel.setBlock → probeWake bumps the per-cell epoch;
+    // any move of the item itself fires probeBox (the position changed — a
+    // disturbance by definition); removal fires probeRemove. A resting item
+    // whose cell epoch changed runs ONE full vanilla tick, then may rest
+    // again. Entity pushes (boats/pistons moving the item) surface as box
+    // probes; explosions that only knock back without breaking blocks are
+    // covered by the ItemEntity.hurt probe (see probeHurt).
+    // Residual, documented gap: Paper's Entity-level despawnTime (a private
+    // final set only via API, never for vanilla items) is checked inside the
+    // skipped super.tick — vanilla item despawn (age vs despawnRate, incl.
+    // the Bukkit ItemDespawnEvent) runs in the vanilla tail and stays exact.
+    // ------------------------------------------------------------------
+    public static final boolean REST_ON =
+            !"false".equals(System.getProperty("centities.rest", "true"));
+    // Sized to the ARENA (1 << 22) — declared with a literal because static
+    // initializers run in declaration order and ARENA is declared below.
+    public static final int[] REST_SLOT = new int[1 << 22]; // packed wake slot
+    public static final int[] REST_GEN = new int[1 << 22];  // epoch+1 at rest; 0 = not resting
+    public static final int[] WAKE_EPOCH = new int[1 << 19];     // [wid:3][cx:8][cz:8]
+    public static volatile long restFast = 0, restMarks = 0, restWakes = 0;
+
+    public static volatile long restChecks = 0;
+    public static boolean itemSkip(net.minecraft.world.entity.item.ItemEntity e) {
+        restChecks++; // before the flag checks: proves the woven call executes
+        if (!REST_ON || !ACTIVE) return false;
+        try {
+            int mask = e.getId() & AMASK;
+            int g = REST_GEN[mask];
+            if (g != 0) {
+                if (WAKE_EPOCH[REST_SLOT[mask]] + 1 == g) {
+                    restFast++;
+                    return true;
+                }
+                REST_GEN[mask] = 0; // woken: full vanilla tick this time
+                restWakes++;
+                return false;
+            }
+            // Rest candidate? Checked while the item still ticks fully.
+            // The delta threshold: a landing item's residual velocity decays
+            // geometrically (0.98 * damping); 1e-4 keeps a wind-down item in
+            // full-tick mode for a few extra ticks — conservative direction.
+            net.minecraft.world.phys.Vec3 d = e.getDeltaMovement();
+            if (e.onGround() && e.pickupDelay <= 0 && e.age >= 0 && e.age < 5800
+                    && !e.isInWater() && !e.isInLava()
+                    && Math.abs(d.x) < 1.0e-4 && Math.abs(d.y) < 1.0e-4
+                    && Math.abs(d.z) < 1.0e-4) {
+                int slot = wakeSlotOf(e);
+                REST_SLOT[mask] = slot;
+                REST_GEN[mask] = WAKE_EPOCH[slot] + 1;
+                restMarks++;
+            }
+            return false;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "itemSkip: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+            return false;
+        }
+    }
+
+    private static int wakeSlotOf(net.minecraft.world.entity.item.ItemEntity e) {
+        AABB b = e.getBoundingBox();
+        int wid = worldId(e.level());
+        int cx = cellFloor((b.minX + b.maxX) * 0.5);
+        int cz = cellFloor((b.minZ + b.maxZ) * 0.5);
+        return wakeSlot(wid, cx, cz);
+    }
+
+    private static int wakeSlot(int wid, int cx, int cz) {
+        // [wid:3][cx:8][cz:8] = 2^19 slots — cells beyond ±2048 blocks per
+        // axis wrap into other slots: a spurious wake (safe direction),
+        // never a missed one.
+        return (((wid & 0x7) << 16) | ((cx & 0xFF) << 8) | (cz & 0xFF)) & 0x7FFFF;
+    }
+
+    /** Prefix of ServerLevel.setBlock(BlockPos, BlockState, int[, int]). */
+    public static void probeWake(net.minecraft.world.level.Level level,
+            net.minecraft.core.BlockPos pos) {
+        try {
+            if (!REST_ON || !ACTIVE || level == null || pos == null
+                    || !(level instanceof net.minecraft.server.level.ServerLevel)
+                    || level.isClientSide) {
+                return;
+            }
+            int wid = worldId(level);
+            if (wid < 0) return;
+            int x = pos.getX(), z = pos.getZ();
+            int cx = cellFloor((double) x), cz = cellFloor((double) z);
+            bumpWake(wid, cx, cz);
+            // Boundary-adjacent cells: an edit within 1 block of a cell edge
+            // can affect resting items whose boxes reach across it. A spurious
+            // wake costs one vanilla tick; a missed one would be a desync.
+            int lx = Math.floorMod(x, 16), lz = Math.floorMod(z, 16);
+            if (lx <= 0) bumpWake(wid, cx - 1, cz);
+            if (lx >= 15) bumpWake(wid, cx + 1, cz);
+            if (lz <= 0) bumpWake(wid, cx, cz - 1);
+            if (lz >= 15) bumpWake(wid, cx, cz + 1);
+            if (lx <= 0 && lz <= 0) bumpWake(wid, cx - 1, cz - 1);
+            if (lx <= 0 && lz >= 15) bumpWake(wid, cx - 1, cz + 1);
+            if (lx >= 15 && lz <= 0) bumpWake(wid, cx + 1, cz - 1);
+            if (lx >= 15 && lz >= 15) bumpWake(wid, cx + 1, cz + 1);
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeWake: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
+
+    private static void bumpWake(int wid, int cx, int cz) {
+        WAKE_EPOCH[wakeSlot(wid, cx, cz)]++;
+    }
+
+    /** Prefix of ItemEntity.hurtServer: any damage (explosion knockback, kill
+     *  commands, void) is a disturbance — drop the rest state before the hurt
+     *  applies. Cheap by design: only items reach it. */
+    public static volatile long hurtProbes = 0;
+    public static void probeHurt(Entity e) {
+        try {
+            hurtProbes++; // TEMP L2a apply-check counter (also fires from tick)
+            if (REST_ON && ACTIVE && e != null) {
+                REST_GEN[e.getId() & AMASK] = 0;
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeHurt: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
     // TEMP 4b.2a bring-up diagnostics (first rowKey miss snapshot).
     public static volatile long dbgExpKey = 0, dbgGotKey = 0, dbgExpSlot = -1, dbgMisses = 0;
 
@@ -108,6 +249,7 @@ public final class CeHooks {
                 + " row=" + rowFast + "/" + rowMulti + "/" + rowStale + "/" + rowPending
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
+                + " rest=" + restFast + "/" + restMarks + "/" + restWakes + "/" + restChecks + "/" + hurtProbes
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
@@ -220,6 +362,7 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
                 ARENA[e.getId() & AMASK] = null;
+                REST_GEN[e.getId() & AMASK] = 0; // gone: drop the rest state
                 batchRemove(e.getId());
             }
         } catch (Throwable t) {
@@ -240,6 +383,7 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
                 probesBox++;
                 ARENA[e.getId() & AMASK] = e;
+                REST_GEN[e.getId() & AMASK] = 0; // a box change is a disturbance
                 // Row-neutral classification (4b.2a): a box change WITHIN one
                 // home cell cannot alter any row's id list — the row path's
                 // live-box filter covers it — so the row-path pending scan
@@ -490,6 +634,7 @@ public final class CeHooks {
             bN = 0; // pending deltas are irrelevant: the index is dropped and
             nativeReset(); // will be fully rebuilt by resync on resume
             java.util.Arrays.fill(ARENA, null); // release entity refs for GC
+            java.util.Arrays.fill(REST_GEN, 0); // rest states die with the index
             suspends++;
         }
     }

@@ -25,6 +25,7 @@ use std::sync::{LazyLock, Mutex};
 const LEVEL_CLASS: &str = "net/minecraft/world/level/Level";
 const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
 const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup";
+const ITEM_ENTITY_CLASS: &str = "net/minecraft/world/entity/item/ItemEntity";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 static PATCHES_OK: AtomicU64 = AtomicU64::new(0);
 static PATCHES_FAIL: AtomicU64 = AtomicU64::new(0);
+
 /// Global ref of the Level class loader, captured once at arm time. Byte
 /// hooks run inside JVMTI ClassFileLoadHook callbacks where class queries
 /// (GetLoadedClasses etc.) are restricted — they must NEVER call find_class;
@@ -346,6 +348,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(LEVEL_CLASS, |_n, b| patch_level(b));
     cplug_sdk::hooks::register_bytes(ENTITY_CLASS, |_n, b| patch_entity(b));
     cplug_sdk::hooks::register_bytes(LOOKUP_CLASS, |_n, b| patch_lookup(b));
+    cplug_sdk::hooks::register_bytes(ITEM_ENTITY_CLASS, |_n, b| patch_item(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -387,20 +390,74 @@ fn arm_module() {
     // the callback self-deadlocks the runtime's non-reentrant hook registry.
     // Uses the bytes stashed by the boot-time hook.
     precompute_level(loader);
+    force_init_item_entity_raw(loader);
+    precompute_item(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
     // Retransform → ClassFileLoadHook → our byte hooks patch the classes.
-    for cls in [LEVEL_CLASS, ENTITY_CLASS, LOOKUP_CLASS] {
+    for cls in [
+        LEVEL_CLASS,
+        ENTITY_CLASS,
+        LOOKUP_CLASS,
+        ITEM_ENTITY_CLASS,
+    ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!(
             "[c-entities] retransform {cls}: rc={rc}"
         ));
     }
 
+
+    // Paper re-loads kernel classes after bootstrap: a retransform that
+    // landed on a doomed bootstrap class object never reaches the running
+    // code (observed 2026-10-20: ItemEntity rc=0, hook bytes ignored, the
+    // live class stayed vanilla). The woven code itself is the proof:
+    // the verifier reads the Java counters and re-applies a class until its
+    // counter moves (probes fire = the woven call executes). JVMTI hands the
+    // hook the ORIGINAL bytes on every pass, so byte-level markers cannot
+    // detect "already applied" — only live execution can.
+    std::thread::spawn(|| {
+        let targets = [
+            (LEVEL_CLASS, Counter::Queries),
+            (ENTITY_CLASS, Counter::Boxes),
+            (LOOKUP_CLASS, Counter::Adds),
+            (ITEM_ENTITY_CLASS, Counter::RestChecks),
+        ];
+        let mut logged_done = false;
+        for attempt in 0..180 {
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            let snap = read_hook_counters();
+            let mut pending: Vec<&str> = Vec::new();
+            for (cls, c) in targets.iter() {
+                if snap.get(c).copied().unwrap_or(0) == 0 {
+                    pending.push(cls);
+                }
+            }
+            if pending.is_empty() {
+                if !logged_done {
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] patch verifier: all woven code live after {attempt} checks"
+                    ));
+                    logged_done = true;
+                }
+                continue; // keep watching: a class reload would zero nothing,
+                          // but a future re-apply request must still find us
+            }
+            for cls in pending {
+                let rc = cplug_sdk::retransform_class(cls);
+                if attempt < 3 {
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] patch verifier: re-apply {cls}: rc={rc}"
+                    ));
+                }
+            }
+        }
+    });
+
     let ok_n = PATCHES_OK.load(Ordering::Acquire);
     let fail_n = PATCHES_FAIL.load(Ordering::Acquire);
-    if ok_n >= 3 && fail_n == 0 {
+    if ok_n >= 4 && fail_n == 0 {
         // CeHooks.setActive(true) — on the EXACT class object define_class
         // returned (global ref), never via find_class (loader mismatch).
         let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
@@ -457,6 +514,141 @@ fn precompute_level(loader: jni::jobject) {
             cplug_sdk::log::info("[c-entities] FAILED to precompute Level.getEntities — vanilla kept");
         }
     }
+}
+
+/// Precompute the ItemEntity.tick skip guard (L2a). The guard's skip path
+/// jumps to bytecode offset 432 — the merge-gate `istore_2` of tick()V in
+/// Paper 1.21.8-60 (javap-verified): past ALL physics (oldPos, gravity,
+/// noCollision, move, friction, landing damping, the block-position-change
+/// event) but BEFORE the merge gate, so the vanilla tail (merge scan,
+/// age/despawn incl. the Bukkit despawn event) still runs in bytecode with
+/// full private access. The skip path initializes local 1 (the pre-move
+/// Vec3, read by the hasImpulse check at 517-541) with the FROZEN delta and
+/// pushes iconst_0 for i2 (position unchanged → merge interval 40) — the
+/// local/stack types at the target then match the vanilla flow exactly.
+fn force_init_item_entity_raw(loader: jni::jobject) {
+    // The retransform of a PREPARED-but-not-INITIALIZED class (status 0x3)
+    // returned rc=0 yet the woven guard never executed (observed 2026-10-20:
+    // restChecks stayed 0 while vanilla tick ran). Forcing <clinit> first
+    // brings ItemEntity to status 0x7, same as every target that works.
+    let _ = cplug_sdk::jni_util::with_attached(|e| {
+        let sys = cplug_sdk::classes::find_class("java/lang/Class")?.0;
+        if let Some(mid) = e.get_static_method_id(
+            sys,
+            "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+        ) {
+            if let Some(name) = e.new_string_utf("net.minecraft.world.entity.item.ItemEntity") {
+                let res = e.call_static_object_method(
+                    sys,
+                    mid,
+                    &[
+                        jni::jvalue { l: name },
+                        jni::jvalue { z: 1 },
+                        jni::jvalue { l: loader },
+                    ],
+                );
+                if e.exception_check() {
+                    e.exception_describe();
+                    e.exception_clear();
+                } else if !res.is_null() {
+                    e.delete_local_ref(res);
+                }
+            }
+        }
+        Some(())
+    });
+}
+
+fn precompute_item(loader: jni::jobject) {
+    let stash = STASH.lock().ok().and_then(|mut s| s.remove(ITEM_ENTITY_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info("[c-entities] precompute ItemEntity guard: original bytes not seen at boot");
+        return;
+    };
+    let spec = cplug_sdk::asm::SkipGuard {
+        method_name: "tick",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "itemSkip",
+        check_desc: "(Lnet/minecraft/world/entity/item/ItemEntity;)Z",
+        // 0 = pattern-select the merge-interval istore_2 (iconst_0, istore_2,
+        // iload_2, ifeq, iconst_2, goto, bipush 40, istore_3) — runtime bytes
+        // differ from the shipped jar (Paper re-transforms at load), so a
+        // hard offset from javap does not survive; the pattern is unique.
+        target: 0,
+        init_local: Some((
+            1,
+            "getDeltaMovement",
+            "()Lnet/minecraft/world/phys/Vec3;",
+        )),
+        end_push: Some(0x04), // iconst_0
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_skip_guard(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(ITEM_ENTITY_CLASS, b);
+            }
+            cplug_sdk::log::info("[c-entities] precomputed ItemEntity skip guard (target 432)");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] FAILED to precompute ItemEntity guard — vanilla tick kept");
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Counter {
+    Queries,
+    Boxes,
+    Adds,
+    RestChecks,
+}
+
+/// Read the Java-side woven-code counters (probes that fire = the patch is
+/// live). Zero on any JNI trouble: the verifier then keeps re-applying,
+/// which is the safe direction.
+fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
+    let mut out = std::collections::HashMap::new();
+    let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+    if hooks_cls == 0 {
+        return out;
+    }
+    let _ = cplug_sdk::jni_util::with_attached(|e| {
+        let cls = hooks_cls as jni::jclass;
+        let mut fids: std::collections::HashMap<Counter, jni::jfieldID> =
+            std::collections::HashMap::new();
+        for (c, (n, sig)) in [
+            (Counter::Queries, ("queriesFast", "J")),
+            (Counter::Boxes, ("probesBox", "J")),
+            (Counter::Adds, ("probesAdd", "J")),
+            (Counter::RestChecks, ("restChecks", "J")),
+        ] {
+            if let Some(fid) = e.get_static_field_id(cls, n, sig) {
+                fids.insert(c, fid);
+            }
+        }
+        let raw = e.raw();
+        for (c, fid) in fids {
+            // SAFETY: `raw` is a live JNI env inside this attach scope; the
+            // vtable deref mirrors the other direct vtable calls in this file.
+            let v = unsafe {
+                let vt = *raw;
+                ((*vt).GetStaticLongField)(raw, cls, fid)
+            };
+            out.insert(c, v);
+        }
+        if e.exception_check() {
+            e.exception_clear();
+        }
+        Some(())
+    });
+    out
 }
 
 fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
@@ -623,9 +815,23 @@ fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     let pre = PRECOMPUTED.lock().ok()?.get(LEVEL_CLASS).cloned();
     match pre {
         Some(b) if !b.is_empty() => {
+            // 4b.2a + L2a: the Level hook carries BOTH rewrites — the
+            // precomputed getEntities replace_body AND the setBlock wake
+            // prefixes (a wake-probe failure must fail the arm: resting
+            // items without wakes would go stale).
+            let b2 = match patch_level_setblock_wakes(b) {
+                Ok(b2) => b2,
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] setBlock wake probe refused: {e}"
+                    ));
+                    return None;
+                }
+            };
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Level.getEntities (precomputed)");
-            Some(b)
+            cplug_sdk::log::info("[c-entities] patched Level.getEntities + setBlock wakes");
+            Some(b2)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -643,6 +849,7 @@ fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
+
     let add = patch::insert_static_call_at_start(
         bytes.to_vec(),
         "addEntity",
@@ -686,10 +893,88 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_entity_inner(bytes)).ok().flatten()
 }
 
+/// L2a resting items: the tick guard is precomputed at arm time
+/// (precompute_item); the boot-time hook only stashes the bytes.
+fn patch_item(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_item_inner(bytes)).ok().flatten()
+}
+
+fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(ITEM_ENTITY_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+
+    let pre = PRECOMPUTED.lock().ok()?.get(ITEM_ENTITY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            // Wake insurance: an explosion that only knocks an item back (no
+            // block broken nearby) would leave it resting while vanilla moves
+            // it. hurtServer fires before any knockback — clear the rest state.
+            let pre2 = match patch::insert_static_call_at_start(
+                b,
+                "hurtServer",
+                "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/damagesource/DamageSource;F)Z",
+                HOOKS_CLASS,
+                "probeHurt",
+                "(Lnet/minecraft/world/entity/Entity;)V",
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => b2,
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] ItemEntity.hurtServer probe refused: {e}"
+                    ));
+                    return None;
+                }
+            };
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ItemEntity.tick guard + hurt probe");
+            Some(pre2)
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] FAILED to patch ItemEntity.tick — vanilla kept");
+            None
+        }
+    }
+}
+
+/// L2a wake probes: EVERY gameplay block write funnels through
+/// Level.setBlock(pos, state, flags[, recursion]) — Paper made it concrete on
+/// Level (javap-verified; ServerLevel does not declare it). Resting items are
+/// woken via CeHooks.probeWake so their next tick runs full vanilla physics.
+/// A probe failure here MUST disable arming entirely (silent wake loss would
+/// make resting items stale — the arm gate counts this class).
+fn patch_level_setblock_wakes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    const WAKE_DESC: &str = "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)V";
+    let with_rec = patch::insert_static_call_at_start(
+        bytes,
+        "setBlock",
+        "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;II)Z",
+        HOOKS_CLASS,
+        "probeWake",
+        WAKE_DESC,
+        &[(0, b'L'), (1, b'L')],
+    )?;
+    patch::insert_static_call_at_start(
+        with_rec,
+        "setBlock",
+        "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;I)Z",
+        HOOKS_CLASS,
+        "probeWake",
+        WAKE_DESC,
+        &[(0, b'L'), (1, b'L')],
+    )
+}
+
 fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
+
     // setBoundingBox is the SINGLE box-change choke point in 1.21.8
     // (setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox,
     // javap-verified on the shipped jar). One probe covers every move with
