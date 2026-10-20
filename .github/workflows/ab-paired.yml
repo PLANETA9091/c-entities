@@ -13,14 +13,14 @@ permissions:
 
 env:
   SCENARIOS: items-100k mixed-150k spread-100k
-  REPEATS: '1'
+  REPEATS: '3'
   MEASURE: '400'
   GATE_MARGIN: '1.05'
 
 jobs:
   paired:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
       - name: Checkout CRUSSTY (runtime + sdk path deps live at repo-parent)
@@ -42,20 +42,24 @@ jobs:
 
       - name: Paired off/on runs
         run: |
-          REP=$REPEATS
-          for r in $(seq 1 "$REP"); do
-            for SC in $SCENARIOS; do
-              case "$SC" in
-                items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0;;
-                mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;;
-                spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600;;
-              esac
-              # mixed-150k on a 2-vCPU runner: fill ~18m + warmup ~9m
-              # (about 5.7 s/tick observed) — a 600-tick window does not
-              # fit the budget; 300 ticks keep the gate meaningful.
-              MEAS="$MEASURE"
-              if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
-              for ARM in off on; do
+          # items-100k runs 3 paired reps (the contested gate after 4b.2a's
+          # single-sample 1.057 vs margin 1.05 — profiles proved the module
+          # tax there is ~0.2ms/tick, so the delta read as noise); mixed and
+          # spread keep 1 rep (decided: 0.823 / 0.999). The gate reads
+          # REPEATS=3 but tolerates missing samples per scenario.
+          for SC in $SCENARIOS; do
+            case "$SC" in
+              items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0; REPS=3;;
+              mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1;;
+              spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1;;
+            esac
+            # mixed-150k on a 2-vCPU runner: fill ~18m + warmup ~9m
+            # (about 5.7 s/tick observed) — a 600-tick window does not
+            # fit the budget; 300 ticks keep the gate meaningful.
+            MEAS="$MEASURE"
+            if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
+            for r in $(seq 1 "$REPS"); do
+            for ARM in off on; do
                 if [ "$ARM" = "on" ]; then
                   M='on'
                 else
@@ -131,5 +135,5 @@ jobs:
           PY
         env:
           SCENARIOS: items-100k mixed-150k spread-100k
-          REPEATS: '1'
+          REPEATS: '3'
           GATE_MARGIN: '1.05'
