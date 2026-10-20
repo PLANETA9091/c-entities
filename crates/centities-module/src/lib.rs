@@ -283,7 +283,15 @@ fn level_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     }
 }
 
+// LAW: a panic unwinding through the extern "C" JVMTI callback aborts the
+// JVM (observed: signal 6 during the 4a patcher bring-up). Every hook body
+// is wrapped in catch_unwind — a failure degrades to vanilla bytes (class
+// untouched), never a crash. Zero cost on the happy path.
 fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_level_inner(bytes)).ok().flatten()
+}
+
+fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         // Boot load: stash the original bytes and stay vanilla. The actual
         // rewrite happens at arm time OUTSIDE the hook callback (see
@@ -310,6 +318,10 @@ fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_lookup(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_lookup_inner(bytes)).ok().flatten()
+}
+
+fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
@@ -353,6 +365,10 @@ fn patch_lookup(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_entity_inner(bytes)).ok().flatten()
+}
+
+fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
