@@ -1112,6 +1112,13 @@ public final class CeHooks {
             }
         }
         if (total == 0) { rowEmpty++; return new ArrayList<>(0); }
+        // Row-size ceiling: the row path pays a per-candidate home re-check
+        // + live-box test in Java (~30ns each), while the native query does
+        // the AABB filter in Rust and returns only the exact candidates.
+        // Past ~64 candidates the native path wins (measured: merge scans in
+        // ~200-id rows spent ~10% of the tick in cellOfBox/rowQuery loops).
+        // Rows stay the zero-JNI win for small cells.
+        if (total > 64) { rowBig++; return null; }
         ArrayList<Entity> out = new ArrayList<>(Math.min(total, 64));
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
