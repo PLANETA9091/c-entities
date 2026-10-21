@@ -80,9 +80,9 @@ jobs:
            echo "execute in overworld summon minecraft:zombie 8 -59 8 {NoAI:1b,PersistenceRequired:1b}";
            echo "execute in overworld summon minecraft:armor_stand 10 -59 10 {Marker:1b,Gravity:0b}";
            sleep 2;
-           echo "execute in overworld summon minecraft:item 0 50 0 {Item:{id:\"minecraft:stone\",Count:1b},PickupDelay:32767}";
+           echo "execute in overworld summon minecraft:item 0 50 0 {Item:{id:\"minecraft:stone\",count:1},PickupDelay:32767}";
            sleep 6;
-           echo "execute in overworld summon minecraft:item 4 55 4 {Item:{id:\"minecraft:dirt\",Count:1b},PickupDelay:32767}";
+           echo "execute in overworld summon minecraft:item 4 55 4 {Item:{id:\"minecraft:dirt\",count:1},PickupDelay:32767}";
            sleep 3;
            echo "execute in overworld summon minecraft:zombie -8 -59 -8 {NoAI:1b,PersistenceRequired:1b}";
            sleep 40;
@@ -119,7 +119,21 @@ jobs:
           echo "$LAST_HOOKS" | grep -q "active=true"           || fail "kill switch is OFF (module disarmed)"
           echo "$LAST_HOOKS" | grep -Eq "add=[1-9]"            || fail "probeAdd never fired (EntityLookup probe dead)"
           echo "$LAST_HOOKS" | grep -Eq "box=[1-9]"            || fail "probeBox never fired (Entity probe dead)"
-          echo "$LAST_HOOKS" | grep -Eq "fast=[1-9]"           || fail "fast path never served a query"
+                    # Liveness: either the query fast path served traffic OR the merge fast
+          # path did (falling items drive mergeScanNative). One 45s retry covers a
+          # slow first soak window; the items now spawn with 1.21.8 item NBT
+          # (count:1) so the traffic is deterministic.
+          LIVE=0
+          echo "$LAST_HOOKS" | grep -Eq "fast=[1-9]" && LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "merge=[0-9]+/[0-9]+/[1-9]" && LIVE=1
+          if [ "$LIVE" != "1" ]; then
+            sleep 45
+            LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)
+            echo "retry hooks: $LAST_HOOKS"
+            echo "$LAST_HOOKS" | grep -Eq "fast=[1-9]" && LIVE=1
+            echo "$LAST_HOOKS" | grep -Eq "merge=[0-9]+/[0-9]+/[1-9]" && LIVE=1
+          fi
+          [ "$LIVE" = "1" ] || fail "no woven fast path served a query"
           echo "$LAST_HOOKS" | grep -Eq "desync=0 "            || fail "index desynced from the world"
           echo "E2E OK: module armed, patches applied, probes + fast path LIVE (add/box/fast counters > 0)"
       - uses: actions/upload-artifact@v4
