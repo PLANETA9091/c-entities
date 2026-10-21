@@ -1018,7 +1018,7 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     // (setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox,
     // javap-verified on the shipped jar). One probe covers every move with
     // the EXACT new box — no separate setPos probe, half the JNI traffic.
-    match patch::insert_static_call_at_start(
+    let boxed = match patch::insert_static_call_at_start(
         bytes.to_vec(),
         "setBoundingBox",
         "(Lnet/minecraft/world/phys/AABB;)V",
@@ -1027,14 +1027,57 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;)V",
         &[(0, b'L'), (1, b'L')],
     ) {
+        Ok(b) => b,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!("[c-entities] setBoundingBox probe refused: {e}"));
+            return None;
+        }
+    };
+
+    // L3.2 wake-on-impulse: a RESTING item's tick is skipped, so ANY external
+    // velocity change (a zombie/boat pushing it, knockback, plugin velocity)
+    // would never surface — the item would stay put while vanilla slides it
+    // away, and pushers re-query it every tick (measured on CI spread/mixed:
+    // pushed-resting items densified their piles, 2.27x AABB.intersects CPU
+    // across the 19M push queries, +32..70% p50). setDeltaMovement is the
+    // complete choke point for velocity writes (Entity.push(*) lands here;
+    // both overloads write the field directly). Waking a NON-resting entity
+    // is a no-op (one array read + branch, ~3ns — the common case for every
+    // mob/stacked item), so the probe is free outside the rest guard.
+    let d1 = match patch::insert_static_call_at_start(
+        boxed,
+        "setDeltaMovement",
+        "(Lnet/minecraft/world/phys/Vec3;)V",
+        HOOKS_CLASS,
+        "probeDelta",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!("[c-entities] setDeltaMovement(Vec3) probe refused: {e}"));
+            return None;
+        }
+    };
+    match patch::insert_static_call_at_start(
+        d1,
+        "setDeltaMovement",
+        "(DDD)V",
+        HOOKS_CLASS,
+        "probeDelta",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(0, b'L')],
+    ) {
         Ok(b) => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Entity setBoundingBox probe");
+            cplug_sdk::log::info("[c-entities] patched Entity box probe + wake-on-impulse");
             Some(b)
         }
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] setBoundingBox probe refused: {e}"));
+            cplug_sdk::log::info(&format!("[c-entities] setDeltaMovement(DDD) probe refused: {e}"));
             None
         }
     }

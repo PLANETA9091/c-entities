@@ -556,6 +556,24 @@ public final class CeHooks {
     // entities too) — the batch is a multi-producer append buffer.
     // ------------------------------------------------------------------
 
+    /** Prefix of Entity.setDeltaMovement(Vec3) AND setDeltaMovement(DDD):
+     *  wake-on-impulse. A resting item's tick is skipped, so any external
+     *  velocity change (a push, knockback, plugin velocity) must clear the
+     *  rest state or the item would never move while vanilla slides it away.
+     *  Waking a non-resting entity is one array read + branch (~3ns). */
+    public static void probeDelta(Entity e) {
+        try {
+            if (e != null) {
+                REST_GEN[e.getId() & AMASK] = 0;
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeDelta: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
+
     /** Prefix of EntityLookup.addEntity(Entity,boolean,boolean): slot 1 = entity. */
     public static void probeAdd(Entity e) {
         try {
