@@ -1,6 +1,7 @@
 package dev.planeta9091.centities;
 
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
 import java.util.ArrayList;
 import java.util.List;
@@ -119,6 +120,11 @@ public final class CeHooks {
     public static final int[] WAKE_EPOCH = new int[1 << 19];     // [wid:3][cx:8][cz:8]
     public static volatile long restFast = 0, restMarks = 0, restWakes = 0;
 
+    // Why an active item fails rest-marking (diagnostics for the items that
+    // keep full-ticking forever — the rest guard's residual CPU cost).
+    public static volatile long restFailGround = 0, restFailDelay = 0,
+            restFailAge = 0, restFailFluid = 0, restFailVel = 0;
+
     public static volatile long restChecks = 0;
     public static boolean itemSkip(net.minecraft.world.entity.item.ItemEntity e) {
         restChecks++; // before the flag checks: proves the woven call executes
@@ -137,6 +143,15 @@ public final class CeHooks {
                     // items-100k). Incrementing here keeps the merge cadence
                     // bit-identical to a vanilla resting item.
                     e.tickCount++;
+                    // The vanilla prologue also decays the pickup delay
+                    // (pickupDelay > 0 && != 32767 → --) BEFORE super.tick;
+                    // the guard jumps past it, so mirror the decay here —
+                    // otherwise a resting item's delay would freeze and it
+                    // would stay un-pickable forever. 32767 (infinite) never
+                    // decays in vanilla and never decays here.
+                    if (e.pickupDelay > 0 && e.pickupDelay != 32767) {
+                        e.pickupDelay--;
+                    }
                     restFast++;
                     return true;
                 }
@@ -148,11 +163,38 @@ public final class CeHooks {
             // The delta threshold: a landing item's residual velocity decays
             // geometrically (0.98 * damping); 1e-4 keeps a wind-down item in
             // full-tick mode for a few extra ticks — conservative direction.
+            //
+            // pickupDelay is NOT a physics property: a grounded item with a
+            // pending pickup delay is exactly as static as one without, and
+            // the skip path mirrors the vanilla prologue's decay (see above).
+            // This matters enormously on real maps: unstackable drops keep
+            // pickupDelay == 32767 forever, and the old `pickupDelay <= 0`
+            // gate left ~50% of all items full-ticking forever (measured:
+            // restF=delay ~17k/tick on items-100k, the single largest
+            // residual cost).
+            // Diagnostics: items that NEVER settle are the reason the rest
+            // guard leaves full-tick CPU on the table; count WHICH condition
+            // blocks them (same short-circuit semantics as the old single
+            // predicate, order of pure reads is irrelevant).
             net.minecraft.world.phys.Vec3 d = e.getDeltaMovement();
-            if (e.onGround() && e.pickupDelay <= 0 && e.age >= 0 && e.age < 5800
-                    && !e.isInWater() && !e.isInLava()
-                    && Math.abs(d.x) < 1.0e-4 && Math.abs(d.y) < 1.0e-4
-                    && Math.abs(d.z) < 1.0e-4) {
+            if (!e.onGround()) {
+                restFailGround++;
+                return false;
+            }
+            if (e.age < 0 || e.age >= 5800) {
+                restFailAge++;
+                return false;
+            }
+            if (e.isInWater() || e.isInLava()) {
+                restFailFluid++;
+                return false;
+            }
+            if (Math.abs(d.x) >= 1.0e-4 || Math.abs(d.y) >= 1.0e-4
+                    || Math.abs(d.z) >= 1.0e-4) {
+                restFailVel++;
+                return false;
+            }
+            {
                 int slot = wakeSlotOf(e);
                 REST_SLOT[mask] = slot;
                 REST_GEN[mask] = WAKE_EPOCH[slot] + 1;
@@ -191,6 +233,157 @@ public final class CeHooks {
         // axis wrap into other slots: a spurious wake (safe direction),
         // never a missed one.
         return (((wid & 0x7) << 16) | ((cx & 0xFF) << 8) | (cz & 0xFF)) & 0x7FFFF;
+    }
+
+    // ------------------------------------------------------------------
+    // L3 RUST MERGE BROAD-PHASE — the woven ItemEntity.mergeWithNeighbours
+    // guard calls mergeScanNative on every invocation. true = the fast path
+    // performed the ENTIRE neighbour merge (or proved it a vanilla no-op);
+    // false = run the vanilla body unchanged (exact mirror).
+    //
+    // WHY: a merge scan is getEntitiesOfClass(ItemEntity, 1x0.25x1 box).
+    // Vanilla's moonrise scan pays O(section) AABB tests per scan — with
+    // bench items-100k piling ~25 items/block (~6500/section) that measured
+    // ~95us/scan; and the resting fast path keeps many more items in the
+    // mergable (count<max) state than vanilla collapses into full stacks,
+    // so scan CPU hit ~32% of the tick (JFR phase-split, vs 2.8% vanilla).
+    // The Rust index answers the same query with exact per-entity AABB
+    // intersection over the covered cells only — a handful of candidates,
+    // no section scan.
+    //
+    // EXACTNESS CONTRACT: candidates = every ItemEntity whose CURRENT AABB
+    // intersects the merge box (Rust index, property-tested vs brute force)
+    // + the vanilla predicate (other != this && isMergable, applied in Java)
+    // + the vanilla loop body (isMergable re-check, fixItemsMergingThroughWalls
+    // clip, tryToMerge with full private access via MethodHandle). Any
+    // uncertainty (index not ready, off-thread, regrow/desync, MH failure)
+    // returns false — the vanilla body runs. Documented semantic note: the
+    // candidate ORDER may differ from vanilla's section order; when one scan
+    // can merge with several neighbours, WHICH partner absorbs first may
+    // differ, but every merge performed is vanilla-legal and per-pile totals
+    // are conserved (the A/B gate tracks the observable state).
+    // ------------------------------------------------------------------
+    public static final boolean MERGE_ON =
+            !"false".equals(System.getProperty("centities.mergeFast", "true"));
+    public static volatile long mergeChecks = 0, mergeSelf = 0, mergeFast = 0;
+    public static volatile long mergeMirror = 0, mergeCand = 0;
+
+    private static volatile java.lang.invoke.MethodHandle MH_TRY_MERGE;
+    private static volatile java.lang.invoke.MethodHandle MH_IS_MERGABLE;
+    private static volatile boolean MH_FAILED = false;
+
+    /** Lazy private-access handles: ItemEntity.tryToMerge(ItemEntity)V and
+     *  ItemEntity.isMergable()Z. Runs once, on the server thread, from the
+     *  first merge scan — ItemEntity is loaded by then (the caller IS one). */
+    private static synchronized boolean initMergeMhs(Object sample) {
+        if (MH_FAILED) return false;
+        if (MH_TRY_MERGE != null) return true;
+        try {
+            Class<?> ie = sample.getClass();
+            java.lang.reflect.Method tm = ie.getDeclaredMethod("tryToMerge", ie);
+            tm.setAccessible(true);
+            MH_TRY_MERGE = java.lang.invoke.MethodHandles.lookup().unreflect(tm)
+                    .asType(java.lang.invoke.MethodType.methodType(void.class, ie, ie));
+            java.lang.reflect.Method im = ie.getDeclaredMethod("isMergable");
+            im.setAccessible(true);
+            MH_IS_MERGABLE = java.lang.invoke.MethodHandles.lookup().unreflect(im)
+                    .asType(java.lang.invoke.MethodType.methodType(boolean.class, ie));
+            return true;
+        } catch (Throwable t) {
+            MH_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "mergeMhs: " + t;
+            return false;
+        }
+    }
+
+    private static boolean isMergableFast(ItemEntity e) {
+        try {
+            return (boolean) MH_IS_MERGABLE.invokeExact(e);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Vanilla predicate + class filter: other instanceof ItemEntity,
+     *  other != self, other.isMergable().
+     *
+     *  CONSTRAINT: CeHooks is embedded into the JVM as the SINGLE class file
+     *  CeHooks.class — named/anonymous nested classes are separate class
+     *  files the runtime never defines (observed 2026-10-21:
+     *  NoClassDefFoundError CeHooks$MergePred crashed the boot). So the
+     *  predicate is a method-reference lambda (invokedynamic inside this
+     *  same class — the BootstrapMethods path CeWarmup pre-warms), and the
+     *  per-scan "self" lives in a static field confined to the server
+     *  thread (fastQuery applies the predicate synchronously within the
+     *  same call; off-thread callers take the mirror and never reach it). */
+    private static ItemEntity MERGE_SELF; // server-thread confined
+
+    private static boolean mergePredTest(Entity o) {
+        if (!(o instanceof ItemEntity) || o == MERGE_SELF) return false;
+        return isMergableFast((ItemEntity) o);
+    }
+
+    private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
+
+    public static boolean mergeScanNative(ItemEntity e) {
+        mergeChecks++;
+        if (!MERGE_ON || !ACTIVE) return false;
+        try {
+            net.minecraft.world.level.Level w = e.level();
+            if (!(w instanceof net.minecraft.server.level.ServerLevel)
+                    || w.isClientSide) {
+                return false;
+            }
+            if (MH_TRY_MERGE == null && !initMergeMhs(e)) return false;
+            // Vanilla no-op: mergeWithNeighbours() returns immediately when
+            // this item cannot merge. Proven without any query.
+            if (e.isRemoved() || !isMergableFast(e)) {
+                mergeSelf++;
+                return true;
+            }
+            net.minecraft.server.level.ServerLevel sl =
+                    (net.minecraft.server.level.ServerLevel) w;
+            double r = w.spigotConfig.itemMerge;
+            boolean horizOnly =
+                    w.paperConfig().entities.behavior.onlyMergeItemsHorizontally;
+            AABB box = e.getBoundingBox().inflate(r, horizOnly ? 0.0 : r - 0.5, r);
+            MERGE_SELF = e;
+            List<Entity> cands;
+            try {
+                cands = fastQuery(sl, e, box, MERGE_PRED);
+            } finally {
+                MERGE_SELF = null;
+            }
+            if (cands == null) {
+                mergeMirror++;
+                return false; // index unsure — vanilla body
+            }
+            mergeFast++;
+            mergeCand += cands.size();
+            boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
+            for (int k = 0; k < cands.size(); k++) {
+                ItemEntity other = (ItemEntity) cands.get(k);
+                // Vanilla loop re-checks isMergable per candidate; the walls
+                // fix is a per-candidate ray clip (paper default off).
+                if (!isMergableFast(other)) continue;
+                if (walls
+                        && w.clipDirect(e.position(), other.position(),
+                               net.minecraft.world.phys.shapes.CollisionContext.of(e))
+                            == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                    continue;
+                }
+                MH_TRY_MERGE.invokeExact(e, other);
+                if (e.isRemoved()) return true; // absorbed — vanilla stops
+            }
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "mergeScan: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+            return false;
+        }
     }
 
     /** Prefix of ServerLevel.setBlock(BlockPos, BlockState, int[, int]). */
@@ -269,6 +462,10 @@ public final class CeHooks {
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
                 + " rest=" + restFast + "/" + restMarks + "/" + restWakes + "/" + restChecks + "/" + hurtProbes
+                + " restF=" + restFailGround + "/" + restFailDelay + "/" + restFailAge
+                + "/" + restFailFluid + "/" + restFailVel
+                + " merge=" + mergeChecks + "/" + mergeSelf + "/" + mergeFast
+                + "/" + mergeMirror + "/" + mergeCand
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses

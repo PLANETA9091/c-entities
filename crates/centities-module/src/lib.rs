@@ -424,6 +424,7 @@ fn arm_module() {
             (LOOKUP_CLASS, Counter::Adds),
             (ITEM_ENTITY_CLASS, Counter::RestChecks),
         ];
+        let merge_woven = MERGE_WOVEN.load(Ordering::Acquire);
         let mut logged_done = false;
         for attempt in 0..180 {
             std::thread::sleep(std::time::Duration::from_millis(2000));
@@ -433,6 +434,9 @@ fn arm_module() {
                 if snap.get(c).copied().unwrap_or(0) == 0 {
                     pending.push(cls);
                 }
+            }
+            if merge_woven && snap.get(&Counter::MergeChecks).copied().unwrap_or(0) == 0 {
+                pending.push(ITEM_ENTITY_CLASS);
             }
             if pending.is_empty() {
                 if !logged_done {
@@ -560,6 +564,11 @@ fn force_init_item_entity_raw(loader: jni::jobject) {
     });
 }
 
+/// Whether the L3 merge fast path was woven into the precomputed ItemEntity
+/// bytes. The patch verifier only demands its counter when this is set —
+/// a refused merge weave must NOT block arming (the tick guard stays live).
+static MERGE_WOVEN: AtomicBool = AtomicBool::new(false);
+
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH.lock().ok().and_then(|mut s| s.remove(ITEM_ENTITY_CLASS));
     let Some(bytes) = stash else {
@@ -589,11 +598,39 @@ fn precompute_item(loader: jni::jobject) {
         cplug_sdk::asm::insert_skip_guard(env, loader, &bytes, &spec)
     });
     match patched {
-        Some(Some(b)) if !b.is_empty() => {
+        Some(Some(mut b)) if !b.is_empty() => {
+            // L3 Rust merge broad-phase (best-effort): weave the early-return
+            // guard into mergeWithNeighbours on TOP of the tick guard. A
+            // refusal here keeps the module armed with vanilla merges.
+            let mspec = cplug_sdk::asm::EarlyReturnGuard {
+                method_name: "mergeWithNeighbours",
+                method_desc: "()V",
+                check_class: HOOKS_CLASS,
+                check_name: "mergeScanNative",
+                check_desc: "(Lnet/minecraft/world/entity/item/ItemEntity;)Z",
+            };
+            match cplug_sdk::jni_util::with_attached(|env| {
+                cplug_sdk::asm::insert_early_return_guard(env, loader, &b, &mspec)
+            }) {
+                Some(Some(b2)) if !b2.is_empty() => {
+                    b = b2;
+                    MERGE_WOVEN.store(true, Ordering::Release);
+                    cplug_sdk::log::info(
+                        "[c-entities] precomputed ItemEntity skip guard + merge fast path",
+                    );
+                }
+                _ => {
+                    cplug_sdk::log::info(
+                        "[c-entities] merge fast path refused — vanilla merge kept (arm continues)",
+                    );
+                }
+            }
             if let Ok(mut pc) = PRECOMPUTED.lock() {
                 pc.insert(ITEM_ENTITY_CLASS, b);
             }
-            cplug_sdk::log::info("[c-entities] precomputed ItemEntity skip guard (target 432)");
+            if !MERGE_WOVEN.load(Ordering::Acquire) {
+                cplug_sdk::log::info("[c-entities] precomputed ItemEntity skip guard (target 432)");
+            }
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -608,6 +645,7 @@ enum Counter {
     Boxes,
     Adds,
     RestChecks,
+    MergeChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -628,6 +666,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::Boxes, ("probesBox", "J")),
             (Counter::Adds, ("probesAdd", "J")),
             (Counter::RestChecks, ("restChecks", "J")),
+            (Counter::MergeChecks, ("mergeChecks", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
