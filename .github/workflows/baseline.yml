@@ -61,7 +61,7 @@ jobs:
           java-version: '21'
       - uses: dtolnay/rust-toolchain@stable
       - name: Checkout CRUSSTY (module scenarios)
-        if: matrix.MODULE == 'on'
+        if: matrix.AB == '1' || matrix.MODULE == 'on'
         run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
       - uses: actions/setup-node@v4
         with:
@@ -89,7 +89,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Upload artifacts (paired module leg)
-        if: always()
+        if: matrix.AB == '1' && always()
         uses: actions/upload-artifact@v4
         with:
           name: baseline-${{ matrix.name }}-mod
