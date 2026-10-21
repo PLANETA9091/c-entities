@@ -11,6 +11,7 @@ on:
       - '.github/workflows/baseline.yml'
       - 'baseline/**'
       - 'scripts/**'
+      - 'crates/**'
   workflow_dispatch: {}
 
 permissions:
@@ -26,21 +27,20 @@ jobs:
         include:
           - { name: control,    SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: items-25k,  SCALE: 25000,  PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
-          - { name: items-100k, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 1200 }
           - { name: mobs-10k,   SCALE: 10000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: mobs-25k,   SCALE: 25000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: mixed-50k,  SCALE: 50000,  PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
-          - { name: mixed-150k, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 1200 }
-          # Realistic distribution: same population, spread over 600x600 (doc 06 said 1500, but ~38k ticking
-          # chunks would swamp the entity signal with chunk overhead) —
-          # where a spatial index must WIN (cells actually filter candidates).
-          - { name: spread-100k,  SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600 }
           - { name: tiles-25k,  SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 15000, TILE_F: 10000, MEASURE: 600 }
           - { name: tiles-100k, SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 60000, TILE_F: 40000, MEASURE: 600 }
-          # A/B: same scenarios with the c-entities module injected (CRUSSTY)
-          - { name: items-100k-mod, SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 1200, MODULE: 'on' }
-          - { name: mixed-150k-mod, SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, MODULE: 'on' }
-          - { name: spread-100k-mod, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600, MODULE: 'on' }
+          # A/B pairs: vanilla and module runs BACK-TO-BACK ON THE SAME
+          # RUNNER. Separate jobs previously landed on different VMs whose
+          # CPU speed differs ~15-25% (observed: spread vanilla 472.6 ->
+          # 399.4 between two runs) — the single-rep spread/mixed verdicts
+          # were runner noise, not module regressions. Paired on one runner,
+          # the only variable left is the module.
+          - { name: items-100k,  SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AB: '1' }
+          - { name: spread-100k, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600, AB: '1' }
+          - { name: mixed-150k,  SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AB: '1' }
     env:
       RUN_NAME: ${{ matrix.name }}
       SCALE: ${{ matrix.SCALE }}
@@ -72,9 +72,15 @@ jobs:
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
         run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
+      - name: Run paired A/B (vanilla then module, same runner)
+        if: matrix.AB == '1'
+        run: |
+          bash scripts/run-baseline.sh
+          MODULE=on RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
+        if: matrix.AB != '1'
         run: bash scripts/run-baseline.sh
-      - name: Upload artifacts
+      - name: Upload artifacts (paired A/B leg)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -82,6 +88,15 @@ jobs:
           path: bench/${{ matrix.name }}/results/
           retention-days: 30
           if-no-files-found: error
+      - name: Upload artifacts (paired module leg)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-${{ matrix.name }}-mod
+          path: bench/${{ matrix.name }}-mod/results/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
 
   publish:
     needs: run
