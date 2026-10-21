@@ -118,16 +118,39 @@ public final class CeHooks {
     public static final int[] REST_SLOT = new int[1 << 22]; // packed wake slot
     public static final int[] REST_GEN = new int[1 << 22];  // epoch+1 at rest; 0 = not resting
     public static final int[] WAKE_EPOCH = new int[1 << 19];     // [wid:3][cx:8][cz:8]
+    // Churn backoff (paired-CI spread): items near wandering zombies get
+    // woken before their next tick FOREVER — marking them cost 19.5M useless
+    // marks per run (each mark = cell math + setOldPosAndRot) while restFast
+    // stayed 0. The wake probes count per-id wakes; a churny item stops
+    // being marked, and each clean full tick decays the counter (the zone
+    // heals when the pusher leaves).
+    public static final int[] REST_CHURN = new int[1 << 22];
     public static volatile long restFast = 0, restMarks = 0, restWakes = 0;
+    // Wake-source attribution (which probe cleared a resting item).
+    public static volatile long wakesDelta = 0, wakesBox = 0, wakesSelf = 0;
+
+    // SELF-TICK window (paired with the wake-on-impulse probe): the marking
+    // tick's own physics (friction/landing damping at tick() bytecodes
+    // 339/373) calls setDeltaMovement microseconds AFTER itemSkip set the
+    // rest mark — without this window the mark was wiped by its own tick
+    // every time (measured: restFast=0, 1.8M self-wakes on items-100k) and
+    // NO item ever rested. An external push cannot land inside the window:
+    // the server thread is inside THIS item's tick() until it returns, and
+    // the self-physics calls all sit in the first ~10us of the body (the
+    // merge scan that follows does not change velocity). 50us is generous.
+    private static volatile int SELF_TICK_MASK = -1;
+    private static volatile long SELF_TICK_UNTIL = 0;
 
     // Why an active item fails rest-marking (diagnostics for the items that
     // keep full-ticking forever — the rest guard's residual CPU cost).
     public static volatile long restFailGround = 0, restFailDelay = 0,
-            restFailAge = 0, restFailFluid = 0, restFailVel = 0;
+            restFailAge = 0, restFailFluid = 0, restFailVel = 0, restFailChurn = 0;
 
     public static volatile long restChecks = 0;
     public static boolean itemSkip(net.minecraft.world.entity.item.ItemEntity e) {
         restChecks++; // before the flag checks: proves the woven call executes
+        SELF_TICK_MASK = e.getId() & AMASK; // open the self-physics window
+        SELF_TICK_UNTIL = System.nanoTime() + 50_000;
         if (!REST_ON || !ACTIVE) return false;
         try {
             int mask = e.getId() & AMASK;
@@ -193,6 +216,17 @@ public final class CeHooks {
                     || Math.abs(d.z) >= 1.0e-4) {
                 restFailVel++;
                 return false;
+            }
+            // Churn backoff: a recently-woken item may be woken again before
+            // the next tick (pusher nearby) — the mark would be wasted. Each
+            // full tick that reached HERE decayed the counter first, so the
+            // zone heals ~4 ticks after the pusher leaves.
+            if (REST_CHURN[mask] > 0) {
+                REST_CHURN[mask]--;
+                if (REST_CHURN[mask] >= 4) {
+                    restFailChurn++;
+                    return false;
+                }
             }
             {
                 int slot = wakeSlotOf(e);
@@ -462,8 +496,9 @@ public final class CeHooks {
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
                 + " rest=" + restFast + "/" + restMarks + "/" + restWakes + "/" + restChecks + "/" + hurtProbes
+                + " wakes=" + wakesDelta + "/" + wakesBox + "/" + wakesSelf
                 + " restF=" + restFailGround + "/" + restFailDelay + "/" + restFailAge
-                + "/" + restFailFluid + "/" + restFailVel
+                + "/" + restFailFluid + "/" + restFailVel + "/" + restFailChurn
                 + " merge=" + mergeChecks + "/" + mergeSelf + "/" + mergeFast
                 + "/" + mergeMirror + "/" + mergeCand
                 + " offT=" + mOffThread
@@ -564,7 +599,18 @@ public final class CeHooks {
     public static void probeDelta(Entity e) {
         try {
             if (e != null) {
-                REST_GEN[e.getId() & AMASK] = 0;
+                int m = e.getId() & AMASK;
+                if (REST_GEN[m] != 0) { // resting: decide whether the impulse
+                    // is self-physics (this item's own marking tick) or an
+                    // external push; only the latter may break the rest.
+                    if (SELF_TICK_MASK == m && System.nanoTime() < SELF_TICK_UNTIL) {
+                        wakesSelf++;
+                    } else {
+                        REST_GEN[m] = 0;
+                        wakesDelta++;
+                        if (REST_CHURN[m] < 8) REST_CHURN[m]++;
+                    }
+                }
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -617,7 +663,10 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
                 probesBox++;
                 ARENA[e.getId() & AMASK] = e;
-                REST_GEN[e.getId() & AMASK] = 0; // a box change is a disturbance
+                if (REST_GEN[e.getId() & AMASK] != 0) {
+                    REST_GEN[e.getId() & AMASK] = 0; // a box change is a disturbance
+                    wakesBox++;
+                }
                 // Row-neutral classification (4b.2a): a box change WITHIN one
                 // home cell cannot alter any row's id list — the row path's
                 // live-box filter covers it — so the row-path pending scan
