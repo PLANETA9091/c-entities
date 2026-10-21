@@ -128,6 +128,15 @@ public final class CeHooks {
             int g = REST_GEN[mask];
             if (g != 0) {
                 if (WAKE_EPOCH[REST_SLOT[mask]] + 1 == g) {
+                    // vanilla Entity.tick starts with ++tickCount; the guard
+                    // jump lands PAST super.tick(), so without this the
+                    // counter freezes while resting — and a frozen
+                    // tickCount stuck at tickCount % 40 == 0 turns the merge
+                    // gate's (tickCount % 40) into "scan EVERY tick" for
+                    // ~1/40 of all items (measured 12.6x merge-scan CPU on
+                    // items-100k). Incrementing here keeps the merge cadence
+                    // bit-identical to a vanilla resting item.
+                    e.tickCount++;
                     restFast++;
                     return true;
                 }
@@ -148,6 +157,16 @@ public final class CeHooks {
                 REST_SLOT[mask] = slot;
                 REST_GEN[mask] = WAKE_EPOCH[slot] + 1;
                 restMarks++;
+                // CRITICAL (local A/B regression, items-100k): the skipped
+                // physics also skips setOldPos — xo/yo/zo freeze at the last
+                // active tick, so the merge gate's "position changed?"
+                // comparison (floor(old) != floor(new)) keeps returning TRUE
+                // and every resting item merge-scans every 2 ticks instead
+                // of every 40 (12.6x merge-scan CPU, +19.7% p50 on 2 cores).
+                // Syncing old-pos ONCE at the rest transition restores the
+                // vanilla merge cadence; the item never moves while resting,
+                // so one sync is exact for the whole rest window.
+                e.setOldPosAndRot();
             }
             return false;
         } catch (Throwable t) {
