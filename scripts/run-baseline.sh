@@ -71,6 +71,7 @@ cd "$S"
 XMX="${XMX:-8G}"
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off}"
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+  ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true" \
   -jar paper.jar nogui > "$R/server.log" 2>&1 &

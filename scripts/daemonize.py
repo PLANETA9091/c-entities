@@ -30,6 +30,8 @@ def main() -> None:
     if pid2 > 0:
         os._exit(0)
 
+    logdir = os.path.dirname(os.path.abspath(logfile))
+    os.makedirs(logdir, exist_ok=True)
     fd = os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(fd, 0)
     os.dup2(fd, 1)
