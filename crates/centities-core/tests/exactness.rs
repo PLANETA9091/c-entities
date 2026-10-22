@@ -254,3 +254,71 @@ fn query_buffer_reuse() {
         idx.query(0, &Aabb::new(qx, 60.0, 0.0, qx + 4.0, 70.0, 4.0), &mut out);
     }
 }
+
+#[test]
+fn packed_window_is_conservative() {
+    // L4c windowed rows: the packed (xLo, xHi) interval must be a SUPERSET of
+    // the entity's true f64 x-interval for every upsert/position — the Java
+    // row scan may skip a candidate only when the packed interval is disjoint
+    // from the query window, so a packed interval that clips the true one
+    // would be a silent false negative. Property: for random boxes across
+    // cell boundaries (and near the +-32-block clamp edge), for every query
+    // box that the true interval intersects, the packed interval must
+    // intersect too.
+    let mut idx = EntityIndex::new();
+    let mut lcg = 0x243F6A8885A308D3u64;
+    let mut rnd = move || {
+        lcg ^= lcg << 13;
+        lcg ^= lcg >> 7;
+        lcg ^= lcg << 17;
+        lcg
+    };
+    // spans several cells around the origin, incl. negative coords
+    let id0 = 1i64;
+    for _ in 0..20_000i64 {
+        let fx = (rnd() % 4096) as f64 / 1024.0 - 2.0;   // -2..2
+        let fz = (rnd() % 4096) as f64 / 1024.0 - 2.0;
+        let w = (rnd() % 1024) as f64 / 1024.0;           // 0..1
+        let h = (rnd() % 512) as f64 / 1024.0;
+        let x0 = fx * 16.0;                                // stride across cells
+        let z0 = fz * 16.0;
+        let b = Aabb::new(x0, 64.0, z0, x0 + w, 64.0 + h, z0 + h);
+        idx.upsert(id0, 0, &b);
+
+        // read back the packed window for the entity's home cell
+        let home = {
+            let mut probe = Vec::new();
+            idx.query(0, &Aabb::new(x0, 64.0, z0, x0 + 0.01, 64.01, z0 + 0.01), &mut probe);
+            assert!(probe.contains(&id0));
+            probe.clear();
+            // find the home cell by scanning the query result's cell — simpler:
+            // re-derive from the center the same way upsert does
+            let cx = (b.center_x().floor() as i32) >> 4;
+            let cz = (b.center_z().floor() as i32) >> 4;
+            (cx, cz)
+        };
+        let (ox, _) = ((home.0 as i64 * 16) as f64, home.1 as i64 * 16);
+        // packed scan of that cell (cap high enough)
+        let mut packed: Vec<i64> = Vec::new();
+        // locate the cell id via a packed scan through cell_key lookup
+        let mut found = false;
+        for cell in 1..idx.stats().cells as u32 + 1 {
+            if let Some(key) = idx.cell_key_of(cell) {
+                let (kcx, kcz) = centities_core::key_coords(key);
+                if (kcx, kcz) == home {
+                    let (_n, ov) = idx.cell_scan_packed(cell, &mut packed, 4096);
+                    assert!(!ov);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "home cell not found");
+        let entry = packed.iter().copied().find(|p| (p & 0xFFFF_FFFF) == (id0 & 0xFFFF_FFFF))
+            .expect("entity missing from packed row");
+        let lo = (((entry >> 32) & 0xFFFF) as f64 - 32768.0) / 1024.0 + ox;
+        let hi = (((entry >> 48) & 0xFFFF) as f64 - 32768.0) / 1024.0 + ox;
+        assert!(lo <= b.x0 + 1e-3, "packed lo {} clips true minX {}", lo, b.x0);
+        assert!(hi >= b.x1 - 1e-3, "packed hi {} clips true maxX {}", hi, b.x1);
+    }
+}

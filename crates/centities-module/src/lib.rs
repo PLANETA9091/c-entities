@@ -283,7 +283,11 @@ fn publish(env: &JniEnv, st: &mut CeState) {
         }
         let Some(key) = st.idx.cell_key_of(cell) else { continue };
         let slot = row_slot(key);
-        let (count, overflow) = st.idx.cell_scan(cell, &mut st.p.ids, ROW_CAP);
+        // L4c windowed rows: entries carry a conservative packed x-interval
+        // (id + xLo + xHi, 1/1024-block units, cell-relative) so the Java row
+        // scan skips x-disjoint candidates without dereferencing the Entity.
+        // See EntityIndex::cell_scan_packed for the conservativeness contract.
+        let (count, overflow) = st.idx.cell_scan_packed(cell, &mut st.p.ids, ROW_CAP);
         if overflow {
             // sticky dense: kill any published row (Java sees the sentinel)
             if st.p.dense.len() <= ci {

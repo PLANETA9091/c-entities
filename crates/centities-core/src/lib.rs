@@ -710,6 +710,44 @@ impl EntityIndex {
         }
         (total, total > cap)
     }
+
+    /// L4c windowed rows: like [`cell_scan`], but each pushed long packs the
+    /// id TOGETHER with a conservative x-interval of the entity's box in
+    /// 1/1024-block units relative to the row's cell origin:
+    ///
+    ///   bits 0..31  id (as i32, low word — same as cell_scan emits)
+    ///   bits 32..47 xLo biased by +32768 (floor(x0*1024) - 2)
+    ///   bits 48..63 xHi biased by +32768 (ceil(x1*1024) + 2)
+    ///
+    /// CONSERVATIVENESS CONTRACT (exactness of the Java row scan): the packed
+    /// interval is a SUPERSET of the entity's true x-interval — the f32
+    /// cell-relative entry coordinates lose at most ~0.002 blocks (ULP at
+    /// |rel| < 64), covered by the +-2-unit slack on top of floor/ceil. The
+    /// Java reader may therefore SKIP a candidate only when its packed
+    /// interval is disjoint from the query's x-window — a skipped candidate
+    /// provably has no x overlap, hence cannot intersect the query box.
+    /// Non-oversize boxes have half-span <= MAX_HALF_SPAN (8 blocks), so the
+    /// true interval lies within +-32 blocks of the cell origin and always
+    /// fits the biased 16-bit fields; anything that would clamp is already
+    /// oversize and never reaches a cell.
+    pub fn cell_scan_packed(&self, cell: u32, out: &mut Vec<i64>, cap: usize) -> (usize, bool) {
+        out.clear();
+        let head = *self.heads.get(cell as usize).unwrap_or(&0);
+        let mut total = 0usize;
+        let mut cur = head;
+        while cur != 0 {
+            let s = cur as usize - 1;
+            if total < cap {
+                let e = &self.entries[s];
+                let lo = (((e.x0 * 1024.0).floor() - 2.0).max(-32768.0) as i64) + 32768;
+                let hi = (((e.x1 * 1024.0).ceil() + 2.0).min(32767.0) as i64) + 32768;
+                out.push((e.id & 0xFFFF_FFFF) | (lo << 32) | (hi << 48));
+            }
+            total += 1;
+            cur = self.entries[s].next;
+        }
+        (total, total > cap)
+    }
 }
 
 impl Default for EntityIndex {
