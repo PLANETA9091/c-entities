@@ -711,7 +711,7 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}]",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{})",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
