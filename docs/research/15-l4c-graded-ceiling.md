@@ -1,0 +1,88 @@
+# L4c — graded row ceiling + latch hysteresis consistency
+
+Follows doc 14 (L4 query dominance, L4b win latch). Owner mandate unchanged:
+outputs byte-identical, never slower than vanilla. Owner directive: real
+Rust acceleration, no tick-skipping.
+
+## What CI said about L4b (run 39741539403, commit 6a56dd9)
+
+Ten of eleven baseline legs succeeded (mixed-150k hit the job timeout and
+was cancelled; publish skipped). Paired A/B p50:
+
+| scenario | vanilla | module | delta |
+|---|---:|---:|---:|
+| items-100k | 95.9 | 48.8 | **-49.1%** |
+| mobs-25k  | 448.0 | 285.2 | **-36.3%** (first module leg ever) |
+| spread-100k | 470.5 | **517.8** | **+10.0% REGRESSION** (was -5.8% at 49182d2) |
+
+## Spread post-mortem (counter + profile evidence)
+
+`spread-100k` = 60k items + 20k armor stands + 20k zombies over AREA=600.
+Every living entity runs a push query per tick (`LivingEntity.pushEntities`
+-> `getPushableEntities` -> the hooked `Level.getEntities`): ~10.5k
+queries/tick, ~11 candidates each.
+
+1. **The flat 64-candidate row ceiling (L3.1) misfired.** spread rows hold
+   100-300 candidates (mid-density: dense relative to the ceiling, sparse
+   relative to items-100k's ~830/cell). `rowBig=4,020,609` refusals
+   (~10.6k/tick) pushed ALL of them onto the JNI native path:
+   `fastMs` delta = **208 ms/tick** (~30us per query), visible as +10% p50.
+   The JFR profile undercounts this — `jdk.ExecutionSample` only samples at
+   safepoints, and a thread inside JNI is not at one; the counters caught
+   what the profile hid.
+2. **The L4b win latch ignored the hysteresis it was meant to shortcut.**
+   mobs-25k w2b0: 3 lucky ~1us re-probes latched the bucket, then every
+   query paid the ~13us fast average against a **4us mirror** (fast EMA
+   250us had been saying so all along, N=1M). The break condition
+   (`dt > 4 x MIRR_EMA` = 16us) fired often enough to keep flap-cycling the
+   latch instead of releasing it.
+
+## The fix (CeHooks.java only; two surgical changes)
+
+- `ROW_TOTAL_CAP = 512` replaces the flat `total > 64` refusal. Genuinely
+  dense cells (mobs-25k ~700/cell, items-100k ~830/cell) still bail to the
+  native Rust filter; spread's 100-300-candidate rows now scan in Java at
+  ~40-70ns/candidate (~10-20us total) instead of the ~13-30us fixed JNI
+  toll. Exactness contract untouched: home re-check + live-box filter +
+  ARENA/getter resolve are per-candidate and unchanged.
+- The latch now releases the moment the running fast EMA stops beating the
+  mirror EMA at the SAME 4/5 boundary `wantFast` uses
+  (`FAST_EMA*4 >= MIRR_EMA*5 -> FAST_LATCH = 0`). True-win buckets keep the
+  latch (spread w2b0: ~15us fast vs ~2.9ms mirror); mobs-25k w2b0 drops
+  back to mirror duty.
+
+## Local verification (2-core sandbox, spread-100k, MODULE=on, 600 ticks)
+
+Counter deltas over the last 100 measured ticks:
+
+| metric | CI @6a56dd9 | local @a633c61 |
+|---|---:|---:|
+| rowBig refusals | 10.6k/tick | **~350/tick** (199k total) |
+| fast-path total cost | 208 ms/tick | **12.3 ms/tick** |
+| small-box queries routed | fast (JNI) | mirror (EMA-honest on 2 cores) |
+
+Local p50 839.7ms is NOT comparable to CI 4-core numbers (2 cores, 2.5G
+heap); the routing story is the signal: the query toll the ceiling
+regression added is gone, and the gate is back to EMA-honest routing
+everywhere it was measured.
+
+## Expected CI (a633c61)
+
+- spread-100k-mod: 517.8 -> ~400-440 (back to -8..-15% vs vanilla).
+- mobs-25k-mod: 285 -> ~240-250 (latch stops paying 3x on 4.6k q/tick).
+- items-100k-mod: unchanged ~48.8 (rows ~830/cell stay native; latch idle).
+- mixed-150k: mix of both effects; the cancelled leg runs this time.
+
+## What remains (next levers, honestly Rust-accelerable)
+
+1. **Sorted/windowed rows** — rows store candidates homed in a 16x16 cell;
+   a push box touches ~2.6/16 of the x-range. Publishing rows sorted by
+   center-x (or with conservative packed x-bounds per id) would let the row
+   scan skip 85-95% of candidates without dereferencing the Entity
+   (~10-20us -> ~2-4us per mid-density query). Publish-side sort cost must
+   be amortized (dirty rows only) or made incremental.
+2. **Native query toll** — the JNI path pays ~5-30us fixed (crossing, drain,
+   publish, array copy, ARENA resolve). Batched queries (per-tick push
+   sweep) would amortize it, but require restructuring vanilla's per-entity
+   call sites — deferred.
+3. Tracker/dispatch floors (doc 14) — unchanged, Java-structural.
