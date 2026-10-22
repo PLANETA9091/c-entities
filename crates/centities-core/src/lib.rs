@@ -351,12 +351,31 @@ pub struct Stats {
     pub oversize: usize,
 }
 
+/// L5 — contiguous per-cell SoA storage.
+///
+/// The L1..L4 index chained entries through a global `entries` vec
+/// (`next` pointers): a dense-cell query pointer-chased ~700 hops over a
+/// 100k-entry array (~14us, measured on CI) while vanilla's section scan
+/// iterates a contiguous collection (~10us) — the recorded honest loss
+/// (doc 15, "dense-cell queries are the remaining honest loss").
+///
+/// The rework stores each cell's entities in THREE parallel contiguous
+/// arrays (ids / 6-f32 boxes / slots): a dense scan is a flat sequential
+/// read at memory bandwidth (~2-3us for 700 entries). Exactness contract
+/// is unchanged: f32 cell-relative coords (same quantization bound),
+/// false positives allowed (Java re-filters live boxes), false negatives
+/// impossible (same single-homing + margin math).
 pub struct EntityIndex {
-    entries: Vec<Entry>,
-    homes: Vec<u32>, // parallel to entries: home cell id (1-based)
-    heads: Vec<u32>, // cell id -> first slot+1 (0 = empty); 1-based cells
-    cell_keys: Vec<u64>, // parallel to heads: the cell's key (for world clear)
-    free_cells: Vec<u32>,
+    // per-entity sparse arrays (slot-indexed)
+    ids: Vec<i64>,
+    worlds: Vec<u16>,
+    homes: Vec<u32>, // 1-based cell id
+    cpos: Vec<u32>,  // position inside the home cell's arrays
+    // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
+    cell_ids: Vec<Vec<i64>>,
+    cell_box: Vec<Vec<f32>>,   // stride 6: x0,y0,z0,x1,y1,z1 (f32)
+    cell_slots: Vec<Vec<u32>>, // global slot per position (O(1) swap-remove)
+    cell_keys: Vec<u64>,       // 0 = unused cell id
     cellmap: CellMap,
     idmap: IdMap,
     oversize: Vec<Oversize>,
@@ -367,11 +386,14 @@ pub struct EntityIndex {
 impl EntityIndex {
     pub fn new() -> Self {
         EntityIndex {
-            entries: Vec::new(),
+            ids: Vec::new(),
+            worlds: Vec::new(),
             homes: Vec::new(),
-            heads: vec![0],       // cell 0 unused
-            cell_keys: vec![0],   // cell 0 unused
-            free_cells: Vec::new(),
+            cpos: Vec::new(),
+            cell_ids: vec![Vec::new()], // cell 0 unused
+            cell_box: vec![Vec::new()],
+            cell_slots: vec![Vec::new()],
+            cell_keys: vec![0],
             cellmap: CellMap::new(1 << 12),
             idmap: IdMap::new(1 << 12),
             oversize: Vec::new(),
@@ -390,8 +412,9 @@ impl EntityIndex {
     }
 
     /// Insert or update an entity's AABB. O(1) typical (same-cell update is
-    /// 6 stores). `world` is a caller-assigned small id per Level instance.
-    /// Returns the cell-level change (see [`UpsertEv`]).
+    /// 6 stores into the cell's contiguous arrays). `world` is a
+    /// caller-assigned small id per Level instance. Returns the cell-level
+    /// change (see [`UpsertEv`]).
     pub fn upsert(&mut self, id: i64, world: u16, b: &Aabb) -> UpsertEv {
         let hx = (b.x1 - b.x0) * 0.5;
         let hz = (b.z1 - b.z0) * 0.5;
@@ -411,36 +434,25 @@ impl EntityIndex {
             let home = self.homes[slot as usize];
             let key = self.cell_keys[home as usize];
             let (ocx, ocz) = key_coords(key);
-            if self.entries[slot as usize].world == world && ocx == ncx && ocz == ncz {
-                // same cell: bounds update only
-                let (ox, oz) = cell_origin(ncx, ncz);
-                let e = &mut self.entries[slot as usize];
-                e.x0 = (b.x0 - ox) as f32;
-                e.y0 = b.y0 as f32;
-                e.z0 = (b.z0 - oz) as f32;
-                e.x1 = (b.x1 - ox) as f32;
-                e.y1 = b.y1 as f32;
-                e.z1 = (b.z1 - oz) as f32;
+            if self.worlds[slot as usize] == world && ocx == ncx && ocz == ncz {
+                // same cell: bounds update in place (contiguous store write)
+                let p = self.cpos[slot as usize] as usize;
+                let box_ = &mut self.cell_box[home as usize];
+                box_[p * 6] = (b.x0 - ocx as f64 * CELL as f64) as f32;
+                box_[p * 6 + 1] = b.y0 as f32;
+                box_[p * 6 + 2] = (b.z0 - ocz as f64 * CELL as f64) as f32;
+                box_[p * 6 + 3] = (b.x1 - ocx as f64 * CELL as f64) as f32;
+                box_[p * 6 + 4] = b.y1 as f32;
+                box_[p * 6 + 5] = (b.z1 - ocz as f64 * CELL as f64) as f32;
                 return UpsertEv::Same;
             }
-            // moved cell (or world): unlink, rewrite, relink
-            self.unlink(home, slot);
-            let old_home = home;
-            {
-                let (ox, oz) = cell_origin(ncx, ncz);
-                let e = &mut self.entries[slot as usize];
-                e.x0 = (b.x0 - ox) as f32;
-                e.y0 = b.y0 as f32;
-                e.z0 = (b.z0 - oz) as f32;
-                e.x1 = (b.x1 - ox) as f32;
-                e.y1 = b.y1 as f32;
-                e.z1 = (b.z1 - oz) as f32;
-                e.world = world;
-            }
-            let home = self.cell_id(world, ncx, ncz);
-            self.link(home, slot);
-            self.homes[slot as usize] = home;
-            return UpsertEv::Moved { old: old_home, new: home };
+            // moved cell (or world): O(1) swap-remove + push
+            self.cell_remove(home, self.cpos[slot as usize] as usize);
+            let new_home = self.cell_id(world, ncx, ncz);
+            self.cell_add(new_home, slot as usize, b, ncx, ncz);
+            self.homes[slot as usize] = new_home;
+            self.worlds[slot as usize] = world;
+            return UpsertEv::Moved { old: home, new: new_home };
         } else {
             // if it used to be oversize, drop that record
             let mut from_oversize = false;
@@ -449,25 +461,15 @@ impl EntityIndex {
                 self.stats.oversize -= 1;
                 from_oversize = true;
             }
-            let (ox, oz) = cell_origin(ncx, ncz);
-            let e = Entry {
-                id,
-                x0: (b.x0 - ox) as f32,
-                y0: b.y0 as f32,
-                z0: (b.z0 - oz) as f32,
-                x1: (b.x1 - ox) as f32,
-                y1: b.y1 as f32,
-                z1: (b.z1 - oz) as f32,
-                next: 0,
-                world,
-            };
             let slot = {
-                self.entries.push(e);
+                self.ids.push(id);
+                self.worlds.push(world);
                 self.homes.push(0);
-                (self.entries.len() - 1) as u32
+                self.cpos.push(0);
+                (self.ids.len() - 1) as u32
             };
             let home = self.cell_id(world, ncx, ncz);
-            self.link(home, slot);
+            self.cell_add(home, slot as usize, b, ncx, ncz);
             self.homes[slot as usize] = home;
             self.idmap.insert(id, slot);
             self.stats.entities += 1;
@@ -478,9 +480,9 @@ impl EntityIndex {
     pub fn remove(&mut self, id: i64) -> RemoveEv {
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
-            self.unlink(home, slot);
+            self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
-            self.free_slot(slot);
+            self.free_slot(slot as usize);
             self.stats.entities -= 1;
             RemoveEv::Normal { cell: home }
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
@@ -495,9 +497,9 @@ impl EntityIndex {
     /// Drop every entity belonging to `world` (used on Level unload).
     pub fn clear_world(&mut self, world: u16) {
         let mut dead = Vec::new();
-        for e in &self.entries {
-            if e.world == world {
-                dead.push(e.id);
+        for (s, w) in self.worlds.iter().enumerate() {
+            if *w == world {
+                dead.push(self.ids[s]);
             }
         }
         for id in dead {
@@ -516,13 +518,24 @@ impl EntityIndex {
 
     /// Drop everything (module reset / kill switch).
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.ids.clear();
+        self.worlds.clear();
         self.homes.clear();
-        self.heads.truncate(1);
-        self.heads[0] = 0;
+        self.cpos.clear();
+        for v in self.cell_ids.iter_mut() {
+            v.clear();
+        }
+        for v in self.cell_box.iter_mut() {
+            v.clear();
+        }
+        for v in self.cell_slots.iter_mut() {
+            v.clear();
+        }
         self.cell_keys.truncate(1);
         self.cell_keys[0] = 0;
-        self.free_cells.clear();
+        self.cell_ids.truncate(1);
+        self.cell_box.truncate(1);
+        self.cell_slots.truncate(1);
         self.cellmap = CellMap::new(1 << 12);
         self.idmap = IdMap::new(1 << 12);
         self.oversize.clear();
@@ -534,6 +547,9 @@ impl EntityIndex {
     ///   - single-homing safety: query XZ box expanded by max_half_span,
     ///   - quantization safety: + MARGIN,
     ///   - oversize entities scanned exactly.
+    ///
+    /// L5: the per-cell scan is a flat sequential read of the cell's
+    /// contiguous id/box arrays (no pointer chasing).
     pub fn query(&self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
         out.clear();
         let ex = self.max_half_span + MARGIN as f64;
@@ -551,25 +567,33 @@ impl EntityIndex {
         for cx in cx0..=cx1 {
             for cz in cz0..=cz1 {
                 let key = cell_key(world, cx, cz);
-                let head = match self.cellmap.find(key) {
-                    Some(v) => v,
+                let cid = match self.cellmap.find(key) {
+                    Some(v) => v as usize,
                     None => continue,
                 };
+                let ids = &self.cell_ids[cid];
+                let bx = &self.cell_box[cid];
+                let n = ids.len();
                 let (ox, oz) = cell_origin(cx, cz);
-                let mut cur = self.heads[head as usize];
-                while cur != 0 {
-                    let e = &self.entries[cur as usize - 1];
-                    debug_assert_eq!(e.world, world);
-                    if e.y0 < my1 && e.y1 > my0 {
-                        let x0 = e.x0 as f64 + ox;
-                        let x1 = e.x1 as f64 + ox;
-                        let z0 = e.z0 as f64 + oz;
-                        let z1 = e.z1 as f64 + oz;
+                // X/Z compare in f64 EXACTLY like the pre-L5 chain scan: the
+                // f32 cell-relative coord is promoted and the f64 origin is
+                // added losslessly — no extra rounding beyond the stored
+                // quantization (covered by MARGIN). An f32 compare here
+                // could produce a false NEGATIVE at world-scale ULPs.
+                let mut i = 0;
+                while i < n {
+                    let o = i * 6;
+                    // y first: most rejections win here
+                    if bx[o + 1] < my1 && bx[o + 4] > my0 {
+                        let x0 = bx[o] as f64 + ox;
+                        let x1 = bx[o + 3] as f64 + ox;
+                        let z0 = bx[o + 2] as f64 + oz;
+                        let z1 = bx[o + 5] as f64 + oz;
                         if x0 < qx1 && x1 > qx0 && z0 < qz1 && z1 > qz0 {
-                            out.push(e.id);
+                            out.push(ids[i]);
                         }
                     }
-                    cur = e.next;
+                    i += 1;
                 }
             }
         }
@@ -582,94 +606,93 @@ impl EntityIndex {
 
     // ---- internals ----
 
+    /// Create-or-get the 1-based cell id for the key. Cells are never
+    /// freed (the publisher's dirty-marking relies on stable cell ids).
     fn cell_id(&mut self, world: u16, cx: i32, cz: i32) -> u32 {
         let key = cell_key(world, cx, cz);
         if let Some(v) = self.cellmap.find(key) {
             return v;
         }
-        let id = match self.free_cells.pop() {
-            Some(i) => {
-                self.heads[i as usize] = 0;
-                self.cell_keys[i as usize] = key;
-                i
-            }
-            None => {
-                self.heads.push(0);
-                self.cell_keys.push(key);
-                (self.heads.len() - 1) as u32
-            }
-        };
+        self.cell_ids.push(Vec::new());
+        self.cell_box.push(Vec::new());
+        self.cell_slots.push(Vec::new());
+        self.cell_keys.push(key);
+        let id = (self.cell_keys.len() - 1) as u32;
         self.cellmap.insert(key, id);
         self.stats.cells += 1;
+        let _ = world;
         id
     }
 
+    /// Append an entity to a cell's contiguous arrays; fixes cpos.
     #[inline]
-    fn link(&mut self, cell: u32, slot: u32) {
-        let old = self.heads[cell as usize];
-        self.entries[slot as usize].next = old;
-        self.heads[cell as usize] = slot + 1;
+    fn cell_add(&mut self, cell: u32, slot: usize, b: &Aabb, cx: i32, cz: i32) {
+        let p = self.cell_ids[cell as usize].len() as u32;
+        self.cell_ids[cell as usize].push(self.ids[slot]);
+        self.cell_box[cell as usize].extend_from_slice(&[
+            (b.x0 - cx as f64 * CELL as f64) as f32,
+            b.y0 as f32,
+            (b.z0 - cz as f64 * CELL as f64) as f32,
+            (b.x1 - cx as f64 * CELL as f64) as f32,
+            b.y1 as f32,
+            (b.z1 - cz as f64 * CELL as f64) as f32,
+        ]);
+        self.cell_slots[cell as usize].push(slot as u32);
+        self.cpos[slot] = p;
     }
 
-    fn unlink(&mut self, cell: u32, slot: u32) {
-        if self.heads[cell as usize] == slot + 1 {
-            let nxt = self.entries[slot as usize].next;
-            self.heads[cell as usize] = nxt;
-            return;
-        }
-        let mut cur = self.heads[cell as usize];
-        while cur != 0 {
-            let i = cur as usize - 1;
-            if self.entries[i].next == slot + 1 {
-                self.entries[i].next = self.entries[slot as usize].next;
-                return;
+    /// Swap-remove position `pos` from a cell's arrays; fixes the moved
+    /// entity's cpos. O(1).
+    #[inline]
+    fn cell_remove(&mut self, cell: u32, pos: usize) {
+        let ids = &mut self.cell_ids[cell as usize];
+        let last = ids.len() - 1;
+        if pos != last {
+            let moved_slot = self.cell_slots[cell as usize][last] as usize;
+            ids[pos] = ids[last];
+            let box_ = &mut self.cell_box[cell as usize];
+            for k in 0..6 {
+                box_[pos * 6 + k] = box_[last * 6 + k];
             }
-            cur = self.entries[i].next;
+            self.cell_slots[cell as usize][pos] = moved_slot as u32;
+            self.cpos[moved_slot] = pos as u32;
         }
-        debug_assert!(false, "unlink: slot missing from cell chain");
+        ids.pop();
+        self.cell_box[cell as usize].truncate((ids.len()) * 6);
+        self.cell_slots[cell as usize].pop();
     }
 
-    /// After swap-removing `last` into `slot`, fix `to` references in the
-    /// moved entity's cell chain (and head).
-    fn rechain(&mut self, cell: u32, from: u32, to: u32) {
-        if self.heads[cell as usize] == from + 1 {
-            self.heads[cell as usize] = to + 1;
-            return; // the moved entry was the head; nothing else references it
-        }
-        let mut cur = self.heads[cell as usize];
-        while cur != 0 {
-            let i = cur as usize - 1;
-            if self.entries[i].next == from + 1 {
-                self.entries[i].next = to + 1;
-                return;
-            }
-            cur = self.entries[i].next;
-        }
-        debug_assert!(false, "rechain: from-slot missing");
-    }
-
-    fn free_slot(&mut self, slot: u32) {
-        let last = self.entries.len() - 1;
-        if slot as usize != last {
-            let moved_id = self.entries[last].id;
+    /// Global swap-remove of `slot` (parallel arrays); fixes the moved
+    /// entity's cell_slots entry via its cpos. O(1).
+    #[inline]
+    fn free_slot(&mut self, slot: usize) {
+        let last = self.ids.len() - 1;
+        if slot != last {
+            let moved_id = self.ids[last];
+            let moved_world = self.worlds[last];
             let moved_home = self.homes[last];
-            self.entries[slot as usize] = self.entries[last];
-            self.homes[slot as usize] = moved_home;
-            self.rechain(moved_home, last as u32, slot);
-            self.idmap.insert(moved_id, slot);
+            let moved_cpos = self.cpos[last];
+            self.ids[slot] = moved_id;
+            self.worlds[slot] = moved_world;
+            self.homes[slot] = moved_home;
+            self.cpos[slot] = moved_cpos;
+            let mp = moved_cpos as usize;
+            self.cell_slots[moved_home as usize][mp] = slot as u32;
+            self.idmap.insert(moved_id, slot as u32);
         }
-        // the tail index dies with the pop; capacity is reclaimed implicitly
-        self.entries.pop();
+        self.ids.pop();
+        self.worlds.pop();
         self.homes.pop();
+        self.cpos.pop();
     }
 
     fn upsert_oversize(&mut self, id: i64, world: u16, b: Aabb) -> UpsertEv {
         if let Some(slot) = self.idmap.find(id) {
             // was a normal entity: detach it first
             let home = self.homes[slot as usize];
-            self.unlink(home, slot);
+            self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
-            self.free_slot(slot);
+            self.free_slot(slot as usize);
             self.stats.entities -= 1;
             if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
                 self.oversize[p] = Oversize { id, world, b };
@@ -695,23 +718,19 @@ impl EntityIndex {
         self.cell_keys.get(cell as usize).copied().filter(|k| *k != 0)
     }
 
-    /// Walk the chain of `cell`: push up to `cap` ids into `out`, return
+    /// The count of `cell`: push up to `cap` ids into `out`, return
     /// (total_count, overflow) where overflow = total > cap. The full count
     /// is always computed (the publisher needs it to decide publishability),
     /// but ids beyond cap are not stored.
     pub fn cell_scan(&self, cell: u32, out: &mut Vec<i64>, cap: usize) -> (usize, bool) {
         out.clear();
-        let head = *self.heads.get(cell as usize).unwrap_or(&0);
-        let mut total = 0usize;
-        let mut cur = head;
-        while cur != 0 {
-            let s = cur as usize - 1;
-            if total < cap {
-                out.push(self.entries[s].id);
-            }
-            total += 1;
-            cur = self.entries[s].next;
-        }
+        let ids = match self.cell_ids.get(cell as usize) {
+            Some(v) => v,
+            None => return (0, false),
+        };
+        let total = ids.len();
+        let cap = cap.min(total);
+        out.extend_from_slice(&ids[..cap]);
         (total, total > cap)
     }
 
@@ -736,19 +755,19 @@ impl EntityIndex {
     /// oversize and never reaches a cell.
     pub fn cell_scan_packed(&self, cell: u32, out: &mut Vec<i64>, cap: usize) -> (usize, bool) {
         out.clear();
-        let head = *self.heads.get(cell as usize).unwrap_or(&0);
-        let mut total = 0usize;
-        let mut cur = head;
-        while cur != 0 {
-            let s = cur as usize - 1;
-            if total < cap {
-                let e = &self.entries[s];
-                let lo = (((e.x0 * 1024.0).floor() - 2.0).max(-32768.0) as i64) + 32768;
-                let hi = (((e.x1 * 1024.0).ceil() + 2.0).min(32767.0) as i64) + 32768;
-                out.push((e.id & 0xFFFF_FFFF) | (lo << 32) | (hi << 48));
-            }
-            total += 1;
-            cur = self.entries[s].next;
+        let ids = match self.cell_ids.get(cell as usize) {
+            Some(v) => v,
+            None => return (0, false),
+        };
+        let bx = &self.cell_box[cell as usize];
+        let total = ids.len();
+        let cap = cap.min(total);
+        for i in 0..cap {
+            let o = i * 6;
+            let id = ids[i];
+            let lo = (((bx[o] * 1024.0).floor() - 2.0).max(-32768.0) as i64) + 32768;
+            let hi = (((bx[o + 3] * 1024.0).ceil() + 2.0).min(32767.0) as i64) + 32768;
+            out.push((id & 0xFFFF_FFFF) | (lo << 32) | (hi << 48));
         }
         (total, total > cap)
     }
@@ -778,38 +797,44 @@ pub fn key_coords(key: u64) -> (i32, i32) {
 
 #[doc(hidden)]
 impl EntityIndex {
-    /// Deep invariant check: chains, homes, idmap, free list all consistent.
+    /// Deep invariant check: cells, homes, cpos, idmap all consistent.
     pub fn check_invariants(&self) {
         use std::collections::HashSet as HS;
-        let n = self.entries.len();
-        let mut in_chain: HS<usize> = HS::new();
-        for ci in 1..self.heads.len() {
+        let n = self.ids.len();
+        let mut seen_slots: HS<usize> = HS::new();
+        for ci in 1..self.cell_keys.len() {
+            if self.cell_keys[ci] == 0 {
+                continue;
+            }
             let world = (self.cell_keys[ci] >> 44) as u16;
-            let mut cur = self.heads[ci];
-            let mut seen = 0usize;
-            while cur != 0 {
-                let s = cur as usize - 1;
-                assert!(s < n, "chain slot {s} out of range (cell {ci})");
-                assert!(in_chain.insert(s), "slot {s} in two chains");
-                assert_eq!(self.homes[s], ci as u32, "homes[{s}] = {}, expected cell {ci}", self.homes[s]);
-                assert_eq!(self.entries[s].world, world, "entry {s} world mismatch in cell {ci}");
-                cur = self.entries[s].next;
-                seen += 1;
-                assert!(seen <= n, "cycle in cell {ci} chain");
+            let ids = &self.cell_ids[ci];
+            let bx = &self.cell_box[ci];
+            let slots = &self.cell_slots[ci];
+            assert_eq!(ids.len() * 6, bx.len(), "cell {ci}: box stride mismatch");
+            assert_eq!(ids.len(), slots.len(), "cell {ci}: slots mismatch");
+            for (p, (&id, &slot)) in ids.iter().zip(slots.iter()).enumerate() {
+                let s = slot as usize;
+                assert!(s < n, "cell {ci} pos {p}: slot {s} out of range");
+                assert!(seen_slots.insert(s), "slot {s} in two cells");
+                assert_eq!(self.ids[s], id, "cell {ci} pos {p}: id mismatch");
+                assert_eq!(self.homes[s], ci as u32, "homes[{s}] != cell {ci}");
+                assert_eq!(self.cpos[s], p as u32, "cpos[{s}] != {p}");
+                assert_eq!(self.worlds[s], world, "worlds[{s}] mismatch in cell {ci}");
             }
         }
         for s in 0..n {
-            assert_eq!(self.idmap.find(self.entries[s].id), Some(s as u32),
-                "idmap: entry {s} id {} not mapped", self.entries[s].id);
-            assert!(in_chain.contains(&s), "entry {s} not in any chain");
-        }
-        for f in &self.free_cells {
-            let fi = *f as usize;
-            assert!(fi < self.heads.len(), "free cell {} beyond heads len", fi);
-            assert_eq!(self.heads[fi], 0, "freed cell {} still has a chain", fi);
+            assert_eq!(self.idmap.find(self.ids[s]), Some(s as u32),
+                "idmap: entry {s} id {} not mapped", self.ids[s]);
+            assert!(seen_slots.contains(&s), "entry {s} not in any cell");
+            let ci = self.homes[s] as usize;
+            let p = self.cpos[s] as usize;
+            assert_eq!(self.cell_ids[ci][p], self.ids[s], "cell {ci}[{p}] != ids[{s}]");
         }
         let mut seen_keys: HS<u64> = HS::new();
-        for ci in 1..self.heads.len() {
+        for ci in 1..self.cell_keys.len() {
+            if self.cell_keys[ci] == 0 {
+                continue;
+            }
             assert!(self.cellmap.find(self.cell_keys[ci]) == Some(ci as u32),
                 "cellmap does not map cell {ci}");
             assert!(seen_keys.insert(self.cell_keys[ci]), "duplicate cell key");
