@@ -51,7 +51,7 @@ jobs:
       MEASURE_TICKS: ${{ matrix.MEASURE }}
       AREA: ${{ matrix.AREA || '150' }}
       RUN_TIMEOUT: '1100'
-      XMX: '8G'
+      XMX: '5G'   # 8G + JFR + 100k entities OOM-killed the 16GB runner on the big legs
       MODULE: ${{ matrix.MODULE || 'off' }}
     steps:
       - uses: actions/checkout@v4
