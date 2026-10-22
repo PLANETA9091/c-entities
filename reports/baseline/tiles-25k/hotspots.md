@@ -1,106 +1,106 @@
 # JVM hotspots (JFR ExecutionSample)
 
-Samples: 1651
+Samples: 1937
 
 ## Top 60 by self-time (leaf frames)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 6.18% | `net.minecraft.world.item.ItemStack.getMaxStackSize() line: 581` |
-| 2 | 5.63% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
-| 3 | 4.48% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1461` |
-| 4 | 3.45% | `net.minecraft.server.level.ServerLevel.moonrise$getChunkTaskScheduler() line: 342` |
-| 5 | 3.27% | `net.minecraft.core.Vec3i.equals(Object) line: 45` |
-| 6 | 2.73% | `net.minecraft.world.level.chunk.LevelChunk$BoundTickingBlockEntity.tick() line: 929` |
-| 7 | 2.00% | `net.minecraft.core.NonNullList.get(int) line: 44` |
-| 8 | 1.94% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 9 | 1.88% | `java.util.HashMap.getNode(Object) line: 585` |
-| 10 | 1.64% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 11 | 1.57% | `com.google.common.collect.Iterators$5.computeNext() line: 671` |
-| 12 | 1.45% | `com.google.common.collect.RegularImmutableList.get(int) line: 79` |
-| 13 | 1.45% | `net.minecraft.world.level.chunk.LevelChunk$RebindableTickingBlockEntityWrapper.isRemoved() line: 1004` |
-| 14 | 1.45% | `net.minecraft.world.level.block.entity.HopperBlockEntity.pushItemsTick(Level, BlockPos, BlockState, HopperBlockEntity) line: 131` |
-| 15 | 1.21% | `net.minecraft.world.level.chunk.LevelChunk.getBlockEntity(BlockPos, LevelChunk$EntityCreationType) line: 474` |
-| 16 | 1.09% | `ca.spottedleaf.moonrise.patches.starlight.light.StarLightEngine.performLightIncrease(LightChunkGetter) line: 1125` |
-| 17 | 1.03% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 279` |
-| 18 | 0.97% | `java.util.Arrays.copyOf(byte[], int) line: 3541` |
-| 19 | 0.91% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.getBlock() line: 641` |
-| 20 | 0.91% | `net.minecraft.world.level.block.entity.BaseContainerBlockEntity.getItem(int) line: 127` |
-| 21 | 0.85% | `net.minecraft.world.level.levelgen.SurfaceRules$SequenceRule.tryApply(int, int, int) line: 590` |
-| 22 | 0.85% | `net.minecraft.world.level.chunk.ImposterProtoChunk.getNoiseBiome(int, int, int) line: 175` |
-| 23 | 0.85% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 256` |
-| 24 | 0.79% | `it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet.contains(Object) line: 446` |
-| 25 | 0.67% | `java.lang.StringLatin1.hashCode(byte[]) line: 194` |
-| 26 | 0.67% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 207` |
-| 27 | 0.67% | `net.minecraft.world.level.chunk.PalettedContainer.pack(IdMap, PalettedContainer$Strategy) line: 350` |
-| 28 | 0.61% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 758` |
-| 29 | 0.61% | `net.minecraft.world.level.chunk.LinearPalette.idFor(Object) line: 52` |
-| 30 | 0.61% | `net.minecraft.server.level.ServerLevel.tickChunk(LevelChunk, int) line: 916` |
-| 31 | 0.61% | `net.minecraft.world.level.block.entity.BlockEntity.isRemoved() line: 261` |
-| 32 | 0.55% | `net.minecraft.world.level.levelgen.synth.ImprovedNoise.p(int) line: 82` |
-| 33 | 0.55% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.blocksMotion() line: 651` |
-| 34 | 0.55% | `net.minecraft.world.level.chunk.PalettedContainer$Data.copyFrom(Palette, BitStorage) line: 468` |
-| 35 | 0.55% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 201` |
-| 36 | 0.48% | `org.objectweb.asm.ClassReader.readCode(MethodVisitor, Context, int) line: 1722` |
-| 37 | 0.48% | `net.minecraft.util.SimpleBitStorage.get(int) line: 336` |
-| 38 | 0.42% | `java.util.concurrent.ConcurrentHashMap.get(Object) line: 946` |
-| 39 | 0.42% | `java.lang.String.hashCode() line: 2358` |
-| 40 | 0.42% | `ca.spottedleaf.moonrise.patches.collisions.CollisionUtil$MergedVoxelCoordinateList.merge(double[], double, double[], double, boolean, boolean) line: 1496` |
-| 41 | 0.42% | `net.minecraft.world.level.levelgen.NoiseChunk.updateForZ(int, double) line: 325` |
-| 42 | 0.42% | `net.minecraft.world.level.levelgen.SurfaceSystem.buildSurface(RandomState, BiomeManager, Registry, boolean, WorldGenerationContext, ChunkAccess, NoiseChunk, SurfaceRules$RuleSource) line: 137` |
-| 43 | 0.42% | `net.minecraft.world.level.chunk.PalettedContainer.readPalette(PalettedContainer$Data, int) line: 96` |
-| 44 | 0.42% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder.addGenerationBlockingNeighbour(NewChunkHolder) line: 514` |
-| 45 | 0.42% | `net.minecraft.world.level.ChunkPos.asLong(int, int) line: 85` |
-| 46 | 0.42% | `java.util.concurrent.locks.AbstractQueuedSynchronizer.compareAndSetState(int, int) line: 569` |
-| 47 | 0.42% | `net.minecraft.nbt.CompoundTag.write(DataOutput) line: 180` |
-| 48 | 0.36% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 282` |
-| 49 | 0.36% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 285` |
-| 50 | 0.36% | `org.objectweb.asm.ClassReader.readCode(MethodVisitor, Context, int) line: 2425` |
-| 51 | 0.36% | `net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.isLit() line: 152` |
-| 52 | 0.36% | `net.minecraft.nbt.CompoundTag.copy() line: 410` |
-| 53 | 0.30% | `net.minecraft.world.level.levelgen.DensityFunctions$EndIslandDensityFunction.getHeightValue(SimplexNoise, int, int) line: 554` |
-| 54 | 0.30% | `net.minecraft.util.SimpleBitStorage.get(int) line: 334` |
-| 55 | 0.30% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getVolatile(VarHandle, Object) line: 99` |
-| 56 | 0.30% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getHash(long) line: 154` |
-| 57 | 0.30% | `net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.serverTick(ServerLevel, BlockPos, BlockState, AbstractFurnaceBlockEntity) line: 188` |
-| 58 | 0.24% | `paperclip.libs.io.sigpipe.jbsdiff.Patch.patch(byte[], byte[], OutputStream) line: 94` |
-| 59 | 0.24% | `java.lang.AbstractStringBuilder.ensureCapacityInternal(int) line: 243` |
-| 60 | 0.24% | `java.util.regex.Pattern$CharPropertyGreedy.match(Matcher, int, CharSequence) line: 4452` |
+| 1 | 4.80% | `net.minecraft.world.item.ItemStack.getMaxStackSize() line: 581` |
+| 2 | 2.63% | `com.google.common.collect.RegularImmutableList.get(int) line: 79` |
+| 3 | 2.48% | `ca.spottedleaf.moonrise.patches.starlight.light.SWMRNibbleArray.set(int, int) line: 422` |
+| 4 | 2.27% | `com.google.common.collect.Iterators$5.computeNext() line: 671` |
+| 5 | 2.01% | `net.minecraft.core.Vec3i.equals(Object) line: 45` |
+| 6 | 1.86% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 7 | 1.70% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 207` |
+| 8 | 1.60% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 279` |
+| 9 | 1.39% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
+| 10 | 1.39% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 256` |
+| 11 | 1.29% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.getBlock() line: 641` |
+| 12 | 1.24% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
+| 13 | 1.14% | `java.lang.String.hashCode() line: 2358` |
+| 14 | 1.14% | `net.minecraft.server.level.ServerLevel.moonrise$getChunkTaskScheduler() line: 342` |
+| 15 | 1.08% | `it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet.contains(Object) line: 446` |
+| 16 | 1.03% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1461` |
+| 17 | 0.88% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 714` |
+| 18 | 0.88% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 758` |
+| 19 | 0.88% | `net.minecraft.world.level.chunk.ImposterProtoChunk.getNoiseBiome(int, int, int) line: 175` |
+| 20 | 0.83% | `net.minecraft.world.level.chunk.LevelChunk.getBlockEntity(BlockPos, LevelChunk$EntityCreationType) line: 474` |
+| 21 | 0.83% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 275` |
+| 22 | 0.77% | `java.util.concurrent.ConcurrentHashMap.get(Object) line: 946` |
+| 23 | 0.77% | `net.minecraft.world.level.block.entity.BaseContainerBlockEntity.getItem(int) line: 127` |
+| 24 | 0.72% | `org.objectweb.asm.ClassReader.readCode(MethodVisitor, Context, int) line: 2425` |
+| 25 | 0.67% | `net.minecraft.world.level.levelgen.SurfaceRules$TestRule.tryApply(int, int, int) line: 712` |
+| 26 | 0.67% | `net.minecraft.world.level.chunk.PalettedContainer.getAndSet(int, Object) line: 226` |
+| 27 | 0.67% | `java.util.HashMap.getNode(Object) line: 585` |
+| 28 | 0.67% | `net.minecraft.world.level.chunk.LevelChunk$RebindableTickingBlockEntityWrapper.isRemoved() line: 1004` |
+| 29 | 0.62% | `com.sun.crypto.provider.CounterMode.implCrypt(byte[], int, int, byte[], int) line: 194` |
+| 30 | 0.62% | `java.lang.StringLatin1.hashCode(byte[]) line: 194` |
+| 31 | 0.62% | `it.unimi.dsi.fastutil.ints.IntArraySet.findKey(int) line: 205` |
+| 32 | 0.57% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 285` |
+| 33 | 0.57% | `net.minecraft.core.NonNullList.get(int) line: 44` |
+| 34 | 0.57% | `net.minecraft.world.level.chunk.LevelChunk$BoundTickingBlockEntity.tick() line: 929` |
+| 35 | 0.52% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 764` |
+| 36 | 0.52% | `org.objectweb.asm.ClassReader.readUtf(int, int, char[]) line: 3733` |
+| 37 | 0.52% | `net.neoforged.art.internal.EnhancedRemapper.map(String) line: 88` |
+| 38 | 0.52% | `net.minecraft.world.level.chunk.LinearPalette.idFor(Object) line: 52` |
+| 39 | 0.52% | `net.minecraft.util.Mth.lerp3(double, double, double, double, double, double, double, double, double, double, double) line: 561` |
+| 40 | 0.52% | `net.minecraft.world.level.levelgen.material.MaterialRuleList.calculate(DensityFunction$FunctionContext) line: 12` |
+| 41 | 0.52% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.getChunkHolder(long) line: 930` |
+| 42 | 0.52% | `net.minecraft.world.level.ChunkPos.asLong(int, int) line: 85` |
+| 43 | 0.46% | `com.sun.crypto.provider.CounterMode.increment(byte[]) line: 164` |
+| 44 | 0.46% | `java.lang.AbstractStringBuilder.ensureCapacityInternal(int) line: 243` |
+| 45 | 0.46% | `net.minecraft.world.level.chunk.LevelChunkSection.updateBlockCallback(int, int, int, BlockState, BlockState) line: 129` |
+| 46 | 0.46% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 201` |
+| 47 | 0.46% | `net.minecraft.world.level.Level.getChunk(int, int, ChunkStatus, boolean) line: 1071` |
+| 48 | 0.46% | `net.minecraft.server.level.ServerLevel.tickChunk(LevelChunk, int) line: 916` |
+| 49 | 0.41% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 282` |
+| 50 | 0.41% | `org.objectweb.asm.ClassReader.readCode(MethodVisitor, Context, int) line: 1722` |
+| 51 | 0.41% | `java.math.BigInteger.implMultiplyToLen(int[], int, int[], int, int[]) line: 1819` |
+| 52 | 0.41% | `net.minecraft.world.level.chunk.ProtoChunk.getBlockState(int, int, int) line: 117` |
+| 53 | 0.41% | `net.minecraft.world.level.levelgen.Heightmap.lambda$static$0(BlockState) line: 30` |
+| 54 | 0.41% | `ca.spottedleaf.concurrentutil.util.HashUtil.mix(long) line: 93` |
+| 55 | 0.36% | `java.util.Arrays.copyOf(byte[], int) line: 3541` |
+| 56 | 0.36% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupBlock() line: 824` |
+| 57 | 0.36% | `net.minecraft.world.level.levelgen.synth.SimplexNoise.dot(int[], double, double, double) line: 56` |
+| 58 | 0.36% | `net.minecraft.world.level.levelgen.Beardifier.compute(DensityFunction$FunctionContext) line: 80` |
+| 59 | 0.36% | `net.minecraft.world.level.levelgen.SurfaceRules$SequenceRule.tryApply(int, int, int) line: 585` |
+| 60 | 0.36% | `net.minecraft.world.level.levelgen.Heightmap.update(int, int, int, BlockState) line: 86` |
 
 ## Top 30 callers of hot leaves
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 10.30% | `net.minecraft.server.level.ServerLevel.tick(BooleanSupplier) line: 819` |
-| 2 | 3.63% | `net.minecraft.world.level.block.entity.HopperBlockEntity.getFullState(HopperBlockEntity) line: 173` |
-| 3 | 3.51% | `net.minecraft.server.level.ServerLevel.shouldTickBlocksAt(long) line: 830` |
-| 4 | 2.73% | `net.minecraft.world.level.chunk.LevelChunk$RebindableTickingBlockEntityWrapper.tick() line: 999` |
-| 5 | 2.42% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.initBlock() line: 326` |
-| 6 | 2.18% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 324` |
-| 7 | 1.94% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupNoRandPartC() line: 948` |
-| 8 | 1.94% | `java.util.LinkedHashMap.get(Object) line: 536` |
-| 9 | 1.57% | `com.google.common.collect.AbstractIterator.tryToComputeNext() line: 145` |
-| 10 | 1.45% | `net.minecraft.world.level.chunk.status.ChunkDependencies.get(int) line: 51` |
-| 11 | 1.45% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
-| 12 | 1.45% | `net.minecraft.world.level.chunk.LevelChunk$BoundTickingBlockEntity.tick() line: 929` |
-| 13 | 1.45% | `net.minecraft.world.level.chunk.LevelChunk.getBlockState(BlockPos) line: 285` |
-| 14 | 1.45% | `net.minecraft.world.level.block.entity.HopperBlockEntity.isFullContainer(Container, Direction) line: 522` |
-| 15 | 1.27% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.get(long) line: 224` |
-| 16 | 1.21% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 256` |
-| 17 | 1.21% | `net.minecraft.world.level.Level.getBlockEntity(BlockPos) line: 1640` |
-| 18 | 1.09% | `net.minecraft.world.Container.getMaxStackSize(ItemStack) line: 32` |
-| 19 | 1.09% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 328` |
-| 20 | 1.03% | `org.objectweb.asm.ClassReader.readMethod(ClassVisitor, Context, int) line: 1512` |
-| 21 | 1.03% | `net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity.serverTick(ServerLevel, BlockPos, BlockState, AbstractFurnaceBlockEntity) line: 188` |
-| 22 | 0.97% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 279` |
-| 23 | 0.91% | `net.minecraft.world.level.block.entity.RandomizableContainerBlockEntity.getItem(int) line: 58` |
-| 24 | 0.91% | `net.minecraft.world.level.block.entity.BaseContainerBlockEntity.getItem(int) line: 127` |
-| 25 | 0.85% | `net.minecraft.world.level.LevelReader.getNoiseBiome(int, int, int) line: 78` |
-| 26 | 0.85% | `ca.spottedleaf.moonrise.patches.starlight.light.SkyStarLightEngine.lightChunk(LightChunkGetter, ChunkAccess, boolean) line: 543` |
-| 27 | 0.79% | `net.minecraft.world.level.levelgen.SurfaceSystem.buildSurface(RandomState, BiomeManager, Registry, boolean, WorldGenerationContext, ChunkAccess, NoiseChunk, SurfaceRules$RuleSource) line: 150` |
-| 28 | 0.79% | `java.util.ArrayList.batchRemove(Collection, boolean, int, int) line: 905` |
-| 29 | 0.73% | `com.sun.crypto.provider.GHASH.update(byte[], int, int) line: 180` |
-| 30 | 0.67% | `java.lang.String.hashCode() line: 2358` |
+| 1 | 4.23% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.initBlock() line: 326` |
+| 2 | 2.63% | `net.minecraft.world.level.chunk.status.ChunkDependencies.get(int) line: 51` |
+| 3 | 2.53% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.get(long) line: 224` |
+| 4 | 2.48% | `ca.spottedleaf.moonrise.patches.starlight.light.StarLightEngine.performLightIncrease(LightChunkGetter) line: 1168` |
+| 5 | 2.48% | `net.minecraft.world.level.chunk.LevelChunk.getBlockState(BlockPos) line: 285` |
+| 6 | 2.32% | `net.minecraft.server.level.ServerLevel.tick(BooleanSupplier) line: 819` |
+| 7 | 2.27% | `com.google.common.collect.AbstractIterator.tryToComputeNext() line: 145` |
+| 8 | 2.17% | `net.minecraft.world.level.block.entity.HopperBlockEntity.getFullState(HopperBlockEntity) line: 173` |
+| 9 | 1.96% | `org.objectweb.asm.ClassReader.readMethod(ClassVisitor, Context, int) line: 1512` |
+| 10 | 1.60% | `net.minecraft.server.level.ServerLevel.shouldTickBlocksAt(long) line: 830` |
+| 11 | 1.55% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupNoRandPartA() line: 880` |
+| 12 | 1.50% | `net.minecraft.world.Container.getMaxStackSize(ItemStack) line: 32` |
+| 13 | 1.39% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 279` |
+| 14 | 1.19% | `net.minecraft.world.level.block.entity.HopperBlockEntity.isFullContainer(Container, Direction) line: 522` |
+| 15 | 1.14% | `java.util.ArrayList.batchRemove(Collection, boolean, int, int) line: 905` |
+| 16 | 1.08% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 324` |
+| 17 | 0.98% | `com.sun.crypto.provider.GHASH.update(byte[], int, int) line: 180` |
+| 18 | 0.93% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 328` |
+| 19 | 0.88% | `net.minecraft.world.level.LevelReader.getNoiseBiome(int, int, int) line: 78` |
+| 20 | 0.88% | `net.minecraft.world.level.Level.getBlockEntity(BlockPos) line: 1640` |
+| 21 | 0.77% | `net.minecraft.world.level.block.entity.RandomizableContainerBlockEntity.getItem(int) line: 58` |
+| 22 | 0.77% | `net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase.is(Block) line: 990` |
+| 23 | 0.72% | `java.util.LinkedHashMap.get(Object) line: 536` |
+| 24 | 0.72% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getHash(long) line: 154` |
+| 25 | 0.67% | `com.sun.crypto.provider.CounterMode.crypt(byte[], int, int, byte[], int) line: 181` |
+| 26 | 0.67% | `org.objectweb.asm.ClassReader.readUtf(int, char[]) line: 3702` |
+| 27 | 0.67% | `net.neoforged.art.internal.EnhancedRemapper.getClass(String) line: 121` |
+| 28 | 0.67% | `net.minecraft.world.level.levelgen.SurfaceRules$SequenceRule.tryApply(int, int, int) line: 586` |
+| 29 | 0.67% | `net.minecraft.world.level.Level.tickBlockEntities() line: 1463` |
+| 30 | 0.62% | `java.lang.String.hashCode() line: 2358` |
 
 GC pauses: 0, total 0 ms
 
