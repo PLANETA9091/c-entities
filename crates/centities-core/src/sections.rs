@@ -132,16 +132,28 @@ pub struct GatherFlags {
 /// multiply-shift hash, linear probing, backward-shift deletion — no SipHash
 /// on the L6 hot path).
 struct SecMap {
-    keys: Vec<u64>, // 0 = empty (sec_key never 0: biased)
+    // u64::MAX = empty. sec_key(0,0,0) == 0 (the spawn sections!) — a 0
+    // sentinel made that section UNCACHEABLE: every find() saw an empty
+    // slot, every gather re-called the provider and inserted again, and
+    // get_or_populate pushed a fresh ~18KB data slot per lookup (the 100k
+    // fill burned ~34k slots/tick = the 8GB RSS explosion). Real packed
+    // keys never reach u64::MAX (all three fields maxed simultaneously is
+    // impossible for legal section coords).
+    keys: Vec<u64>,
     vals: Vec<u32>, // slot+1
     mask: u64,
     len: usize,
 }
 
+#[inline]
+fn sec_empty() -> u64 {
+    u64::MAX
+}
+
 impl SecMap {
     fn new(cap_pow2: usize) -> Self {
         let n = cap_pow2.max(16);
-        SecMap { keys: vec![0; n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
+        SecMap { keys: vec![sec_empty(); n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
     }
 
     #[inline]
@@ -149,7 +161,7 @@ impl SecMap {
         let mut i = (crate::hash64(key) & self.mask) as usize;
         loop {
             let k = self.keys[i];
-            if k == 0 {
+            if k == sec_empty() {
                 return None;
             }
             if k == key {
@@ -166,7 +178,7 @@ impl SecMap {
         let mut i = (crate::hash64(key) & self.mask) as usize;
         loop {
             let k = self.keys[i];
-            if k == 0 {
+            if k == sec_empty() {
                 self.keys[i] = key;
                 self.vals[i] = slot + 1;
                 self.len += 1;
@@ -191,7 +203,7 @@ impl SecMap {
                 let n = self.keys.len();
                 let mut hole = i;
                 let mut j = (i + 1) & (n - 1);
-                while self.keys[j] != 0 {
+                while self.keys[j] != sec_empty() {
                     let ideal = (crate::hash64(self.keys[j]) & self.mask) as usize;
                     let d = (j.wrapping_sub(ideal)) & (n - 1);
                     let h = (hole.wrapping_sub(ideal)) & (n - 1);
@@ -202,7 +214,7 @@ impl SecMap {
                     }
                     j = (j + 1) & (n - 1);
                 }
-                self.keys[hole] = 0;
+                self.keys[hole] = sec_empty();
                 self.vals[hole] = 0;
                 self.len -= 1;
                 return;
@@ -213,12 +225,12 @@ impl SecMap {
 
     fn grow(&mut self) {
         let n = self.keys.len() * 2;
-        let old_keys = std::mem::replace(&mut self.keys, vec![0; n]);
+        let old_keys = std::mem::replace(&mut self.keys, vec![sec_empty(); n]);
         let old_vals = std::mem::replace(&mut self.vals, vec![0; n]);
         self.mask = (n - 1) as u64;
         self.len = 0;
         for i in 0..old_keys.len() {
-            if old_keys[i] != 0 {
+            if old_keys[i] != sec_empty() {
                 self.insert(old_keys[i], old_vals[i] - 1);
             }
         }

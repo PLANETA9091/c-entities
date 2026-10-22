@@ -7,6 +7,7 @@
 use centities_core::sections::{SectionData, SectionProvider};
 use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv};
 use std::cell::Cell;
+    use std::rc::Rc;
 
 fn rss_mb() -> f64 {
     let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
@@ -76,17 +77,64 @@ fn main() {
     let mut grid = centities_core::sections::SectionGrid::new();
     let mut scratch = Scratch::new();
     let provider_calls = Cell::new(0u64);
+    let tick_counter = Cell::new(0u32);
+    let TICK = tick_counter.clone();
+    let cells_all = (Rc::new(Cell::new(i32::MAX)), Rc::new(Cell::new(i32::MIN)), Rc::new(Cell::new(i32::MAX)), Rc::new(Cell::new(i32::MIN)), Rc::new(Cell::new(i32::MAX)), Rc::new(Cell::new(i32::MIN)));
+    let (MINX, MAXX, MINY, MAXY, MINZ, MAXZ) = (cells_all.0.clone(), cells_all.1.clone(), cells_all.2.clone(), cells_all.3.clone(), cells_all.4.clone(), cells_all.5.clone());
 
     {
         let pc = &provider_calls;
-        let mut provider = move |_cx: i32, _cy: i32, _cz: i32, _load: bool| -> Result<SectionData, ()> {
+        // A solid floor at the section's lowest y layer: exercises the
+        // collide + landing paths (the all-air repro never collided and
+        // missed the CI explosion — the bug lives in the collide/landing
+        // neighborhood).
+        let tick_cell = TICK.clone();
+        let mut provider = move |cx: i32, cy: i32, _cz: i32, _load: bool| -> Result<SectionData, ()> {
             pc.set(pc.get() + 1);
-            Ok(SectionData::all_air())
+            // per-tick coordinate extremes (same cells the logger reads)
+            MINX.set(MINX.get().min(cx));
+            MAXX.set(MAXX.get().max(cx));
+            MINY.set(MINY.get().min(cy));
+            MAXY.set(MAXY.get().max(cy));
+            MINZ.set(MINZ.get().min(_cz));
+            MAXZ.set(MAXZ.get().max(_cz));
+            let _ = tick_cell;
+            let _ = (&MINX, &MAXX, &MINY, &MAXY, &MINZ, &MAXZ);
+            if cy != 0 {
+                return Ok(SectionData::all_air());
+            }
+            // one palette entry: a full-cube collider, friction 0.6, speed 1.0
+            let floor = centities_core::sections::PaletteEntry {
+                collider: Some(centities_core::itemtick::Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)),
+                friction: 0.6,
+                speed: 1.0,
+                is_water: false,
+                has_fluid: false,
+                cobweb: false,
+                entity_inside_special: false,
+                step_on_special: false,
+                fall_on_special: false,
+            };
+            let mut sd = SectionData::all_air();
+            use centities_core::sections::PaletteEntry;
+            sd.entries = vec![PaletteEntry::air(), floor];
+            // fill y=0 layer (local y 0) with palette 1
+            for lz in 0..16u16 {
+                for lx in 0..16u16 {
+                    sd.blocks[(lx | (lz << 4)) as usize] = 1;
+                }
+            }
+            let _ = cx;
+            Ok(sd)
         };
         let prov: SectionProvider = &mut provider;
 
     let t0 = std::time::Instant::now();
     for t in 0..ticks {
+        tick_counter.set(t as u32);
+        cells_all.0.set(i32::MAX); cells_all.1.set(i32::MIN);
+        cells_all.2.set(i32::MAX); cells_all.3.set(i32::MIN);
+        cells_all.4.set(i32::MAX); cells_all.5.set(i32::MIN);
         // emulate the flush: batch of items accumulated this tick
         for (k, st) in states.iter_mut().enumerate() {
             st.tick_count = st.tick_count.wrapping_add(1);
@@ -96,14 +144,24 @@ fn main() {
             // outcome ignored: the module commits + writebacks; the memory
             // story is identical (commit = field stores, no allocation).
         }
-        if t % 50 == 0 || t == ticks - 1 {
+        if t % 10 == 0 || t == ticks - 1 {
             let el = t0.elapsed().as_millis() as f64 / 1000.0;
+            let (mut md, mut mp) = (0.0f64, 0.0f64);
+            for st in &states {
+                let ad = st.dx.abs().max(st.dy.abs()).max(st.dz.abs());
+                if ad.is_finite() { md = md.max(ad); }
+                let ap = st.x.abs().max(st.y.abs()).max(st.z.abs());
+                if ap.is_finite() { mp = mp.max(ap); }
+            }
             println!(
-                "tick {t:4} rss {:.0}MB grid={} calls={} elapsed {:.1}s",
+                "tick {t:4} rss {:.0}MB grid={} calls={} elapsed {:.1}s maxD={md:.3} maxP={mp:.3} secX[{}..{}] secY[{}..{}] secZ[{}..{}]",
                 rss_mb(),
                 grid.populated,
                 provider_calls.get(),
-                el
+                el,
+                cells_all.0.get(), cells_all.1.get(),
+                cells_all.2.get(), cells_all.3.get(),
+                cells_all.4.get(), cells_all.5.get(),
             );
         }
     }
