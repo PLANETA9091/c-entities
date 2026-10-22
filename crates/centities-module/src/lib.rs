@@ -735,6 +735,17 @@ fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
     };
     let loader = env.call_object_method(level_cls.0, mid, &[]);
     cplug_sdk::log::info("[c-entities] bridge: step 4 define_class");
+    // define nested/helper classes FIRST (the outer class references them)
+    for (name, bytes) in hooks_classes() {
+        if name == "dev/planeta9091/centities/CeHooks.class" {
+            continue;
+        }
+        let iname = &name[..name.len() - 6]; // strip ".class"
+        if env.define_class(iname, loader, bytes).is_none() {
+            cplug_sdk::log::info(&format!("[c-entities] bridge define_class failed for {iname}"));
+            return None;
+        }
+    }
     let Some(cls) = env.define_class(HOOKS_CLASS, loader, HOOKS_CLASS_BYTES) else {
         cplug_sdk::log::info("[c-entities] bridge define_class failed");
         return None;
@@ -1302,6 +1313,28 @@ pub extern "system" fn n_flush(
 
 // bridge class bytes (compiled by build.rs against the paper jar)
 static HOOKS_CLASS_BYTES: &[u8] = include_bytes!(concat!(env!("CE_HOOKS_CLASS")));
+static HOOKS_BLOB: &[u8] = include_bytes!(concat!(env!("CE_HOOKS_BLOB")));
+
+/// All compiled bridge classes: (internal name, bytes). The bridge may
+/// declare nested classes — each must be defined into the SAME loader.
+fn hooks_classes() -> Vec<(&'static str, &'static [u8])> {
+    let mut out = Vec::new();
+    let b = HOOKS_BLOB;
+    let mut i = 0usize;
+    let count = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    i = 4;
+    for _ in 0..count {
+        let nl = u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        i += 2;
+        let name = std::str::from_utf8(&b[i..i + nl]).expect("utf8 name");
+        i += nl;
+        let cl = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+        i += 4;
+        out.push((name, &b[i..i + cl]));
+        i += cl;
+    }
+    out
+}
 
 /// Off-thread upsert (worldgen workers): queued, drained by the next
 /// server-thread apply so the index and the published rows keep a single

@@ -411,6 +411,8 @@ public final class CeHooks {
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
+                + " item=" + itemChecks + "/" + itemNative + "/" + itemResync
+                + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -1251,7 +1253,24 @@ public final class CeHooks {
     /** Kill-switch arm/disarm from the native side. */
     public static void setActive(boolean on) {
         ACTIVE = on;
+        if (on && ITEM_TICK_ON) {
+            // arm the L6 machinery: VarHandles + the (runtime-only) Bukkit
+            // surface. A failure keeps VH_READY/BUKKIT_READY false — the
+            // collectors then route EVERY item vanilla (inherent safety).
+            boolean ok = initItemVh();
+            ok &= initBukkit();
+            if (ok) {
+                cplugReady = true;
+            }
+        }
+        if (!on) {
+            cplugReady = false;
+        }
     }
+
+    /** Both init passes succeeded — L6 may arm. Volatile: read by the
+     *  collectors on the server thread, written by the arm thread. */
+    private static volatile boolean cplugReady = false;
 
     // ------------------------------------------------------------------
     // Natives (Rust). queryNative applies the caller's pending probe batch
@@ -1350,23 +1369,91 @@ public final class CeHooks {
     // ---- VarHandles (lazy; the bridge class lives in the kernel loader
     // with Paper fully visible) ----
     private static volatile boolean VH_READY = false;
-    private static VarHandle VH_FALL_DIST, VH_REMAINING_FIRE, VH_DESPAWN_TIME,
-            VH_DESPAWN_RATE, VH_ON_GROUND, VH_STUCK, VH_SUPPORTING, VH_FRIC_STATE;
+    private static RefField VH_REMAINING_FIRE, VH_DESPAWN_TIME,
+            VH_DESPAWN_RATE, VH_STUCK, VH_FRIC_STATE;
+
+    /** fallDistance is a public double field in 1.21.8 mojang-mapped. */
+    private static float fallDistOf(Entity e) {
+        return (float) e.fallDistance;
+    }
+
+    private static void setFallDist(Entity e, float v) {
+        e.fallDistance = v;
+    }
+
+    /** Access to a private field. The VarHandle is preferred (proven to
+     *  work for ItemEntity members by the L3 merge handles); for Entity
+     *  members the MH unreflect refused even after setAccessible on the
+     *  sandbox JVM — plain reflection honors the accessible flag and is
+     *  guaranteed, so it is the fallback (and, for the two fields the
+     *  collector reads per tick, reflection on a cached Field costs
+     *  ~15-25ns which is acceptable). */
+    private static final class RefField {
+        final java.lang.reflect.Field f;
+        final VarHandle vh;
+        RefField(Class<?> start, String name) throws ReflectiveOperationException {
+            Class<?> k = start;
+            java.lang.reflect.Field found = null;
+            while (k != null && found == null) {
+                try {
+                    found = k.getDeclaredField(name);
+                } catch (NoSuchFieldException notHere) {
+                    k = k.getSuperclass();
+                }
+            }
+            if (found == null) throw new NoSuchFieldException(start.getName() + "." + name);
+            found.setAccessible(true);
+            f = found;
+            VarHandle h = null;
+            try {
+                h = MethodHandles.lookup().unreflectVarHandle(found);
+            } catch (Throwable mhRefused) {
+                h = null; // plain reflection fallback
+            }
+            vh = h;
+        }
+        int getInt(Object o) {
+            try {
+                return vh != null ? (int) vh.get(o) : f.getInt(o);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        void setInt(Object o, int v) {
+            try {
+                if (vh != null) vh.set(o, v); else f.setInt(o, v);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        Object getObj(Object o) {
+            try {
+                return vh != null ? vh.get(o) : f.get(o);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        void setObj(Object o, Object v) {
+            try {
+                if (vh != null) vh.set(o, v); else f.set(o, v);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+    }
 
     private static synchronized boolean initItemVh() {
         if (VH_READY) return true;
         try {
-            MethodHandles.Lookup l = MethodHandles.lookup();
-            VH_FALL_DIST = l.findVarHandle(Entity.class, "fallDistance", float.class);
-            VH_REMAINING_FIRE = l.findVarHandle(Entity.class, "remainingFireTicks", int.class);
-            VH_DESPAWN_RATE = l.findVarHandle(ItemEntity.class, "despawnRate", int.class);
-            VH_ON_GROUND = l.findVarHandle(Entity.class, "onGround", boolean.class);
-            VH_STUCK = l.findVarHandle(Entity.class, "stuckSpeedMultiplier", Vec3.class);
-            VH_FRIC_STATE = l.findVarHandle(ItemEntity.class, "frictionState", Object.class);
-            VH_SUPPORTING = l.findVarHandle(Entity.class, "mainSupportingBlockPos", java.util.Optional.class);
+            // fallDistance / onGround / mainSupportingBlockPos are PUBLIC in
+            // 1.21.8 mojang-mapped: direct field access, zero overhead.
+            VH_REMAINING_FIRE = new RefField(Entity.class, "remainingFireTicks");
+            VH_DESPAWN_RATE = new RefField(ItemEntity.class, "despawnRate");
+            VH_STUCK = new RefField(Entity.class, "stuckSpeedMultiplier");
+            VH_FRIC_STATE = new RefField(ItemEntity.class, "frictionState");
             try {
-                VH_DESPAWN_TIME = l.findVarHandle(Entity.class, "despawnTime", int.class);
-            } catch (ReflectiveOperationException notPaperOrRenamed) {
+                VH_DESPAWN_TIME = new RefField(Entity.class, "despawnTime");
+            } catch (NoSuchFieldException notPaperOrRenamed) {
                 VH_DESPAWN_TIME = null; // documented gap (same as the L2 guard)
             }
             VH_READY = true;
@@ -1379,13 +1466,13 @@ public final class CeHooks {
     }
 
     private static int fireTicks(Entity e) {
-        return VH_REMAINING_FIRE == null ? 0 : (int) VH_REMAINING_FIRE.get(e);
+        return VH_REMAINING_FIRE == null ? 0 : VH_REMAINING_FIRE.getInt(e);
     }
 
     /** TriState.FALSE without the adventure class on the compile classpath. */
     private static boolean frictionDisabled(Entity e) {
         try {
-            Object st = VH_FRIC_STATE.get(e);
+            Object st = VH_FRIC_STATE.getObj(e);
             return st != null && "FALSE".equals(((Enum<?>) st).name());
         } catch (Throwable t) {
             return false;
@@ -1393,7 +1480,7 @@ public final class CeHooks {
     }
 
     private static int despawnTimeOf(Entity e) {
-        return VH_DESPAWN_TIME == null ? -1 : (int) VH_DESPAWN_TIME.get(e);
+        return VH_DESPAWN_TIME == null ? -1 : VH_DESPAWN_TIME.getInt(e);
     }
 
     /**
@@ -1402,7 +1489,7 @@ public final class CeHooks {
      */
     public static boolean itemSkip(ItemEntity e) {
         itemChecks++;
-        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !BUKKIT_READY || ibN >= IB_CAP) return false;
+        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) return false;
         if (e.level().isClientSide) return false; // client-side ticks stay vanilla
         try {
             boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
@@ -1456,7 +1543,7 @@ public final class CeHooks {
         IB_D[o + 3] = d.x;
         IB_D[o + 4] = d.y;
         IB_D[o + 5] = d.z;
-        IB_D[o + 6] = (float) VH_FALL_DIST.get(e);
+        IB_D[o + 6] = fallDistOf(e);
         // stuck + supporting are store-owned; only resync entries get fresh
         // values (flush pass 1)
         IB_D[o + 7] = 0.0;
@@ -1470,7 +1557,7 @@ public final class CeHooks {
         IB_I[oi] = e.tickCount; // dispatcher already ++ed
         IB_I[oi + 1] = e.age;
         IB_I[oi + 2] = e.pickupDelay;
-        IB_I[oi + 3] = (int) VH_DESPAWN_RATE.get(e);
+        IB_I[oi + 3] = VH_DESPAWN_RATE.getInt(e);
         ibN = i + 1;
     }
 
@@ -1481,9 +1568,10 @@ public final class CeHooks {
      */
     public static void itemTickFlush(Level level) {
         int n = ibN;
+        itemFlushes++;
         if (n == 0) return;
         ibN = 0;
-        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !(level instanceof ServerLevel)) {
+        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || !(level instanceof ServerLevel)) {
             return;
         }
         if (!initBukkit()) {
@@ -1509,12 +1597,12 @@ public final class CeHooks {
                     IB_D[o + 3] = d.x;
                     IB_D[o + 4] = d.y;
                     IB_D[o + 5] = d.z;
-                    IB_D[o + 6] = (float) VH_FALL_DIST.get(e);
-                    Vec3 stuck = (Vec3) VH_STUCK.get(e);
+                    IB_D[o + 6] = fallDistOf(e);
+                    Vec3 stuck = (Vec3) VH_STUCK.getObj(e);
                     IB_D[o + 7] = stuck == null ? 0.0 : stuck.x;
                     IB_D[o + 8] = stuck == null ? 0.0 : stuck.y;
                     IB_D[o + 9] = stuck == null ? 0.0 : stuck.z;
-                    Object sup = VH_SUPPORTING == null ? null : VH_SUPPORTING.get(e);
+                    Object sup = e.mainSupportingBlockPos;
                     if (sup instanceof java.util.Optional<?> opt && opt.isPresent()
                             && opt.get() instanceof BlockPos bp) {
                         IB_D[o + 10] = bp.getX();
@@ -1528,7 +1616,7 @@ public final class CeHooks {
                     IB_I[oi] = e.tickCount;
                     IB_I[oi + 1] = e.age;
                     IB_I[oi + 2] = e.pickupDelay;
-                    IB_I[oi + 3] = (int) VH_DESPAWN_RATE.get(e);
+                    IB_I[oi + 3] = VH_DESPAWN_RATE.getInt(e);
                     itemResync++;
                 }
             }
@@ -1594,8 +1682,8 @@ public final class CeHooks {
                     e.age = outI[i * 3];
                     e.pickupDelay = outI[i * 3 + 1];
                     if ((bits & (1 << 7)) != 0
-                            && (int) VH_DESPAWN_RATE.get(e) == IB_I[i * 4 + 3]
-                            && e.age >= (int) VH_DESPAWN_RATE.get(e)) {
+                            && VH_DESPAWN_RATE.getInt(e) == IB_I[i * 4 + 3]
+                            && e.age >= VH_DESPAWN_RATE.getInt(e)) {
                         itemDespawn++;
                         Object ev = MH_DESPAWN_EV.invoke(e);
                         Boolean cancelled = (Boolean) ev.getClass()
@@ -1612,10 +1700,10 @@ public final class CeHooks {
                 e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
                 e.age = outI[i * 3];
                 e.pickupDelay = outI[i * 3 + 1];
-                VH_FALL_DIST.set(e, (float) outD[o + 6]);
+                setFallDist(e, (float) outD[o + 6]);
                 boolean wantGround = (bits & (1 << 1)) != 0;
                 if (wantGround != e.onGround()) {
-                    VH_ON_GROUND.set(e, wantGround);
+                    e.onGround = wantGround;
                 }
                 if ((bits & 1) != 0) { // MOVED
                     e.setPos(outD[o + 3], outD[o + 4], outD[o + 5]);
@@ -1629,8 +1717,8 @@ public final class CeHooks {
                     if (e.isRemoved()) continue;
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
-                    if ((int) VH_DESPAWN_RATE.get(e) == IB_I[i * 4 + 3]
-                            && e.age >= (int) VH_DESPAWN_RATE.get(e)) {
+                    if (VH_DESPAWN_RATE.getInt(e) == IB_I[i * 4 + 3]
+                            && e.age >= VH_DESPAWN_RATE.getInt(e)) {
                         itemDespawn++;
                         Object ev = MH_DESPAWN_EV.invoke(e);
                         Boolean cancelled = (Boolean) ev.getClass()

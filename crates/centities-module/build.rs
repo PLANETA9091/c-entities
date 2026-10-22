@@ -56,6 +56,32 @@ fn main() {
         .expect("javac (JDK 17+) must be on PATH");
     assert!(st.success(), "javac failed for CeHooks.java");
     println!("cargo:rustc-env=CE_HOOKS_CLASS={}", classes.join("dev/planeta9091/centities/CeHooks.class").display());
+
+    // Embed ALL classes (the bridge may declare nested/helper classes): a
+    // simple length-prefixed blob — [u32 count][u16 nameLen][name][u32 len][bytes]...
+    let mut names: Vec<PathBuf> = Vec::new();
+    let pkg = classes.join("dev/planeta9091/centities");
+    for e in std::fs::read_dir(&pkg).expect("compiled classes dir") {
+        let p = e.expect("entry").path();
+        if p.extension().and_then(|s| s.to_str()) == Some("class") {
+            names.push(p);
+        }
+    }
+    names.sort();
+    assert!(!names.is_empty(), "no classes compiled");
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&(names.len() as u32).to_be_bytes());
+    for n in &names {
+        let rel = n.strip_prefix(&classes).expect("rel").to_str().expect("utf8");
+        let bytes = std::fs::read(n).expect("class bytes");
+        blob.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+        blob.extend_from_slice(rel.as_bytes());
+        blob.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&bytes);
+    }
+    let blob_path = out.join("hooks_classes.bin");
+    std::fs::write(&blob_path, &blob).expect("write blob");
+    println!("cargo:rustc-env=CE_HOOKS_BLOB={}", blob_path.display());
 }
 
 /// Locate javac: PATH, JAVA_HOME, common Linux install globs.

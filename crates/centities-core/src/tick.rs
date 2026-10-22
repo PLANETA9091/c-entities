@@ -32,7 +32,7 @@ use crate::itemtick::{
     mth_equal, mth_floor, perform_collisions, voxel_shape_intersect, Aabb6, EPS7, FRICTION_F32_AS_F64,
     GATE_HORZ_SQR, ITEM_GRAVITY, MOVE_EPS, Y_DRAG,
 };
-use crate::sections::{PaletteEntry, SectionGrid, SectionProvider};
+use crate::sections::{SectionGrid, SectionProvider};
 
 /// Vanilla defaults for air / unloaded blocks (Block friction 0.6F,
 /// speedFactor 1.0F).
@@ -319,37 +319,17 @@ pub fn tick_item(
             below_step_special = st.fr_step_special;
         } else {
             let (entry, _unloaded) = sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
-            let below = entry.unwrap_or(PaletteEntry {
-                collider: None,
-                friction: AIR_FRICTION,
-                speed: AIR_SPEED,
-                is_water: false,
-                has_fluid: false,
-                cobweb: false,
-                entity_inside_special: false,
-                step_on_special: false,
-                fall_on_special: false,
-            });
-            below_friction = below.friction;
-            below_speed = below.speed;
-            below_step_special = below.step_on_special;
+            let below = entry.unwrap_or((AIR_FRICTION, AIR_SPEED, false, false, false, false, false, false));
+            below_friction = below.0;
+            below_speed = below.1;
+            below_step_special = below.6;
         }
 
         let at = (mth_floor(new_pos.0), mth_floor(new_pos.1), mth_floor(new_pos.2));
         let (entry_at, _u) = sg.block_at(at.0, at.1, at.2, env.min_section_y, env.max_section_y, provider);
-        let at_e = entry_at.unwrap_or(PaletteEntry {
-            collider: None,
-            friction: AIR_FRICTION,
-            speed: AIR_SPEED,
-            is_water: false,
-            has_fluid: false,
-            cobweb: false,
-            entity_inside_special: false,
-            step_on_special: false,
-            fall_on_special: false,
-        });
-        at_speed = if !at_e.is_water && at_e.speed == 1.0 { below_speed } else { at_e.speed };
-        at_is_water = at_e.is_water;
+        let at_e = entry_at.unwrap_or((AIR_FRICTION, AIR_SPEED, false, false, false, false, false, false));
+        at_speed = if !at_e.2 && at_e.1 == 1.0 { below_speed } else { at_e.1 };
+        at_is_water = at_e.2;
 
         // checkInsideBlocks path scan (movement < 1 block for native items;
         // the DDA branch is a safety net)
@@ -574,17 +554,17 @@ fn check_inside_blocks(
                     }
                     scratch.visited.push((bx, by, bz));
                     let (entry, unloaded) = sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
-                    let entry = match (entry, unloaded) {
-                        (Some(e), false) => e,
-                        _ => continue, // air (or unloaded -> vanilla reads air)
-                    };
-                    // getEntityInsideCollisionShape defaults to Shapes.block()
-                    // for every block: entityInside runs for any non-air
-                    // block; only the EFFECT matters.
-                    if entry.cobweb {
-                        cobweb = true;
-                    } else if entry.entity_inside_special {
-                        special = true;
+                    // (fr, speed, water, fluid, cobweb, inside, step, fall)
+                    // air (or unloaded -> vanilla reads air) yields None
+                    if let Some(e) = (match (entry, unloaded) {
+                        (Some(e), false) => Some(e),
+                        _ => None,
+                    }) {
+                        if e.4 {
+                            cobweb = true;
+                        } else if e.5 {
+                            special = true;
+                        }
                     }
                 }
             }
@@ -610,12 +590,11 @@ fn find_supporting_block(sg: &mut SectionGrid, env: &TickEnv, box_: &Aabb6, ex: 
     for cy in min_block_y..=max_block_y {
         for cz in min_block_z..=max_block_z {
             for cx in min_block_x..=max_block_x {
-                let (entry, unloaded) = sg.block_at(cx, cy, cz, env.min_section_y, env.max_section_y, provider);
-                let entry = match (entry, unloaded) {
-                    (Some(e), false) => e,
+                let (rel, unloaded) = sg.block_box_at(cx, cy, cz, env.min_section_y, env.max_section_y, provider);
+                let rel = match (rel, unloaded) {
+                    (Some(r), false) => r,
                     _ => continue,
                 };
-                let Some(rel) = entry.collider else { continue };
                 let shifted = Aabb6::new(
                     box_.x0 - cx as f64,
                     box_.y0 - cy as f64,

@@ -250,6 +250,9 @@ const F_FRIC_OFF: i32 = 8;
 const F_FORCE_VANILLA: i32 = 16;
 const F_ON_GROUND: i32 = 32;
 
+static FLUSH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUSH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     static T_IDS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static T_FLAGS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
@@ -353,6 +356,7 @@ unsafe fn n_item_tick_impl(
                                 border_margin: envv_d[5],
                             };
                             let items_native = envv_i[3] != 0;
+                            let t0 = std::time::Instant::now();
                             let world = &mut core.worlds[wid as usize];
                             let mut provider = make_provider(wid);
                             let prov: SectionProvider = &mut provider;
@@ -496,6 +500,20 @@ unsafe fn n_item_tick_impl(
                             }
                             ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 8) as i32, od.as_ptr());
                             ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n * 3) as i32, oi.as_ptr());
+                            {
+                                let dt = t0.elapsed().as_nanos() as u64;
+                                FLUSH_NANOS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+                                let cnt = FLUSH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if cnt % 200 == 0 {
+                                    let total = FLUSH_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+                                    cplug_sdk::log::info(&format!(
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}",
+                                        cnt,
+                                        total as f64 / cnt as f64 / 1000.0,
+                                        n
+                                    ));
+                                }
+                            }
                             0
                         })
                     })

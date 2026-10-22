@@ -14,7 +14,6 @@
 //! instead of gathering.
 
 use crate::itemtick::{mth_floor, voxel_shape_intersect, Aabb6};
-use std::collections::HashMap;
 
 /// 4096 blocks per section, index = x | z << 4 | y << 8.
 pub const SEC_BLOCKS: usize = 4096;
@@ -129,42 +128,167 @@ pub struct GatherFlags {
     pub fall_special: bool,
 }
 
+/// Open-addressed map from section key to data slot (the CellMap pattern:
+/// multiply-shift hash, linear probing, backward-shift deletion — no SipHash
+/// on the L6 hot path).
+struct SecMap {
+    keys: Vec<u64>, // 0 = empty (sec_key never 0: biased)
+    vals: Vec<u32>, // slot+1
+    mask: u64,
+    len: usize,
+}
+
+impl SecMap {
+    fn new(cap_pow2: usize) -> Self {
+        let n = cap_pow2.max(16);
+        SecMap { keys: vec![0; n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
+    }
+
+    #[inline]
+    fn find(&self, key: u64) -> Option<u32> {
+        let mut i = (crate::hash64(key) & self.mask) as usize;
+        loop {
+            let k = self.keys[i];
+            if k == 0 {
+                return None;
+            }
+            if k == key {
+                return Some(self.vals[i] - 1);
+            }
+            i = (i + 1) & self.mask as usize;
+        }
+    }
+
+    fn insert(&mut self, key: u64, slot: u32) {
+        if (self.len + 1) * 10 >= self.keys.len() * 7 {
+            self.grow();
+        }
+        let mut i = (crate::hash64(key) & self.mask) as usize;
+        loop {
+            let k = self.keys[i];
+            if k == 0 {
+                self.keys[i] = key;
+                self.vals[i] = slot + 1;
+                self.len += 1;
+                return;
+            }
+            if k == key {
+                self.vals[i] = slot + 1;
+                return;
+            }
+            i = (i + 1) & self.mask as usize;
+        }
+    }
+
+    fn remove(&mut self, key: u64) {
+        let mut i = (crate::hash64(key) & self.mask) as usize;
+        loop {
+            let k = self.keys[i];
+            if k == 0 {
+                return;
+            }
+            if k == key {
+                let n = self.keys.len();
+                let mut hole = i;
+                let mut j = (i + 1) & (n - 1);
+                while self.keys[j] != 0 {
+                    let ideal = (crate::hash64(self.keys[j]) & self.mask) as usize;
+                    let d = (j.wrapping_sub(ideal)) & (n - 1);
+                    let h = (hole.wrapping_sub(ideal)) & (n - 1);
+                    if h < d {
+                        self.keys[hole] = self.keys[j];
+                        self.vals[hole] = self.vals[j];
+                        hole = j;
+                    }
+                    j = (j + 1) & (n - 1);
+                }
+                self.keys[hole] = 0;
+                self.vals[hole] = 0;
+                self.len -= 1;
+                return;
+            }
+            i = (i + 1) & self.mask as usize;
+        }
+    }
+
+    fn grow(&mut self) {
+        let n = self.keys.len() * 2;
+        let old_keys = std::mem::replace(&mut self.keys, vec![0; n]);
+        let old_vals = std::mem::replace(&mut self.vals, vec![0; n]);
+        self.mask = (n - 1) as u64;
+        self.len = 0;
+        for i in 0..old_keys.len() {
+            if old_keys[i] != 0 {
+                self.insert(old_keys[i], old_vals[i] - 1);
+            }
+        }
+    }
+}
+
+/// Small per-block property copy for the hot lookups.
+pub type BlockProps = (f32, f32, bool, bool, bool, bool, bool, bool);
+
 /// Per-world section cache.
-#[derive(Default)]
 pub struct SectionGrid {
-    map: HashMap<u64, SectionData>,
+    map: SecMap,
+    data: Vec<SectionData>, // slot 0 unused
+    free: Vec<u32>,
     pub populated: u64,
     pub lookups: u64,
 }
 
 impl SectionGrid {
     pub fn new() -> SectionGrid {
-        SectionGrid { map: HashMap::new(), populated: 0, lookups: 0 }
+        SectionGrid {
+            map: SecMap::new(1 << 10),
+            data: vec![SectionData::all_air()],
+            free: Vec::new(),
+            populated: 0,
+            lookups: 0,
+        }
     }
 
     pub fn invalidate_all(&mut self) {
-        self.map.clear();
+        self.map = SecMap::new(1 << 10);
+        self.data.truncate(1);
+        self.free.clear();
     }
 
     pub fn invalidate(&mut self, cx: i32, cy: i32, cz: i32) {
-        self.map.remove(&sec_key(cx, cy, cz));
+        if let Some(slot) = self.map.find(sec_key(cx, cy, cz)) {
+            self.data[slot as usize] = SectionData::all_air(); // keep capacity
+            self.map.remove(sec_key(cx, cy, cz));
+            self.free.push(slot);
+        }
     }
 
     #[inline]
-    fn get_or_populate(&mut self, cx: i32, cy: i32, cz: i32, load: bool, provider: SectionProvider) -> Result<&SectionData, ()> {
-        if !self.map.contains_key(&sec_key(cx, cy, cz)) {
-            match provider(cx, cy, cz, load) {
-                Ok(data) => {
-                    self.populated += 1;
-                    self.map.insert(sec_key(cx, cy, cz), data);
-                }
-                Err(()) => {
-                    // Cache absence for THIS query only; do not poison the map.
-                    return Err(());
-                }
+    fn get_or_populate(&mut self, cx: i32, cy: i32, cz: i32, load: bool, provider: SectionProvider) -> Result<usize, ()> {
+        let key = sec_key(cx, cy, cz);
+        if let Some(slot) = self.map.find(key) {
+            return Ok(slot as usize);
+        }
+        match provider(cx, cy, cz, load) {
+            Ok(data) => {
+                self.populated += 1;
+                let slot = match self.free.pop() {
+                    Some(s) => {
+                        self.data[s as usize] = data;
+                        s as usize
+                    }
+                    None => {
+                        self.data.push(data);
+                        self.data.len() - 1
+                    }
+                };
+                self.map.insert(key, slot as u32);
+                Ok(slot)
+            }
+            Err(()) => {
+                // Cache absence for THIS query only; do not poison the map.
+                Err(())
             }
         }
-        Ok(&self.map[&sec_key(cx, cy, cz)])
     }
 
     /// Gather every single-cuboid block collider intersecting `box`, exactly
@@ -216,13 +340,14 @@ impl SectionGrid {
                         continue;
                     }
                     self.lookups += 1;
-                    let data = match self.get_or_populate(curr_chunk_x, curr_chunk_y, curr_chunk_z, false, provider) {
-                        Ok(d) => d,
+                    let slot = match self.get_or_populate(curr_chunk_x, curr_chunk_y, curr_chunk_z, false, provider) {
+                        Ok(s) => s,
                         Err(()) => {
                             flags.unloaded = true;
                             continue;
                         }
                     };
+                    let data = &self.data[slot];
                     if data.complex {
                         flags.complex = true;
                         // Multi-cuboid shapes are not stored as boxes; the
@@ -262,9 +387,12 @@ impl SectionGrid {
     }
 
     /// Block-state lookup used by friction / speed-factor / path-scan paths.
-    /// Returns (palette entry, unloaded) — unloaded chunks read as air,
-    /// exactly like `getBlockState` semantics the caller replicates.
-    pub fn block_at(&mut self, x: i32, y: i32, z: i32, min_section_y: i32, max_section_y: i32, provider: SectionProvider) -> (Option<PaletteEntry>, bool) {
+    /// Returns (props, unloaded) — unloaded chunks read as air, exactly like
+    /// `getBlockState` semantics the caller replicates. Props = (friction,
+    /// speed, is_water, has_fluid, cobweb, entity_inside_special,
+    /// step_on_special, fall_on_special) — a small copy, no palette clone.
+    #[allow(clippy::type_complexity)]
+    pub fn block_at(&mut self, x: i32, y: i32, z: i32, min_section_y: i32, max_section_y: i32, provider: SectionProvider) -> (Option<BlockProps>, bool) {
         let cx = x >> 4;
         let cy = y >> 4;
         let cz = z >> 4;
@@ -273,10 +401,48 @@ impl SectionGrid {
         }
         self.lookups += 1;
         match self.get_or_populate(cx, cy, cz, true, provider) {
-            Ok(data) => {
+            Ok(slot) => {
+                let data = &self.data[slot];
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
                 let idx = data.blocks[local];
-                (data.entry(idx).cloned(), false)
+                // copy only the small fields the callers need (no PaletteEntry
+                // clone on the hot path)
+                match data.entry(idx) {
+                    Some(e) => (
+                        Some((
+                            e.friction,
+                            e.speed,
+                            e.is_water,
+                            e.has_fluid,
+                            e.cobweb,
+                            e.entity_inside_special,
+                            e.step_on_special,
+                            e.fall_on_special,
+                        )),
+                        false,
+                    ),
+                    None => (None, false),
+                }
+            }
+            Err(()) => (None, true),
+        }
+    }
+
+    /// The collider of one block, for find_supporting_block (Aabb6 is Copy).
+    pub fn block_box_at(&mut self, x: i32, y: i32, z: i32, min_section_y: i32, max_section_y: i32, provider: SectionProvider) -> (Option<Aabb6>, bool) {
+        let cx = x >> 4;
+        let cy = y >> 4;
+        let cz = z >> 4;
+        if cy < min_section_y || cy > max_section_y {
+            return (None, false);
+        }
+        self.lookups += 1;
+        match self.get_or_populate(cx, cy, cz, true, provider) {
+            Ok(slot) => {
+                let data = &self.data[slot];
+                let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
+                let idx = data.blocks[local];
+                (data.entry(idx).and_then(|e| e.collider), false)
             }
             Err(()) => (None, true),
         }

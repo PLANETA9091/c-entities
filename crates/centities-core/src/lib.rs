@@ -69,7 +69,7 @@ impl Aabb {
 }
 
 #[inline]
-fn hash64(mut x: u64) -> u64 {
+pub fn hash64(mut x: u64) -> u64 {
     // splitmix64 finalizer: good avalanche, constant-time, dependency-free
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
