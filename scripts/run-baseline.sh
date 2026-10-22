@@ -85,11 +85,16 @@ fi
 
 cd "$S"
 XMX="${XMX:-8G}"
-echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off}"
+# Bisect knobs (workflow_dispatch inputs): CE_ITEM_TICK is read via
+# System.getenv; the merge knob is a system property in CeHooks — map it.
+export CE_ITEM_TICK="${CE_ITEM_TICK:-1}"
+if [ "${CE_MERGE:-1}" = "0" ]; then MERGE_PROP="-Dcentities.mergeFast=false"; else MERGE_PROP=""; fi
+echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=$CE_MERGE"
 # ExitOnOutOfMemoryError: a JVM OOM must fail FAST (FATAL with logs) instead
 # of GC-thrashing the VM into a kernel-OOM runner death.
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
+  ${MERGE_PROP} \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
@@ -110,7 +115,10 @@ JPID=$!
     NRSS=$(ps -o rss= -C node 2>/dev/null | awk 'NR==1{printf "%.0fMB", $1/1024}')
     SYSMEM=$(free -m 2>/dev/null | awk '/Mem:/{printf "%s/%sMB", $3, $2}')
     echo "WD[$i] rss java=$JRSS node=${NRSS:-0} mem=$SYSMEM"
-    jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1
+    # jcmd attaches via the VM's attach mechanism — it can STALL for minutes
+    # on a busy JVM (observed: the watchdog hung inside jcmd and the NMT
+    # sample never landed). Hard-cap it.
+    timeout 5 jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1
     grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3
   done
 ) &

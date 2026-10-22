@@ -17,6 +17,12 @@ on:
       only:
         description: 'comma-separated leg names to run (empty = full matrix). Artifacts only — the publish job is skipped so partial reruns never overwrite committed reports.'
         default: ''
+      ce_item_tick:
+        description: 'CE_ITEM_TICK for the mod leg (1=on, 0=item pipeline off — bisect knob)'
+        default: '1'
+      ce_merge:
+        description: 'CE_MERGE for the mod leg (1=on, 0=merge fast path off — bisect knob)'
+        default: '1'
 
 permissions:
   contents: write
@@ -84,15 +90,15 @@ jobs:
       - name: Install mineflayer
         run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
       - name: Run paired A/B (vanilla then module, same runner)
-        if: matrix.AB == '1'
+        if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: |
           bash scripts/run-baseline.sh
-          MODULE=on RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
+          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
-        if: matrix.AB != '1'
+        if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh
       - name: Upload artifacts (paired A/B leg)
-        if: always()
+        if: matrix.AB == '1' && always() && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         uses: actions/upload-artifact@v4
         with:
           name: baseline-${{ matrix.name }}
@@ -100,7 +106,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Upload artifacts (paired module leg)
-        if: matrix.AB == '1' && always()
+        if: matrix.AB == '1' && always() && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         uses: actions/upload-artifact@v4
         with:
           name: baseline-${{ matrix.name }}-mod
@@ -111,6 +117,9 @@ jobs:
 
   publish:
     needs: run
+    # A partial rerun (workflow_dispatch with `only`) must never overwrite
+    # the committed full-matrix reports with a subset.
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.only == ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
