@@ -12,7 +12,11 @@ on:
       - 'baseline/**'
       - 'scripts/**'
       - 'crates/**'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'comma-separated leg names to run (empty = full matrix). Artifacts only — the publish job is skipped so partial reruns never overwrite committed reports.'
+        default: ''
 
 permissions:
   contents: write
@@ -23,6 +27,10 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # ubuntu-26 runner images reclaim long JVM-heavy jobs (three runs lost
+      # their big legs to 'runner shutdown'); capping parallel legs also
+      # keeps the account-level concurrency spike bounded.
+      max-parallel: 6
       matrix:
         include:
           - { name: control,    SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
@@ -51,7 +59,10 @@ jobs:
       MEASURE_TICKS: ${{ matrix.MEASURE }}
       AREA: ${{ matrix.AREA || '150' }}
       RUN_TIMEOUT: '1100'
-      XMX: '5G'   # 8G + JFR + 100k entities OOM-killed the 16GB runner on the big legs
+      # 8G + JFR + 100k entities OOM-killed the 16GB runner on the big legs;
+      # 5G still died on the new ubuntu-26 images — 4G plus the JFR maxsize
+      # cap keeps the JVM footprint well inside the runner budget.
+      XMX: '4G'
       MODULE: ${{ matrix.MODULE || 'off' }}
     steps:
       - uses: actions/checkout@v4

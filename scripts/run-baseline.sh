@@ -73,7 +73,7 @@ echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
-  -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true" \
+  -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
   -jar paper.jar nogui > "$R/server.log" 2>&1 &
 JPID=$!
 

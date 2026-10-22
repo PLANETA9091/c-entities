@@ -27,6 +27,7 @@ const LEVEL_CLASS: &str = "net/minecraft/world/level/Level";
 const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
 const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup";
 const ITEM_ENTITY_CLASS: &str = "net/minecraft/world/entity/item/ItemEntity";
+const SERVER_LEVEL_CLASS: &str = "net/minecraft/server/level/ServerLevel";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -356,6 +357,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(ENTITY_CLASS, |_n, b| patch_entity(b));
     cplug_sdk::hooks::register_bytes(LOOKUP_CLASS, |_n, b| patch_lookup(b));
     cplug_sdk::hooks::register_bytes(ITEM_ENTITY_CLASS, |_n, b| patch_item(b));
+    cplug_sdk::hooks::register_bytes(SERVER_LEVEL_CLASS, |_n, b| patch_serverlevel(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -399,6 +401,7 @@ fn arm_module() {
     precompute_level(loader);
     force_init_item_entity_raw(loader);
     precompute_item(loader);
+    precompute_serverlevel(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -408,6 +411,7 @@ fn arm_module() {
         ENTITY_CLASS,
         LOOKUP_CLASS,
         ITEM_ENTITY_CLASS,
+        SERVER_LEVEL_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!(
@@ -430,6 +434,7 @@ fn arm_module() {
             (ENTITY_CLASS, Counter::Boxes),
             (LOOKUP_CLASS, Counter::Adds),
             (ITEM_ENTITY_CLASS, Counter::ItemChecks),
+            (SERVER_LEVEL_CLASS, Counter::DispChecks),
         ];
         let merge_woven = MERGE_WOVEN.load(Ordering::Acquire);
         let mut logged_done = false;
@@ -659,6 +664,86 @@ fn precompute_item(loader: jni::jobject) {
     }
 }
 
+/// L7 dispatch takeover: the tick is suppressed ONE LEVEL HIGHER — a
+/// conditional early-return prefix on `ServerLevel.tickNonPassenger(Entity)`:
+///
+///   if (CeHooks.itemDispatch(entity)) return;
+///   ...vanilla dispatcher: setOldPosAndRot, tickCount++/totalEntityAge++,
+///      profiler, checkIfActive (AABB vs players), tick()/inactiveTick(),
+///      postTick (handlePortal), passengers...
+///
+/// For a dispatch-owned item the Rust core computes the equivalent of the
+/// ENTIRE body natively (active: full physics tick; inactive: the
+/// inactiveTick semantics), and the applier mirrors the dispatcher's
+/// tickCount/totalEntityAge side effects. A suppressed item therefore skips
+/// setOldPosAndRot (5% of tick CPU at 100k items), the per-entity profiler
+/// push (a lambda alloc per entity per tick), checkIfActive's AABB work and
+/// the tick() entry itself — the Java per-item floor collapses to the guard.
+///
+/// BEST-EFFORT: if this weave is refused, the module still arms at the L6
+/// level (the ItemEntity.tick guard computes the tick natively; only the
+/// dispatcher floor stays vanilla).
+fn precompute_serverlevel(loader: jni::jobject) {
+    let stash = STASH.lock().ok().and_then(|mut s| s.remove(SERVER_LEVEL_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info("[c-entities] precompute ServerLevel dispatch: original bytes not seen at boot");
+        return;
+    };
+    let spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "tickNonPassenger",
+        method_desc: "(Lnet/minecraft/world/entity/Entity;)V",
+        check_class: HOOKS_CLASS,
+        check_name: "itemDispatch",
+        check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+    };
+    let patched =
+        cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+        });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(SERVER_LEVEL_CLASS, b);
+            }
+            cplug_sdk::log::info("[c-entities] precomputed ServerLevel dispatch guard");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ServerLevel dispatch — L6 tick guard kept",
+            );
+        }
+    }
+}
+
+fn patch_serverlevel(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_serverlevel_inner(bytes)).ok().flatten()
+}
+
+fn patch_serverlevel_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The guard is
+        // woven at arm time (precompute_serverlevel) — outside the callback.
+        let mut st = STASH.lock().ok()?;
+        st.entry(SERVER_LEVEL_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(SERVER_LEVEL_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ServerLevel tickNonPassenger dispatch guard");
+            Some(b)
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] FAILED to patch ServerLevel dispatch — vanilla kept");
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Counter {
     Queries,
@@ -667,6 +752,7 @@ enum Counter {
     RestChecks,
     MergeChecks,
     ItemChecks,
+    DispChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -689,6 +775,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::RestChecks, ("restChecks", "J")),
             (Counter::MergeChecks, ("mergeChecks", "J")),
             (Counter::ItemChecks, ("itemChecks", "J")),
+            (Counter::DispChecks, ("dispChecks", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);

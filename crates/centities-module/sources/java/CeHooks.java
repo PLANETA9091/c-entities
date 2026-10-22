@@ -413,6 +413,8 @@ public final class CeHooks {
                 + "/" + dbgExpSlot + "/" + dbgMisses
                 + " item=" + itemChecks + "/" + itemNative + "/" + itemResync
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
+                + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
+                + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -559,6 +561,10 @@ public final class CeHooks {
      *  Waking a non-resting entity is one array read + branch (~3ns). */
     public static void probeDelta(Entity e) {
         try {
+            // L7 first: an external velocity change on a dispatch-owned item
+            // clears its native mode (the applier's own writebacks run inside
+            // IN_ITEM_APPLY and do not trip this).
+            l7ExternalMutation(e);
             if (e != null) {
                 int m = e.getId() & AMASK;
                 if (REST_GEN[m] != 0) { // resting: decide whether the impulse
@@ -621,6 +627,11 @@ public final class CeHooks {
      *  probeAdd — and for no-op positions). */
     public static void probeBox(Entity e, AABB newBox) {
         try {
+            // L7 first (cheapest checks inside): an external box change on a
+            // dispatch-owned item clears its native mode. Runs even when the
+            // query index is suspended (INDEXING false) — correctness does
+            // not depend on the index.
+            l7ExternalMutation(e);
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
                 probesBox++;
                 ARENA[e.getId() & AMASK] = e;
@@ -1331,6 +1342,193 @@ public final class CeHooks {
     public static final int IF_FORCE_VANILLA = 16;  // fresh-flag gate: vanilla this tick
     public static final int IF_ON_GROUND = 32;      // e.onGround() at collect time
 
+    // ==================================================================
+    // L7 — DISPATCH TAKEOVER.
+    //
+    // The vanilla dispatcher (ServerLevel.tickNonPassenger) runs, per
+    // entity per tick: setOldPosAndRot (~5% of tick CPU at 100k items),
+    // tickCount++/totalEntityAge++, TWO profiler pushes (one allocates a
+    // capturing lambda per entity per tick), ActivationRange.checkIfActive
+    // (entity-vs-player AABB work) and only THEN tick()/inactiveTick() +
+    // postTick (handlePortal). The L6 tick guard already suppressed the
+    // tick BODY for native items — every native item still paid this full
+    // dispatcher floor.
+    //
+    // itemDispatch (woven as an early-return guard on tickNonPassenger)
+    // suppresses the DISPATCHER itself for items the core owns. Correctness
+    // contract, layered:
+    //   1. MODE native (the flush re-evaluates the mode every tick);
+    //   2. cheap field gates: removed / noPhysics / portal / passengers /
+    //      empty stack route vanilla immediately;
+    //   3. WORLD_REV gate: if ANY block changed since this item's last
+    //      native tick, run the expensive fresh-flag gates (fluids, fire,
+    //      despawnTime) so water flowing onto a resting item is exact on
+    //      the very tick it happens; steady state costs nothing;
+    //   4. external mutations: probeBox/probeDelta clear the item's mode
+    //      synchronously (any setBoundingBox/setDeltaMovement outside the
+    //      applier's writeback window);
+    //   5. activation: a byte-faithful port of checkIfActive for items
+    //      (incl. the (tickCount+id)%4 force-active rotation, the 200-tick
+    //      grace and the 20-tick temporary wake with immunity probing)
+    //      decides native-active vs native-inactive; its side effects are
+    //      reproduced exactly;
+    //   6. the 256-tick cadence belt (core-side): one full vanilla tick +
+    //      re-ingest per 256 native ticks heals any residual drift window;
+    //   7. the applier mirrors the suppressed dispatcher's tickCount++ /
+    //      totalEntityAge++ so the Java entity stays dispatcher-fresh.
+    // Any uncertainty returns false — the vanilla dispatcher runs and the
+    // L6 tick guard collects exactly as before (graceful degradation to L6
+    // if this weave is refused).
+    // ==================================================================
+    public static volatile long dispChecks = 0, dispNative = 0,
+            dispInactive = 0, dispPass = 0, dispGate = 0;
+
+    /** World revision: bumped by the flush whenever any section changed
+     *  since the previous flush. MODE_REV[slot] stamps the revision that
+     *  was current at the item's latest re-evaluation; a mismatch forces
+     *  the expensive fresh-flag gates for that item on the next dispatch. */
+    public static final int[] MODE_REV = new int[1 << 22];
+    public static volatile int WORLD_REV = 0;
+    /** The applier's writeback window: setPos/setDeltaMovement fired inside
+     *  the flush are OUR writes, not external mutations — the box/delta
+     *  probes must not clear native modes for them. */
+    static boolean IN_ITEM_APPLY = false;
+
+    /**
+     * Woven EarlyReturnGuard on ServerLevel.tickNonPassenger(Entity):
+     * true = the vanilla dispatcher body is suppressed (the Rust core
+     * computes this item's tick natively at the flush).
+     */
+    public static boolean itemDispatch(Entity ent) {
+        dispChecks++;
+        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady) return false;
+        if (!(ent instanceof ItemEntity e)) return false;
+        if (ibN >= IB_CAP) return false;
+        try {
+            if (e.level().isClientSide) return false;
+            int slot = e.getId() & MAMASK;
+            if (MODE_GEN[slot] != MODE_EPOCH || MODE_VAL[slot] == 0) {
+                dispPass++;
+                return false;
+            }
+            // cheap fresh-flag gates: always plain field reads
+            if (e.isRemoved() || e.noPhysics
+                    || e.portalProcess != null || e.portalCooldown > 0
+                    || e.getItem().isEmpty()) {
+                dispPass++;
+                return false;
+            }
+            if (!e.getPassengers().isEmpty()) {
+                dispPass++;
+                return false;
+            }
+            // the world's block set changed since this item's last native
+            // tick: the expensive gates decide (their L6 pre-tick role)
+            if (MODE_REV[slot] != WORLD_REV) {
+                dispGate++;
+                if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
+                        || despawnTimeOf(e) >= 0) {
+                    dispPass++;
+                    return false;
+                }
+            }
+            boolean active = itemCheckActive(e);
+            appendDispatch(e, active);
+            if (active) {
+                dispNative++;
+            } else {
+                dispInactive++;
+            }
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "itemDispatch: " + t;
+            ACTIVE = false;
+            return false;
+        }
+    }
+
+    /**
+     * Byte-faithful port of ActivationRange.checkIfActive(Entity) for
+     * ItemEntity (io.papermc.paper.entity.activation.ActivationRange,
+     * javap-verified on the shipped 1.21.8-60 jar), INCLUDING its side
+     * effects (isTemporarilyActive=false on every call; the 20-tick
+     * immunity wakeup). The vanilla dispatcher increments tickCount BEFORE
+     * calling checkIfActive; this guard runs pre-increment, so every
+     * tickCount read is (field + 1). The portal branches are unreachable:
+     * itemDispatch routes portalProcess/portalCooldown items vanilla.
+     */
+    private static boolean itemCheckActive(ItemEntity e) {
+        if ((e.tickCount + 1 + e.getId()) % 4 == 0) return true;
+        if (e.defaultActivationState) return true;
+        if (e.tickCount + 1 < 200) return true; // isAlive(): isRemoved gated above
+        long cur = net.minecraft.server.MinecraftServer.currentTick;
+        boolean isActive = e.activatedTick >= cur;
+        e.isTemporarilyActive = false;
+        if (!isActive && (cur - e.activatedTick - 1L) % 20L == 0L) {
+            int i = itemImmunities(e);
+            if (i >= 0) {
+                e.activatedTick = cur + i;
+            } else {
+                e.isTemporarilyActive = true;
+            }
+            isActive = true;
+        }
+        return isActive;
+    }
+
+    /**
+     * The ItemEntity slice of ActivationRange.checkEntityImmunities
+     * (byte-faithful): items are neither AbstractArrow nor LivingEntity and
+     * their activationType is MISC (checkInactiveWakeup returns -1 for
+     * MISC), so the port reduces to: fire -> 2, immunity stamp -> 1,
+     * water+fluid-push -> 100, not-on-ground -> 100, on-ground-and-moving
+     * -> 100, else -1 (temporarily active for this tick only).
+     */
+    private static int itemImmunities(ItemEntity e) {
+        if (e.getRemainingFireTicks() > 0) return 2;
+        long cur = net.minecraft.server.MinecraftServer.currentTick;
+        if (e.activatedImmunityTick >= cur) return 1;
+        if (e.isInWater() && e.isPushedByFluid()) return 100;
+        if (!e.onGround()) return 100;
+        if (e.getDeltaMovement().horizontalDistanceSqr() > 9.999999747378752E-6) {
+            return 100;
+        }
+        return -1;
+    }
+
+    /** L7 dispatch append: the entry carries ONLY the id + flags — the Rust
+     *  store owns the full state for IF_NATIVE entries (hydrated from the
+     *  last commit). pickupDelay is re-read fresh every dispatch (plugin
+     *  parity: a mid-flight change must win over the stored value; the
+     *  flush compares and prefers the batch). */
+    private static void appendDispatch(ItemEntity e, boolean active) {
+        int i = ibN;
+        ibN = i + 1;
+        IB_IDS[i] = e.getId();
+        IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE);
+        int o = i * 10;
+        for (int j = 0; j < 14; j++) IB_D[o + j] = 0.0;
+        IB_I[i * 4] = 0;
+        IB_I[i * 4 + 1] = 0;
+        IB_I[i * 4 + 2] = e.pickupDelay;
+        IB_I[i * 4 + 3] = 0;
+    }
+
+    /** L7: an external mutation of this item (box or velocity change
+     *  outside the applier's window) clears its native mode — the next
+     *  dispatch routes it vanilla and the L6 tick guard re-ingests the
+     *  fresh state. Called from probeBox/probeDelta BEFORE their indexing
+     *  gates (it must fire even when the query index is suspended). */
+    private static void l7ExternalMutation(Entity e) {
+        if (ITEM_TICK_ON && !IN_ITEM_APPLY && e instanceof ItemEntity) {
+            int slot = e.getId() & MAMASK;
+            if (MODE_GEN[slot] == MODE_EPOCH) {
+                MODE_VAL[slot] = 0;
+            }
+        }
+    }
+
     private static int wakeSlot(int wid, int cx, int cz) {
         // [wid:3][cx:8][cz:8] = 2^19 slots — cells beyond ±2048 blocks per
         // axis wrap into other slots: a spurious wake (safe direction),
@@ -1527,6 +1725,27 @@ public final class CeHooks {
         // fresh by the tick collector when the item reactivates, so a vanilla
         // inactivity window is bit-exact. The guard weave stays (the counter
         // proves the weave is live; the mode table is never consulted here).
+        //
+        // L7 EXCEPTION: dispatch-inactive items are OWNED by the core (the
+        // dispatcher itself is suppressed). The 256-tick cadence belt flags
+        // such an item VANILLA_NEXT at the flush, its next inactiveTick runs
+        // vanilla — collect it HERE (once) so the flush re-ingests the
+        // post-tick state and re-arms the mode. GEN==EPOCH && VAL==0
+        // identifies exactly those (recently owned, currently vanilla); the
+        // forever-vanilla population has a stale GEN and stays free.
+        if (ACTIVE && ITEM_TICK_ON && cplugReady && ibN < IB_CAP
+                && !e.level().isClientSide) {
+            try {
+                int slot = e.getId() & MAMASK;
+                if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
+                    appendItem(e, IF_INACTIVE | IF_RESYNC);
+                }
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = "itemInactiveCollect: " + t;
+                ACTIVE = false;
+            }
+        }
         return false;
     }
 
@@ -1636,29 +1855,39 @@ public final class CeHooks {
             envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
 
             double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
-            int[] outI = growI(n * 3);    // age, pickupDelay, bits
+            int[] outI = growI(n * 4);    // age, pickupDelay, bits, tickCount (L7)
 
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_D, IB_I,
                     envD, envI, outD, outI);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
             }
+            // L7 world revision: the stamps written below record the revision
+            // CURRENT BEFORE this drain — any bump after an item's stamp
+            // forces its expensive fresh-flag gates on the next dispatch.
+            int revBefore = WORLD_REV;
             // drain the section invalidations (next tick's gather sees the
             // new blocks; the vanilla_next routing self-heals this tick)
             if (sdN > 0 && sdWid >= 0) {
                 nativeItemInvalidate(sdWid, sdN, SD_X, SD_Y, SD_Z);
                 sdN = 0;
                 sdWid = -1;
+                WORLD_REV = revBefore + 1;
             }
 
-            // pass 2: apply, in batch order (== vanilla entity tick order)
+            // pass 2: apply, in batch order (== vanilla entity tick order).
+            // The writebacks fire setPos/setDeltaMovement → probeBox/probeDelta
+            // — IN_ITEM_APPLY marks them as OUR writes (no mode clearing).
+            IN_ITEM_APPLY = true;
+            try {
             int epoch = MODE_EPOCH + 1;
             for (int i = 0; i < n; i++) {
                 int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
                 int f = IB_FLAGS[i];
-                int bits = outI[i * 3 + 2];
+                int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
                 MODE_GEN[mSlot] = epoch;
+                MODE_REV[mSlot] = revBefore;
                 if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
                     MODE_VAL[mSlot] = 0;
                     itemVanillaNext++;
@@ -1677,29 +1906,40 @@ public final class CeHooks {
                 Entity ref = arenaRef(IB_IDS[i]);
                 if (!(ref instanceof ItemEntity)) continue;
                 ItemEntity e = (ItemEntity) ref;
+                // L7: mirror the suppressed dispatcher's tickCount++ and
+                // totalEntityAge++ (the vanilla tickNonPassenger body was
+                // skipped for dispatch-owned entries).
+                e.tickCount = outI[i * 4 + 3];
+                e.totalEntityAge = e.totalEntityAge + 1;
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
-                    e.age = outI[i * 3];
-                    e.pickupDelay = outI[i * 3 + 1];
-                    if ((bits & (1 << 7)) != 0
-                            && VH_DESPAWN_RATE.getInt(e) == IB_I[i * 4 + 3]
-                            && e.age >= VH_DESPAWN_RATE.getInt(e)) {
-                        itemDespawn++;
-                        Object ev = MH_DESPAWN_EV.invoke(e);
-                        Boolean cancelled = (Boolean) ev.getClass()
-                                .getMethod("isCancelled").invoke(ev);
-                        if (cancelled) {
-                            e.age = 0;
-                        } else {
-                            MH_DISCARD.invoke(e, CAUSE_DESPAWN);
+                    e.age = outI[i * 4];
+                    e.pickupDelay = outI[i * 4 + 1];
+                    if ((bits & (1 << 7)) != 0) {
+                        int rate = VH_DESPAWN_RATE.getInt(e);
+                        // IF_NATIVE entries carry no batch despawnRate — the
+                        // field IS the truth (ctor-fixed in vanilla); the
+                        // age check below still gates the event.
+                        boolean rateOk = (f & IF_NATIVE) != 0
+                                || rate == IB_I[i * 4 + 3];
+                        if (rateOk && e.age >= rate) {
+                            itemDespawn++;
+                            Object ev = MH_DESPAWN_EV.invoke(e);
+                            Boolean cancelled = (Boolean) ev.getClass()
+                                    .getMethod("isCancelled").invoke(ev);
+                            if (cancelled) {
+                                e.age = 0;
+                            } else {
+                                MH_DISCARD.invoke(e, CAUSE_DESPAWN);
+                            }
                         }
                     }
                     continue;
                 }
                 int o = i * 8;
                 e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
-                e.age = outI[i * 3];
-                e.pickupDelay = outI[i * 3 + 1];
+                e.age = outI[i * 4];
+                e.pickupDelay = outI[i * 4 + 1];
                 setFallDist(e, (float) outD[o + 6]);
                 boolean wantGround = (bits & (1 << 1)) != 0;
                 if (wantGround != e.onGround()) {
@@ -1717,8 +1957,10 @@ public final class CeHooks {
                     if (e.isRemoved()) continue;
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
-                    if (VH_DESPAWN_RATE.getInt(e) == IB_I[i * 4 + 3]
-                            && e.age >= VH_DESPAWN_RATE.getInt(e)) {
+                    int rate = VH_DESPAWN_RATE.getInt(e);
+                    boolean rateOk = (f & IF_NATIVE) != 0
+                            || rate == IB_I[i * 4 + 3];
+                    if (rateOk && e.age >= rate) {
                         itemDespawn++;
                         Object ev = MH_DESPAWN_EV.invoke(e);
                         Boolean cancelled = (Boolean) ev.getClass()
@@ -1744,8 +1986,12 @@ public final class CeHooks {
                 }
             }
             MODE_EPOCH = epoch;
+            } finally {
+                IN_ITEM_APPLY = false;
+            }
         } catch (Throwable t) {
             ibN = 0;
+            IN_ITEM_APPLY = false;
             lastError = System.nanoTime();
             lastErrorText = "itemTickFlush: " + t;
             t.printStackTrace();

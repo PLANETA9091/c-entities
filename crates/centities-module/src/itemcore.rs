@@ -25,6 +25,29 @@ const STORE_MASK: u64 = (STORE_CAP - 1) as u64;
 #[derive(Clone, Copy)]
 struct ItemEntry {
     tag: u64, // (id >> 17) | 1 — validity check against slot aliasing
+    // L7 dispatch-owned state: for IF_NATIVE entries the STORE is the source
+    // of truth (the dispatch guard suppresses the whole vanilla dispatcher,
+    // so nothing else reads or writes these fields between flushes; the
+    // applier mirrors every commit back into the entity). Probed external
+    // mutations (setBoundingBox/setDeltaMovement prefixes) clear the item's
+    // native mode, forcing a full vanilla tick + re-ingest.
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    age: i32,
+    pickup_delay: i32,
+    tick_count: i32,
+    despawn_rate: i32,
+    fall_dist: f32,
+    on_ground: bool,
+    /// Consecutive native aborts without a commit. >= 4 forces VANILLA_NEXT
+    /// so a permanently-imprecise item cannot freeze forever (vanilla runs,
+    /// the resync re-ingests, the streak resets).
+    aborts: u8,
+    // L6 persistent parts (Java cannot cheaply provide these every tick)
     stuck: (f64, f64, f64),
     sup: (i32, i32, i32),
     sup_present: bool,
@@ -39,6 +62,21 @@ impl ItemEntry {
     fn fresh(tag: u64) -> ItemEntry {
         ItemEntry {
             tag,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            age: 0,
+            pickup_delay: 0,
+            tick_count: 0,
+            // 6000 = vanilla default; a dispatch entry can only appear after
+            // a resync flush ingested the real value, so this is a seatbelt.
+            despawn_rate: 6000,
+            fall_dist: 0.0,
+            on_ground: false,
+            aborts: 0,
             stuck: (0.0, 0.0, 0.0),
             sup: (0, 0, 0),
             sup_present: false,
@@ -56,6 +94,22 @@ pub struct ItemWorld {
     entries: Vec<ItemEntry>,
     pub grid: SectionGrid,
     pub scratch: Scratch,
+}
+
+/// The full per-entry state snapshot used by the L7 dispatch protocol.
+struct EntryState {
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    age: i32,
+    pickup_delay: i32,
+    tick_count: i32,
+    despawn_rate: i32,
+    fall_dist: f32,
+    on_ground: bool,
 }
 
 impl ItemWorld {
@@ -83,14 +137,23 @@ impl ItemWorld {
     }
 }
 
-/// Per-world item cores (wid 0..7).
+/// Per-world item cores (wid 0..7). Worlds are LAZY: each ItemWorld costs
+/// ~20 MB (131072 entries x full state), and a server typically ticks 1-3
+/// worlds — preallocating all 8 burned ~160 MB of native memory for nothing
+/// (the 100k-item bench legs died with runner shutdowns at exactly this
+/// kind of resident overhead).
 pub struct ItemCore {
-    pub worlds: Vec<ItemWorld>,
+    pub worlds: Vec<Option<ItemWorld>>,
 }
 
 impl ItemCore {
     pub fn new() -> ItemCore {
-        ItemCore { worlds: (0..8).map(|_| ItemWorld::new()).collect() }
+        ItemCore { worlds: (0..8).map(|_| None).collect() }
+    }
+
+    #[inline]
+    pub fn world(&mut self, wid: usize) -> &mut ItemWorld {
+        self.worlds[wid].get_or_insert_with(ItemWorld::new)
     }
 }
 
@@ -331,7 +394,10 @@ unsafe fn n_item_tick_impl(
                             idv.resize(n, 0);
                             fv.resize(n, 0);
                             od.resize(n * 8, 0.0);
-                            oi.resize(n * 3, 0);
+                            // L7 outI layout: [age, pickupDelay, bits, tickCount] —
+                            // the applier mirrors the dispatcher's tickCount++/totalEntityAge++
+                            // for entries whose vanilla dispatcher was suppressed.
+                            oi.resize(n * 4, 0);
                             ((*vt).GetLongArrayRegion)(raw, ids, 0, n as i32, idv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
                             ((*vt).GetDoubleArrayRegion)(raw, in_d, 0, (n * 14) as i32, d.as_mut_ptr());
@@ -357,7 +423,7 @@ unsafe fn n_item_tick_impl(
                             };
                             let items_native = envv_i[3] != 0;
                             let t0 = std::time::Instant::now();
-                            let world = &mut core.worlds[wid as usize];
+                            let world = core.world(wid as usize);
                             let mut provider = make_provider(wid);
                             let prov: SectionProvider = &mut provider;
                             for k in 0..n {
@@ -398,6 +464,9 @@ unsafe fn n_item_tick_impl(
                                 if (f & (F_RESYNC | F_FORCE_VANILLA)) != 0 {
                                     // vanilla body ran this tick: ingest the fresh
                                     // state (incl. stuck/sup) and re-eval the mode.
+                                    // L7: FULL state ingest — the entry becomes the
+                                    // dispatch-owned source of truth once the item
+                                    // re-arms, so everything must be current here.
                                     let entry = world.entry(id);
                                     entry.stuck = (d[k * 14 + 7], d[k * 14 + 8], d[k * 14 + 9]);
                                     entry.sup = (
@@ -406,6 +475,19 @@ unsafe fn n_item_tick_impl(
                                         d[k * 14 + 12] as i32,
                                     );
                                     entry.sup_present = d[k * 14 + 13] != 0.0;
+                                    entry.x = d[k * 14];
+                                    entry.y = d[k * 14 + 1];
+                                    entry.z = d[k * 14 + 2];
+                                    entry.dx = d[k * 14 + 3];
+                                    entry.dy = d[k * 14 + 4];
+                                    entry.dz = d[k * 14 + 5];
+                                    entry.age = iv[k * 4 + 1];
+                                    entry.pickup_delay = iv[k * 4 + 2];
+                                    entry.tick_count = iv[k * 4];
+                                    entry.despawn_rate = iv[k * 4 + 3];
+                                    entry.fall_dist = d[k * 14 + 6] as f32;
+                                    entry.on_ground = (f & F_ON_GROUND) != 0;
+                                    entry.aborts = 0;
                                     st.stuck = entry.stuck;
                                     st.sup_x = entry.sup.0;
                                     st.sup_y = entry.sup.1;
@@ -421,10 +503,14 @@ unsafe fn n_item_tick_impl(
                                     od[k * 8] = st.dx;
                                     od[k * 8 + 1] = st.dy;
                                     od[k * 8 + 2] = st.dz;
+                                    od[k * 8 + 3] = st.x;
+                                    od[k * 8 + 4] = st.y;
+                                    od[k * 8 + 5] = st.z;
                                     od[k * 8 + 6] = st.fall_dist as f64;
-                                    oi[k * 3] = st.age;
-                                    oi[k * 3 + 1] = st.pickup_delay;
-                                    oi[k * 3 + 2] = bits;
+                                    oi[k * 4] = st.age;
+                                    oi[k * 4 + 1] = st.pickup_delay;
+                                    oi[k * 4 + 2] = bits;
+                                    oi[k * 4 + 3] = st.tick_count;
                                     continue;
                                 }
                                 // hydrate the persistent parts
@@ -443,6 +529,53 @@ unsafe fn n_item_tick_impl(
                                         st.fr_step_special = entry.fr_step_special;
                                     }
                                 }
+                                // L7 dispatch-owned entries: the STORE is the state
+                                // source (the vanilla dispatcher was suppressed, the
+                                // batch carries no fresh fields except the guard's
+                                // pickupDelay read for plugin parity).
+                                if (f & F_NATIVE) != 0 {
+                                    let es = {
+                                        let e = world.entry(id);
+                                        EntryState {
+                                            x: e.x,
+                                            y: e.y,
+                                            z: e.z,
+                                            dx: e.dx,
+                                            dy: e.dy,
+                                            dz: e.dz,
+                                            age: e.age,
+                                            pickup_delay: e.pickup_delay,
+                                            tick_count: e.tick_count,
+                                            despawn_rate: e.despawn_rate,
+                                            fall_dist: e.fall_dist,
+                                            on_ground: e.on_ground,
+                                        }
+                                    };
+                                    st.x = es.x;
+                                    st.y = es.y;
+                                    st.z = es.z;
+                                    st.dx = es.dx;
+                                    st.dy = es.dy;
+                                    st.dz = es.dz;
+                                    st.xo = es.x;
+                                    st.yo = es.y;
+                                    st.zo = es.z;
+                                    st.age = es.age;
+                                    st.despawn_rate = es.despawn_rate;
+                                    st.fall_dist = es.fall_dist;
+                                    st.on_ground = es.on_ground;
+                                    st.on_ground_no_blocks = world.entry(id).sup_no_blocks;
+                                    // the suppressed tickNonPassenger would have ++ed
+                                    st.tick_count = es.tick_count.wrapping_add(1);
+                                    // plugin-parity: the guard re-read pickupDelay
+                                    // every tick; a mid-flight change wins.
+                                    let fresh_pd = iv[k * 4 + 2];
+                                    if fresh_pd != es.pickup_delay {
+                                        st.pickup_delay = fresh_pd;
+                                    } else {
+                                        st.pickup_delay = es.pickup_delay;
+                                    }
+                                }
                                 let outcome = if (f & F_INACTIVE) != 0 {
                                     tick_item_inactive(&mut st)
                                 } else {
@@ -451,14 +584,26 @@ unsafe fn n_item_tick_impl(
                                 if outcome.has(TickOutcome::ABORTED) {
                                     // no commit, no writeback: the item froze
                                     // this tick; vanilla computes it next tick.
-                                    let mode = if items_native
-                                        && centities_core::tick::want_native(&st, &tenv)
-                                    {
-                                        B_NATIVE_OK
-                                    } else {
-                                        B_VANILLA_NEXT
+                                    // L7 seatbelt: an item that aborts 4 times
+                                    // in a row must not freeze forever — force
+                                    // a vanilla tick (the resync re-ingests and
+                                    // clears the streak).
+                                    let (mode, clear) = {
+                                        let entry = world.entry(id);
+                                        entry.aborts = entry.aborts.saturating_add(1);
+                                        if items_native
+                                            && entry.aborts < 4
+                                            && centities_core::tick::want_native(&st, &tenv)
+                                        {
+                                            (B_NATIVE_OK, false)
+                                        } else {
+                                            (B_VANILLA_NEXT, true)
+                                        }
                                     };
-                                    oi[k * 3 + 2] = B_ABORTED | mode;
+                                    if clear {
+                                        world.entry(id).aborts = 0;
+                                    }
+                                    oi[k * 4 + 2] = B_ABORTED | mode;
                                     continue;
                                 }
                                 // commit the store
@@ -472,6 +617,23 @@ unsafe fn n_item_tick_impl(
                                     entry.friction = st.friction;
                                     entry.speed = st.speed;
                                     entry.fr_step_special = st.fr_step_special;
+                                    // L7: mirror the full state back (dispatch-owned)
+                                    entry.x = st.x;
+                                    entry.y = st.y;
+                                    entry.z = st.z;
+                                    entry.dx = st.dx;
+                                    entry.dy = st.dy;
+                                    entry.dz = st.dz;
+                                    entry.age = st.age;
+                                    entry.pickup_delay = st.pickup_delay;
+                                    entry.tick_count = st.tick_count;
+                                    entry.fall_dist = st.fall_dist;
+                                    entry.on_ground = st.on_ground;
+                                    entry.aborts = 0;
+                                    if (f & F_NATIVE) == 0 {
+                                        // collector-carried entries refresh despawnRate
+                                        entry.despawn_rate = iv[k * 4 + 3];
+                                    }
                                 }
                                 od[k * 8] = st.dx;
                                 od[k * 8 + 1] = st.dy;
@@ -481,8 +643,8 @@ unsafe fn n_item_tick_impl(
                                 od[k * 8 + 5] = st.z;
                                 od[k * 8 + 6] = st.fall_dist as f64;
                                 od[k * 8 + 7] = st.land_fall as f64;
-                                oi[k * 3] = st.age;
-                                oi[k * 3 + 1] = st.pickup_delay;
+                                oi[k * 4] = st.age;
+                                oi[k * 4 + 1] = st.pickup_delay;
                                 let mut ob = 0i32;
                                 if outcome.has(TickOutcome::MOVED) { ob |= B_MOVED; }
                                 if outcome.has(TickOutcome::ON_GROUND) { ob |= B_ON_GROUND; }
@@ -491,15 +653,22 @@ unsafe fn n_item_tick_impl(
                                 if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
                                 if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
                                 if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
-                                if outcome.has(TickOutcome::VANILLA_NEXT) || !items_native {
+                                if outcome.has(TickOutcome::VANILLA_NEXT)
+                                    || !items_native
+                                    // L7 cadence belt: every 256th tick the item runs
+                                    // one full vanilla tick + re-ingest (heals any
+                                    // drift window: probes, hash gaps, plugin writes).
+                                    || (st.tick_count & 0xFF) == 0
+                                {
                                     ob |= B_VANILLA_NEXT;
                                 } else {
                                     ob |= B_NATIVE_OK;
                                 }
-                                oi[k * 3 + 2] = ob;
+                                oi[k * 4 + 2] = ob;
+                                oi[k * 4 + 3] = st.tick_count;
                             }
                             ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 8) as i32, od.as_ptr());
-                            ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n * 3) as i32, oi.as_ptr());
+                            ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n * 4) as i32, oi.as_ptr());
                             {
                                 let dt = t0.elapsed().as_nanos() as u64;
                                 FLUSH_NANOS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
@@ -579,7 +748,7 @@ unsafe fn n_item_invalidate_impl(
     ((*vt).GetIntArrayRegion)(raw, ys, 0, n as i32, vy.as_mut_ptr());
     ((*vt).GetIntArrayRegion)(raw, zs, 0, n as i32, vz.as_mut_ptr());
     let core = cst.items.as_mut().unwrap();
-    let world = &mut core.worlds[wid as usize];
+    let world = core.world(wid as usize);
     for k in 0..n {
         world.invalidate_section(vx[k], vy[k], vz[k]);
         // fr-memo hole-closer: items overlapping the changed section may sit
