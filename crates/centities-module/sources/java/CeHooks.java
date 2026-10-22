@@ -566,9 +566,23 @@ public final class CeHooks {
                         if (me > 0 && dt > 4 * me) {
                             if (bk < 2) bk++;
                             if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
+                            // an expensive sample also breaks the latch — the
+                            // world changed under it (density spike, batch)
+                            FAST_LATCH[gi] = 0;
+                            CHEAP_STREAK[gi] = 0;
                         } else {
                             if (me > 0 && dt < me) bk = 0; // cheap again
                             if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
+                            // L4b win latch: 3 consecutive samples cheaper
+                            // than the mirror EMA latch the bucket to fast
+                            if (me > 0 && dt < me) {
+                                if (++CHEAP_STREAK[gi] >= 3) {
+                                    FAST_LATCH[gi] = 4096;
+                                    CHEAP_STREAK[gi] = 0;
+                                }
+                            } else {
+                                CHEAP_STREAK[gi] = 0;
+                            }
                         }
                         FAST_BACKOFF[gi] = bk;
                         queriesFast++;
@@ -576,7 +590,9 @@ public final class CeHooks {
                     }
                     // fast refused (notReady/regrow/desync) — mirror is the
                     // safe answer; no EMA record (this cost is anomaly, not
-                    // the mirror's steady-state price).
+                    // the mirror's steady-state price). The latch dies too:
+                    // routing must not stick to a refusing path.
+                    FAST_LATCH[gi] = 0;
                     queriesMirror++;
                     return mirror(level, source, box, predicate);
                 }
@@ -816,6 +832,20 @@ public final class CeHooks {
      *  step doubles up to 1/1024 until fast gets cheap again; probing never
      *  stops entirely (L4: that starvation fed the suspend storms). */
     private static final int[] FAST_BACKOFF = new int[GWORLDS * GBUCKETS];
+    /** L4b win latch: after 3 consecutive fast samples BEATING the mirror
+     *  EMA, route this bucket to fast unconditionally for the next 4096
+     *  queries. The EMA race converges too slowly in busy worlds: the fill
+     *  phase poisons FAST_EMA to ~ms prices, the 1/256..1/1024 re-probe
+     *  duty then needs hundreds of ticks to un-poison it, and meanwhile
+     *  ~95% of queries pay the mirror (measured mixed-150k L4: fast took
+     *  over around tick ~1085 of 1200 — the bucket ENDED at f26us/m335us,
+     *  a 13x win nobody collected). The latch flips the routing the moment
+     *  the fast path has DEMONSTRABLY won 3 samples in a row; a sample
+     *  worse than 2x the mirror EMA breaks the latch immediately, so a
+     *  wrong latch costs at most a bounded burst (4096 x ~40us worst case),
+     *  never correctness (both paths are exact). */
+    private static final int[] FAST_LATCH = new int[GWORLDS * GBUCKETS];
+    private static final int[] CHEAP_STREAK = new int[GWORLDS * GBUCKETS];
     private static int gateDecisions = 0, gateFastChosen = 0;
 
     /** INDEXING=false would mean probes do nothing. L4: there is no suspend
@@ -860,7 +890,10 @@ public final class CeHooks {
      *  ~20 samples instead of being stuck in mirror forever. */
     private static boolean wantFast(int gi) {
         boolean fast;
-        if (FAST_N[gi] < 16) {
+        if (FAST_LATCH[gi] > 0) {
+            FAST_LATCH[gi]--;
+            fast = true; // latched: the fast path proved itself 3x in a row
+        } else if (FAST_N[gi] < 16) {
             fast = true; // bootstrap: a few measured probes per bucket
         } else {
             int step = 256 << Math.min(FAST_BACKOFF[gi], 2); // 256..1024
