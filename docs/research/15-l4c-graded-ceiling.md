@@ -163,3 +163,46 @@ placement moves from queries to probes. Consequences:
 Expected: mobs-25k recovers the latched basin (or better — dense queries
 on the row path), spread keeps the L4c win via row-served mid-density,
 items-100k unchanged.
+
+## L4e CI verdict (run 39772814947, commit 4e6a7a6; 9/10 legs, mixed-150k job timeout)
+
+| scenario | vanilla | module | delta |
+|---|---:|---:|---:|
+| items-100k | 81.9 | 45.0 | **-45.1%** |
+| mobs-25k | 551.4 | 590.3 | +7.0% |
+| spread-100k | 527.6 | 519.7 | -1.5% |
+
+Counter evidence that the machinery now works as designed:
+
+- mobs-25k w2b0: **fast EMA 12us** (was 348-368us pre-drain-fix), fast
+  streamed 3.77M queries; `rowWinSkip=384.7M` candidates skipped by the
+  packed x-window without deref.
+- spread: rowFast **8.48M** (was 3.8M), rowWinSkip 535M, rowBig collapsed
+  to 122k; row path + native path both healthy.
+- items-100k: unchanged across every run (-45..-50%, deterministic
+  counts) — the one scenario where A/B is exact.
+
+## Bench integrity findings (follow-ups, not module bugs)
+
+1. **Run-to-run variance is huge for mob scenarios**: vanilla mobs-25k
+   447 -> 519 -> 551 across three runs (shared runners); the 6a56dd9
+   "-36%" module leg (285ms) does not reproduce in any later run and is
+   best explained as a lucky early-phase basin (warm latch + fast
+   stream), not a stable property of the code. items-100k, whose counts
+   are deterministic, is the only scenario with a trustworthy A/B ratio.
+2. **Probe-ledger gap = chunk-unload removals**: `removeChunk` drops a
+   chunk's entities WITHOUT per-entity `removeEntity` calls, so the
+   module's remove probe misses them (mobs-25k: adds 28,249 - removes
+   7,384 = 20,865 ledger-live vs 25,049 actual). Self-healing: a chunk
+   reload re-adds through `addRecursivelySafe -> addEntity` (probed), and
+   the id-keyed upsert refreshes the index; stale entries are
+   predicate-shielded (`isAlive`/`isRemoved` checks in the push/merge
+   predicates). Follow-up: probe the chunk-unload callback
+   implementation for full ledger parity.
+3. **Dense-cell queries are the remaining honest loss** (mobs b5: fast
+   ~18us vs mirror ~10us): the Rust query walks a cell's linked chain
+   (pointer-chasing, ~14us for 700 entries) while vanilla's section scan
+   iterates a contiguous collection (~10us). The next structural lever is
+   a contiguous per-cell entry layout (flat array scan at memory
+   bandwidth, ~2-3us) — a centities-core data-structure rework, recorded
+   as the L5 candidate.
