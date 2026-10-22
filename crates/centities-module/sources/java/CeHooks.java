@@ -83,6 +83,11 @@ public final class CeHooks {
     public static final boolean ROW_PATH_ON =
             !"false".equals(System.getProperty("centities.rowPath", "true"));
     private static final int ROW_CAP = 510;      // must match the native ROW_CAP
+    /** L4c graded row total: mid-density rows (spread-100k: 100-300 candidates)
+     *  scan in Java at ~40-70ns/candidate — ~3x cheaper than the native query's
+     *  fixed JNI toll. Genuinely dense cells (mobs-25k ~700, items-100k ~830 per
+     *  cell) still bail to the native Rust filter. */
+    private static final int ROW_TOTAL_CAP = 512;
 
     // Row-path diagnostics: hits and every distinct miss reason.
     public static volatile long rowFast = 0;
@@ -585,6 +590,20 @@ public final class CeHooks {
                             }
                         }
                         FAST_BACKOFF[gi] = bk;
+                        // L4c latch consistency: the latch must obey the SAME
+                        // hysteresis as wantFast. A latched bucket whose running
+                        // fast EMA no longer beats the mirror EMA releases
+                        // immediately (CI mobs-25k w2b0: 3 lucky ~1us samples
+                        // latched the bucket, then every query paid the ~13us
+                        // fast average against a 4us mirror — a self-inflicted
+                        // 3x loss on ~4.6k queries/tick). True-win buckets keep
+                        // the latch (spread w2b0: ~15us vs ~2.9ms mirror).
+                        if (FAST_LATCH[gi] > 0) {
+                            long me2 = MIRR_EMA[gi];
+                            if (me2 > 0 && FAST_EMA[gi] * 4 >= me2 * 5) {
+                                FAST_LATCH[gi] = 0;
+                            }
+                        }
                         queriesFast++;
                         return out;
                     }
@@ -1168,14 +1187,18 @@ public final class CeHooks {
             }
         }
         if (total == 0) { rowEmpty++; return new ArrayList<>(0); }
-        // Row-size ceiling: the row path pays a per-candidate home re-check
-        // + live-box test in Java (~30ns each), while the native query does
-        // the AABB filter in Rust and returns only the exact candidates.
-        // Past ~64 candidates the native path wins (measured: merge scans in
-        // ~200-id rows spent ~10% of the tick in cellOfBox/rowQuery loops).
-        // Rows stay the zero-JNI win for small cells.
-        if (total > 64) { rowBig++; return null; }
-        ArrayList<Entity> out = new ArrayList<>(Math.min(total, 64));
+        // Row-size ceiling (L4c, graded): the row path pays a per-candidate
+        // home re-check + live-box test in Java (~40-70ns each), while the
+        // native query pays a FIXED ~13-30us JNI+drain+publish toll and then
+        // filters in Rust. The old flat 64 ceiling measured right for the
+        // dense worlds it was tuned on (mobs-25k rows ~700/cell — the native
+        // filter wins there), but CI spread-100k made it a regression: rows
+        // of 100-300 candidates were refused into the native path at
+        // ~30us/query x 6.7k/tick = ~200ms/tick, +10% p50 over vanilla.
+        // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
+        // on the native path while serving mid-density rows at ~10-20us.
+        if (total > ROW_TOTAL_CAP) { rowBig++; return null; }
+        ArrayList<Entity> out = new ArrayList<>(Math.min(total, ROW_TOTAL_CAP));
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
         for (int r = 0; r < nr; r++) {
