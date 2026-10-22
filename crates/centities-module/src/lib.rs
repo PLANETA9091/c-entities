@@ -13,6 +13,7 @@
 
 #[doc(hidden)]
 pub mod patch;
+pub mod itemcore;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
@@ -49,7 +50,7 @@ const ROW_CAP: usize = 510; // cells denser than this are never published
 const ROW_SENTINEL: i64 = 0x7FF; // count-field value marking a killed row
 const DIRECT_CAP: usize = 1 << 16; // off-thread event queue bound
 
-static INDEX: Mutex<Option<CeState>> = Mutex::new(None);
+pub(crate) static INDEX: Mutex<Option<CeState>> = Mutex::new(None);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 static PATCHES_OK: AtomicU64 = AtomicU64::new(0);
@@ -61,7 +62,7 @@ static PATCHES_FAIL: AtomicU64 = AtomicU64::new(0);
 /// they resolve everything from this cached loader instead.
 static LOADER: AtomicUsize = AtomicUsize::new(0);
 /// Global ref of the DEFINED CeHooks class (the one the woven code calls).
-static HOOKS_CLASS_GLOBAL: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static HOOKS_CLASS_GLOBAL: AtomicUsize = AtomicUsize::new(0);
 /// Original class bytes seen at boot load (stash — hooks may not do heavy
 /// work inside the ClassFileLoadHook callback).
 static STASH: LazyLock<Mutex<HashMap<&'static str, Vec<u8>>>> =
@@ -114,11 +115,13 @@ struct Publisher {
 struct CeState {
     idx: centities_core::EntityIndex,
     p: Publisher,
+    items: Option<itemcore::ItemCore>,
 }
 
-fn new_state() -> CeState {
+pub(crate) fn new_state() -> CeState {
     CeState {
         idx: centities_core::EntityIndex::new(),
+        items: None,
         p: Publisher {
             info: PUB_INFO.lock().ok().and_then(|g| *g),
             dirty: Vec::new(),
@@ -426,13 +429,22 @@ fn arm_module() {
             (LEVEL_CLASS, Counter::Queries),
             (ENTITY_CLASS, Counter::Boxes),
             (LOOKUP_CLASS, Counter::Adds),
-            (ITEM_ENTITY_CLASS, Counter::RestChecks),
+            (ITEM_ENTITY_CLASS, Counter::ItemChecks),
         ];
         let merge_woven = MERGE_WOVEN.load(Ordering::Acquire);
         let mut logged_done = false;
         for attempt in 0..180 {
             std::thread::sleep(std::time::Duration::from_millis(2000));
             let snap = read_hook_counters();
+            if attempt < 6 || attempt % 25 == 0 {
+                let dbg: Vec<(String, i64)> = snap
+                    .iter()
+                    .map(|(k, v)| (format!("{:?}", k), *v))
+                    .collect();
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] verifier snapshot: {:?}", dbg
+                ));
+            }
             let mut pending: Vec<&str> = Vec::new();
             for (cls, c) in targets.iter() {
                 if snap.get(c).copied().unwrap_or(0) == 0 {
@@ -580,26 +592,30 @@ fn precompute_item(loader: jni::jobject) {
         cplug_sdk::log::info("[c-entities] precompute ItemEntity guard: original bytes not seen at boot");
         return;
     };
-    let spec = cplug_sdk::asm::SkipGuard {
+    // L6: the tick is COMPUTED natively — a conditional early-return prefix
+    // (`if (CeHooks.itemSkip(e)) return;`) suppresses the vanilla body for
+    // items the Rust core computes at the flush. The rest-skip era is over
+    // (owner directive: compute in Rust, never skip).
+    let tick_spec = cplug_sdk::asm::EarlyReturnGuard {
         method_name: "tick",
         method_desc: "()V",
         check_class: HOOKS_CLASS,
         check_name: "itemSkip",
         check_desc: "(Lnet/minecraft/world/entity/item/ItemEntity;)Z",
-        // 0 = pattern-select the merge-interval istore_2 (iconst_0, istore_2,
-        // iload_2, ifeq, iconst_2, goto, bipush 40, istore_3) — runtime bytes
-        // differ from the shipped jar (Paper re-transforms at load), so a
-        // hard offset from javap does not survive; the pattern is unique.
-        target: 0,
-        init_local: Some((
-            1,
-            "getDeltaMovement",
-            "()Lnet/minecraft/world/phys/Vec3;",
-        )),
-        end_push: Some(0x04), // iconst_0
+    };
+    let inactive_spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "inactiveTick",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "itemInactiveCollect",
+        check_desc: "(Lnet/minecraft/world/entity/item/ItemEntity;)Z",
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::insert_skip_guard(env, loader, &bytes, &spec)
+        let Some(b1) = cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &tick_spec)
+        else {
+            return None;
+        };
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &b1, &inactive_spec)
     });
     match patched {
         Some(Some(mut b)) if !b.is_empty() => {
@@ -643,13 +659,14 @@ fn precompute_item(loader: jni::jobject) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Counter {
     Queries,
     Boxes,
     Adds,
     RestChecks,
     MergeChecks,
+    ItemChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -671,6 +688,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::Adds, ("probesAdd", "J")),
             (Counter::RestChecks, ("restChecks", "J")),
             (Counter::MergeChecks, ("mergeChecks", "J")),
+            (Counter::ItemChecks, ("itemChecks", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
@@ -804,6 +822,10 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64));
     push!("nativeReset", "()V",
         n_reset as extern "system" fn(*mut jni::JNIEnv, jni::jclass));
+    push!("nativeItemTick", "(II[J[I[D[I[D[I[D[I)I",
+        itemcore::n_item_tick as *const c_void);
+    push!("nativeItemInvalidate", "(II[I[I[I)V",
+        itemcore::n_item_invalidate as *const c_void);
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -872,9 +894,31 @@ fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                     return None;
                 }
             };
+            // L6 flush prefix (best-effort): if refused, the mode table never
+            // arms (items stay vanilla) — inherently safe, arm continues.
+            let b3 = match patch::insert_static_call_at_start(
+                b2.clone(),
+                "tickBlockEntities",
+                "()V",
+                HOOKS_CLASS,
+                "itemTickFlush",
+                "(Lnet/minecraft/world/level/Level;)V",
+                &[(0, b'L')],
+            ) {
+                Ok(b3) => {
+                    cplug_sdk::log::info("[c-entities] L6 flush prefix woven (Level.tickBlockEntities)");
+                    b3
+                }
+                Err(e) => {
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] L6 flush prefix refused (items stay vanilla): {e}"
+                    ));
+                    b2.clone()
+                }
+            };
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
             cplug_sdk::log::info("[c-entities] patched Level.getEntities + setBlock wakes");
-            Some(b2)
+            Some(b3)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);

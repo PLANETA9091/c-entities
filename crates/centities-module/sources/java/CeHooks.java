@@ -3,6 +3,16 @@ package dev.planeta9091.centities;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.gameevent.GameEvent;
+import net.minecraft.world.phys.Vec3;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
@@ -153,127 +163,10 @@ public final class CeHooks {
             restFailAge = 0, restFailFluid = 0, restFailVel = 0, restFailChurn = 0;
 
     public static volatile long restChecks = 0;
-    public static boolean itemSkip(net.minecraft.world.entity.item.ItemEntity e) {
-        restChecks++; // before the flag checks: proves the woven call executes
-        SELF_TICK_MASK = e.getId() & AMASK; // open the self-physics window
-        SELF_TICK_UNTIL = System.nanoTime() + 50_000;
-        if (!REST_ON || !ACTIVE) return false;
-        try {
-            int mask = e.getId() & AMASK;
-            int g = REST_GEN[mask];
-            if (g != 0) {
-                if (WAKE_EPOCH[REST_SLOT[mask]] + 1 == g) {
-                    // vanilla Entity.tick starts with ++tickCount; the guard
-                    // jump lands PAST super.tick(), so without this the
-                    // counter freezes while resting — and a frozen
-                    // tickCount stuck at tickCount % 40 == 0 turns the merge
-                    // gate's (tickCount % 40) into "scan EVERY tick" for
-                    // ~1/40 of all items (measured 12.6x merge-scan CPU on
-                    // items-100k). Incrementing here keeps the merge cadence
-                    // bit-identical to a vanilla resting item.
-                    e.tickCount++;
-                    // The vanilla prologue also decays the pickup delay
-                    // (pickupDelay > 0 && != 32767 → --) BEFORE super.tick;
-                    // the guard jumps past it, so mirror the decay here —
-                    // otherwise a resting item's delay would freeze and it
-                    // would stay un-pickable forever. 32767 (infinite) never
-                    // decays in vanilla and never decays here.
-                    if (e.pickupDelay > 0 && e.pickupDelay != 32767) {
-                        e.pickupDelay--;
-                    }
-                    restFast++;
-                    return true;
-                }
-                REST_GEN[mask] = 0; // woken: full vanilla tick this time
-                restWakes++;
-                return false;
-            }
-            // Rest candidate? Checked while the item still ticks fully.
-            // The delta threshold: a landing item's residual velocity decays
-            // geometrically (0.98 * damping); 1e-4 keeps a wind-down item in
-            // full-tick mode for a few extra ticks — conservative direction.
-            //
-            // pickupDelay is NOT a physics property: a grounded item with a
-            // pending pickup delay is exactly as static as one without, and
-            // the skip path mirrors the vanilla prologue's decay (see above).
-            // This matters enormously on real maps: unstackable drops keep
-            // pickupDelay == 32767 forever, and the old `pickupDelay <= 0`
-            // gate left ~50% of all items full-ticking forever (measured:
-            // restF=delay ~17k/tick on items-100k, the single largest
-            // residual cost).
-            // Diagnostics: items that NEVER settle are the reason the rest
-            // guard leaves full-tick CPU on the table; count WHICH condition
-            // blocks them (same short-circuit semantics as the old single
-            // predicate, order of pure reads is irrelevant).
-            net.minecraft.world.phys.Vec3 d = e.getDeltaMovement();
-            if (!e.onGround()) {
-                restFailGround++;
-                return false;
-            }
-            if (e.age < 0 || e.age >= 5800) {
-                restFailAge++;
-                return false;
-            }
-            if (e.isInWater() || e.isInLava()) {
-                restFailFluid++;
-                return false;
-            }
-            if (Math.abs(d.x) >= 1.0e-4 || Math.abs(d.y) >= 1.0e-4
-                    || Math.abs(d.z) >= 1.0e-4) {
-                restFailVel++;
-                return false;
-            }
-            // Churn backoff: a recently-woken item may be woken again before
-            // the next tick (pusher nearby) — the mark would be wasted. Each
-            // full tick that reached HERE decayed the counter first, so the
-            // zone heals ~4 ticks after the pusher leaves.
-            if (REST_CHURN[mask] > 0) {
-                REST_CHURN[mask]--;
-                if (REST_CHURN[mask] >= 4) {
-                    restFailChurn++;
-                    return false;
-                }
-            }
-            {
-                int slot = wakeSlotOf(e);
-                REST_SLOT[mask] = slot;
-                REST_GEN[mask] = WAKE_EPOCH[slot] + 1;
-                restMarks++;
-                // CRITICAL (local A/B regression, items-100k): the skipped
-                // physics also skips setOldPos — xo/yo/zo freeze at the last
-                // active tick, so the merge gate's "position changed?"
-                // comparison (floor(old) != floor(new)) keeps returning TRUE
-                // and every resting item merge-scans every 2 ticks instead
-                // of every 40 (12.6x merge-scan CPU, +19.7% p50 on 2 cores).
-                // Syncing old-pos ONCE at the rest transition restores the
-                // vanilla merge cadence; the item never moves while resting,
-                // so one sync is exact for the whole rest window.
-                e.setOldPosAndRot();
-            }
-            return false;
-        } catch (Throwable t) {
-            lastError = System.nanoTime();
-            lastErrorText = "itemSkip: " + t;
-            t.printStackTrace();
-            ACTIVE = false;
-            return false;
-        }
-    }
-
-    private static int wakeSlotOf(net.minecraft.world.entity.item.ItemEntity e) {
-        AABB b = e.getBoundingBox();
-        int wid = worldId(e.level());
-        int cx = cellFloor((b.minX + b.maxX) * 0.5);
-        int cz = cellFloor((b.minZ + b.maxZ) * 0.5);
-        return wakeSlot(wid, cx, cz);
-    }
-
-    private static int wakeSlot(int wid, int cx, int cz) {
-        // [wid:3][cx:8][cz:8] = 2^19 slots — cells beyond ±2048 blocks per
-        // axis wrap into other slots: a spurious wake (safe direction),
-        // never a missed one.
-        return (((wid & 0x7) << 16) | ((cx & 0xFF) << 8) | (cz & 0xFF)) & 0x7FFFF;
-    }
+    // The L2 rest-skip itemSkip body was REMOVED by design (owner directive:
+    // "мы оптимизируем, ускоряем на Rust", not "не тикать"). The name is
+    // reused by the L6 native-tick collector below (the woven call site is
+    // identical).
 
     // ------------------------------------------------------------------
     // L3 RUST MERGE BROAD-PHASE — the woven ItemEntity.mergeWithNeighbours
@@ -430,10 +323,16 @@ public final class CeHooks {
     public static void probeWake(net.minecraft.world.level.Level level,
             net.minecraft.core.BlockPos pos) {
         try {
-            if (!REST_ON || !ACTIVE || level == null || pos == null
+            if (!ACTIVE || level == null || pos == null
                     || !(level instanceof net.minecraft.server.level.ServerLevel)
                     || level.isClientSide) {
                 return;
+            }
+            // L6: the changed section's cached collision/fluid data is stale —
+            // the flush invalidates it (next tick's gather sees the new blocks;
+            // the vanilla_next routing self-heals this tick).
+            if (ITEM_TICK_ON) {
+                markSectionDirty(level, pos.getX(), pos.getY(), pos.getZ());
             }
             int wid = worldId(level);
             if (wid < 0) return;
@@ -1372,4 +1271,606 @@ public final class CeHooks {
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
     public static native void nativeReset();
+
+    // ==================================================================
+    // L6 — NATIVE ITEM TICK CORE.
+    // The owner directive is binding: the item tick is COMPUTED in Rust,
+    // never skipped. The woven ItemEntity.tick / inactiveTick guards call
+    // the collectors below; true = the vanilla body is suppressed because
+    // the Rust core computes the SAME tick natively at the flush (one JNI
+    // crossing per world-tick, at Level.tickBlockEntities — right after the
+    // entity loop, exactly where vanilla's own ordering lands items).
+    //
+    // EXACTNESS: the core is a line-by-line port of ItemEntity.tick +
+    // Entity.move/collide + moonrise performCollisions (f32 literal rules,
+    // 1e-7 epsilons, (tickCount+id)%4 gate, floor-change merge cadence).
+    // Anything the core cannot compute exactly (fluids, fire, complex
+    // shapes, world border, portals, Paper despawn timers) routes vanilla —
+    // those items still tick, in Java. The core re-checks the geometry
+    // reasons every flush; block changes invalidate the section cache via
+    // the probeWake dirty set below.
+    // ==================================================================
+
+    public static final boolean ITEM_TICK_ON = !"0".equals(System.getenv("CE_ITEM_TICK"));
+    public static volatile long itemChecks = 0, itemNative = 0, itemInactive = 0,
+            itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
+            itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0;
+
+    // ---- batch (server-thread confined; one world per tick segment) ----
+    private static final int IB_CAP = 1 << 17;
+    private static final long[] IB_IDS = new long[IB_CAP];
+    private static final int[] IB_FLAGS = new int[IB_CAP];
+    private static final double[] IB_D = new double[IB_CAP * 14]; // x,y,z,dx,dy,dz,fallDist,stuckX,stuckY,stuckZ,supX,supY,supZ,supPresent
+    private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
+    private static int ibN = 0;
+
+    // flag bits (must match itemcore.rs)
+    public static final int IF_INACTIVE = 1;        // entry came from inactiveTick
+    public static final int IF_NATIVE = 2;          // suppress vanilla: Rust computes
+    public static final int IF_RESYNC = 4;          // vanilla body ran (or forced): ingest only
+    public static final int IF_FRIC_OFF = 8;        // frictionState == FALSE -> f = 1.0
+    public static final int IF_FORCE_VANILLA = 16;  // fresh-flag gate: vanilla this tick
+    public static final int IF_ON_GROUND = 32;      // e.onGround() at collect time
+
+    private static int wakeSlot(int wid, int cx, int cz) {
+        // [wid:3][cx:8][cz:8] = 2^19 slots — cells beyond ±2048 blocks per
+        // axis wrap into other slots: a spurious wake (safe direction),
+        // never a missed one.
+        return (((wid & 0x7) << 16) | ((cx & 0xFF) << 8) | (cz & 0xFF)) & 0x7FFFF;
+    }
+
+    // ---- section invalidation (probeWake appends; the flush drains) ----
+    private static final int SD_CAP = 256;
+    private static final int[] SD_X = new int[SD_CAP];
+    private static final int[] SD_Y = new int[SD_CAP];
+    private static final int[] SD_Z = new int[SD_CAP];
+    private static int sdN = 0;
+    private static int sdWid = -1;
+
+    private static void markSectionDirty(Level level, int x, int y, int z) {
+        if (sdN == 0) {
+            sdWid = worldId(level);
+        }
+        if (sdN >= SD_CAP) {
+            return; // overflow: the epoch-safe resync cadence self-heals
+        }
+        SD_X[sdN] = x >> 4;
+        SD_Y[sdN] = y >> 4;
+        SD_Z[sdN] = z >> 4;
+        sdN++;
+    }
+
+    /** Woven probe (existing): extend with the L6 section invalidation. */
+    // (probeWake body below appends via markSectionDirty before its wake bump)
+    private static final int[] MODE_VAL = new int[1 << 22];
+    private static final int[] MODE_GEN = new int[1 << 22];
+    private static volatile int MODE_EPOCH = 1;
+    private static final int MAMASK = (1 << 22) - 1;
+
+    // ---- VarHandles (lazy; the bridge class lives in the kernel loader
+    // with Paper fully visible) ----
+    private static volatile boolean VH_READY = false;
+    private static VarHandle VH_FALL_DIST, VH_REMAINING_FIRE, VH_DESPAWN_TIME,
+            VH_DESPAWN_RATE, VH_ON_GROUND, VH_STUCK, VH_SUPPORTING, VH_FRIC_STATE;
+
+    private static synchronized boolean initItemVh() {
+        if (VH_READY) return true;
+        try {
+            MethodHandles.Lookup l = MethodHandles.lookup();
+            VH_FALL_DIST = l.findVarHandle(Entity.class, "fallDistance", float.class);
+            VH_REMAINING_FIRE = l.findVarHandle(Entity.class, "remainingFireTicks", int.class);
+            VH_DESPAWN_RATE = l.findVarHandle(ItemEntity.class, "despawnRate", int.class);
+            VH_ON_GROUND = l.findVarHandle(Entity.class, "onGround", boolean.class);
+            VH_STUCK = l.findVarHandle(Entity.class, "stuckSpeedMultiplier", Vec3.class);
+            VH_FRIC_STATE = l.findVarHandle(ItemEntity.class, "frictionState", Object.class);
+            VH_SUPPORTING = l.findVarHandle(Entity.class, "mainSupportingBlockPos", java.util.Optional.class);
+            try {
+                VH_DESPAWN_TIME = l.findVarHandle(Entity.class, "despawnTime", int.class);
+            } catch (ReflectiveOperationException notPaperOrRenamed) {
+                VH_DESPAWN_TIME = null; // documented gap (same as the L2 guard)
+            }
+            VH_READY = true;
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initItemVh: " + t;
+            return false;
+        }
+    }
+
+    private static int fireTicks(Entity e) {
+        return VH_REMAINING_FIRE == null ? 0 : (int) VH_REMAINING_FIRE.get(e);
+    }
+
+    /** TriState.FALSE without the adventure class on the compile classpath. */
+    private static boolean frictionDisabled(Entity e) {
+        try {
+            Object st = VH_FRIC_STATE.get(e);
+            return st != null && "FALSE".equals(((Enum<?>) st).name());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static int despawnTimeOf(Entity e) {
+        return VH_DESPAWN_TIME == null ? -1 : (int) VH_DESPAWN_TIME.get(e);
+    }
+
+    /**
+     * Woven EarlyReturnGuard on ItemEntity.tick: true = the vanilla body is
+     * suppressed (the Rust core computes this tick at the flush).
+     */
+    public static boolean itemSkip(ItemEntity e) {
+        itemChecks++;
+        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !BUKKIT_READY || ibN >= IB_CAP) return false;
+        if (e.level().isClientSide) return false; // client-side ticks stay vanilla
+        try {
+            boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[e.getId() & MAMASK] != 0;
+            // fresh-flag gates: anything the core cannot compute exactly runs
+            // vanilla THIS tick (the flush re-evaluates the mode afterwards).
+            if (e.isRemoved() || e.noPhysics || e.isInWater() || e.isInLava()
+                    || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
+                    || e.getItem().isEmpty()) {
+                appendItem(e, IF_FORCE_VANILLA);
+                return false;
+            }
+            appendItem(e, (nativeMode ? IF_NATIVE : IF_RESYNC)
+                    | (frictionDisabled(e) ? IF_FRIC_OFF : 0)
+                    | (e.onGround() ? IF_ON_GROUND : 0));
+            return nativeMode;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "itemSkip: " + t;
+            ACTIVE = false;
+            return false;
+        }
+    }
+
+    /**
+     * Woven EarlyReturnGuard on ItemEntity.inactiveTick: true = suppressed
+     * (the core computes pickupDelay--/age++/despawn natively).
+     */
+    public static boolean itemInactiveCollect(ItemEntity e) {
+        itemChecks++;
+        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !BUKKIT_READY || ibN >= IB_CAP) return false;
+        try {
+            if (e.isRemoved()) return false;
+            boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[e.getId() & MAMASK] != 0;
+            appendItem(e, IF_INACTIVE | (nativeMode ? IF_NATIVE : IF_RESYNC));
+            return nativeMode;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "itemInactiveCollect: " + t;
+            ACTIVE = false;
+            return false;
+        }
+    }
+
+    private static void appendItem(ItemEntity e, int flags) {
+        int i = ibN;
+        int id = e.getId();
+        IB_IDS[i] = id;
+        IB_FLAGS[i] = flags;
+        Vec3 d = e.getDeltaMovement();
+        int o = i * 10;
+        IB_D[o] = e.getX();
+        IB_D[o + 1] = e.getY();
+        IB_D[o + 2] = e.getZ();
+        IB_D[o + 3] = d.x;
+        IB_D[o + 4] = d.y;
+        IB_D[o + 5] = d.z;
+        IB_D[o + 6] = (float) VH_FALL_DIST.get(e);
+        // stuck + supporting are store-owned; only resync entries get fresh
+        // values (flush pass 1)
+        IB_D[o + 7] = 0.0;
+        IB_D[o + 8] = 0.0;
+        IB_D[o + 9] = 0.0;
+        IB_D[o + 10] = 0.0;
+        IB_D[o + 11] = 0.0;
+        IB_D[o + 12] = 0.0;
+        IB_D[o + 13] = 0.0;
+        int oi = i * 4;
+        IB_I[oi] = e.tickCount; // dispatcher already ++ed
+        IB_I[oi + 1] = e.age;
+        IB_I[oi + 2] = e.pickupDelay;
+        IB_I[oi + 3] = (int) VH_DESPAWN_RATE.get(e);
+        ibN = i + 1;
+    }
+
+    /**
+     * Woven static prefix on Level.tickBlockEntities — runs right after the
+     * entity loop of THIS level's tick: flush the batch (one JNI crossing),
+     * apply the writebacks, run the exact vanilla event snippets.
+     */
+    public static void itemTickFlush(Level level) {
+        int n = ibN;
+        if (n == 0) return;
+        ibN = 0;
+        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !(level instanceof ServerLevel)) {
+            return;
+        }
+        if (!initBukkit()) {
+            return; // mode bits never arm -> items stay vanilla
+        }
+        try {
+            itemFlushes++;
+            int wid = worldId(level);
+            boolean isNether = level.dimension() == Level.NETHER;
+
+            // pass 1: resync entries re-read state POST vanilla tick
+            for (int i = 0; i < n; i++) {
+                int f = IB_FLAGS[i];
+                if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
+                    Entity ref = arenaRef(IB_IDS[i]);
+                    if (!(ref instanceof ItemEntity)) continue;
+                    ItemEntity e = (ItemEntity) ref;
+                    int o = i * 10;
+                    IB_D[o] = e.getX();
+                    IB_D[o + 1] = e.getY();
+                    IB_D[o + 2] = e.getZ();
+                    Vec3 d = e.getDeltaMovement();
+                    IB_D[o + 3] = d.x;
+                    IB_D[o + 4] = d.y;
+                    IB_D[o + 5] = d.z;
+                    IB_D[o + 6] = (float) VH_FALL_DIST.get(e);
+                    Vec3 stuck = (Vec3) VH_STUCK.get(e);
+                    IB_D[o + 7] = stuck == null ? 0.0 : stuck.x;
+                    IB_D[o + 8] = stuck == null ? 0.0 : stuck.y;
+                    IB_D[o + 9] = stuck == null ? 0.0 : stuck.z;
+                    Object sup = VH_SUPPORTING == null ? null : VH_SUPPORTING.get(e);
+                    if (sup instanceof java.util.Optional<?> opt && opt.isPresent()
+                            && opt.get() instanceof BlockPos bp) {
+                        IB_D[o + 10] = bp.getX();
+                        IB_D[o + 11] = bp.getY();
+                        IB_D[o + 12] = bp.getZ();
+                        IB_D[o + 13] = 1.0;
+                    } else {
+                        IB_D[o + 13] = 0.0;
+                    }
+                    int oi = i * 4;
+                    IB_I[oi] = e.tickCount;
+                    IB_I[oi + 1] = e.age;
+                    IB_I[oi + 2] = e.pickupDelay;
+                    IB_I[oi + 3] = (int) VH_DESPAWN_RATE.get(e);
+                    itemResync++;
+                }
+            }
+
+            // env snapshot (once per flush)
+            double[] envD = new double[6];
+            envD[0] = isNether ? 0.0 : level.getMinY() + voidOffset(level);
+            envD[1] = level.getWorldBorder().getMinX();
+            envD[2] = level.getWorldBorder().getMaxX();
+            envD[3] = level.getWorldBorder().getMinZ();
+            envD[4] = level.getWorldBorder().getMaxZ();
+            envD[5] = 2.0; // border routing margin
+            int[] envI = new int[4];
+            envI[0] = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection(level);
+            envI[1] = ca.spottedleaf.moonrise.common.util.WorldUtil.getMaxSection(level);
+            envI[2] = (voidDamageEnabled(level) && !isNether) ? 1 : 0;
+            envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
+
+            double[] outD = new double[n * 8]; // dx,dy,dz,x,y,z,fallDist,landFall
+            int[] outI = new int[n * 3];       // age, pickupDelay, bits
+
+            int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_D, IB_I,
+                    envD, envI, outD, outI);
+            if (rc != 0) {
+                return; // core not ready: everything stays vanilla this tick
+            }
+            // drain the section invalidations (next tick's gather sees the
+            // new blocks; the vanilla_next routing self-heals this tick)
+            if (sdN > 0 && sdWid >= 0) {
+                nativeItemInvalidate(sdWid, sdN, SD_X, SD_Y, SD_Z);
+                sdN = 0;
+                sdWid = -1;
+            }
+
+            // pass 2: apply, in batch order (== vanilla entity tick order)
+            int epoch = MODE_EPOCH + 1;
+            for (int i = 0; i < n; i++) {
+                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
+                int f = IB_FLAGS[i];
+                int bits = outI[i * 3 + 2];
+                int mSlot = (int) (IB_IDS[i] & MAMASK);
+                MODE_GEN[mSlot] = epoch;
+                if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
+                    MODE_VAL[mSlot] = 0;
+                    itemVanillaNext++;
+                } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
+                    MODE_VAL[mSlot] = 1;
+                } else {
+                    MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
+                                         // want_native next flush
+                }
+                if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
+                    // aborted (bit 13): the core did not compute — nothing to
+                    // apply, the item froze this tick and runs vanilla next.
+                    if ((bits & (1 << 13)) != 0) itemAbort++;
+                    continue;
+                }
+                Entity ref = arenaRef(IB_IDS[i]);
+                if (!(ref instanceof ItemEntity)) continue;
+                ItemEntity e = (ItemEntity) ref;
+                if ((f & IF_INACTIVE) != 0) {
+                    // inactiveTick semantics: pickupDelay/age/despawn only
+                    e.age = outI[i * 3];
+                    e.pickupDelay = outI[i * 3 + 1];
+                    if ((bits & (1 << 7)) != 0
+                            && (int) VH_DESPAWN_RATE.get(e) == IB_I[i * 4 + 3]
+                            && e.age >= (int) VH_DESPAWN_RATE.get(e)) {
+                        itemDespawn++;
+                        Object ev = MH_DESPAWN_EV.invoke(e);
+                        Boolean cancelled = (Boolean) ev.getClass()
+                                .getMethod("isCancelled").invoke(ev);
+                        if (cancelled) {
+                            e.age = 0;
+                        } else {
+                            MH_DISCARD.invoke(e, CAUSE_DESPAWN);
+                        }
+                    }
+                    continue;
+                }
+                int o = i * 8;
+                e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                e.age = outI[i * 3];
+                e.pickupDelay = outI[i * 3 + 1];
+                VH_FALL_DIST.set(e, (float) outD[o + 6]);
+                boolean wantGround = (bits & (1 << 1)) != 0;
+                if (wantGround != e.onGround()) {
+                    VH_ON_GROUND.set(e, wantGround);
+                }
+                if ((bits & 1) != 0) { // MOVED
+                    e.setPos(outD[o + 3], outD[o + 4], outD[o + 5]);
+                }
+                if ((bits & (1 << 2)) != 0) { // HAS_IMPULSE (OR-only)
+                    e.hasImpulse = true;
+                }
+                if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
+                    itemMerge++;
+                    mergeScanNative(e);
+                    if (e.isRemoved()) continue;
+                }
+                if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
+                    if ((int) VH_DESPAWN_RATE.get(e) == IB_I[i * 4 + 3]
+                            && e.age >= (int) VH_DESPAWN_RATE.get(e)) {
+                        itemDespawn++;
+                        Object ev = MH_DESPAWN_EV.invoke(e);
+                        Boolean cancelled = (Boolean) ev.getClass()
+                                .getMethod("isCancelled").invoke(ev);
+                        if (cancelled) {
+                            e.age = 0;
+                        } else {
+                            MH_DISCARD.invoke(e, CAUSE_DESPAWN);
+                        }
+                    }
+                }
+                if ((bits & (1 << 8)) != 0) { // VOID: vanilla discard
+                    itemVoid++;
+                    MH_DISCARD.invoke(e, CAUSE_VOID);
+                }
+                if ((bits & (1 << 9)) != 0) { // LAND: fallOn + gameEvent
+                    itemLand++;
+                    BlockPos p = e.getOnPosLegacy();
+                    BlockState s = e.level().getBlockState(p);
+                    s.getBlock().fallOn(e.level(), s, p, e, (float) outD[o + 7]);
+                    e.level().gameEvent(GameEvent.HIT_GROUND, e.position(),
+                            GameEvent.Context.of(e, s));
+                }
+            }
+            MODE_EPOCH = epoch;
+        } catch (Throwable t) {
+            ibN = 0;
+            lastError = System.nanoTime();
+            lastErrorText = "itemTickFlush: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
+
+    /** ARENA resolve with the id-match staleness check (same as queries). */
+    private static Entity arenaRef(long id) {
+        Entity cand = ARENA[(int) (id & 0xFFFF_FFFFL) & AMASK];
+        return (cand != null && cand.getId() == id) ? cand : null;
+    }
+
+    // ---- Bukkit surface via reflection (the compile classpath carries the
+    // mojang-mapped SERVER only; the API jars exist at runtime) ----
+    private static volatile boolean BUKKIT_READY = false;
+    private static volatile MethodHandle MH_VOID_ENABLED, MH_VOID_OFFSET, MH_DESPAWN_EV, MH_DISCARD;
+    private static Object CAUSE_DESPAWN, CAUSE_VOID;
+
+    private static synchronized boolean initBukkit() {
+        if (BUKKIT_READY) return true;
+        try {
+            Class<?> world = Class.forName("org.bukkit.World");
+            MH_VOID_ENABLED = MethodHandles.lookup().unreflect(
+                    world.getMethod("isVoidDamageEnabled"));
+            MH_VOID_OFFSET = MethodHandles.lookup().unreflect(
+                    world.getMethod("getVoidDamageMinBuildHeightOffset"));
+            Class<?> cef = Class.forName("org.bukkit.craftbukkit.event.CraftEventFactory");
+            for (java.lang.reflect.Method m : cef.getDeclaredMethods()) {
+                if (m.getName().equals("callItemDespawnEvent")
+                        && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0] == ItemEntity.class) {
+                    MH_DESPAWN_EV = MethodHandles.lookup().unreflect(m);
+                }
+            }
+            Class<?> cause = Class.forName("org.bukkit.event.entity.EntityRemoveEvent$Cause");
+            CAUSE_DESPAWN = cause.getField("DESPAWN").get(null);
+            CAUSE_VOID = cause.getField("OUT_OF_WORLD").get(null);
+            for (java.lang.reflect.Method m : Entity.class.getMethods()) {
+                if (m.getName().equals("discard") && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0] == cause) {
+                    MH_DISCARD = MethodHandles.lookup().unreflect(m);
+                }
+            }
+            BUKKIT_READY = MH_DESPAWN_EV != null && MH_DISCARD != null
+                    && CAUSE_DESPAWN != null && CAUSE_VOID != null;
+            return BUKKIT_READY;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initBukkit: " + t;
+            return false;
+        }
+    }
+
+    private static boolean voidDamageEnabled(Level level) {
+        try {
+            Object w = level.getWorld();
+            Object r = MH_VOID_ENABLED.invoke(w);
+            return r instanceof Boolean b ? b : true;
+        } catch (Throwable unavailable) {
+            return true; // vanilla default: void discards below-world entities
+        }
+    }
+
+    /** World.getVoidDamageMinBuildHeightOffset via reflection (Paper API). */
+    private static double voidOffset(Level level) {
+        try {
+            Object w = level.getWorld();
+            Object r = MH_VOID_OFFSET.invoke(w);
+            return r instanceof Number num ? num.doubleValue() : 0.0;
+        } catch (Throwable unavailable) {
+            return 0.0;
+        }
+    }
+
+    /**
+     * Section provider (JNI up-call from the Rust cache): packs the
+     * palette-driven section data. outD: 8 doubles per palette entry
+     * [flag, x0,y0,z0,x1,y1,z1, friction] + [speed, water, fluid, cobweb,
+     * insideSpecial, stepSpecial, fallSpecial, complex] packed as doubles;
+     * outBlocks: 4096 palette indices (0xFFFF = air slot 0). Returns false
+     * when the chunk is absent (load=false semantics: gather treats absent
+     * as empty, exactly like vanilla).
+     */
+    public static boolean itemSectionData(
+            int wid, int cx, int cy, int cz, boolean load,
+            double[] outD, int[] outBlocks) {
+        Level level = wid < WID_SLOTS.length ? WID_SLOTS[wid] : null;
+        if (!(level instanceof ServerLevel sl)) return false;
+        net.minecraft.world.level.chunk.LevelChunk chunk;
+        try {
+            if (load) {
+                chunk = sl.getChunk(cx, cz);
+            } else {
+                chunk = sl.getChunkSource().getChunkNow(cx, cz);
+                if (chunk == null) return false;
+            }
+        } catch (Throwable unavailable) {
+            return false;
+        }
+        int secIdx = cy - ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection(sl);
+        net.minecraft.world.level.chunk.LevelChunkSection[] sections = chunk.getSections();
+        if (secIdx < 0 || secIdx >= sections.length) return false;
+        net.minecraft.world.level.chunk.LevelChunkSection section = sections[secIdx];
+        java.util.HashMap<BlockState, Integer> paletteIdx = new java.util.HashMap<>(32);
+        int entryN = 0; // slot 0 = air
+        outD[0] = 0.0; // air entry: no collider
+        outD[8] = 0.6;
+        outD[9] = 1.0;
+        outD[10] = 0.0; outD[11] = 0.0; outD[12] = 0.0;
+        outD[13] = 0.0; outD[14] = 0.0; outD[15] = 0.0; outD[16] = 0.0;
+        outD[17] = 0.0;
+        entryN = 1;
+        try {
+            net.minecraft.world.level.block.state.BlockState[] states =
+                    new net.minecraft.world.level.block.state.BlockState[4096];
+            int nn = 0;
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        int local = x | (z << 4) | (y << 8);
+                        BlockState st = section.states.get(x, y, z);
+                        states[nn++] = st;
+                        Integer pi = paletteIdx.get(st);
+                        if (pi == null) {
+                            pi = entryN;
+                            paletteIdx.put(st, pi);
+                            writeEntry(outD, pi, st);
+                            entryN++;
+                        }
+                        outBlocks[local] = pi;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+        return true;
+    }
+
+    /** One palette entry -> 18 packed doubles at slot * 18. */
+    private static void writeEntry(double[] outD, int slot, BlockState st) {
+        int o = slot * 18;
+        var shape = st.getCollisionShape(
+                net.minecraft.world.level.EmptyBlockGetter.INSTANCE,
+                BlockPos.ZERO, net.minecraft.world.phys.shapes.CollisionContext.empty());
+        var boxes = shape.toAabbs();
+        int complex = boxes.size() > 1 ? 1 : 0;
+        if (boxes.size() == 1) {
+            var b = boxes.get(0);
+            outD[o] = 1.0;
+            outD[o + 1] = b.minX; outD[o + 2] = b.minY; outD[o + 3] = b.minZ;
+            outD[o + 4] = b.maxX; outD[o + 5] = b.maxY; outD[o + 6] = b.maxZ;
+        } else {
+            outD[o] = 0.0;
+        }
+        outD[o + 7] = st.getBlock().getFriction();
+        outD[o + 8] = st.getBlock().getSpeedFactor();
+        outD[o + 9] = (st.is(net.minecraft.world.level.block.Blocks.WATER)
+                || st.is(net.minecraft.world.level.block.Blocks.BUBBLE_COLUMN)) ? 1.0 : 0.0;
+        outD[o + 10] = st.getFluidState().isEmpty() ? 0.0 : 1.0;
+        outD[o + 11] = st.is(net.minecraft.world.level.block.Blocks.COBWEB) ? 1.0 : 0.0;
+        outD[o + 12] = overrides(st, "entityInside") ? 1.0 : 0.0;
+        outD[o + 13] = overrides(st, "stepOn") ? 1.0 : 0.0;
+        outD[o + 14] = overrides(st, "updateEntityMovementAfterFallOn") ? 1.0 : 0.0;
+        outD[o + 15] = overridesShape(st) ? 1.0 : 0.0;
+        outD[o + 16] = complex;
+        outD[o + 17] = 0.0;
+    }
+
+    /** true when the block class overrides the (possibly renamed) method. */
+    private static boolean overrides(BlockState st, String name) {
+        try {
+            Class<?> k = st.getBlock().getClass();
+            while (k != null && k != net.minecraft.world.level.block.state.BlockBehaviour.class) {
+                for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
+                    if (m.getName().equals(name)) return true;
+                }
+                k = k.getSuperclass();
+            }
+            return false;
+        } catch (Throwable t) {
+            return true; // uncertain -> route vanilla
+        }
+    }
+
+    /** true when the block class overrides the context-sensitive shape hook. */
+    private static boolean overridesShape(BlockState st) {
+        try {
+            Class<?> k = st.getBlock().getClass();
+            while (k != null && k != net.minecraft.world.level.block.Block.class) {
+                for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
+                    if (m.getName().equals("getCollisionShape")
+                            || m.getName().equals("getShape")) return true;
+                }
+                k = k.getSuperclass();
+            }
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    // natives (registered in lib.rs)
+    public static native int nativeItemTick(
+            int wid, int n, long[] ids, int[] flags,
+            double[] inD, int[] inI, double[] envD, int[] envI,
+            double[] outD, int[] outI);
+    public static native void nativeItemInvalidate(
+            int wid, int n, int[] xs, int[] ys, int[] zs);
 }

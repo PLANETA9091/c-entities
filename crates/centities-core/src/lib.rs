@@ -18,6 +18,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod itemtick;
+pub mod sections;
+pub mod tick;
+
 /// 16-block XZ cells. Cell edge is the density lever: dense populations
 /// (100k+ entities packed tight) scan k entities per query where k scales
 /// with (query_box / cell)^2, so finer cells cut the dense-case candidate
