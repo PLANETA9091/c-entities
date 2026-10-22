@@ -134,3 +134,32 @@ releases a latch that genuinely loses.
 
 Expected: spread w2b0 row-served at ~2-5us (was 15-30us JNI), mobs-25k
 dense cells native under the restored latch, items-100k unchanged.
+
+## L4e (probe-time batch draining) — the cold-trap root cause
+
+The L4d mobs-25k re-run STILL landed in the all-mirror basin
+(`fast=21,225 mirror=21,618,570`, re-probes ~368us). Root cause found in
+the flush counters: `flush=21,681 / 18,739,443` — **865 probe entries per
+drain**. The batch drained only when a fast query happened (18 probes/tick
+x 1/1024 duty); without a fast STREAM the batch grew across ticks, and
+each rare fast query paid the whole backlog — apply ~865 entries plus the
+dirty-row publish of everything accumulated — at cold-JIT prices. The EMAs
+honestly priced that at ~348-368us, preferred the 9us mirror, and the
+fast path never streamed again. The 6a56dd9 "-36%" state was a lucky
+basin: its latch was set during early warm phases and the stream kept
+itself warm.
+
+Fix: drain the batch at PROBE time, every 64 entries (`DRAIN_CAP`), and
+raise the row path's pending tolerance to the same 64 (`PENDING_CAP`,
+WIN_IDS resized). The total apply+publish work is invariant — only its
+placement moves from queries to probes. Consequences:
+
+- a fast query is now PURE (~2-8us): no backlog to drain;
+- probe prices become honest and stable, so the latch/bootstrap can set
+  on merit instead of early-phase luck;
+- `bN <= 64` between drains keeps the zero-JNI row path servable
+  (previously `bN > 16` refused it constantly in moving-entity worlds).
+
+Expected: mobs-25k recovers the latched basin (or better — dense queries
+on the row path), spread keeps the L4c win via row-served mid-density,
+items-100k unchanged.

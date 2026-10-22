@@ -755,6 +755,18 @@ public final class CeHooks {
     // producer and the flusher are the same thread.
     // ------------------------------------------------------------------
     private static final int BATCH_CAP = 1 << 16;
+    /** L4e: drain the pending probe batch EVERY 64 entries (was: only at
+     *  3/4 of the 64k cap). The old policy let the batch grow for whole
+     *  ticks when no fast query drained it (mobs-25k all-mirror: ~865
+     *  entries between drains), so the RARE fast query paid the entire
+     *  backlog — apply + dirty-row publish at cold-JIT prices (~348us per
+     *  re-probe vs ~13us warm) — which made the EMAs honestly prefer the
+     *  mirror and starved the fast path into the cold trap permanently.
+     *  Draining at probe time keeps queries pure (~2-8us) and keeps the
+     *  pending batch within the row path's PENDING_CAP, so the zero-JNI row
+     *  path stays servable between drains. The total apply+publish work is
+     *  invariant — only its placement moves from queries to probes. */
+    private static final int DRAIN_CAP = 64;
     private static final long[] B_IDS = new long[BATCH_CAP];
     private static final double[] B_BOX = new double[BATCH_CAP * 6];
     private static int bN = 0;
@@ -773,7 +785,7 @@ public final class CeHooks {
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
         bN++;
-        if (bN >= BATCH_CAP - BATCH_CAP / 4) flush();
+        if (bN >= DRAIN_CAP) flush();
     }
 
     /** Batch entry flag (bit 62): the upsert keeps the entity's home cell
@@ -798,7 +810,7 @@ public final class CeHooks {
         }
         B_IDS[bN] = (1L << 63) | (id & 0xFFFF_FFFFL); // negative long = remove
         bN++;
-        if (bN >= BATCH_CAP - BATCH_CAP / 4) flush();
+        if (bN >= DRAIN_CAP) flush();
     }
 
     /** Apply the pending batch in ONE native call. Correctness: the batch is
@@ -1130,7 +1142,9 @@ public final class CeHooks {
     private static final long[] MQ_CELL_X0 = new long[4];
     // Pending row-neutral ids homed in a covered cell: their packed windows
     // are stale until the next publish, so the window test must not skip them.
-    private static final int[] WIN_IDS = new int[16];
+    // Sized to PENDING_CAP: every pending row-neutral id of a covered cell
+    // MUST be recorded, or its stale window could false-skip it.
+    private static final int[] WIN_IDS = new int[64];
     private static int winN = 0;
 
     private static List<Entity> rowQuery(
@@ -1178,7 +1192,10 @@ public final class CeHooks {
         // batch can do to the covered cells (move out, remove, in-cell box
         // change) is made exact by the home re-check + live-box filter below.
         if (bN > 0) {
-            if (bN > 16) { rowPending++; return null; } // bound the scan
+            // L4e: bound raised 16 -> 64 to match DRAIN_CAP — probe-time
+            // draining keeps bN <= 64, so the scan below stays O(64x4) while
+            // the row path now serves between drains instead of refusing.
+            if (bN > 64) { rowPending++; return null; } // bound the scan
             winN = 0;
             for (int i = 0; i < bN; i++) {
                 long l = B_IDS[i];
