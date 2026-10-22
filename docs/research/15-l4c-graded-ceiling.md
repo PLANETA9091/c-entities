@@ -86,3 +86,51 @@ everywhere it was measured.
    sweep) would amortize it, but require restructuring vanilla's per-entity
    call sites — deferred.
 3. Tracker/dispatch floors (doc 14) — unchanged, Java-structural.
+
+---
+
+# ADDENDUM — L4c CI verdict + L4d (partial revert + windowed rows)
+
+## L4c on CI (run 39763715530, commit a633c61, 9/11 legs before supersede)
+
+| scenario | vanilla | module | delta | was @6a56dd9 |
+|---|---:|---:|---:|---:|
+| items-100k | 95.6 | 48.0 | **-49.8%** | -49.1% (unchanged, as predicted) |
+| spread-100k | 464.8 | 361.3 | **-22.3%** | +10.0% REGRESSION -> fixed |
+| mobs-25k | 447.3 | 467.8 | **+4.6%** | -36.3% -> BROKEN by the latch release |
+
+## The latch release was a self-fulfilling cold-path trap
+
+Releasing the latch stopped the fast stream in mobs-25k w2b0. The JNI
+route went cold: re-probes priced at ~348us (qMs sampled phase nanos
+agree) vs ~13us while the stream was warm. Everything fell back to a
+full-load mirror — 18.7k queries/tick, `AABB.intersects` share 13.5% ->
+26.5% — and the leg lost its win. A stale-high fast EMA can never snap
+down to the warm price without the stream that warms it, so "release
+when the EMA says fast loses" always confirms itself.
+
+The spread regression L4c chased was the row CEILING all along: spread
+w2b0 hysteresis alone routed fast (15us vs 2.9ms mirror) even with the
+latch armed. Lesson recorded: **a latch that gates a warm path must be
+judged at its warm operating point, not against an EMA trained while
+the path was idle.** The existing break (`dt > 4 x MIRR_EMA`) still
+releases a latch that genuinely loses.
+
+## L4d (commit 13d65cc)
+
+1. Revert of the latch release (latch semantics back to 6a56dd9).
+2. `ROW_TOTAL_CAP = 512` kept (the actual spread fix).
+3. **Windowed rows**: each published row entry packs
+   `(id, xLo, xHi)` — the entity's x-interval in 1/1024-block units
+   relative to the row's cell origin (floor/ceil + 2-unit slack, 16 bits
+   each, conservative superset of the true interval — property-tested).
+   The Java row scan skips x-disjoint candidates at ~3ns without
+   dereferencing the Entity; survivors run the unchanged exact path
+   (home re-check + live-box intersects + predicate). Pending same-cell
+   box changes leave a row's window stale for that id until the next
+   publish — the pending scan records such ids (WIN_IDS) and bypasses
+   the window test for them; cross-cell/removal pending entries keep
+   the existing refusal/null-resolve paths.
+
+Expected: spread w2b0 row-served at ~2-5us (was 15-30us JNI), mobs-25k
+dense cells native under the restored latch, items-100k unchanged.
