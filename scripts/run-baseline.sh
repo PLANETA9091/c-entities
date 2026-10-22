@@ -114,15 +114,16 @@ JPID=$!
     # evaluates false KILLS the watchdog after the first sample (observed:
     # every dead-leg log had exactly one WD line). Use an if.
     if [ "$i" -gt 18 ]; then sleep 20; fi
-    JRSS=$(ps -o rss= -p "$JPID" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')
-    NRSS=$(ps -o rss= -C node 2>/dev/null | awk 'NR==1{printf "%.0fMB", $1/1024}')
-    SYSMEM=$(free -m 2>/dev/null | awk '/Mem:/{printf "%s/%sMB", $3, $2}')
+    JRSS=$(ps -o rss= -p "$JPID" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}' || true)
+    NRSS=$(ps -o rss= -C node 2>/dev/null | awk 'NR==1{printf "%.0fMB", $1/1024}' || true)
+    SYSMEM=$(free -m 2>/dev/null | awk '/Mem:/{printf "%s/%sMB", $3, $2}' || true)
     echo "WD[$i] rss java=$JRSS node=${NRSS:-0} mem=$SYSMEM"
     # jcmd attaches via the VM's attach mechanism — it can STALL for minutes
     # on a busy JVM (observed: the watchdog hung inside jcmd and the NMT
-    # sample never landed). Hard-cap it.
-    timeout 5 jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1
-    grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3
+    # sample never landed). Hard-cap it. EVERY pipeline in this loop needs
+    # `|| true`: pipefail + grep-no-match kills the subshell silently.
+    timeout 5 jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1 || true
+    grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3 || true
   done
 ) &
 WDPID=$!
