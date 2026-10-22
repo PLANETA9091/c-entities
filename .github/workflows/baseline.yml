@@ -28,7 +28,7 @@ jobs:
           - { name: control,    SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: items-25k,  SCALE: 25000,  PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: mobs-10k,   SCALE: 10000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
-          - { name: mobs-25k,   SCALE: 25000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
+          - { name: mobs-25k,   SCALE: 25000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600, AB: '1' }
           - { name: mixed-50k,  SCALE: 50000,  PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: tiles-25k,  SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 15000, TILE_F: 10000, MEASURE: 600 }
           - { name: tiles-100k, SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 60000, TILE_F: 40000, MEASURE: 600 }

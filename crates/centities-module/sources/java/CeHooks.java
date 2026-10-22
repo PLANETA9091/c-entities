@@ -492,6 +492,7 @@ public final class CeHooks {
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
+                + " gate=" + gateStats()
                 + " row=" + rowFast + "/" + rowMulti + "/" + rowStale + "/" + rowPending
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
@@ -506,6 +507,26 @@ public final class CeHooks {
                 + "/" + dbgExpSlot + "/" + dbgMisses
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
+    }
+
+    /** L4 gate telemetry: per-bucket (every registered world) EMA/N snapshot
+     *  so CI logs show WHICH buckets route where and why. Format:
+     *  w<wid>b<b>:f<fastEma>us<n>/m<mirrEma>us<n>/bk<n>[;..] — buckets with
+     *  zero traffic on both sides are omitted. */
+    private static String gateStats() {
+        StringBuilder sb = new StringBuilder(160);
+        for (int wid = 0; wid < GWORLDS; wid++) {
+            for (int b = 0; b < GBUCKETS; b++) {
+                int gi = wid * GBUCKETS + b;
+                if (FAST_N[gi] == 0 && MIRR_N[gi] == 0) continue;
+                if (sb.length() > 0) sb.append(';');
+                sb.append('w').append(wid).append('b').append(b)
+                  .append(":f").append(FAST_EMA[gi] / 1000).append("us").append(FAST_N[gi])
+                  .append("/m").append(MIRR_EMA[gi] / 1000).append("us").append(MIRR_N[gi])
+                  .append("/bk").append(FAST_BACKOFF[gi]);
+            }
+        }
+        return sb.length() == 0 ? "-" : sb.toString();
     }
 
     // ------------------------------------------------------------------
@@ -534,17 +555,20 @@ public final class CeHooks {
                         // the new reality instead of creeping at 1/8.
                         long me = MIRR_EMA[gi];
                         int bk = FAST_BACKOFF[gi];
-                        if (me > 0 && dt > 2 * me) {
-                            if (bk < 4) bk++;
-                            // Soft unstick: jump half-way toward the sample,
-                            // NOT to the sample. A single expensive re-probe
-                            // must not wipe the EMA's memory of a bucket where
-                            // fast genuinely wins most of the time (4a.1 did
-                            // that and pushed spread-100k into a permanent
-                            // mirror + suspend/resync storm).
+                        // L4 backoff: escalate only on a CLEAR loss (4x the
+                        // mirror price — 2x was within fill-phase noise and
+                        // starved probing into suspend storms); the duty
+                        // cycle never drops below 1/1024. A re-probe that is
+                        // CHEAPER than the EMA remembers snaps the EMA down
+                        // instantly: the world got denser (the common
+                        // direction), and the old 1/8 creep kept fast losing
+                        // for thousands of ticks after fill.
+                        if (me > 0 && dt > 4 * me) {
+                            if (bk < 2) bk++;
                             if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
-                        } else if (bk > 0 && me > 0 && dt < me) {
-                            bk--; // cheap again — restore probing granularity
+                        } else {
+                            if (me > 0 && dt < me) bk = 0; // cheap again
+                            if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
                         }
                         FAST_BACKOFF[gi] = bk;
                         queriesFast++;
@@ -754,15 +778,25 @@ public final class CeHooks {
     }
 
     // ------------------------------------------------------------------
-    // PARITY GATE (iteration 4). Owner's hard requirement: the module must
+    // PARITY GATE (iteration L4). Owner's hard requirement: the module must
     // never be slower than vanilla. Per (world, volume-bucket) we keep an
     // EMA of measured fast-path and mirror-path nanos; every query is routed
     // to the measured-cheaper path. Fast wins only in dense buckets (the
     // exact Rust index skips the section scan's wasted intersects); small
-    // queries stay vanilla. When fast queries all but disappear across the
-    // whole gate window, indexing suspends entirely (probes = 1 volatile
-    // read) and re-arms through a full resync when an expensive query shows
-    // up again. Worst case is therefore vanilla parity minus gate arithmetic.
+    // queries stay vanilla. Worst case is vanilla parity minus gate
+    // arithmetic (probes keep running; their cost is O(changes), not
+    // O(queries)).
+    //
+    // L4: the old suspend/resync machinery is GONE. Measured on CI
+    // (mixed-150k-mod): fast=773k vs mirror=19M with 198 suspend->resync
+    // cycles re-upserting 18.9M entities. The cycle was self-sustaining:
+    // the re-probe backoff starves fast (1/4096 duty), a 16k-decision window
+    // then sees chosen<32 and suspends, the resync taxes ~5-15ms and
+    // poisons the fast EMA, mirror serves everything, repeat. Without
+    // suspend the EMA race converges in ~20 samples per bucket and the
+    // worst case is a 1/256..1/1024 probe tax — no resync storms, no
+    // all-mirror phases. Correctness never depended on suspend: both paths
+    // are always exact, the desync guard + kill-switches remain.
     //
     // Thread-safety: gate state is heuristic — decisions happen on the
     // server thread; races from other callers degrade to a stale choice,
@@ -776,30 +810,17 @@ public final class CeHooks {
     private static final int[] MIRR_N = new int[GWORLDS * GBUCKETS];
     private static final int[] FAST_SEQ = new int[GWORLDS * GBUCKETS];
     private static final int[] MIRR_SEQ = new int[GWORLDS * GBUCKETS];
-    /** Re-probe backoff per cell (0..4): when a re-probe lands on a much
+    /** Re-probe backoff per cell (0..2): when a re-probe lands on a much
      *  more expensive fast sample than mirror, the 1/256 probe rate itself
      *  becomes a tax (mixed-150k: 66 probes/tick × 307us = 20 ms/tick). The
-     *  step doubles up to 1/4096 until fast gets cheap again. */
+     *  step doubles up to 1/1024 until fast gets cheap again; probing never
+     *  stops entirely (L4: that starvation fed the suspend storms). */
     private static final int[] FAST_BACKOFF = new int[GWORLDS * GBUCKETS];
     private static int gateDecisions = 0, gateFastChosen = 0;
-    private static final int GATE_WINDOW = 16_384;
-    private static final int GATE_MIN_FAST = 32;   // below: fast is useless
-    private static final long RESUME_NANOS = 30_000; // an expensive query re-arms
-    /** Last sampled mirror price (0 = none). A suspend must not fire while
-     *  mirror queries are this expensive — the world is dense enough that a
-     *  re-synced index may win; suspending then causes a suspend<->resync
-     *  cycle (spread-100k 4a.1: 65.8k batch entries/tick = resync every
-     *  tick). */
-    private static volatile long lastMirrorNanos = 0;
-    /** Gate windows that must pass (with a live index) before suspend is
-     *  allowed again — set by resumeIndexing. Without it the gate drops the
-     *  index and resumes it in the same tick: suspend<->resync storm. */
-    private static volatile int suspendCooldown = 0;
 
-    /** INDEXING=false means probes do nothing (suspend). SUSPENDED means the
-     *  gate also refuses fast queries until a full resync re-arms the index. */
+    /** INDEXING=false would mean probes do nothing. L4: there is no suspend
+     *  path anymore — the field stays as a manual kill-switch only. */
     private static volatile boolean INDEXING = true;
-    private static volatile boolean SUSPENDED = false;
 
     private static void ema(long[] arr, int i, long sample) {
         long e = arr[i];
@@ -828,23 +849,21 @@ public final class CeHooks {
             mBadWorld++;
             return -1; // no gate cell — vanilla, guaranteed parity
         }
-        if (SUSPENDED) {
-            gateDecisions++;
-            return -1; // resume trigger lives in mirrorMaybeTimed
-        }
         return wid * GBUCKETS + bucketOf(box);
     }
 
     /** The per-cell routing decision. FAST_N < 16 bootstraps with measured
-     *  probes; afterwards a 1/256 re-probe keeps EMAs from going stale and
-     *  the comparison runs with hysteresis (fast must be < 80% of mirror).
-     *  Also feeds the suspend window. */
+     *  probes; afterwards a 1/256..1/1024 re-probe keeps EMAs from going
+     *  stale and the comparison runs with hysteresis (fast must be < 80% of
+     *  mirror). L4: no suspend side effect — probing NEVER stops, so a
+     *  world that gets denser over time converges onto the fast path in
+     *  ~20 samples instead of being stuck in mirror forever. */
     private static boolean wantFast(int gi) {
         boolean fast;
         if (FAST_N[gi] < 16) {
             fast = true; // bootstrap: a few measured probes per bucket
         } else {
-            int step = 256 << Math.min(FAST_BACKOFF[gi], 4); // 256..4096
+            int step = 256 << Math.min(FAST_BACKOFF[gi], 2); // 256..1024
             if ((++FAST_SEQ[gi] & (step - 1)) == 0) {
                 fast = true; // periodic re-probe (backed off): EMAs must not go stale
                 fastProbes++;
@@ -855,22 +874,19 @@ public final class CeHooks {
         gateDecisions++;
         if (fast) {
             gateFastChosen++;
-        } else {
-            maybeSuspend();
         }
         return fast;
     }
 
-    /** Mirror with sampled timing: the EMA needs mirror prices, and while
-     *  suspended a single expensive sample is the resume trigger. gi >= 0
-     *  means the query has a gate cell (per-bucket sampling applies);
-     *  gi < 0 means vanilla outright (sample only for the resume scan). */
+    /** Mirror with sampled timing: the EMA needs mirror prices to route.
+     *  gi >= 0 means the query has a gate cell (per-bucket sampling
+     *  applies); gi < 0 means vanilla outright (nothing to price). */
     private static List<Entity> mirrorMaybeTimed(
             net.minecraft.world.level.Level level,
             Entity source, AABB box, Predicate<? super Entity> predicate, int gi) {
         boolean sample;
         if (gi < 0) {
-            sample = SUSPENDED && (mirrorProbes++ & 63) == 0; // resume scan while asleep
+            sample = false; // vanilla-outright query: no bucket to price
         } else if (MIRR_N[gi] < 64) {
             sample = true;
         } else {
@@ -884,71 +900,11 @@ public final class CeHooks {
         List<Entity> ret = mirror(level, source, box, predicate);
         long dt = System.nanoTime() - t0;
         if (dt <= 0) dt = 1;
-        lastMirrorNanos = dt;
         if (gi >= 0) {
             ema(MIRR_EMA, gi, dt);
             if (MIRR_N[gi] < 1_000_000) MIRR_N[gi]++;
         }
-        if (SUSPENDED && dt >= RESUME_NANOS) {
-            resumeIndexing();
-        }
         return ret;
-    }
-
-    private static void maybeSuspend() {
-        if (gateDecisions < GATE_WINDOW) return;
-        int chosen = gateFastChosen;
-        gateDecisions = 0;
-        gateFastChosen = 0;
-        if (SUSPENDED) return;
-        // Dense world in mirror mode: dropping the index now guarantees a
-        // suspend<->resync cycle (resume re-arms on the very next expensive
-        // sample). Keep indexing and let the gate keep measuring.
-        if (lastMirrorNanos >= RESUME_NANOS) return;
-        // Post-resume cooldown: judge the freshly re-synced index over 4
-        // full windows before suspend may fire again.
-        if (suspendCooldown > 0) {
-            suspendCooldown--;
-            return;
-        }
-        if (chosen < GATE_MIN_FAST) {
-            SUSPENDED = true;
-            INDEXING = false;
-            bN = 0; // pending deltas are irrelevant: the index is dropped and
-            nativeReset(); // will be fully rebuilt by resync on resume
-            java.util.Arrays.fill(ARENA, null); // release entity refs for GC
-            java.util.Arrays.fill(REST_GEN, 0); // rest states die with the index
-            suspends++;
-        }
-    }
-
-    /** Full re-sync of the Rust index + ARENA from the live lookups. Runs on
-     *  the calling (server) thread; vanilla's getAllEntities iterates safely.
-     *  Off-thread direct probes racing the resync are harmless: worst case a
-     *  candidate is briefly stale and resolve falls back or skips it. */
-    private static void resumeIndexing() {
-        if (!SERVER_THREAD.get()) {
-            return; // the resync writes server-thread state — retry later
-        }
-        nativeReset();
-        for (net.minecraft.world.level.Level w : WORLDS.keySet()) {
-            if (!(w instanceof net.minecraft.server.level.ServerLevel sl)) continue;
-            int wid = worldId(sl);
-            int n = 0;
-            for (Entity e : sl.getAllEntities()) {
-                if (e == null || e.isRemoved()) continue;
-                AABB b = e.getBoundingBox();
-                ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), wid, b, false);
-                n++;
-            }
-            resyncEnts += n;
-        }
-        flush();
-        INDEXING = true;
-        SUSPENDED = false;
-        resumes++;
-        suspendCooldown = 4;
     }
 
     // ------------------------------------------------------------------
