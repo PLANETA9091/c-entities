@@ -94,6 +94,7 @@ public final class CeHooks {
     public static volatile long rowMulti = 0, rowNoRow = 0, rowKey = 0, rowStale = 0;
     public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
     public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
+    public static volatile long rowWinSkip = 0; // L4c: candidates skipped by the packed x-window
 
     // ------------------------------------------------------------------
     // L2a RESTING ITEMS — the woven ItemEntity.tick guard calls itemSkip
@@ -501,6 +502,7 @@ public final class CeHooks {
                 + " row=" + rowFast + "/" + rowMulti + "/" + rowStale + "/" + rowPending
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
+                + "/w" + rowWinSkip
                 + " rest=" + restFast + "/" + restMarks + "/" + restWakes + "/" + restChecks + "/" + hurtProbes
                 + " wakes=" + wakesDelta + "/" + wakesBox + "/" + wakesSelf
                 + " restF=" + restFailGround + "/" + restFailDelay + "/" + restFailAge
@@ -590,20 +592,19 @@ public final class CeHooks {
                             }
                         }
                         FAST_BACKOFF[gi] = bk;
-                        // L4c latch consistency: the latch must obey the SAME
-                        // hysteresis as wantFast. A latched bucket whose running
-                        // fast EMA no longer beats the mirror EMA releases
-                        // immediately (CI mobs-25k w2b0: 3 lucky ~1us samples
-                        // latched the bucket, then every query paid the ~13us
-                        // fast average against a 4us mirror — a self-inflicted
-                        // 3x loss on ~4.6k queries/tick). True-win buckets keep
-                        // the latch (spread w2b0: ~15us vs ~2.9ms mirror).
-                        if (FAST_LATCH[gi] > 0) {
-                            long me2 = MIRR_EMA[gi];
-                            if (me2 > 0 && FAST_EMA[gi] * 4 >= me2 * 5) {
-                                FAST_LATCH[gi] = 0;
-                            }
-                        }
+                        // L4d: the L4c latch release (drop the latch when the
+                        // stale fast EMA stops beating the mirror EMA) is
+                        // REVERTED — it was a self-fulfilling trap. CI mobs-25k:
+                        // releasing the latch stopped the fast stream, the JNI
+                        // path went cold (re-probes priced at ~348us vs ~13us
+                        // warm), everything fell back to a full-load mirror at
+                        // 8us x 18.7k/tick, and the leg regressed -36% -> +4.6%.
+                        // The spread regression L4c chased was the row CEILING
+                        // (rowBig refusals -> JNI toll), never the latch: in
+                        // spread w2b0 hysteresis alone routed fast (15us vs
+                        // 2.9ms mirror) even with the latch armed. The existing
+                        // break (dt > 4 x mirror EMA) still releases a latch
+                        // that genuinely loses.
                         queriesFast++;
                         return out;
                     }
@@ -1124,6 +1125,13 @@ public final class CeHooks {
     // Multi-cell scratch (server-thread only, reused — no per-query alloc).
     private static final long[][] MQ_ROWS = new long[4][];
     private static final int[] MQ_CELL = new int[4];
+    // L4c windowed rows: the UNWRAPPED cell x-origin of each covered row
+    // (world blocks) — the reference frame for the packed candidate windows.
+    private static final long[] MQ_CELL_X0 = new long[4];
+    // Pending row-neutral ids homed in a covered cell: their packed windows
+    // are stale until the next publish, so the window test must not skip them.
+    private static final int[] WIN_IDS = new int[16];
+    private static int winN = 0;
 
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
@@ -1159,6 +1167,7 @@ public final class CeHooks {
                 if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
                 MQ_ROWS[nr] = row;
                 MQ_CELL[nr] = (cx & 0x3FF) | ((cz & 0x3FF) << 10);
+                MQ_CELL_X0[nr] = (long) cx << 4;
                 nr++;
                 total += n;
             }
@@ -1170,14 +1179,32 @@ public final class CeHooks {
         // change) is made exact by the home re-check + live-box filter below.
         if (bN > 0) {
             if (bN > 16) { rowPending++; return null; } // bound the scan
+            winN = 0;
             for (int i = 0; i < bN; i++) {
                 long l = B_IDS[i];
                 if (l < 0) continue;                 // removals resolve to null below
-                if ((l & ROW_NEUTRAL) != 0) continue; // same-cell box change: row id list unchanged
+                if ((l & ROW_NEUTRAL) != 0) {
+                    // same-cell box change: the row's ID LIST is unchanged,
+                    // but the packed x-window this row was published with is
+                    // now stale for that id. If its (recomputed) home is one
+                    // of the covered cells, the window test must not skip it
+                    // — record the id so the scan derefs it and lets the live
+                    // box decide (all APPLIED changes are republished before
+                    // any later query; only PENDING ones go stale).
+                    int o = i * 6;
+                    int home = (cellFloor((B_BOX[o] + B_BOX[o + 3]) * 0.5) & 0x3FF)
+                            | ((cellFloor((B_BOX[o + 2] + B_BOX[o + 5]) * 0.5) & 0x3FF) << 10);
+                    for (int r = 0; r < nr; r++) {
+                        if (MQ_CELL[r] == home && winN < WIN_IDS.length) {
+                            WIN_IDS[winN++] = (int) l;
+                        }
+                    }
+                    continue;
+                }
                 if (((l >> 32) & 0xFFFF) != (wid & 0xFFFF)) continue;
-                int o = i * 6;
-                int home = (cellFloor((B_BOX[o] + B_BOX[o + 3]) * 0.5) & 0x3FF)
-                        | ((cellFloor((B_BOX[o + 2] + B_BOX[o + 5]) * 0.5) & 0x3FF) << 10);
+                int o2 = i * 6;
+                int home = (cellFloor((B_BOX[o2] + B_BOX[o2 + 3]) * 0.5) & 0x3FF)
+                        | ((cellFloor((B_BOX[o2 + 2] + B_BOX[o2 + 5]) * 0.5) & 0x3FF) << 10);
                 for (int r = 0; r < nr; r++) {
                     if (MQ_CELL[r] == home) {
                         rowPending++;
@@ -1185,6 +1212,8 @@ public final class CeHooks {
                     }
                 }
             }
+        } else {
+            winN = 0;
         }
         if (total == 0) { rowEmpty++; return new ArrayList<>(0); }
         // Row-size ceiling (L4c, graded): the row path pays a per-candidate
@@ -1205,9 +1234,39 @@ public final class CeHooks {
             long[] row = MQ_ROWS[r];
             int packed = MQ_CELL[r];
             int n = (int) (row[1] & 0x7FF);
+            // L4c windowed scan: each row entry packs (id, xLo, xHi) — a
+            // conservative x-interval of the entity's box in 1/1024-block
+            // units relative to the ROW's cell origin (see the Rust
+            // cell_scan_packed contract; floor/ceil + 2-unit slack on both
+            // sides make the packed interval a strict superset of the true
+            // one). The query window is quantized the same way, so a
+            // candidate whose packed interval is disjoint from it provably
+            // has no x overlap and cannot intersect the query box — it is
+            // skipped WITHOUT dereferencing the Entity. Survivors run the
+            // UNCHANGED exact path below (home re-check + live-box intersects
+            // + predicate), so the window can only save work, never change
+            // the answer. Typical push query: ~2.6 blocks wide in a 16-block
+            // cell -> ~85% of candidates skipped at ~3ns each.
+            long cellX0 = MQ_CELL_X0[r];
+            int qLo = ((int) Math.floor((box.minX - cellX0) * 1024.0)) - 2 + 32768;
+            int qHi = ((int) Math.ceil((box.maxX - cellX0) * 1024.0)) + 2 + 32768;
             for (int k = 0; k < n; k++) {
-                int cid = (int) row[2 + k];
+                long p = row[2 + k];
+                int cid = (int) p;
                 if (cid == srcId) continue;
+                // stale-window guard: pending same-cell box changes are not
+                // reflected in the packed window — deref them and let the
+                // live box decide (winN is 0..2 in practice).
+                boolean winTrusted = true;
+                for (int w = 0; w < winN; w++) {
+                    if (WIN_IDS[w] == cid) { winTrusted = false; break; }
+                }
+                if (winTrusted
+                        && ((((int) (p >>> 48)) & 0xFFFF) < qLo
+                            || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
+                    rowWinSkip++;
+                    continue;
+                }
                 Entity e = ARENA[cid & AMASK];
                 if (e == null || e.getId() != cid) {
                     e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
