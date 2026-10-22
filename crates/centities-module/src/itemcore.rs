@@ -167,10 +167,18 @@ thread_local! {
 }
 
 pub fn make_provider(wid: i32) -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
+    use std::sync::atomic::Ordering::Relaxed;
     move |cx: i32, cy: i32, cz: i32, load: bool| -> Result<SectionData, ()> {
-        SEC_UPCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SEC_UPCALLS.fetch_add(1, Relaxed);
+        SEC_MIN_X.fetch_min(cx, Relaxed);
+        SEC_MAX_X.fetch_max(cx, Relaxed);
+        SEC_MIN_Y.fetch_min(cy, Relaxed);
+        SEC_MAX_Y.fetch_max(cy, Relaxed);
+        SEC_MIN_Z.fetch_min(cz, Relaxed);
+        SEC_MAX_Z.fetch_max(cz, Relaxed);
         let hooks_cls = HOOKS_CLASS_GLOBAL.load(std::sync::atomic::Ordering::Acquire);
         if hooks_cls == 0 {
+            SEC_ERRS.fetch_add(1, Relaxed);
             return Err(());
         }
         cplug_sdk::jni_util::with_attached(|env| unsafe {
@@ -320,6 +328,16 @@ static FLUSH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// SectionData slots the grid retains (the CI 100k-mod legs exploded RSS at
 /// ~300MB/s with NMT flat — this line names the growing structure).
 static SEC_UPCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Provider coordinate extremes: if the gather feeds garbage (NaN/huge
+/// deltas), these explode — the 100k fill showed 457k retained sections for
+/// ~12k items, which is impossible for sane coords.
+static SEC_MIN_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MAX);
+static SEC_MAX_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+static SEC_MIN_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MAX);
+static SEC_MAX_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+static SEC_MIN_Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MAX);
+static SEC_MAX_Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+static SEC_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn proc_rss_mb() -> u64 {
     // /proc/self/statm: [total, resident, ...] in 4KB pages
@@ -693,17 +711,24 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={}, grid pop={} look={} idx ents={} cells={} oversize={}",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}]",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
                                         proc_rss_mb(),
                                         SEC_UPCALLS.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_ERRS.load(std::sync::atomic::Ordering::Relaxed),
                                         g.populated,
                                         g.lookups,
                                         idx_stats.entities,
                                         idx_stats.cells,
                                         idx_stats.oversize,
+                                        SEC_MIN_X.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_MAX_X.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_MIN_Y.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_MAX_Y.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_MIN_Z.load(std::sync::atomic::Ordering::Relaxed),
+                                        SEC_MAX_Z.load(std::sync::atomic::Ordering::Relaxed),
                                     ));
                                 }
                             }
