@@ -729,6 +729,8 @@ unsafe fn n_item_tick_impl(
                                         SEC_MAX_Y.load(std::sync::atomic::Ordering::Relaxed),
                                         SEC_MIN_Z.load(std::sync::atomic::Ordering::Relaxed),
                                         SEC_MAX_Z.load(std::sync::atomic::Ordering::Relaxed),
+                                        format_args!("{:e}", max_abs_delta),
+                                        format_args!("{:e}", max_abs_pos),
                                     ));
                                 }
                             }
