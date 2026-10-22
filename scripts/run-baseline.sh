@@ -89,6 +89,7 @@ echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_
 # ExitOnOutOfMemoryError: a JVM OOM must fail FAST (FATAL with logs) instead
 # of GC-thrashing the VM into a kernel-OOM runner death.
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
+  -XX:NativeMemoryTracking=summary \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
@@ -102,12 +103,14 @@ JPID=$!
 # of java/node are captured no matter how the leg dies.
 (
   for i in $(seq 1 120); do
-    sleep 30
+    sleep 10
     kill -0 "$JPID" 2>/dev/null || break
+    [ $i -gt 18 ] && sleep 20
     JRSS=$(ps -o rss= -p "$JPID" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')
     NRSS=$(ps -o rss= -C node 2>/dev/null | awk 'NR==1{printf "%.0fMB", $1/1024}')
     SYSMEM=$(free -m 2>/dev/null | awk '/Mem:/{printf "%s/%sMB", $3, $2}')
     echo "WD[$i] rss java=$JRSS node=${NRSS:-0} mem=$SYSMEM"
+    jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1
     grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3
   done
 ) &
