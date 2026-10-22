@@ -168,6 +168,7 @@ thread_local! {
 
 pub fn make_provider(wid: i32) -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
     move |cx: i32, cy: i32, cz: i32, load: bool| -> Result<SectionData, ()> {
+        SEC_UPCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hooks_cls = HOOKS_CLASS_GLOBAL.load(std::sync::atomic::Ordering::Acquire);
         if hooks_cls == 0 {
             return Err(());
@@ -315,6 +316,20 @@ const F_ON_GROUND: i32 = 32;
 
 static FLUSH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FLUSH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostics: how many section up-calls the provider served and how many
+/// SectionData slots the grid retains (the CI 100k-mod legs exploded RSS at
+/// ~300MB/s with NMT flat — this line names the growing structure).
+static SEC_UPCALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn proc_rss_mb() -> u64 {
+    // /proc/self/statm: [total, resident, ...] in 4KB pages
+    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else { return 0 };
+    s.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|pages| pages * 4096 / 1024 / 1024)
+        .unwrap_or(0)
+}
 
 thread_local! {
     static T_IDS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
@@ -673,13 +688,22 @@ unsafe fn n_item_tick_impl(
                                 let dt = t0.elapsed().as_nanos() as u64;
                                 FLUSH_NANOS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
                                 let cnt = FLUSH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                if cnt % 200 == 0 {
+                                if cnt % 50 == 0 {
                                     let total = FLUSH_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+                                    let g = &world.grid;
+                                    let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={}, grid pop={} look={} idx ents={} cells={} oversize={}",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
-                                        n
+                                        n,
+                                        proc_rss_mb(),
+                                        SEC_UPCALLS.load(std::sync::atomic::Ordering::Relaxed),
+                                        g.populated,
+                                        g.lookups,
+                                        idx_stats.entities,
+                                        idx_stats.cells,
+                                        idx_stats.oversize,
                                     ));
                                 }
                             }
