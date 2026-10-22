@@ -457,6 +457,8 @@ unsafe fn n_item_tick_impl(
                             let items_native = envv_i[3] != 0;
                             let t0 = std::time::Instant::now();
                             let world = core.world(wid as usize);
+                            let mut max_abs_delta: f64 = 0.0f64;
+                            let mut max_abs_pos: f64 = 0.0f64;
                             let mut provider = make_provider(wid);
                             let prov: SectionProvider = &mut provider;
                             for k in 0..n {
@@ -608,6 +610,12 @@ unsafe fn n_item_tick_impl(
                                     } else {
                                         st.pickup_delay = es.pickup_delay;
                                     }
+                                }
+                                {
+                                    let ad = st.dx.abs().max(st.dy.abs()).max(st.dz.abs());
+                                    if ad.is_finite() && ad > max_abs_delta { max_abs_delta = ad; }
+                                    let ap = st.x.abs().max(st.y.abs()).max(st.z.abs());
+                                    if ap.is_finite() && ap > max_abs_pos { max_abs_pos = ap; }
                                 }
                                 let outcome = if (f & F_INACTIVE) != 0 {
                                     tick_item_inactive(&mut st)
