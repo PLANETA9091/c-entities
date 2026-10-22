@@ -1,5 +1,0 @@
-{
-  "id": "entities",
-  "main": "libcentities_module.so",
-  "dependencies": []
-}
