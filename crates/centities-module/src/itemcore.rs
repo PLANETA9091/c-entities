@@ -24,7 +24,7 @@ const STORE_MASK: u64 = (STORE_CAP - 1) as u64;
 
 #[derive(Clone, Copy)]
 struct ItemEntry {
-    tag: u64, // (id >> 18) | 1 — validity check against slot aliasing
+    tag: u64, // (id >> 17) | 1 — validity check against slot aliasing
     stuck: (f64, f64, f64),
     sup: (i32, i32, i32),
     sup_present: bool,
@@ -70,7 +70,7 @@ impl ItemWorld {
     #[inline]
     fn entry(&mut self, id: i64) -> &mut ItemEntry {
         let slot = (id as u64 & STORE_MASK) as usize;
-        let tag = (id as u64 >> 18) | 1;
+        let tag = (id as u64 >> 17) | 1;
         let e = &mut self.entries[slot];
         if e.tag != tag {
             *e = ItemEntry::fresh(tag);
@@ -564,5 +564,23 @@ unsafe fn n_item_invalidate_impl(
     let world = &mut core.worlds[wid as usize];
     for k in 0..n {
         world.invalidate_section(vx[k], vy[k], vz[k]);
+        // fr-memo hole-closer: items overlapping the changed section may sit
+        // on a block whose friction/speed just changed. Query the index
+        // (in-process, zero JNI) for the section's entity ids and clear
+        // their memos — the next native tick re-resolves exactly.
+        let sx = (vx[k] << 4) as f64;
+        let sy = (vy[k] << 4) as f64;
+        let sz = (vz[k] << 4) as f64;
+        let box_ = centities_core::Aabb::new(sx, sy, sz, sx + 16.0, sy + 16.0, sz + 16.0);
+        let mut hits: Vec<i64> = Vec::with_capacity(64);
+        cst.idx.query(wid as u16, &box_, &mut hits);
+        for id in hits {
+            let slot = (id as u64 & STORE_MASK) as usize;
+            let tag = (id as u64 >> 17) | 1;
+            let e = &mut world.entries[slot];
+            if e.tag == tag {
+                e.fr_pos = (i32::MIN, i32::MIN, i32::MIN);
+            }
+        }
     }
 }

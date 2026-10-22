@@ -1433,19 +1433,14 @@ public final class CeHooks {
      */
     public static boolean itemInactiveCollect(ItemEntity e) {
         itemChecks++;
-        if (!ACTIVE || !ITEM_TICK_ON || !VH_READY || !BUKKIT_READY || ibN >= IB_CAP) return false;
-        try {
-            if (e.isRemoved()) return false;
-            boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
-                    && MODE_VAL[e.getId() & MAMASK] != 0;
-            appendItem(e, IF_INACTIVE | (nativeMode ? IF_NATIVE : IF_RESYNC));
-            return nativeMode;
-        } catch (Throwable t) {
-            lastError = System.nanoTime();
-            lastErrorText = "itemInactiveCollect: " + t;
-            ACTIVE = false;
-            return false;
-        }
+        // L6.1: inactive items BYPASS the pipeline. Vanilla inactiveTick is
+        // ~15ns (pickupDelay--, age++, despawn check) — collecting + flushing
+        // them costs more than it saves. The store keeps only stuck/sup/fr
+        // (none change while inactive); age/pickupDelay/tickCount are re-read
+        // fresh by the tick collector when the item reactivates, so a vanilla
+        // inactivity window is bit-exact. The guard weave stays (the counter
+        // proves the weave is live; the mode table is never consulted here).
+        return false;
     }
 
     private static void appendItem(ItemEntity e, int flags) {
