@@ -68,6 +68,7 @@ fn flat_world(cobweb_at: Option<(i32, i32, i32)>) -> impl FnMut(i32, i32, i32, b
         if let Some((wx, wy, wz)) = cobweb_at {
             if wx >> 4 == cx && wz >> 4 == cz && (wy >> 4) == cy {
                 data.entries = vec![air_entry(), cobweb_entry()];
+                data.blocks = vec![centities_core::sections::AIR_IDX; 4096];
                 let local = ((wx & 15) | ((wz & 15) << 4) | ((wy & 15) << 8)) as usize;
                 data.blocks[local] = 1;
             }

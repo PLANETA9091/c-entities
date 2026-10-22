@@ -290,10 +290,23 @@ fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
             break;
         }
     }
-    let mut blocks = vec![AIR_IDX; 4096];
-    for (i, v) in b.iter().take(4096).enumerate() {
-        blocks[i] = *v as u16;
-    }
+    // Memory diet (the sparse-fill explosion): an all-air section stores NO
+    // blocks array (empty Vec == air in the accessors), and the palette is
+    // shrunk to its exact size — a 2400x2400-block fill touches ~500k
+    // sections and the previous 8KB-per-section blocks array alone was 4GB
+    // of mostly-air cache.
+    let all_air = b[..4096].iter().all(|&v| v == 0);
+    let blocks = if all_air {
+        Vec::new()
+    } else {
+        let mut blocks = vec![AIR_IDX; 4096];
+        for (i, v) in b.iter().take(4096).enumerate() {
+            blocks[i] = *v as u16;
+        }
+        blocks
+    };
+    let mut entries = entries;
+    entries.shrink_to_fit();
     SectionData { entries, blocks, complex, any_fluid, any_inside_special: any_inside }
 }
 

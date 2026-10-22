@@ -70,6 +70,9 @@ impl PaletteEntry {
 pub struct SectionData {
     pub entries: Vec<PaletteEntry>,
     /// Per-block palette index, [x | z<<4 | y<<8]; AIR_IDX for empty slots.
+    /// EMPTY VEC = all-air section: a sparse world's cache must not pay
+    /// 8KB of blocks for sections that are 100% air (the 2400x2400-block
+    /// fill cached 457k sections = 8GB of mostly-air blocks arrays).
     pub blocks: Vec<u16>,
     pub complex: bool,
     pub any_fluid: bool,
@@ -83,7 +86,7 @@ impl SectionData {
     pub fn all_air() -> SectionData {
         SectionData {
             entries: vec![PaletteEntry::air()],
-            blocks: vec![AIR_IDX; SEC_BLOCKS],
+            blocks: Vec::new(),
             complex: false,
             any_fluid: false,
             any_inside_special: false,
@@ -373,7 +376,7 @@ impl SectionGrid {
                         for cz in min_z_it..=max_z_it {
                             for cx in min_x_it..=max_x_it {
                                 let local = (cx | (cz << 4) | (cy << 8)) as usize;
-                                let idx = data.blocks[local];
+                                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
                                 if idx == AIR_IDX {
                                     continue;
                                 }
@@ -416,7 +419,7 @@ impl SectionGrid {
             Ok(slot) => {
                 let data = &self.data[slot];
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
-                let idx = data.blocks[local];
+                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
                 // copy only the small fields the callers need (no PaletteEntry
                 // clone on the hot path)
                 match data.entry(idx) {
@@ -453,7 +456,7 @@ impl SectionGrid {
             Ok(slot) => {
                 let data = &self.data[slot];
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
-                let idx = data.blocks[local];
+                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
                 (data.entry(idx).and_then(|e| e.collider), false)
             }
             Err(()) => (None, true),

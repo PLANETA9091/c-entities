@@ -118,6 +118,7 @@ fn main() {
             let mut sd = SectionData::all_air();
             use centities_core::sections::PaletteEntry;
             sd.entries = vec![PaletteEntry::air(), floor];
+            sd.blocks = vec![centities_core::sections::AIR_IDX; 4096];
             // fill y=0 layer (local y 0) with palette 1
             for lz in 0..16u16 {
                 for lx in 0..16u16 {
