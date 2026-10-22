@@ -36,6 +36,22 @@ cat > "$S/spigot.yml" <<'EOF'
 settings:
   timeout-time: 300
   restart-on-crash: false
+world-settings:
+  default:
+    # The 100k-entity fills put ~50-100k entities inside the DEFAULT item
+    # tracking range (128 blocks) of the single bench bot: the server
+    # streams spawn/metadata for ALL of them every tick (the tracker is
+    # 7%+ of vanilla tick CPU) and the mineflayer bot buffers every packet
+    # — the runner VM died with 'runner shutdown' (kernel OOM pattern)
+    # five runs in a row on exactly the big legs. 48 blocks covers every
+    # gameplay-relevant interaction in the bench and applies to BOTH A/B
+    # legs equally (paired validity preserved).
+    entity-tracking-range:
+      players: 48
+      animals: 48
+      monsters: 48
+      misc: 48
+      other: 48
 EOF
 
 AGENT_ARGS=()
@@ -81,7 +97,10 @@ JPID=$!
 # bot.js resolves modules from its own directory upward, which never reaches
 # tools/ — pass NODE_PATH explicitly (the require() fallback path).
 cd "$ROOT/tools" 2>/dev/null || cd "$ROOT"
-NODE_PATH="$ROOT/tools/node_modules${NODE_PATH:+:$NODE_PATH}" node "$ROOT/scripts/bot.js" &
+# Belt against the runner-OOM pattern: cap the bot's heap so a packet
+# storm degrades the BOT (graceful FATAL) instead of the whole VM.
+NODE_HEAP="--max-old-space-size=1536"
+NODE_PATH="$ROOT/tools/node_modules${NODE_PATH:+:$NODE_PATH}" node $NODE_HEAP "$ROOT/scripts/bot.js" &
 BOTPID=$!
 
 JSON_OK=0
