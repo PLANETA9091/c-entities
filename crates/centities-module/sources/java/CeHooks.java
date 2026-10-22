@@ -1552,8 +1552,8 @@ public final class CeHooks {
             envI[2] = (voidDamageEnabled(level) && !isNether) ? 1 : 0;
             envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
 
-            double[] outD = new double[n * 8]; // dx,dy,dz,x,y,z,fallDist,landFall
-            int[] outI = new int[n * 3];       // age, pickupDelay, bits
+            double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
+            int[] outI = growI(n * 3);    // age, pickupDelay, bits
 
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_D, IB_I,
                     envD, envI, outD, outI);
@@ -1864,6 +1864,20 @@ public final class CeHooks {
         } catch (Throwable t) {
             return true;
         }
+    }
+
+    // reusable writeback buffers (server-thread confined; grown on demand)
+    private static double[] OUT_D = new double[1024 * 8];
+    private static int[] OUT_I = new int[1024 * 3];
+
+    private static double[] growD(int n) {
+        if (OUT_D.length < n) OUT_D = new double[Math.max(n, OUT_D.length * 2)];
+        return OUT_D;
+    }
+
+    private static int[] growI(int n) {
+        if (OUT_I.length < n) OUT_I = new int[Math.max(n, OUT_I.length * 2)];
+        return OUT_I;
     }
 
     // natives (registered in lib.rs)
