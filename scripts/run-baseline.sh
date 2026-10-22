@@ -86,12 +86,32 @@ fi
 cd "$S"
 XMX="${XMX:-8G}"
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off}"
-java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+# ExitOnOutOfMemoryError: a JVM OOM must fail FAST (FATAL with logs) instead
+# of GC-thrashing the VM into a kernel-OOM runner death.
+java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
   -jar paper.jar nogui > "$R/server.log" 2>&1 &
 JPID=$!
+
+# Forensics watchdog: a runner death (exit 143) kills the job — artifacts
+# never upload — but ALREADY-STREAMED job-log lines survive. Stream the
+# module telemetry + per-process RSS into the job log every 30s so the
+# exact death phase (fill/measure), the module's last words and the RSS
+# of java/node are captured no matter how the leg dies.
+(
+  for i in $(seq 1 120); do
+    sleep 30
+    kill -0 "$JPID" 2>/dev/null || break
+    JRSS=$(ps -o rss= -p "$JPID" 2>/dev/null | awk '{printf "%.0fMB", $1/1024}')
+    NRSS=$(ps -o rss= -C node 2>/dev/null | awk 'NR==1{printf "%.0fMB", $1/1024}')
+    SYSMEM=$(free -m 2>/dev/null | awk '/Mem:/{printf "%s/%sMB", $3, $2}')
+    echo "WD[$i] rss java=$JRSS node=${NRSS:-0} mem=$SYSMEM"
+    grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3
+  done
+) &
+WDPID=$!
 
 # mineflayer is installed into tools/node_modules (both on CI and locally);
 # bot.js resolves modules from its own directory upward, which never reaches
@@ -121,6 +141,7 @@ for i in $(seq 1 90); do kill -0 "$JPID" 2>/dev/null || break; sleep 2; done
 kill -TERM "$JPID" 2>/dev/null || true
 sleep 5
 kill "$BOTPID" 2>/dev/null || true
+kill "$WDPID" 2>/dev/null || true
 kill -9 "$JPID" 2>/dev/null || true
 
 cp "$S/baseline.json" "$R/"
