@@ -2098,9 +2098,17 @@ public final class CeHooks {
         net.minecraft.world.level.chunk.LevelChunkSection section = sections[secIdx];
         java.util.HashMap<BlockState, Integer> paletteIdx = new java.util.HashMap<>(32);
         int entryN = 0; // slot 0 = air
+        // AIR entry — the offsets MUST match writeEntry/Rust parse_section:
+        // 0=collider 1-6=box 7=friction 8=speed 9=water 10=fluid 11=cobweb
+        // 12=inside 13=step 14=fall 15=shape 16=complex 17=reserved.
+        // BUG (found via the 100k-fill RSS explosion, ~457k cached sections):
+        // friction/speed were written at 8/9 and water was left at 1.0 — the
+        // parser read air as {friction 0.0, speed 0.6, IS_WATER=1.0}, so every
+        // section reported any_fluid and the core's fluid path ran on garbage.
         outD[0] = 0.0; // air entry: no collider
-        outD[8] = 0.6;
-        outD[9] = 1.0;
+        outD[7] = 0.6; // friction
+        outD[8] = 1.0; // speed factor
+        outD[9] = 0.0; // water: NO
         outD[10] = 0.0; outD[11] = 0.0; outD[12] = 0.0;
         outD[13] = 0.0; outD[14] = 0.0; outD[15] = 0.0; outD[16] = 0.0;
         outD[17] = 0.0;
