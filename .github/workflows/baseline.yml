@@ -146,3 +146,44 @@ jobs:
           # rebase and retry once
           git pull --rebase origin main || git rebase --abort
           git push || (git pull --rebase origin main && git push)
+
+  # ubuntu-26 runners reclaim long JVM-heavy jobs at random ("runner
+  # shutdown", exit 143) — the failure rate scales with leg DURATION, which
+  # is why exactly the paired A/B legs (2 runs + 2 builds, 40+ min) died
+  # three runs in a row while every short leg survived. A runner death kills
+  # the whole step, so no in-step retry can help: this job detects the dead
+  # legs and redispatches ONLY them (workflow_dispatch `only`), once per
+  # push. The redispatched run skips `publish` (partial reruns must never
+  # overwrite committed reports) — artifacts are uploaded for forensics.
+  rerun:
+    needs: run
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Redispatch failed legs
+        run: |
+          FAILED=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" | \
+            python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          names=[]
+          for j in d.get('jobs',[]):
+              if j['conclusion'] not in ('success','skipped',None):
+                  n=j['name']
+                  if n.startswith('run ('):
+                      names.append(n[5:].split(',')[0].strip())
+          print(','.join(names))
+          ")
+          echo "failed legs: $FAILED"
+          if [ -n "$FAILED" ]; then
+            sleep 30  # let the runner fully release
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: token ${{ github.token }}" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/baseline.yml/dispatches" \
+              -d "{\"ref\":\"${{ github.sha }}\",\"inputs\":{\"only\":\"$FAILED\"}}")
+            echo "dispatch http=$CODE"
+          fi
