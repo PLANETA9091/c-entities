@@ -954,28 +954,77 @@ public final class CeHooks {
         int bn = bN;
         boolean prof = (queriesFast & 1023) == 0;
         long t1 = prof ? System.nanoTime() : 0L;
-        int n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                ids, bn, B_IDS, B_BOX);
-        if (prof) queryNanos += System.nanoTime() - t1;
-        if (n >= 0 && bn > 0) {
-            bN = 0;
-            batchesFlushed++;
-            batchEntries += bn;
-        }
-        for (int tries = 0; n >= 0 && n > ids.length && tries < 3; tries++) {
-            ids = new long[n];
-            QBUF.set(ids);
+        int n;
+        java.nio.ByteBuffer dbb = IDS_BUF;
+        if (dbb != null && IDS_BUF_CAP > 0) {
+            // DIRECT OUT BUFFER path (doc 21): one JNI crossing, zero per-
+            // query array ops; ids are read back via intrinsified getLong.
+            n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
+                    bn, B_IDS, B_BOX);
+            if (n >= 0 && bn > 0) {
+                bN = 0;
+                batchesFlushed++;
+                batchEntries += bn;
+            }
+            if (n <= -2) {
+                // capacity hint: the batch was consumed — regrow and retry
+                // WITHOUT re-applying (same contract as the legacy regrow).
+                if (growOutBuffer(-n)) {
+                    n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
+                            0, B_IDS, B_BOX);
+                }
+            }
+            if (n == -1) {
+                mNotReady++;
+                return null; // index not ready / buffer vanished — mirror
+            }
+            if (n < 0) {
+                mRegrowFail++;
+                return null; // regrow failed — mirror
+            }
+            if (n > 0) {
+                if (n > ids.length) {
+                    if (n > (1 << 20)) {
+                        mRegrowFail++;
+                        return null;
+                    }
+                    ids = new long[n];
+                    QBUF.set(ids);
+                }
+                for (int k = 0; k < n; k++) {
+                    ids[k] = dbb.getLong(k << 3);
+                }
+            }
+        } else {
+            // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is
+            // applied by the SAME native call that runs the query — one JNI
+            // crossing and one index-lock acquisition per query (2b paid two
+            // each: a flush before every query was ~1.7M flushes for ~1.9M
+            // queries). batchN>0 only on the first attempt; retries must NOT
+            // re-apply.
             n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    ids, 0, B_IDS, B_BOX);
+                    ids, bn, B_IDS, B_BOX);
+            if (n >= 0 && bn > 0) {
+                bN = 0;
+                batchesFlushed++;
+                batchEntries += bn;
+            }
+            for (int tries = 0; n >= 0 && n > ids.length && tries < 3; tries++) {
+                ids = new long[n];
+                QBUF.set(ids);
+                n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
+                        ids, 0, B_IDS, B_BOX);
+            }
+            if (n < 0) {
+                mNotReady++;
+                return null; // index not ready — mirror
+            }
+            if (n > ids.length) {
+                mRegrowFail++;
+                return null; // regrow failed 3x — mirror
+            }
         }
-        if (n < 0) {
-            mNotReady++;
-            return null; // index not ready — mirror
-        }
-        if (n > ids.length) {
-            mRegrowFail++;
-            return null; // regrow failed 3x — mirror
-        }
+        if (prof) queryNanos += System.nanoTime() - t1;
 
         ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
         int resolved = 0;
@@ -1248,9 +1297,24 @@ public final class CeHooks {
     // a not-yet-published slot and takes the map path.
     private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[4];
 
+    // doc 21: 1-slot LRU pair cache. Queries (and merge scans) come in
+    // same-level bursts — the world alternates at most a few times per tick —
+    // so ONE identity compare hits ~always, and the 4-slot scan + map path
+    // become the fallback. The pair publishes ATOMICALLY (one volatile
+    // reference swap can never tear level/wid apart, unlike two fields).
+    private static final java.util.concurrent.atomic.AtomicReference<Object[]> LAST_WORLD =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
     public static int worldId(net.minecraft.world.level.Level level) {
+        Object[] last = LAST_WORLD.get();
+        if (last != null && last[0] == level) {
+            return (Integer) last[1];
+        }
         for (int w = 0; w < WID_SLOTS.length; w++) {
-            if (WID_SLOTS[w] == level) return w;
+            if (WID_SLOTS[w] == level) {
+                LAST_WORLD.set(new Object[]{level, w});
+                return w;
+            }
         }
         Integer got = WORLDS.get(level);
         int w;
@@ -1264,20 +1328,38 @@ public final class CeHooks {
         if (w < WID_SLOTS.length && WID_SLOTS[w] == null) {
             WID_SLOTS[w] = level;
         }
+        LAST_WORLD.set(new Object[]{level, w});
         return w;
     }
 
     /** Kill-switch arm/disarm from the native side. */
     public static void setActive(boolean on) {
         ACTIVE = on;
-        if (on && ITEM_TICK_ON) {
-            // arm the L6 machinery: VarHandles + the (runtime-only) Bukkit
-            // surface. A failure keeps VH_READY/BUKKIT_READY false — the
-            // collectors then route EVERY item vanilla (inherent safety).
-            boolean ok = initItemVh();
-            ok &= initBukkit();
-            if (ok) {
-                cplugReady = true;
+        if (on) {
+            // doc 21: register the direct out-buffer for queryNative2. The
+            // natives are already registered in the arm sequence; any failure
+            // leaves IDS_BUF null and fastQuery stays on the legacy path.
+            if (IDS_BUF == null) {
+                try {
+                    java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocateDirect(1024 << 3);
+                    int got = nativeSetOutBuffer(bb);
+                    if (got > 0) {
+                        IDS_BUF = bb;
+                        IDS_BUF_CAP = got;
+                    }
+                } catch (Throwable t) {
+                    lastErrorText = "outbuf: " + t;
+                }
+            }
+            if (on && ITEM_TICK_ON) {
+                // arm the L6 machinery: VarHandles + the (runtime-only) Bukkit
+                // surface. A failure keeps VH_READY/BUKKIT_READY false — the
+                // collectors then route EVERY item vanilla (inherent safety).
+                boolean ok = initItemVh();
+                ok &= initBukkit();
+                if (ok) {
+                    cplugReady = true;
+                }
             }
         }
         if (!on) {
@@ -1307,6 +1389,50 @@ public final class CeHooks {
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
     public static native void nativeReset();
+
+    // ------------------------------------------------------------------
+    // doc 21 — DIRECT OUT BUFFER: the query result ids land in a pinned
+    // direct ByteBuffer the native side writes with raw pointer stores —
+    // ZERO per-query JNI array ops (no get_array_length, no
+    // set_long_array_region, no GC write barriers). The buffer is
+    // registered once at arm (and regrown only when a query outgrows it);
+    // a NewGlobalRef keeps it alive on the native side. Java reads ids via
+    // the intrinsified ByteBuffer.getLong (a single Unsafe load each).
+    //
+    // Contract of queryNative2 (no out-array — results go to the buffer):
+    //   n >= 0  — count written into the buffer
+    //   n == -1 — index not ready / buffer vanished (caller: legacy path)
+    //   n <= -2 — required capacity is -n (caller regrows and retries
+    //             WITHOUT re-applying the batch — it was consumed)
+    // ------------------------------------------------------------------
+    public static native int queryNative2(
+            int world, double x0, double y0, double z0, double x1, double y1, double z1,
+            int batchN, long[] batchIds, double[] batchBoxes);
+    /** Registers a direct buffer as the query out-buffer; returns the
+     *  capacity in longs, or 0 on any failure (legacy path stays armed). */
+    public static native int nativeSetOutBuffer(java.nio.ByteBuffer buf);
+
+    /** Direct out-buffer (server-thread confined; written by the arm thread
+     *  before ACTIVE=true publishes — the volatile pair gives visibility). */
+    private static volatile java.nio.ByteBuffer IDS_BUF;
+    private static volatile int IDS_BUF_CAP;
+
+    private static boolean growOutBuffer(int needLongs) {
+        if (needLongs <= 0 || needLongs > (1 << 20)) return false;
+        int cap = Math.max(needLongs, Math.max(IDS_BUF_CAP * 2, 1024));
+        try {
+            java.nio.ByteBuffer nb = java.nio.ByteBuffer.allocateDirect(cap << 3);
+            int got = nativeSetOutBuffer(nb);
+            if (got > 0) {
+                IDS_BUF = nb;
+                IDS_BUF_CAP = got;
+                return true;
+            }
+        } catch (Throwable t) {
+            lastErrorText = "growOut: " + t;
+        }
+        return false;
+    }
 
     // ==================================================================
     // L6 — NATIVE ITEM TICK CORE.

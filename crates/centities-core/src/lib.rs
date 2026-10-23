@@ -14,12 +14,15 @@
 //!   the query margin (1e-3). Global f32 would not be exact (ULP ≈ 2 blocks
 //!   at the world edge); cell-relative f32 is exact for ±30M block worlds.
 //! * No allocation on the steady-state query path (caller-provided buffer).
-//! * No external dependencies, no std HashMap on hot paths, no unsafe.
+//! * No external dependencies, no std HashMap on hot paths.
+//! * Unsafe is confined to src/simd.rs (masked AVX2 loads over in-bounds
+//!   blocked-SoA arrays; scalar fallback + differential parity tests).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod itemtick;
 pub mod sections;
+pub mod simd;
 pub mod tick;
 
 /// 16-block XZ cells. Cell edge is the density lever: dense populations
@@ -34,6 +37,19 @@ pub const CELL_SHIFT: u32 = 4; // 16 == 1 << 4
 pub const MARGIN: f32 = 1.0e-3;
 /// Entities whose AABB half-span exceeds this live in the oversize list.
 pub const MAX_HALF_SPAN: f64 = CELL as f64 / 2.0;
+
+/// Blocked-SoA geometry (doc 21): one block of 8 candidates, six contiguous
+/// segments of 8 f32 (x0,y0,z0,x1,y1,z1). Same bytes-per-candidate as the
+/// old stride-6 layout, but the query scan reads each segment as a single
+/// 8-wide AVX2 vector — zero shuffles. Keep in sync with src/simd.rs.
+pub const BLOCK: usize = 8;
+pub const SEGMENTS: usize = 6;
+pub const BLOCK_F32: usize = BLOCK * SEGMENTS; // 48 f32 per block
+
+/// Prefilter padding for unallocated block lanes: x0 = +INF fails `x0 < qx1`,
+/// x1 = -INF fails `x1 > qx0` — padded lanes reject themselves.
+pub(crate) const PAD_X0: f32 = f32::INFINITY;
+pub(crate) const PAD_X1: f32 = f32::NEG_INFINITY;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aabb {
@@ -395,7 +411,7 @@ pub struct EntityIndex {
     cpos: Vec<u32>,  // position inside the home cell's arrays
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
     cell_ids: Vec<Vec<i64>>,
-    cell_box: Vec<Vec<f32>>,   // stride 6: x0,y0,z0,x1,y1,z1 (f32)
+    cell_box: Vec<Vec<f32>>,   // blocked-SoA: blocks of 48 f32 (simd.rs)
     cell_slots: Vec<Vec<u32>>, // global slot per position (O(1) swap-remove)
     cell_keys: Vec<u64>,       // 0 = unused cell id
     cellmap: CellMap,
@@ -460,12 +476,13 @@ impl EntityIndex {
                 // same cell: bounds update in place (contiguous store write)
                 let p = self.cpos[slot as usize] as usize;
                 let box_ = &mut self.cell_box[home as usize];
-                box_[p * 6] = (b.x0 - ocx as f64 * CELL as f64) as f32;
-                box_[p * 6 + 1] = b.y0 as f32;
-                box_[p * 6 + 2] = (b.z0 - ocz as f64 * CELL as f64) as f32;
-                box_[p * 6 + 3] = (b.x1 - ocx as f64 * CELL as f64) as f32;
-                box_[p * 6 + 4] = b.y1 as f32;
-                box_[p * 6 + 5] = (b.z1 - ocz as f64 * CELL as f64) as f32;
+                let base = (p >> 3) * BLOCK_F32 + (p & 7);
+                box_[base] = (b.x0 - ocx as f64 * CELL as f64) as f32;
+                box_[base + 8] = b.y0 as f32;
+                box_[base + 16] = (b.z0 - ocz as f64 * CELL as f64) as f32;
+                box_[base + 24] = (b.x1 - ocx as f64 * CELL as f64) as f32;
+                box_[base + 32] = b.y1 as f32;
+                box_[base + 40] = (b.z1 - ocz as f64 * CELL as f64) as f32;
                 return UpsertEv::Same;
             }
             // moved cell (or world): O(1) swap-remove + push
@@ -578,6 +595,15 @@ impl EntityIndex {
     ///
     /// L5: the per-cell scan is a flat sequential read of the cell's
     /// contiguous id/box arrays (no pointer chasing).
+    ///
+    /// Doc 21: the scan is an AVX2 f32 prefilter over the blocked-SoA box
+    /// store (8 candidates per vector iteration, zero shuffles) whose
+    /// bounds are the exact bounds expanded by EPSF=1e-2 — a provable
+    /// superset of the exact f64 check (f32 rounding of the cell-relative
+    /// query bound is <= 7.6e-6, 1300x below EPSF). Survivors are
+    /// re-checked by the EXACT f64-promoted compare, so the result set is
+    /// bit-identical to the scalar path (differential-tested in
+    /// tests/simd_parity.rs). No AVX2 (or mode=1): the scalar exact scan.
     pub fn query(&self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
         out.clear();
         let ex = self.max_half_span + MARGIN as f64;
@@ -600,29 +626,13 @@ impl EntityIndex {
                     None => continue,
                 };
                 let ids = &self.cell_ids[cid];
-                let bx = &self.cell_box[cid];
                 let n = ids.len();
-                let (ox, oz) = cell_origin(cx, cz);
-                // X/Z compare in f64 EXACTLY like the pre-L5 chain scan: the
-                // f32 cell-relative coord is promoted and the f64 origin is
-                // added losslessly — no extra rounding beyond the stored
-                // quantization (covered by MARGIN). An f32 compare here
-                // could produce a false NEGATIVE at world-scale ULPs.
-                let mut i = 0;
-                while i < n {
-                    let o = i * 6;
-                    // y first: most rejections win here
-                    if bx[o + 1] < my1 && bx[o + 4] > my0 {
-                        let x0 = bx[o] as f64 + ox;
-                        let x1 = bx[o + 3] as f64 + ox;
-                        let z0 = bx[o + 2] as f64 + oz;
-                        let z1 = bx[o + 5] as f64 + oz;
-                        if x0 < qx1 && x1 > qx0 && z0 < qz1 && z1 > qz0 {
-                            out.push(ids[i]);
-                        }
-                    }
-                    i += 1;
+                if n == 0 {
+                    continue;
                 }
+                let bx = &self.cell_box[cid];
+                let (ox, oz) = cell_origin(cx, cz);
+                simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
             }
         }
         for o in &self.oversize {
@@ -653,24 +663,40 @@ impl EntityIndex {
     }
 
     /// Append an entity to a cell's contiguous arrays; fixes cpos.
+    /// Blocked-SoA: a new block (every 8th candidate) is pre-filled with
+    /// self-rejecting padding (x0=+INF, x1=-INF) so unallocated lanes of a
+    /// partially-filled block can never match the prefilter.
     #[inline]
     fn cell_add(&mut self, cell: u32, slot: usize, b: &Aabb, cx: i32, cz: i32) {
-        let p = self.cell_ids[cell as usize].len() as u32;
-        self.cell_ids[cell as usize].push(self.ids[slot]);
-        self.cell_box[cell as usize].extend_from_slice(&[
-            (b.x0 - cx as f64 * CELL as f64) as f32,
-            b.y0 as f32,
-            (b.z0 - cz as f64 * CELL as f64) as f32,
-            (b.x1 - cx as f64 * CELL as f64) as f32,
-            b.y1 as f32,
-            (b.z1 - cz as f64 * CELL as f64) as f32,
-        ]);
+        let ids = &mut self.cell_ids[cell as usize];
+        let p = ids.len() as u32;
+        if p & 7 == 0 {
+            // new block: pad x0 with +INF (fails x0 < qx1) and x1 with -INF
+            // (fails x1 > qx0); y/z pad values are never reached
+            let mut blk = [0.0f32; BLOCK_F32];
+            for lane in 0..8 {
+                blk[lane] = PAD_X0;
+                blk[24 + lane] = PAD_X1;
+            }
+            self.cell_box[cell as usize].extend_from_slice(&blk);
+        }
+        ids.push(self.ids[slot]);
+        let base = (p >> 3) as usize * BLOCK_F32 + (p & 7) as usize;
+        let box_ = &mut self.cell_box[cell as usize];
+        box_[base] = (b.x0 - cx as f64 * CELL as f64) as f32;
+        box_[base + 8] = b.y0 as f32;
+        box_[base + 16] = (b.z0 - cz as f64 * CELL as f64) as f32;
+        box_[base + 24] = (b.x1 - cx as f64 * CELL as f64) as f32;
+        box_[base + 32] = b.y1 as f32;
+        box_[base + 40] = (b.z1 - cz as f64 * CELL as f64) as f32;
         self.cell_slots[cell as usize].push(slot as u32);
         self.cpos[slot] = p;
     }
 
     /// Swap-remove position `pos` from a cell's arrays; fixes the moved
-    /// entity's cpos. O(1).
+    /// entity's cpos. O(1). Blocked-SoA: the moved candidate's six values
+    /// are copied segment-wise (block math per segment). The vacated lane
+    /// keeps stale data but is past `n` — the scan masks it out.
     #[inline]
     fn cell_remove(&mut self, cell: u32, pos: usize) {
         let ids = &mut self.cell_ids[cell as usize];
@@ -679,14 +705,21 @@ impl EntityIndex {
             let moved_slot = self.cell_slots[cell as usize][last] as usize;
             ids[pos] = ids[last];
             let box_ = &mut self.cell_box[cell as usize];
-            for k in 0..6 {
-                box_[pos * 6 + k] = box_[last * 6 + k];
+            let pb = (pos >> 3) * BLOCK_F32 + (pos & 7);
+            let lb = (last >> 3) * BLOCK_F32 + (last & 7);
+            for &off in &[0usize, 8, 16, 24, 32, 40] {
+                box_[pb + off] = box_[lb + off];
             }
             self.cell_slots[cell as usize][pos] = moved_slot as u32;
             self.cpos[moved_slot] = pos as u32;
         }
         ids.pop();
-        self.cell_box[cell as usize].truncate((ids.len()) * 6);
+        // keep whole-block capacity (padded lanes are self-rejecting); only
+        // release a block when it became fully empty
+        let keep = ((ids.len() + 7) >> 3) * BLOCK_F32;
+        if self.cell_box[cell as usize].len() > keep {
+            self.cell_box[cell as usize].truncate(keep);
+        }
         self.cell_slots[cell as usize].pop();
     }
 
@@ -794,10 +827,10 @@ impl EntityIndex {
         let total = ids.len();
         let cap = cap.min(total);
         for i in 0..cap {
-            let o = i * 6;
             let id = ids[i];
-            let lo = (((bx[o] * 1024.0).floor() - 2.0).max(-32768.0) as i64) + 32768;
-            let hi = (((bx[o + 3] * 1024.0).ceil() + 2.0).min(32767.0) as i64) + 32768;
+            let lo =
+                (((simd::box_at(bx, i, 0) * 1024.0).floor() - 2.0).max(-32768.0) as i64) + 32768;
+            let hi = (((simd::box_at(bx, i, 3) * 1024.0).ceil() + 2.0).min(32767.0) as i64) + 32768;
             out.push((id & 0xFFFF_FFFF) | (lo << 32) | (hi << 48));
         }
         (total, total > cap)
@@ -841,7 +874,13 @@ impl EntityIndex {
             let ids = &self.cell_ids[ci];
             let bx = &self.cell_box[ci];
             let slots = &self.cell_slots[ci];
-            assert_eq!(ids.len() * 6, bx.len(), "cell {ci}: box stride mismatch");
+            // blocked-SoA: whole-block capacity; the tail block's unallocated
+            // lanes hold self-rejecting padding
+            assert_eq!(
+                ((ids.len() + 7) >> 3) * BLOCK_F32,
+                bx.len(),
+                "cell {ci}: block capacity mismatch"
+            );
             assert_eq!(ids.len(), slots.len(), "cell {ci}: slots mismatch");
             for (p, (&id, &slot)) in ids.iter().zip(slots.iter()).enumerate() {
                 let s = slot as usize;

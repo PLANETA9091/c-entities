@@ -1126,7 +1126,10 @@ mod parse_tests {
         d[24 + 23] = 16.0; // shape_override only, NO complex bit
         let b = vec![0i32; 4096];
         let s = parse_section(&d, &b);
-        assert!(!s.complex, "shapeOv with 0 cuboids must not poison the section");
+        assert!(
+            !s.complex,
+            "shapeOv with 0 cuboids must not poison the section"
+        );
         assert!(!s.entries[1].colliders.is_empty() == false);
         assert!(s.entries[1].colliders.is_empty());
         assert!(!s.entries[1].fall_on_special);
@@ -1147,7 +1150,10 @@ mod parse_tests {
         d2[24 + 23] = 48.0;
         let s2 = parse_section(&d2, &b);
         assert!(s2.complex);
-        assert!(s2.entries[1].colliders.is_empty(), "no cuboids may parse for complex entries");
+        assert!(
+            s2.entries[1].colliders.is_empty(),
+            "no cuboids may parse for complex entries"
+        );
     }
 
     /// A plain full-cube block (no shape override, no special bits) parses
@@ -1180,7 +1186,10 @@ mod parse_tests {
     fn step_fall_bits_stay_per_entry() {
         let mut d = vec![0.0; 24 * 2];
         d[24] = 1.0;
-        d[24 + 4] = 1.0; d[24 + 5] = 1.0; d[24 + 6] = 1.0; d[24 + 7] = 1.0;
+        d[24 + 4] = 1.0;
+        d[24 + 5] = 1.0;
+        d[24 + 6] = 1.0;
+        d[24 + 7] = 1.0;
         d[24 + 23] = 12.0; // stepOn(4) + fallOn(8)
         let b = vec![0i32; 4096];
         let s = parse_section(&d, &b);

@@ -966,6 +966,30 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             ) -> i32
     );
     push!(
+        "queryNative2",
+        "(IDDDDDD[JI[J[D)I",
+        n_query2
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                i32,
+                jni::jlongArray,
+                jni::jdoubleArray,
+            ) -> i32
+    );
+    push!(
+        "nativeSetOutBuffer",
+        "(Ljava/nio/ByteBuffer;)I",
+        n_set_out_buffer as extern "system" fn(*mut jni::JNIEnv, jni::jclass, jni::jobject) -> i32
+    );
+    push!(
         "nativeFlush",
         "(I[J[D)V",
         n_flush
@@ -1239,7 +1263,9 @@ fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                 }
             };
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched ItemEntity.tick guard + hurt/setItem probes");
+            cplug_sdk::log::info(
+                "[c-entities] patched ItemEntity.tick guard + hurt/setItem probes",
+            );
             Some(pre3)
         }
         _ => {
@@ -1389,6 +1415,81 @@ thread_local! {
     static BBOXBUF: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Shared core of n_query / n_query2 (doc 21): applies the direct queue and
+/// the caller's pending probe batch under ONE lock acquisition, publishes
+/// dirty rows, runs the exact query into `out`. Returns false when the index
+/// lock is unavailable (caller maps that to its own not-ready contract).
+///
+/// SAFETY: `e` must be a live env on the calling thread; batch arrays are
+/// read via JNI region ops inside the lock.
+unsafe fn locked_flush_query(
+    e: &JniEnv,
+    world: i32,
+    x0: f64,
+    y0: f64,
+    z0: f64,
+    x1: f64,
+    y1: f64,
+    z1: f64,
+    bn: usize,
+    batch_ids: jni::jlongArray,
+    batch_boxes: jni::jdoubleArray,
+    out: &mut Vec<i64>,
+) -> bool {
+    let mut g = match INDEX.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let st = g.get_or_insert_with(new_state);
+    drain_direct(st);
+    if bn > 0 {
+        BIDBUF.with(|b| {
+            let mut b = b.borrow_mut();
+            b.clear();
+            b.resize(bn, 0);
+            e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
+            for l in b.iter() {
+                if *l < 0 {
+                    let ev = st.idx.remove(*l & 0xFFFF_FFFF);
+                    st.note_remove(ev);
+                }
+            }
+            BBOXBUF.with(|bx| {
+                let mut bx = bx.borrow_mut();
+                bx.clear();
+                bx.resize(bn * 6, 0.0);
+                jni_get_double_array_region(e, batch_boxes, 0, (bn * 6) as i32, &mut bx);
+                for (i, l) in b.iter().enumerate() {
+                    if *l >= 0 {
+                        let wid = ((*l >> 32) & 0xFFFF) as u16;
+                        let o = i * 6;
+                        let ev = st.idx.upsert(
+                            *l & 0xFFFF_FFFF,
+                            wid,
+                            &centities_core::Aabb::new(
+                                bx[o],
+                                bx[o + 1],
+                                bx[o + 2],
+                                bx[o + 3],
+                                bx[o + 4],
+                                bx[o + 5],
+                            ),
+                        );
+                        st.note_upsert(ev);
+                    }
+                }
+            });
+        });
+    }
+    publish(e, st);
+    st.idx.query(
+        world as u16,
+        &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
+        out,
+    );
+    true
+}
+
 /// Returns: n >= 0 — count written into `out`; n > out.len — required
 /// capacity (caller regrows and retries); -1 — index not ready.
 pub extern "system" fn n_query(
@@ -1418,61 +1519,24 @@ pub extern "system" fn n_query(
         QSCRATCH
             .with(|q| {
                 let mut q = q.borrow_mut();
-                let mut g = INDEX.lock().ok()?;
-                let st = g.get_or_insert_with(new_state);
-                drain_direct(st);
-                if bn > 0 {
-                    BIDBUF.with(|b| {
-                        let mut b = b.borrow_mut();
-                        b.clear();
-                        b.resize(bn, 0);
-                        e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
-                        for l in b.iter() {
-                            if *l < 0 {
-                                let ev = st.idx.remove(*l & 0xFFFF_FFFF);
-                                st.note_remove(ev);
-                            }
-                        }
-                        BBOXBUF.with(|bx| {
-                            let mut bx = bx.borrow_mut();
-                            bx.clear();
-                            bx.resize(bn * 6, 0.0);
-                            jni_get_double_array_region(
-                                &e,
-                                batch_boxes,
-                                0,
-                                (bn * 6) as i32,
-                                &mut bx,
-                            );
-                            for (i, l) in b.iter().enumerate() {
-                                if *l >= 0 {
-                                    let wid = ((*l >> 32) & 0xFFFF) as u16;
-                                    let o = i * 6;
-                                    let ev = st.idx.upsert(
-                                        *l & 0xFFFF_FFFF,
-                                        wid,
-                                        &centities_core::Aabb::new(
-                                            bx[o],
-                                            bx[o + 1],
-                                            bx[o + 2],
-                                            bx[o + 3],
-                                            bx[o + 4],
-                                            bx[o + 5],
-                                        ),
-                                    );
-                                    st.note_upsert(ev);
-                                }
-                            }
-                        });
-                    });
-                }
-                publish(&e, st);
-                st.idx.query(
-                    world as u16,
-                    &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
+                if locked_flush_query(
+                    &e,
+                    world,
+                    x0,
+                    y0,
+                    z0,
+                    x1,
+                    y1,
+                    z1,
+                    bn,
+                    batch_ids,
+                    batch_boxes,
                     &mut q,
-                );
-                Some(q.len() as i32)
+                ) {
+                    Some(q.len() as i32)
+                } else {
+                    None
+                }
             })
             .unwrap_or(-1)
     };
@@ -1490,6 +1554,130 @@ pub extern "system" fn n_query(
                 let q = q.borrow();
                 // jlong == i64 — write straight from the scratch buffer.
                 e.set_long_array_region(out, 0, n, &q[..n as usize]);
+            });
+        }
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
+// doc 21 — DIRECT OUT BUFFER. The query result ids are written with raw
+// pointer stores into a pinned direct ByteBuffer (registered once at arm,
+// regrown only when a query outgrows it) — the per-query JNI array ops
+// (get_array_length + set_long_array_region) disappear from the hot path.
+// A NewGlobalRef keeps the buffer object alive for as long as it is
+// registered; re-registration releases the previous one.
+// ---------------------------------------------------------------------------
+
+static OUT_ADDR: AtomicU64 = AtomicU64::new(0);
+static OUT_CAP: AtomicI64 = AtomicI64::new(0);
+static OUT_GREF: AtomicUsize = AtomicUsize::new(0);
+
+pub extern "system" fn n_set_out_buffer(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    buf: jni::jobject,
+) -> i32 {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        // release the previous registration first (if any)
+        let prev = OUT_GREF.swap(0, Ordering::AcqRel);
+        OUT_ADDR.store(0, Ordering::Release);
+        if prev != 0 {
+            ((*vt).DeleteGlobalRef)(raw, prev as jni::jobject);
+        }
+        if buf.is_null() {
+            OUT_CAP.store(0, Ordering::Release);
+            return 0;
+        }
+        let addr = ((*vt).GetDirectBufferAddress)(raw, buf);
+        if addr.is_null() {
+            OUT_CAP.store(0, Ordering::Release);
+            return 0;
+        }
+        let cap_bytes = ((*vt).GetDirectBufferCapacity)(raw, buf);
+        if cap_bytes < 8 {
+            OUT_CAP.store(0, Ordering::Release);
+            return 0;
+        }
+        let g = ((*vt).NewGlobalRef)(raw, buf);
+        if g.is_null() {
+            OUT_CAP.store(0, Ordering::Release);
+            return 0;
+        }
+        OUT_GREF.store(g as usize, Ordering::Release);
+        OUT_CAP.store(cap_bytes / 8, Ordering::Release);
+        OUT_ADDR.store(addr as u64, Ordering::Release); // published LAST
+        (cap_bytes / 8).min(i32::MAX as i64) as i32
+    }
+}
+
+/// queryNative2: identical semantics to n_query, but results land in the
+/// registered direct buffer instead of a JNI long array.
+/// Returns: n >= 0 — count in the buffer; n <= -2 — required capacity (-n),
+/// the batch was already consumed; -1 — not ready / no buffer.
+pub extern "system" fn n_query2(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    world: i32,
+    x0: f64,
+    y0: f64,
+    z0: f64,
+    x1: f64,
+    y1: f64,
+    z1: f64,
+    batch_n: i32,
+    batch_ids: jni::jlongArray,
+    batch_boxes: jni::jdoubleArray,
+) -> i32 {
+    let bn = if batch_n > 0 { batch_n as usize } else { 0 };
+    let n = unsafe {
+        let e = JniEnv::from_raw(env);
+        QSCRATCH
+            .with(|q| {
+                let mut q = q.borrow_mut();
+                if locked_flush_query(
+                    &e,
+                    world,
+                    x0,
+                    y0,
+                    z0,
+                    x1,
+                    y1,
+                    z1,
+                    bn,
+                    batch_ids,
+                    batch_boxes,
+                    &mut q,
+                ) {
+                    Some(q.len() as i32)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(-1)
+    };
+    if n < 0 {
+        return -1;
+    }
+    let addr = OUT_ADDR.load(Ordering::Acquire) as *mut i64;
+    if addr.is_null() {
+        return -1; // buffer vanished — caller falls back to the legacy path
+    }
+    let cap = OUT_CAP.load(Ordering::Acquire);
+    if n as i64 > cap {
+        // regrow hint. cap >= 1024 at arm, so n >= 1025 -> -n <= -1025,
+        // safely distinct from -1 (not ready).
+        return -n;
+    }
+    if n > 0 {
+        unsafe {
+            QSCRATCH.with(|q| {
+                let q = q.borrow();
+                // jlong == i64 — raw stores into the pinned direct buffer.
+                std::ptr::copy_nonoverlapping(q.as_ptr(), addr, n as usize);
             });
         }
     }
