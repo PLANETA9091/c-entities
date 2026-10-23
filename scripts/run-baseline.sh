@@ -21,6 +21,11 @@ cp "$ROOT/build/ce-baseline.jar" "$S/plugins/"
 if [ -f "$ROOT/build/viaversion/ViaVersion.jar" ]; then
   cp "$ROOT/build/viaversion/ViaVersion.jar" "$S/plugins/"
 fi
+# ViaBackwards is REQUIRED for old clients (26.1) on the new server: ViaVersion
+# alone only supports newer client versions and the bot gets kicked.
+if [ -f "$ROOT/build/viaversion/ViaBackwards.jar" ]; then
+  cp "$ROOT/build/viaversion/ViaBackwards.jar" "$S/plugins/"
+fi
 cp "$PAPER_JAR" "$S/paper.jar"
 
 cat > "$S/eula.txt" <<'EOF'

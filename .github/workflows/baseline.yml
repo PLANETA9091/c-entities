@@ -90,20 +90,25 @@ jobs:
       - name: Build baseline plugin
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
-        run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
-      - name: Install ViaVersion (bench bot speaks 26.1; server is 26.3)
-        run: |
-          mkdir -p build/viaversion
-          URL=$(curl -fsS https://hangar.papermc.io/api/v1/projects/ViaVersion/versions | \
-            python3 -c "import json,sys;raw=sys.stdin.read();d,_=json.JSONDecoder().raw_decode(raw);u=[(x.get('name') or '', (x.get('downloads') or {}).get('PAPER',{}).get('downloadUrl') or '') for x in d.get('result',[])];u=[t for t in u if t[1]];s=[x[1] for x in u if 'SNAPSHOT' not in x[0]];print(s[0] if s else (u[0][1] if u else ''))")
-          [ -n "$URL" ] || { echo "FATAL: no ViaVersion download URL"; exit 1; }
-          echo "ViaVersion: $URL"
-          curl -fsSL -o build/viaversion/ViaVersion.jar "$URL"
+        run: mkdir -p tools && cd tools && npm install mineflayer minecraft-data@3.117.0 --no-save --loglevel=error
       - name: Run paired A/B (vanilla then module, same runner)
         if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: |
           bash scripts/run-baseline.sh
           MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
+      - name: Install ViaVersion + ViaBackwards (bench bot speaks 26.1; ViaBackwards is REQUIRED — ViaVersion alone refuses old clients, which is why every 26.3 run so far was playerless)
+        run: |
+          mkdir -p build/viaversion
+          fetch() {
+            curl -fsS "https://hangar.papermc.io/api/v1/projects/$1/versions" | \
+            python3 -c "import json,sys;raw=sys.stdin.read();d,_=json.JSONDecoder().raw_decode(raw);u=[(x.get('name') or '', (x.get('downloads') or {}).get('PAPER',{}).get('downloadUrl') or '') for x in d.get('result',[])];u=[t for t in u if t[1]];s=[x[1] for x in u if 'SNAPSHOT' not in x[0]];print(s[0] if s else (u[0][1] if u else ''))" || echo ""
+          }
+          VV=$(fetch ViaVersion);   [ -n "$VV" ] || { echo "FATAL: no ViaVersion URL";   exit 1; }
+          VB=$(fetch ViaBackwards); [ -n "$VB" ] || { echo "FATAL: no ViaBackwards URL"; exit 1; }
+          echo "ViaVersion: $VV"; echo "ViaBackwards: $VB"
+          curl -fsSL -o build/viaversion/ViaVersion.jar "$VV"
+          curl -fsSL -o build/viaversion/ViaBackwards.jar "$VB"
+
       - name: Run baseline
         if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh
