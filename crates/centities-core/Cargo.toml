@@ -9,3 +9,6 @@ description = "Exact entity proximity index for c-entities (no JVM deps)"
 crate-type = ["rlib"]
 
 [dependencies]
+
+[dev-dependencies]
+rayon = "1"

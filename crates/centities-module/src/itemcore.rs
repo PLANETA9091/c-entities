@@ -328,16 +328,22 @@ fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
 // ---------------------------------------------------------------------------
 
 // out bits (mirror of TickOutcome + the mode protocol)
+// The bit positions are the JAVA APPLIER'S CONTRACT (CeHooks.itemTickFlush):
+// MOVED 1, ON_GROUND 2, IMPULSE 4, MERGE 32, DESPAWN 128, VOID 256,
+// LAND 512 (1<<9), VANILLA_NEXT 2048 (1<<11), NATIVE_OK 4096 (1<<12),
+// ABORTED 8192 (1<<13). (The pre-L8 constants had LAND/VANILLA_NEXT/ABORTED
+// shifted one row: the applier then read aborted items as normal ones and
+// applied zeros — the frozen-world CI failure.)
 const B_MOVED: i32 = 1;
 const B_ON_GROUND: i32 = 1 << 1;
 const B_IMPULSE: i32 = 1 << 2;
 const B_MERGE: i32 = 1 << 5;
 const B_DESPAWN: i32 = 1 << 7;
 const B_VOID: i32 = 1 << 8;
-const B_VANILLA_NEXT: i32 = 1 << 9;
-const B_ABORTED: i32 = 1 << 10;
-const B_LAND: i32 = 1 << 11;
+const B_LAND: i32 = 1 << 9;
+const B_VANILLA_NEXT: i32 = 1 << 11;
 const B_NATIVE_OK: i32 = 1 << 12;
+const B_ABORTED: i32 = 1 << 13;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -536,10 +542,19 @@ unsafe fn n_item_tick_impl(
 
                             let mut max_abs_delta: f64 = 0.0f64;
                             let mut max_abs_pos: f64 = 0.0f64;
+                            // per-flush outcome counters (flush-log visibility:
+                            // ok = committed native ticks, ab = aborted)
+                            let mut flush_ok: u64 = 0;
+                            let mut flush_aborts: u64 = 0;
 
                             // ---- phase 1: parse + hydrate (sequential) ----
                             let mut sts: Vec<ItemState> = Vec::with_capacity(n);
                             let mut tickable: Vec<bool> = vec![false; n];
+                            // L7 seatbelt state, carried into phase 2 (the store is
+                            // phases-1/3 only): consecutive native aborts; >= 4
+                            // forces a vanilla tick so an imprecise item cannot
+                            // freeze forever.
+                            let mut aborts_in: Vec<u8> = vec![0; n];
                             for k in 0..n {
                                 let id = idv[k];
                                 let f = fv[k];
@@ -691,6 +706,7 @@ unsafe fn n_item_tick_impl(
                                         st.pickup_delay = es.pickup_delay;
                                     }
                                 }
+                                aborts_in[k] = world.entry(id).aborts;
                                 tickable[k] = true;
                                 sts.push(st);
                             }
@@ -704,10 +720,11 @@ unsafe fn n_item_tick_impl(
                                     .zip(oi.par_chunks_mut(512 * 4))
                                     .zip(recs.par_chunks_mut(512))
                                     .zip(tickable.par_chunks(512))
+                                    .zip(aborts_in.par_chunks(512))
                                     .zip(idv.par_chunks(512))
                                     .zip(fv.par_chunks(512))
                                     .for_each(
-                                        |((((((st_c, od_c), oi_c), rec_c), tk_c), id_c), f_c)| {
+                                        |(((((((st_c, od_c), oi_c), rec_c), tk_c), ab_c), id_c), f_c)| {
                                             let mut scratch = Scratch::new();
                                             let mut provider = make_provider(wid);
                                             let prov: SectionProvider = &mut provider;
@@ -728,8 +745,10 @@ unsafe fn n_item_tick_impl(
                                                     // froze this tick; vanilla computes it
                                                     // next tick. L7 seatbelt: a run of 4
                                                     // aborts forces a vanilla tick (the
-                                                    // counter lives in phase 3).
+                                                    // streak is carried from phase 1 and
+                                                    // updated in phase 3).
                                                     let want = items_native
+                                                        && ab_c[j] < 4
                                                         && centities_core::tick::want_native(st, &tenv);
                                                     let mode =
                                                         if want { B_NATIVE_OK } else { B_VANILLA_NEXT };
@@ -826,15 +845,17 @@ unsafe fn n_item_tick_impl(
                                 if rec.aborted {
                                     {
                                         let entry = world.entry(id);
-                                        entry.aborts = entry.aborts.saturating_add(1);
+                                        entry.aborts = aborts_in[k].saturating_add(1);
                                         if rec.abort_clear {
                                             // L7 seatbelt: the vanilla tick will
                                             // re-ingest; clear the streak with it.
                                             entry.aborts = 0;
                                         }
                                     }
+                                    flush_aborts += 1;
                                     continue;
                                 }
+                                flush_ok += 1;
                                 {
                                     let entry = world.entry(id);
                                     entry.stuck = rec.stuck;
@@ -885,7 +906,7 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{})",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{})",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
@@ -905,6 +926,8 @@ unsafe fn n_item_tick_impl(
                                         SEC_MAX_Z.load(std::sync::atomic::Ordering::Relaxed),
                                         format_args!("{:e}", max_abs_delta),
                                         format_args!("{:e}", max_abs_pos),
+                                        flush_ok,
+                                        flush_aborts,
                                     ));
                                 }
                             }
