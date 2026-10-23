@@ -151,6 +151,24 @@ jobs:
           fi
           [ "$LIVE" = "1" ] || fail "no woven fast path served a query"
           echo "$LAST_HOOKS" | grep -Eq "desync=0 "            || fail "index desynced from the world"
+          # doc 21: the fast path must RESOLVE its candidates — the ids the
+          # native returns have to map back to ARENA/live entities. The
+          # byte-order bug (direct BB defaulted to BIG_ENDIAN over little-
+          # endian native stores) slid through every assert above: every id
+          # read back as 0, resolved=0, and desync stayed 0 (stale>0 reads
+          # as the "normal batching window"). cand=N/M with M=0 while N>0
+          # is that failure shape — assert the resolve ratio for any real
+          # candidate traffic (the tiny e2e world gives N ~ tens).
+          python3 - "$LAST_HOOKS" <<'PY' || fail "fast path returns UNRESOLVABLE ids (cand resolved==0 with candidates>0)"
+import re, sys
+h = sys.argv[1]
+m = re.search(r"cand=(\d+)/(\d+)", h)
+assert m, "no cand= counter in hooks line"
+seen, resolved = int(m.group(1)), int(m.group(2))
+print(f"cand seen={seen} resolved={resolved}")
+if seen >= 8:
+    assert resolved * 2 >= seen, f"resolve ratio too low: {resolved}/{seen}"
+PY
           echo "E2E OK: module armed, patches applied, probes + fast path LIVE (add/box/fast counters > 0)"
       - uses: actions/upload-artifact@v4
         if: always()

@@ -1342,6 +1342,10 @@ public final class CeHooks {
             if (IDS_BUF == null) {
                 try {
                     java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocateDirect(1024 << 3);
+                    // RAW native stores are little-endian; a direct buffer
+                    // defaults to BIG_ENDIAN and would byte-reverse every id
+                    // (the (int) cast then lands on 0 -> 100% arena miss).
+                    bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
                     int got = nativeSetOutBuffer(bb);
                     if (got > 0) {
                         IDS_BUF = bb;
@@ -1422,6 +1426,8 @@ public final class CeHooks {
         int cap = Math.max(needLongs, Math.max(IDS_BUF_CAP * 2, 1024));
         try {
             java.nio.ByteBuffer nb = java.nio.ByteBuffer.allocateDirect(cap << 3);
+            // see setActive: the native side writes little-endian i64s
+            nb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
             int got = nativeSetOutBuffer(nb);
             if (got > 0) {
                 IDS_BUF = nb;
