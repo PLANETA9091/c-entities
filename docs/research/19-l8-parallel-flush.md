@@ -131,3 +131,39 @@ the merge scans (L3 fast path), the 256-tick belt.
 * Java floor levers: tracker (ChunkMap$TrackedEntity.updatePlayer ~3.9%),
   EntityTickList.forEach (~2.5%), NaturalSpawner.createState — separate
   weaves, each vanilla-faithful, each behind its own kill switch.
+
+
+## 4. The abort storm — root cause found and fixed (post-first-CI)
+
+The first L8 CI leg froze the world (mass pinned at 100000, `maxD=0e0`, zero
+merges): every item dispatch-owned and natively ticked, yet no commit ever
+reached Java. Three compounding defects, all fixed:
+
+1. **The writeback bit contract was shifted** (Rust ABORTED=1<<10 /
+   VANILLA_NEXT=1<<9 / LAND=1<<11 vs the applier's 1<<13 / 1<<11 / 1<<9).
+   An aborted item was applied as a normal one — the applier wrote zero
+   deltas/age/pickupDelay/onGround into the entity every tick. The
+   constants now mirror the Java applier exactly, and a property test
+   (`flush_zip`) proves the chunk-zip commits every tickable item without
+   slot crossing.
+2. **The L7 abort seatbelt was lost in the three-phase split** — the abort
+   streak is carried (phase 1 → tick → phase 3) again; 4 consecutive aborts
+   route the item vanilla.
+3. **THE ~48% ABORT STORM — `overrides()` anchored at the wrong base.**
+   In 1.21.8 `stepOn` / `fallOn` / `updateEntityMovementAfterFallOn` MOVED
+   from `BlockBehaviour` into the `Block` base class (javap-verified). The
+   walk-to-BlockBehaviour check therefore matched EVERY block:
+   `fall_on_special=1` everywhere, and the tick core's swept-gather gate
+   (`fall_special -> ABORTED`) aborted every item whose sweep touched any
+   block — i.e. every resting item, every tick. The anchor is now `Block`
+   (the defaults' new home); only genuine overriders below Block (slime,
+   honey, cobweb, ...) flag.
+
+**Consequence for the L7 verdict:** the same storm existed before L8 — the
+old seatbelt cycled every item 4-aborts-then-vanilla, i.e. 4 of 5 ticks the
+item was FROZEN (the forbidden "not tick"), and the first CI leg of this
+series (ok/ab counters) exposed it. The −86.7% p50 in doc 18 was measured
+against that behavior. With the anchor fixed the core computes REAL native
+physics every tick; the next paired A/B is the first honest measurement of
+the native core doing actual work (plus the correct LAND events, which the
+shifted bit had silently dropped).

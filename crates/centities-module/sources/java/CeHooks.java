@@ -2179,11 +2179,20 @@ public final class CeHooks {
         outD[o + 17] = 0.0;
     }
 
-    /** true when the block class overrides the (possibly renamed) method. */
+    /** true when the block class overrides the (possibly renamed) method.
+     *
+     *  1.21.8 ROOT-CAUSE FIX (the ~48% abort storm): stepOn / fallOn /
+     *  updateEntityMovementAfterFallOn MOVED from BlockBehaviour into the
+     *  Block base class itself (javap-verified on the shipped 1.21.8-60
+     *  jar). Anchoring the walk at BlockBehaviour therefore matched EVERY
+     *  block in the game — fall_on_special=1 everywhere — and the tick
+     *  core's swept-gather gate aborted every item whose sweep touched any
+     *  block. The anchor is now Block (the defaults' new home), so only
+     *  genuine overriders below Block (slime, honey, cobweb, ...) flag. */
     private static boolean overrides(BlockState st, String name) {
         try {
             Class<?> k = st.getBlock().getClass();
-            while (k != null && k != net.minecraft.world.level.block.state.BlockBehaviour.class) {
+            while (k != null && k != net.minecraft.world.level.block.Block.class) {
                 for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
                     if (m.getName().equals(name)) return true;
                 }
