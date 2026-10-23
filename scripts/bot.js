@@ -1,5 +1,9 @@
 // Fake player for baseline runs: joins the offline-mode Paper server and
 // stays AFK at spawn so Paper's Entity Activation Range sees a player.
+// Protocol: mineflayer/minecraft-data currently speaks at most 26.1 while
+// the bench server is 26.3 — ViaVersion (staged into plugins/ by
+// run-baseline.sh) performs the server-side translation. Present in BOTH
+// A/B legs, so the paired comparison stays fair.
 const mineflayer = require('mineflayer')
 
 const host = process.env.BOT_HOST || '127.0.0.1'
@@ -11,7 +15,7 @@ function connect(attempt) {
     port,
     username: 'baseline_bot',
     auth: 'offline',
-    version: '1.21.8',
+    version: '26.1',
   })
   bot.on('login', () => console.log('BOT-LOGGED-IN'))
   bot.on('spawn', () => console.log('BOT-SPAWNED'))

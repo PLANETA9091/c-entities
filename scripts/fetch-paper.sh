@@ -2,7 +2,7 @@
 # Download Paper server jar via the official Fill API (v3).
 # Usage: fetch-paper.sh [mc-version] [out-jar]
 set -euo pipefail
-MC="${1:-1.21.8}"
+MC="${1:-26.3}"
 OUT="${2:-server.jar}"
 UA="c-entities-baseline/0.1 (github.com/PLANETA9091/c-entities)"
 

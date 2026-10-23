@@ -101,7 +101,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             w.setGameRule(GameRule.RANDOM_TICK_SPEED, 0);
             w.setStorm(false);
             w.setThundering(false);
-            w.setTime(6000L);
+            try {
+                w.setTime(6000L);
+            } catch (IllegalArgumentException ex) {
+                // 26.3: "Cannot set time in world without world clock" — this
+                // world has no clock object; DO_DAYLIGHT_CYCLE=false (above)
+                // already pins the time, so determinism is preserved.
+            }
         }
 
         getServer().getPluginManager().registerEvents(this, this);

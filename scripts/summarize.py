@@ -35,7 +35,7 @@ def main():
              "mixed-50k", "mixed-150k", "tiles-25k", "tiles-100k"]
     rows.sort(key=lambda r: (order.index(r[0]) if r[0] in order else 99))
 
-    print("# Baseline profile of Paper 1.21.8 (no optimizations)\n")
+    print("# Baseline profile of Paper 26.3 (no optimizations)\n")
     print("Measured on GitHub Actions (ubuntu-latest, 4 vCPU), JFR enabled (~2-5% overhead, identical across runs).\n")
     print("| run | entities | block entities | MSPT p50 | p90 | p99 | max, ms | TPS est. | heap, MB |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")

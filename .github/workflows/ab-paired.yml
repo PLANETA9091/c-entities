@@ -29,16 +29,36 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Fetch Paper 1.21.8 (paperclip)
-        run: bash scripts/fetch-paper.sh 1.21.8 server/paper.jar
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 server/paper.jar
       - name: Build ce-baseline plugin
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
         run: mkdir -p tools && cd tools && npm install mineflayer --no-save --loglevel=error
+      - name: Install ViaVersion (bench bot speaks 26.1; server is 26.3)
+        run: |
+          mkdir -p build/viaversion
+          URL=$(curl -fsS https://hangar.papermc.io/api/v1/projects/ViaVersion/versions | \
+            python3 -c '
+import json, sys
+raw = sys.stdin.read()
+d, _ = json.JSONDecoder().raw_decode(raw)
+urls = []
+for x in d["result"]:
+    dl = (x.get("downloads") or {}).get("PAPER") or {}
+    u = dl.get("downloadUrl")
+    if u:
+        urls.append((x.get("name") or "", u))
+stable = [u for n, u in urls if "SNAPSHOT" not in n]
+print(stable[0] if stable else (urls[0][1] if urls else ""))
+')
+          [ -n "$URL" ] || { echo "FATAL: no ViaVersion download URL"; exit 1; }
+          echo "ViaVersion: $URL"
+          curl -fsSL -o build/viaversion/ViaVersion.jar "$URL"
 
       - name: Paired off/on runs
         run: |

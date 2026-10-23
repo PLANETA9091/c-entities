@@ -1,6 +1,6 @@
 name: e2e
 
-# End-to-end: boot Paper 1.21.8 under CRUSSTY with the c-entities module,
+# End-to-end: boot Paper 26.3 under CRUSSTY with the c-entities module,
 # assert the full injection chain (patches applied by the JVM, module armed,
 # server reaches "Done"). The runtime is built FROM SOURCE — the v2.2.5
 # release binary has the non-NUL-terminated hook-name bug (hooks silently
@@ -33,15 +33,15 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
-      - name: Fetch Paper 1.21.8 (paperclip)
-        run: bash scripts/fetch-paper.sh 1.21.8 /tmp/paper/paperclip.jar
+          java-version: '25'
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 /tmp/paper/paperclip.jar
       - name: One-shot paperclip boot (produce mojang-mapped server jar)
         working-directory: /tmp/paper
         run: |
           echo "eula=false" > eula.txt
           timeout 240 java -jar paperclip.jar nogui > boot.log 2>&1 || true
-          JAR=$(find versions -name "paper-1.21.8.jar" | head -1)
+          JAR=$(find versions -name "paper-26.3.jar" | head -1)
           test -f "$JAR"
           echo "PAPER_JAR=$(pwd)/$JAR" >> "$GITHUB_ENV"
       - name: Tests + build module cdylib
@@ -58,14 +58,14 @@ jobs:
       - name: Stage e2e server directory
         run: |
           mkdir -p e2e/versions e2e/modules/entities e2e/plugins
-          cp /tmp/paper/paperclip.jar e2e/versions/paperclip-1.21.8.jar
+          cp /tmp/paper/paperclip.jar e2e/versions/paperclip-26.3.jar
           cp target/release/libcentities_module.so e2e/modules/entities/
           cp module.json e2e/modules/entities/
           cp build/ce-baseline.jar e2e/plugins/
           cp ../CRUSSTY/runtime/target/release/libcrussty_runtime.so e2e/
           echo "eula=true" > e2e/eula.txt
           printf 'level-type=minecraft\\:flat\nonline-mode=false\nview-distance=3\nsimulation-distance=3\nmotd=c-entities e2e\n' > e2e/server.properties
-      - name: Boot Paper 1.21.8 + CRUSSTY + c-entities (with live entities)
+      - name: Boot Paper 26.3 + CRUSSTY + c-entities (with live entities)
         working-directory: e2e
         run: |
           set -o pipefail
@@ -83,21 +83,26 @@ jobs:
           # with "Incorrect argument" and the item traffic silently vanishes
           # (observed 2026-10-22: three green e2e runs with ZERO item traffic;
           # local poll-Done boot: summons at T+50s work, Done at 32.6s).
+          # 26.3 syntax (console-verified 2026-10-23): `execute in <dim>` on
+          # the console rejects the position argument, so plain `summon`
+          # (default dimension = overworld) is used; entity NBT keys are
+          # snake_case since 1.21.5 (no_ai / persistence_required / marker),
+          # while the item stack key stays Item:{id:...,count:1}.
           (sleep 90;
-           echo "execute in overworld summon minecraft:zombie 8 -59 8 {NoAI:1b,PersistenceRequired:1b}";
-           echo "execute in overworld summon minecraft:armor_stand 10 -59 10 {Marker:1b,Gravity:0b}";
+           echo "summon minecraft:zombie 8 -59 8 {no_ai:1b,persistence_required:1b}";
+           echo "summon minecraft:armor_stand 10 -59 10 {marker:1b,gravity:0b}";
            sleep 2;
-           echo "execute in overworld summon minecraft:item 0 50 0 {Item:{id:\"minecraft:stone\",count:1},PickupDelay:32767}";
+           echo 'summon minecraft:item 0 50 0 {Item:{id:"minecraft:stone",count:1},PickupDelay:32767}';
            sleep 6;
-           echo "execute in overworld summon minecraft:item 4 55 4 {Item:{id:\"minecraft:dirt\",count:1},PickupDelay:32767}";
+           echo 'summon minecraft:item 4 55 4 {Item:{id:"minecraft:dirt",count:1},PickupDelay:32767}';
            sleep 3;
-           echo "execute in overworld summon minecraft:zombie -8 -59 -8 {NoAI:1b,PersistenceRequired:1b}";
+           echo "summon minecraft:zombie -8 -59 -8 {no_ai:1b,persistence_required:1b}";
            sleep 50;
-           echo "execute in overworld summon minecraft:zombie 16 -59 16 {NoAI:1b,PersistenceRequired:1b}";
+           echo "summon minecraft:zombie 16 -59 16 {no_ai:1b,persistence_required:1b}";
            sleep 50; echo stop) | timeout 280 \
             java -Xms1G -Xmx4G \
-            "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-1.21.8.jar" \
-            -jar versions/paperclip-1.21.8.jar --nogui > e2e.log 2>&1 || true
+            "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-26.3.jar" \
+            -jar versions/paperclip-26.3.jar --nogui > e2e.log 2>&1 || true
           echo "## e2e markers" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E "pipeline ready|\[c-entities\]|hooks@|Done \(|crussty-runtime. retransform" e2e.log | head -50 >> "$GITHUB_STEP_SUMMARY" || true
@@ -132,7 +137,7 @@ jobs:
           # path did (falling items drive mergeScanNative) OR the L7
           # dispatch owned real item ticks (disp=checks/NATIVE/...). One 45s
           # retry covers a slow first soak window; the items now spawn with
-          # 1.21.8 item NBT (count:1) so the traffic is deterministic.
+          # 26.3 item NBT (count:1) so the traffic is deterministic.
           LIVE=0
           echo "$LAST_HOOKS" | grep -Eq "fast=[1-9]" && LIVE=1
           echo "$LAST_HOOKS" | grep -Eq "merge=[0-9]+/[0-9]+/[1-9]" && LIVE=1

@@ -2,7 +2,7 @@ name: module
 
 # c-entities: Rust core tests + CRUSSTY module build (weave + JNI bridge).
 # The module build compiles CeHooks.java against the mojang-mapped
-# Paper 1.21.8 jar (produced by a one-shot paperclip boot).
+# Paper 26.3 jar (produced by a one-shot paperclip boot).
 
 on:
   push:
@@ -46,15 +46,15 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
-      - name: Fetch Paper 1.21.8 (paperclip)
-        run: bash scripts/fetch-paper.sh 1.21.8 /tmp/paper/paperclip.jar
+          java-version: '25'
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 /tmp/paper/paperclip.jar
       - name: One-shot paperclip boot (produce mojang-mapped server jar)
         working-directory: /tmp/paper
         run: |
           echo "eula=false" > eula.txt
           timeout 240 java -jar paperclip.jar nogui > boot.log 2>&1 || true
-          JAR=$(find versions -name "paper-1.21.8.jar" | head -1)
+          JAR=$(find versions -name "paper-26.3.jar" | head -1)
           test -f "$JAR"
           echo "PAPER_JAR=$(pwd)/$JAR" >> "$GITHUB_ENV"
       - name: Tests (patcher on the real Level.class)

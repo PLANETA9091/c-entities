@@ -270,7 +270,7 @@ public final class CeHooks {
         try {
             net.minecraft.world.level.Level w = e.level();
             if (!(w instanceof net.minecraft.server.level.ServerLevel)
-                    || w.isClientSide) {
+                    || w.isClientSide()) {
                 return false;
             }
             if (MH_TRY_MERGE == null && !initMergeMhs(e)) return false;
@@ -331,7 +331,7 @@ public final class CeHooks {
         try {
             if (!ACTIVE || level == null || pos == null
                     || !(level instanceof net.minecraft.server.level.ServerLevel)
-                    || level.isClientSide) {
+                    || level.isClientSide()) {
                 return;
             }
             // L6: the changed section's cached collision/fluid data is stale —
@@ -596,7 +596,7 @@ public final class CeHooks {
     /** Prefix of EntityLookup.addEntity(Entity,boolean,boolean): slot 1 = entity. */
     public static void probeAdd(Entity e) {
         try {
-            if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide) {
+            if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
                 ARENA[e.getId() & AMASK] = e;
                 batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox(), false);
@@ -638,7 +638,7 @@ public final class CeHooks {
             // query index is suspended (INDEXING false) — correctness does
             // not depend on the index.
             l7ExternalMutation(e);
-            if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide) {
+            if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide()) {
                 probesBox++;
                 ARENA[e.getId() & AMASK] = e;
                 if (REST_GEN[e.getId() & AMASK] != 0) {
@@ -1420,7 +1420,7 @@ public final class CeHooks {
         if (!(ent instanceof ItemEntity e)) return false;
         if (ibN >= IB_CAP) return false;
         try {
-            if (e.level().isClientSide) return false;
+            if (e.level().isClientSide()) return false;
             int slot = e.getId() & MAMASK;
             if (MODE_GEN[slot] != MODE_EPOCH || MODE_VAL[slot] == 0) {
                 dispPass++;
@@ -1430,7 +1430,7 @@ public final class CeHooks {
             // (stackEmptyDispatch: the cached empty bit replaces the
             // SynchedEntityData read — 6.55% MSPT on items-100k)
             if (e.isRemoved() || e.noPhysics
-                    || e.portalProcess != null || e.portalCooldown > 0
+                    || e.portalProcess != null || e.isOnPortalCooldown()
                     || stackEmptyDispatch(e)) {
                 dispPass++;
                 return false;
@@ -1737,7 +1737,7 @@ public final class CeHooks {
     public static boolean itemSkip(ItemEntity e) {
         itemChecks++;
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) return false;
-        if (e.level().isClientSide) return false; // client-side ticks stay vanilla
+        if (e.level().isClientSide()) return false; // client-side ticks stay vanilla
         try {
             boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
                     && MODE_VAL[e.getId() & MAMASK] != 0;
@@ -1783,7 +1783,7 @@ public final class CeHooks {
         // identifies exactly those (recently owned, currently vanilla); the
         // forever-vanilla population has a stale GEN and stays free.
         if (ACTIVE && ITEM_TICK_ON && cplugReady && ibN < IB_CAP
-                && !e.level().isClientSide) {
+                && !e.level().isClientSide()) {
             try {
                 int slot = e.getId() & MAMASK;
                 if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
@@ -2003,7 +2003,9 @@ public final class CeHooks {
                     e.setPos(outD[o + 3], outD[o + 4], outD[o + 5]);
                 }
                 if ((bits & (1 << 2)) != 0) { // HAS_IMPULSE (OR-only)
-                    e.hasImpulse = true;
+                    // 26.3: Entity.hasImpulse was renamed needsSync
+                    // (same role: forces the tracker to sync the delta)
+                    e.needsSync = true;
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
                     itemMerge++;
@@ -2174,7 +2176,7 @@ public final class CeHooks {
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
                         int local = x | (z << 4) | (y << 8);
-                        BlockState st = section.states.get(x, y, z);
+                        BlockState st = section.getStates().get(x, y, z);
                         states[nn++] = st;
                         Integer pi = paletteIdx.get(st);
                         if (pi == null) {
@@ -2255,7 +2257,7 @@ public final class CeHooks {
         outD[o + 23] = (st.is(net.minecraft.world.level.block.Blocks.COBWEB) ? 1 : 0)
                 | (overrides(st, "entityInside") ? 2 : 0)
                 | (overrides(st, "stepOn") ? 4 : 0)
-                | (overrides(st, "updateEntityMovementAfterFallOn") ? 8 : 0)
+                | (overrides(st, "bounceOn") ? 8 : 0) // 26.3: was updateEntityMovementAfterFallOn
                 | complex;
         outD[o + 19] = st.getBlock().getFriction();
         outD[o + 20] = st.getBlock().getSpeedFactor();
@@ -2273,7 +2275,13 @@ public final class CeHooks {
      *  block in the game — fall_on_special=1 everywhere — and the tick
      *  core's swept-gather gate aborted every item whose sweep touched any
      *  block. The anchor is now Block (the defaults' new home), so only
-     *  genuine overriders below Block (slime, honey, cobweb, ...) flag. */
+     *  genuine overriders below Block (slime, honey, cobweb, ...) flag.
+     *
+     *  26.3 RETARGET: updateEntityMovementAfterFallOn was renamed to
+     *  bounceOn(Level, BlockState, BlockPos, Entity, double) by Mojang
+     *  (fall-damage rework; javap-verified on the shipped 26.3-218 jar —
+     *  Entity calls Block.bounceOn where 1.21.8 called
+     *  updateEntityMovementAfterFallOn). Same anchor semantics. */
     private static boolean overrides(BlockState st, String name) {
         try {
             Class<?> k = st.getBlock().getClass();

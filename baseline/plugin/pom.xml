@@ -11,6 +11,8 @@
 
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
+    <!-- compiled with JDK 25 on CI (26.3 requires Java 25); release 21
+         bytecode loads fine on the 26.3 JVM -->
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
 
@@ -25,7 +27,7 @@
     <dependency>
       <groupId>io.papermc.paper</groupId>
       <artifactId>paper-api</artifactId>
-      <version>1.21.8-R0.1-SNAPSHOT</version>
+      <version>26.3.build.218-stable</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>

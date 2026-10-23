@@ -14,6 +14,13 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-1000}"
 
 mkdir -p "$S/plugins" "$R"
 cp "$ROOT/build/ce-baseline.jar" "$S/plugins/"
+# ViaVersion: the bench bot speaks the mineflayer protocol (max 26.1) while
+# the server is 26.3 — server-side translation is required for the bot to
+# join. Staged whenever the jar was fetched by CI (or manually) — present in
+# BOTH A/B legs, so the paired comparison stays fair.
+if [ -f "$ROOT/build/viaversion/ViaVersion.jar" ]; then
+  cp "$ROOT/build/viaversion/ViaVersion.jar" "$S/plugins/"
+fi
 cp "$PAPER_JAR" "$S/paper.jar"
 
 cat > "$S/eula.txt" <<'EOF'
@@ -60,13 +67,13 @@ if [ "${MODULE:-off}" = "on" ]; then
   # 1. mojang-mapped server jar for javac (one-shot paperclip boot, no world)
   # Idempotent: reuse the previously produced mapped jar when present.
   PB="$ROOT/build/paperboot"
-  MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" 2>/dev/null | head -1 || true)
+  MAPPED=$(find "$PB/versions" -name "paper-26.3.jar" 2>/dev/null | head -1 || true)
   if [ -z "$MAPPED" ]; then
     mkdir -p "$PB"
     cp "$PAPER_JAR" "$PB/paper.jar"
     echo "eula=false" > "$PB/eula.txt"
     (cd "$PB" && timeout 300 java -Xmx2G -jar paper.jar nogui > boot.log 2>&1 || true)
-    MAPPED=$(find "$PB/versions" -name "paper-1.21.8.jar" | head -1)
+    MAPPED=$(find "$PB/versions" -name "paper-26.3.jar" | head -1)
   fi
   [ -n "$MAPPED" ] && [ -f "$MAPPED" ] || { echo "FATAL: paperclip boot produced no mapped jar"; tail -20 "$PB/boot.log" || true; exit 1; }
   # 2. module cdylib (CRUSSTY path deps live at repo-parent/CRUSSTY)

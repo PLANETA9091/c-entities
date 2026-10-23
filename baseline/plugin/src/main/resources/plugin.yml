@@ -2,5 +2,5 @@ name: ce-baseline
 version: 0.1.0
 main: ru.planeta9091.cebaseline.BaselinePlugin
 api-version: '1.21'
-description: Baseline measurement harness for c-entities research (Paper 1.21.8)
+description: Baseline measurement harness for c-entities research (Paper 26.3)
 authors: [PLANETA9091]

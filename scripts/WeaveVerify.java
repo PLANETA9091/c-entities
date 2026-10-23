@@ -131,7 +131,7 @@ public final class WeaveVerify {
     public static void main(String[] args) throws Exception {
         String jar = System.getProperty("paper.jar");
         if (jar == null || jar.isEmpty()) {
-            System.err.println("usage: -Dpaper.jar=<paper-1.21.8.jar>");
+            System.err.println("usage: -Dpaper.jar=<paper-26.3.jar>");
             System.exit(2);
         }
         byte[] orig = readEntry(jar, "net/minecraft/world/entity/item/ItemEntity.class");

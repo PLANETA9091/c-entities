@@ -1,8 +1,11 @@
-//! Compiles sources/java/CeHooks.java against the mojang-mapped Paper 1.21.8
+//! Compiles sources/java/CeHooks.java against the mojang-mapped Paper 26.3
 //! jar and embeds the resulting class bytes (include_bytes! in lib.rs).
 //!
 //! PAPER_JAR env var overrides the default location
-//! (<repo>/../paper-merged/paper-1.21.8.jar).
+//! (<repo>/../paper-merged/paper-26.3.jar). The javac classpath also picks
+//! up every jar under <boot-dir>/libraries (the 26.3 mapped jar references
+//! fastutil/DFU/jspecify annotations that live there — javac refuses to
+//! complete symbols without them).
 
 use std::env;
 use std::path::PathBuf;
@@ -18,7 +21,7 @@ fn main() {
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent()) // repo root's parent (work dir)
-            .map(|w| w.join("paper-merged").join("paper-1.21.8.jar"));
+            .map(|w| w.join("paper-merged").join("paper-26.3.jar"));
         // crates/centities-module -> crates -> repo -> work
         let alt = manifest
             .parent()
@@ -28,7 +31,7 @@ fn main() {
             (Some(p), _) => p.to_string_lossy().into_owned(),
             (None, Some(a)) => a.to_string_lossy().into_owned(),
             _ => panic!(
-                "PAPER_JAR not found: pass PAPER_JAR=<mojang-mapped paper 1.21.8 jar> \
+                "PAPER_JAR not found: pass PAPER_JAR=<mojang-mapped paper 26.3 jar> \
                  (run scripts/fetch-paper.sh + one paperclip boot, see README)"
             ),
         }
@@ -39,6 +42,36 @@ fn main() {
     let _ = std::fs::remove_dir_all(&classes);
     std::fs::create_dir_all(&classes).unwrap();
 
+    // The 26.3 mapped jar references fastutil / DataFixerUpper / jspecify /
+    // jetbrains-annotations types that live in the paperclip boot's
+    // libraries/ tree (NOT inside the server jar) — javac refuses to
+    // complete symbols ("Cannot attach type annotations", CompletionFailure)
+    // without them. Walk up from the mapped jar and append every jar found
+    // under the nearest sibling `libraries/` directory.
+    let mut cp = paper.clone();
+    {
+        let mut dir = PathBuf::from(&paper).parent().map(|p| p.to_path_buf());
+        for _ in 0..4 {
+            match dir.take() {
+                Some(d) => {
+                    let libs = d.join("libraries");
+                    if libs.is_dir() {
+                        let mut jars: Vec<PathBuf> = Vec::new();
+                        collect_jars(&libs, &mut jars);
+                        jars.sort();
+                        for j in jars {
+                            cp.push(':');
+                            cp.push_str(&j.to_string_lossy());
+                        }
+                        break;
+                    }
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+                None => break,
+            }
+        }
+    }
+
     let src = manifest.join("sources").join("java").join("CeHooks.java");
     let javac = find_javac();
     let st = Command::new(&javac)
@@ -47,7 +80,7 @@ fn main() {
             "17",
             "-nowarn",
             "-cp",
-            &paper,
+            &cp,
             "-d",
             classes.to_str().unwrap(),
             src.to_str().unwrap(),
@@ -121,4 +154,18 @@ fn find_javac() -> String {
         }
     }
     panic!("javac not found: install JDK 17+ or set JAVA_HOME");
+}
+
+/// Recursively collect every *.jar under `dir` (sorted by the caller).
+fn collect_jars(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_jars(&p, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("jar") {
+                out.push(p);
+            }
+        }
+    }
 }

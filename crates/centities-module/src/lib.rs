@@ -1,6 +1,6 @@
 //! c-entities CRUSSTY module (v0.2): exact entity proximity index.
 //!
-//! Weave targets (Paper 1.21.8, mojang-mapped):
+//! Weave targets (Paper 26.3, mojang-mapped):
 //!   1. Level.getEntities(Entity, AABB, Predicate)  — replace_body → CeHooks.getEntities
 //!   2. EntityLookup.addEntity(Entity, boolean, boolean) — prefix probe
 //!   3. EntityLookup.removeEntity(Entity)               — prefix probe
@@ -1258,24 +1258,43 @@ fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
 /// make resting items stale — the arm gate counts this class).
 fn patch_level_setblock_wakes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     const WAKE_DESC: &str = "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;)V";
-    let with_rec = patch::insert_static_call_at_start(
-        bytes,
-        "setBlock",
+    // 26.3 RETARGET: Level.setBlock is now the 4-arg overload
+    // (pos, state, flags, recursion) — the 3-arg overload was REMOVED by
+    // Mojang (javap-verified on the shipped 26.3-218 jar; on 1.21.8 both
+    // existed and both were probed). At least ONE probe must land or arming
+    // is refused (silent wake loss would make resting items stale — the arm
+    // gate counts this class). "not found" on one overload is therefore
+    // tolerated as long as the other landed; any structural failure aborts.
+    let mut out = bytes;
+    let mut landed = false;
+    for desc in [
         "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;II)Z",
-        HOOKS_CLASS,
-        "probeWake",
-        WAKE_DESC,
-        &[(0, b'L'), (1, b'L')],
-    )?;
-    patch::insert_static_call_at_start(
-        with_rec,
-        "setBlock",
         "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;I)Z",
-        HOOKS_CLASS,
-        "probeWake",
-        WAKE_DESC,
-        &[(0, b'L'), (1, b'L')],
-    )
+    ] {
+        match patch::insert_static_call_at_start(
+            out.clone(),
+            "setBlock",
+            desc,
+            HOOKS_CLASS,
+            "probeWake",
+            WAKE_DESC,
+            &[(0, b'L'), (1, b'L')],
+        ) {
+            Ok(next) => {
+                out = next;
+                landed = true;
+            }
+            Err(e) => {
+                if !e.contains("not found") {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    if !landed {
+        return Err("setBlock: no overload found (probe refused)".to_string());
+    }
+    Ok(out)
 }
 
 fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {

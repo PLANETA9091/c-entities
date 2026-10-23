@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compile the baseline plugin (Maven, paper-api 1.21.8 from repo.papermc.io).
+# Compile the baseline plugin (Maven, paper-api 26.3 from repo.papermc.io).
 # Requires: JDK 21 + Maven (both available via setup-java/setup-maven on CI).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
