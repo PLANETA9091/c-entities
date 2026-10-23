@@ -91,3 +91,19 @@ Boot Paper 26.3 + CRUSSTY runtime (a34d529) + c-entities module + ce-baseline:
 
 Core tests 21/21 green; module patcher tests green against the real v69 jar
 (own classfile parser accepted v69 without changes).
+
+## 6. First honest A/B on 26.3 (CI, paired same-runner, mean MSPT)
+
+| Scenario | vanilla | module | Δ | note |
+|---|---:|---:|---:|---|
+| items-100k | 65.8 | **35.1** | **−46.6%** | mass 100000→100000 both legs; flush avg 6.6ms, ok/ab=0 aborts |
+| spread-100k | 327.8 | **270.8** | **−17.4%** | gate mostly routes mirror (fast 21µs > mirror 5µs there) |
+| mobs-25k | 367.9 | **215.4** | **−41.4%** | query fusion serves mob AI (2.5M fast + 10.5M mirror) |
+| mixed-150k | 534.7 | 616.6 | **+15.3%** | OPEN: 26.3 vanilla floor dropped (670→535 vs 1.21.8); 20.3M fast queries at EMA 11µs ≈ 84ms/tick; `CeHooks.worldId` 13.28% self-time in spread-mod hotspots (identity-memo suspicion / JFR inline attribution) — next lever |
+
+Telemetry integrity on 26.3: `ab0 stuck0 unl0 fld0 cpx0 fal0` across every
+flush (the 1.21.8 abort-storm class of bugs did not survive the retarget),
+desync=0, ARMED in all mod legs.
+
+Next levers (26.3-specific): cheapen the fast-path per-query price (JNI
+candidate return, worldId memo), then the Java-floor (tracker/EntityTickList).
