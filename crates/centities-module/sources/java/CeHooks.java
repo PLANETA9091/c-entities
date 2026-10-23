@@ -1507,7 +1507,10 @@ public final class CeHooks {
         ibN = i + 1;
         IB_IDS[i] = e.getId();
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE);
-        int o = i * 10;
+        // stride 14 — MUST match the native reader d[k*14+...] (a 10-stride
+        // here misaligned every entry past 0: deltas became neighbouring
+        // items' coordinates — the flying-items bug behind the 8GB grid)
+        int o = i * 14;
         for (int j = 0; j < 14; j++) IB_D[o + j] = 0.0;
         IB_I[i * 4] = 0;
         IB_I[i * 4 + 1] = 0;
@@ -1755,7 +1758,7 @@ public final class CeHooks {
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
         Vec3 d = e.getDeltaMovement();
-        int o = i * 10;
+        int o = i * 14; // stride 14: match n_item_tick's d[k*14+...]
         IB_D[o] = e.getX();
         IB_D[o + 1] = e.getY();
         IB_D[o + 2] = e.getZ();
@@ -1808,7 +1811,7 @@ public final class CeHooks {
                     Entity ref = arenaRef(IB_IDS[i]);
                     if (!(ref instanceof ItemEntity)) continue;
                     ItemEntity e = (ItemEntity) ref;
-                    int o = i * 10;
+                    int o = i * 14; // stride 14: match the native reader
                     IB_D[o] = e.getX();
                     IB_D[o + 1] = e.getY();
                     IB_D[o + 2] = e.getZ();
