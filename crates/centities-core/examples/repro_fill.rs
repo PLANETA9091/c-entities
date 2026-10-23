@@ -4,7 +4,7 @@
 //! provider, and print the process RSS trajectory. If Rust-side code
 //! allocates-and-retains at ~130KB/item, RSS explodes here too (no JVM).
 
-use centities_core::sections::{SectionData, SectionProvider};
+use centities_core::sections::{SectionCache, SectionData, SectionProvider};
 use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -168,7 +168,7 @@ fn main() {
                 let _ = cx;
                 Ok(sd)
             };
-        let prov: SectionProvider = &mut provider;
+        let mut prov: SectionProvider = &mut provider;
 
         let t0 = std::time::Instant::now();
         for t in 0..ticks {
@@ -184,14 +184,10 @@ fn main() {
                 st.tick_count = st.tick_count.wrapping_add(1);
                 let entry = &mut store[k & ((1 << 17) - 1)];
                 entry.tick_count = st.tick_count;
-                let _outcome = tick_item(
-                    st,
-                    (k as i64) | (3 << 17),
-                    &tenv,
-                    &mut grid,
-                    &mut scratch,
-                    prov,
-                );
+                let _outcome = {
+                    let mut sc = SectionCache::new(&grid, &mut prov);
+                    tick_item(st, (k as i64) | (3 << 17), &tenv, &mut sc, &mut scratch)
+                };
                 // outcome ignored: the module commits + writebacks; the memory
                 // story is identical (commit = field stores, no allocation).
             }

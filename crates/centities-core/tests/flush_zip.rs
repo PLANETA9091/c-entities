@@ -4,7 +4,7 @@
 //! oscillation proves the tick really ran).
 
 use centities_core::itemtick::Aabb6;
-use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, SectionProvider};
+use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid};
 use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv, TickOutcome};
 
 fn flat_world() -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
@@ -105,13 +105,12 @@ fn parallel_chunk_zip_commits_every_tickable_item() {
             .for_each(|((((((st_c, od_c), oi_c), rec_c), tk_c), id_c), f_c)| {
                 let mut scratch = Scratch::new();
                 let mut provider = flat_world();
-                let prov: SectionProvider = &mut provider;
+                let mut cache = SectionCache::new(grid_ref, &mut provider);
                 for j in 0..st_c.len() {
                     if !tk_c[j] {
                         continue;
                     }
-                    let outcome =
-                        tick_item(&mut st_c[j], id_c[j], &tenv, grid_ref, &mut scratch, prov);
+                    let outcome = tick_item(&mut st_c[j], id_c[j], &tenv, &mut cache, &mut scratch);
                     let mut ob = 0i32;
                     if outcome.has(TickOutcome::MOVED) {
                         ob |= 1;

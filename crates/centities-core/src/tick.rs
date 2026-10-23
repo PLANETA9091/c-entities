@@ -32,7 +32,7 @@ use crate::itemtick::{
     mth_equal, mth_floor, perform_collisions, voxel_shape_intersect, Aabb6, EPS7,
     FRICTION_F32_AS_F64, GATE_HORZ_SQR, ITEM_GRAVITY, MOVE_EPS, Y_DRAG,
 };
-use crate::sections::{SectionGrid, SectionProvider};
+use crate::sections::SectionCache;
 
 /// Vanilla defaults for air / unloaded blocks (Block friction 0.6F,
 /// speedFactor 1.0F).
@@ -234,9 +234,8 @@ pub fn tick_item(
     st: &mut ItemState,
     id: i64,
     env: &TickEnv,
-    sg: &SectionGrid,
+    sc: &mut SectionCache,
     scratch: &mut Scratch,
-    provider: SectionProvider,
 ) -> TickOutcome {
     let mut out = TickOutcome(0);
 
@@ -255,11 +254,10 @@ pub fn tick_item(
     // The probe happens after gravity in vanilla but reads only the box, so
     // hoisting it before the mutation phase is exact.
     let deflated = box_now.deflate(1.0e-7);
-    let flags_np = sg.gather(
+    let flags_np = sc.gather(
         &deflated,
         env.min_section_y,
         env.max_section_y,
-        provider,
         &mut scratch.boxes,
     );
     if flags_np.unloaded || flags_np.complex || flags_np.any_fluid {
@@ -332,11 +330,10 @@ pub fn tick_item(
         } else {
             Aabb6::expand_towards(&box_now, mv.0, mv.1, mv.2)
         };
-        let swept_flags = sg.gather(
+        let swept_flags = sc.gather(
             &swept,
             env.min_section_y,
             env.max_section_y,
-            provider,
             &mut scratch.boxes,
         );
         if swept_flags.unloaded
@@ -387,8 +384,7 @@ pub fn tick_item(
             below_speed = st.speed;
             below_step_special = st.fr_step_special;
         } else {
-            let (entry, _unloaded) =
-                sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
+            let (entry, _unloaded) = sc.block_at(bx, by, bz, env.min_section_y, env.max_section_y);
             let below = entry.unwrap_or((
                 AIR_FRICTION,
                 AIR_SPEED,
@@ -409,14 +405,7 @@ pub fn tick_item(
             mth_floor(new_pos.1),
             mth_floor(new_pos.2),
         );
-        let (entry_at, _u) = sg.block_at(
-            at.0,
-            at.1,
-            at.2,
-            env.min_section_y,
-            env.max_section_y,
-            provider,
-        );
+        let (entry_at, _u) = sc.block_at(at.0, at.1, at.2, env.min_section_y, env.max_section_y);
         let at_e = entry_at.unwrap_or((
             AIR_FRICTION,
             AIR_SPEED,
@@ -441,7 +430,7 @@ pub fn tick_item(
             out.set(TickOutcome::VANILLA_NEXT);
         } else {
             let (seg_special, seg_cobweb) =
-                check_inside_blocks(sg, env, (st.xo, st.yo, st.zo), new_pos, scratch, provider);
+                check_inside_blocks(sc, env, (st.xo, st.yo, st.zo), new_pos, scratch);
             inside_special = seg_special;
             cobweb_hit = seg_cobweb;
         }
@@ -552,7 +541,7 @@ pub fn tick_item(
         st.fr_step_special = below_step_special;
         // supporting block refresh (post-move box)
         let new_box = Aabb6::item_box(st.x, st.y, st.z);
-        check_supporting_block(sg, env, st, &new_box, collided, scratch, provider);
+        check_supporting_block(sc, env, st, &new_box, collided, scratch);
         // cobweb effect (buffered in vanilla, applied at the end — same final
         // state for a single effect)
         if cobweb_hit {
@@ -625,12 +614,11 @@ fn new_on_ground(mv: (f64, f64, f64), collided: (f64, f64, f64)) -> bool {
 /// axisStepOrder, the box at each segment end deflated by 1e-5, blocks in
 /// floor ranges, shared visited set, air skipped. Returns (special, cobweb).
 fn check_inside_blocks(
-    sg: &SectionGrid,
+    sc: &mut SectionCache,
     env: &TickEnv,
     from: (f64, f64, f64),
     to: (f64, f64, f64),
     scratch: &mut Scratch,
-    provider: SectionProvider,
 ) -> (bool, bool) {
     let dm = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
     if dm.0 * dm.0 + dm.1 * dm.1 + dm.2 * dm.2 <= 0.0 {
@@ -666,7 +654,7 @@ fn check_inside_blocks(
                     }
                     scratch.visited.push((bx, by, bz));
                     let (entry, unloaded) =
-                        sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
+                        sc.block_at(bx, by, bz, env.min_section_y, env.max_section_y);
                     // (fr, speed, water, fluid, cobweb, inside, step, fall)
                     // air (or unloaded -> vanilla reads air) yields None
                     if let Some(e) = (match (entry, unloaded) {
@@ -689,13 +677,12 @@ fn check_inside_blocks(
 /// `Level.findSupportingBlock` (Paper): min distToCenterSqr, ties by
 /// BlockPos compareTo (Y, then Z, then X), over the section cache.
 fn find_supporting_block(
-    sg: &SectionGrid,
+    sc: &mut SectionCache,
     env: &TickEnv,
     box_: &Aabb6,
     ex: f64,
     ey: f64,
     ez: f64,
-    provider: SectionProvider,
 ) -> Option<(i32, i32, i32)> {
     let min_block_x = mth_floor(box_.x0 - EPS7) - 1;
     let max_block_x = mth_floor(box_.x1 + EPS7) + 1;
@@ -712,7 +699,7 @@ fn find_supporting_block(
         for cz in min_block_z..=max_block_z {
             for cx in min_block_x..=max_block_x {
                 let (rel, unloaded) =
-                    sg.block_box_at(cx, cy, cz, env.min_section_y, env.max_section_y, provider);
+                    sc.block_box_at(cx, cy, cz, env.min_section_y, env.max_section_y);
                 let rel = match (rel, unloaded) {
                     (Some(r), false) => r,
                     _ => continue,
@@ -750,13 +737,12 @@ fn find_supporting_block(
 
 /// `Entity.checkSupportingBlock(onGround, movement)`.
 fn check_supporting_block(
-    sg: &SectionGrid,
+    sc: &mut SectionCache,
     env: &TickEnv,
     st: &mut ItemState,
     box_: &Aabb6,
     movement: (f64, f64, f64),
     _scratch: &mut Scratch,
-    provider: SectionProvider,
 ) {
     if st.on_ground {
         let slab = Aabb6::new(
@@ -767,7 +753,7 @@ fn check_supporting_block(
             box_.y0,
             box_.z1,
         );
-        let mut final_found = find_supporting_block(sg, env, &slab, st.x, st.y, st.z, provider);
+        let mut final_found = find_supporting_block(sc, env, &slab, st.x, st.y, st.z);
         if final_found.is_none() && !st.on_ground_no_blocks {
             let slab2 = Aabb6::new(
                 slab.x0 - movement.0,
@@ -777,7 +763,7 @@ fn check_supporting_block(
                 slab.y1,
                 slab.z1 - movement.2,
             );
-            final_found = find_supporting_block(sg, env, &slab2, st.x, st.y, st.z, provider);
+            final_found = find_supporting_block(sc, env, &slab2, st.x, st.y, st.z);
         }
         match final_found {
             Some((sx, sy, sz)) => {

@@ -1336,7 +1336,16 @@ public final class CeHooks {
     private static final int IB_CAP = 1 << 17;
     private static final long[] IB_IDS = new long[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
-    private static final double[] IB_D = new double[IB_CAP * 14]; // x,y,z,dx,dy,dz,fallDist,stuckX,stuckY,stuckZ,supX,supY,supZ,supPresent
+    // L8.2 COMPACT BATCH: only collector-data entries (resync /
+    // force-vanilla — the rare population) carry the 14-double state stride;
+    // they are side-packed contiguously into IB_CD. The 1-based slot number
+    // rides in IB_FLAGS bits 6+ (0 = dispatch-owned, no per-tick fields).
+    // The old layout copied n*14 doubles (~7MB/tick of 99%-dead zeros at
+    // 60k items) through JNI every flush.
+    private static double[] IB_CD = new double[1024 * 14];
+    private static int ibCDN = 0;
+    private static final int IF_CDSHIFT = 6;
+    private static final int IF_CDMASK = 0x3F; // the IF_* bit namespace
     private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
     private static int ibN = 0;
 
@@ -1512,12 +1521,7 @@ public final class CeHooks {
         int i = ibN;
         ibN = i + 1;
         IB_IDS[i] = e.getId();
-        IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE);
-        // stride 14 — MUST match the native reader d[k*14+...] (a 10-stride
-        // here misaligned every entry past 0: deltas became neighbouring
-        // items' coordinates — the flying-items bug behind the 8GB grid)
-        int o = i * 14;
-        for (int j = 0; j < 14; j++) IB_D[o + j] = 0.0;
+        IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
         IB_I[i * 4] = 0;
         IB_I[i * 4 + 1] = 0;
         IB_I[i * 4 + 2] = e.pickupDelay;
@@ -1763,24 +1767,27 @@ public final class CeHooks {
         int id = e.getId();
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
+        // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
+        int ci = ibCDN;
+        int o = ci * 14;
+        if (IB_CD.length < o + 14) {
+            double[] nd = new double[Math.max(o + 14, IB_CD.length * 2)];
+            System.arraycopy(IB_CD, 0, nd, 0, o);
+            IB_CD = nd;
+        }
         Vec3 d = e.getDeltaMovement();
-        int o = i * 14; // stride 14: match n_item_tick's d[k*14+...]
-        IB_D[o] = e.getX();
-        IB_D[o + 1] = e.getY();
-        IB_D[o + 2] = e.getZ();
-        IB_D[o + 3] = d.x;
-        IB_D[o + 4] = d.y;
-        IB_D[o + 5] = d.z;
-        IB_D[o + 6] = fallDistOf(e);
+        IB_CD[o] = e.getX();
+        IB_CD[o + 1] = e.getY();
+        IB_CD[o + 2] = e.getZ();
+        IB_CD[o + 3] = d.x;
+        IB_CD[o + 4] = d.y;
+        IB_CD[o + 5] = d.z;
+        IB_CD[o + 6] = fallDistOf(e);
         // stuck + supporting are store-owned; only resync entries get fresh
         // values (flush pass 1)
-        IB_D[o + 7] = 0.0;
-        IB_D[o + 8] = 0.0;
-        IB_D[o + 9] = 0.0;
-        IB_D[o + 10] = 0.0;
-        IB_D[o + 11] = 0.0;
-        IB_D[o + 12] = 0.0;
-        IB_D[o + 13] = 0.0;
+        for (int j = 7; j < 14; j++) IB_CD[o + j] = 0.0;
+        ibCDN = ci + 1;
+        IB_FLAGS[i] |= (ci + 1) << IF_CDSHIFT;
         int oi = i * 4;
         IB_I[oi] = e.tickCount; // dispatcher already ++ed
         IB_I[oi + 1] = e.age;
@@ -1799,6 +1806,8 @@ public final class CeHooks {
         itemFlushes++;
         if (n == 0) return;
         ibN = 0;
+        int cdN = ibCDN;
+        ibCDN = 0;
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || !(level instanceof ServerLevel)) {
             return;
         }
@@ -1812,33 +1821,33 @@ public final class CeHooks {
 
             // pass 1: resync entries re-read state POST vanilla tick
             for (int i = 0; i < n; i++) {
-                int f = IB_FLAGS[i];
+                int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
                     Entity ref = arenaRef(IB_IDS[i]);
                     if (!(ref instanceof ItemEntity)) continue;
                     ItemEntity e = (ItemEntity) ref;
-                    int o = i * 14; // stride 14: match the native reader
-                    IB_D[o] = e.getX();
-                    IB_D[o + 1] = e.getY();
-                    IB_D[o + 2] = e.getZ();
+                    int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
+                    IB_CD[o] = e.getX();
+                    IB_CD[o + 1] = e.getY();
+                    IB_CD[o + 2] = e.getZ();
                     Vec3 d = e.getDeltaMovement();
-                    IB_D[o + 3] = d.x;
-                    IB_D[o + 4] = d.y;
-                    IB_D[o + 5] = d.z;
-                    IB_D[o + 6] = fallDistOf(e);
+                    IB_CD[o + 3] = d.x;
+                    IB_CD[o + 4] = d.y;
+                    IB_CD[o + 5] = d.z;
+                    IB_CD[o + 6] = fallDistOf(e);
                     Vec3 stuck = (Vec3) VH_STUCK.getObj(e);
-                    IB_D[o + 7] = stuck == null ? 0.0 : stuck.x;
-                    IB_D[o + 8] = stuck == null ? 0.0 : stuck.y;
-                    IB_D[o + 9] = stuck == null ? 0.0 : stuck.z;
+                    IB_CD[o + 7] = stuck == null ? 0.0 : stuck.x;
+                    IB_CD[o + 8] = stuck == null ? 0.0 : stuck.y;
+                    IB_CD[o + 9] = stuck == null ? 0.0 : stuck.z;
                     Object sup = e.mainSupportingBlockPos;
                     if (sup instanceof java.util.Optional<?> opt && opt.isPresent()
                             && opt.get() instanceof BlockPos bp) {
-                        IB_D[o + 10] = bp.getX();
-                        IB_D[o + 11] = bp.getY();
-                        IB_D[o + 12] = bp.getZ();
-                        IB_D[o + 13] = 1.0;
+                        IB_CD[o + 10] = bp.getX();
+                        IB_CD[o + 11] = bp.getY();
+                        IB_CD[o + 12] = bp.getZ();
+                        IB_CD[o + 13] = 1.0;
                     } else {
-                        IB_D[o + 13] = 0.0;
+                        IB_CD[o + 13] = 0.0;
                     }
                     int oi = i * 4;
                     IB_I[oi] = e.tickCount;
@@ -1866,7 +1875,7 @@ public final class CeHooks {
             double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
             int[] outI = growI(n * 4);    // age, pickupDelay, bits, tickCount (L7)
 
-            int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_D, IB_I,
+            int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
@@ -1892,7 +1901,7 @@ public final class CeHooks {
             int epoch = MODE_EPOCH + 1;
             for (int i = 0; i < n; i++) {
                 int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
-                int f = IB_FLAGS[i];
+                int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
                 MODE_GEN[mSlot] = epoch;
@@ -2149,7 +2158,12 @@ public final class CeHooks {
                             net.minecraft.world.level.EmptyBlockGetter.INSTANCE,
                             BlockPos.ZERO, net.minecraft.world.phys.shapes.CollisionContext.empty())
                             .toAabbs().size();
-                    if (bs > 3 || overridesShape(en.getKey())) {
+                    // L8.2 (doc 19 lever 4): the zero-cuboid shape-overrides
+                    // (air, plants, torches) are now HANDLED natively (complex
+                    // stays 0 for them) — logging every such entry poisoned the
+                    // diag with noise. Restrict to genuinely-complex entries:
+                    // >3 cuboids or a shape-override that still carries boxes.
+                    if (bs > 3 || (overridesShape(en.getKey()) && bs > 0)) {
                         System.out.println("[c-entities] section palette complex entry: "
                                 + be.getClass().getName() + " (" + be + ") boxes=" + bs
                                 + " slot=" + en.getValue());
@@ -2273,7 +2287,7 @@ public final class CeHooks {
     // natives (registered in lib.rs)
     public static native int nativeItemTick(
             int wid, int n, long[] ids, int[] flags,
-            double[] inD, int[] inI, double[] envD, int[] envI,
+            double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
             double[] outD, int[] outI);
     public static native void nativeItemInvalidate(
             int wid, int n, int[] xs, int[] ys, int[] zs);

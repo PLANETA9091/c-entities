@@ -14,6 +14,7 @@
 //! instead of gathering.
 
 use crate::itemtick::{mth_floor, voxel_shape_intersect, Aabb6};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
@@ -475,6 +476,251 @@ impl SectionGrid {
         self.lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.get_or_populate(cx, cy, cz, true, provider) {
+            Ok(data) => {
+                let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
+                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
+                (
+                    data.entry(idx).and_then(|e| e.colliders.first().copied()),
+                    false,
+                )
+            }
+            Err(()) => (None, true),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L8.2 — WORKER-LOCAL SECTION CACHE.
+//
+// The shared sharded grid pays, per section visit: one RwLock acquire/
+// release, a hash probe into a shared map, and an Arc refcount inc/dec —
+// and at 100k-item scale the hottest sections (the farm floor) are touched
+// by EVERY worker, so the Arc count and the shard locks are contended
+// cache lines ping-ponging between cores (~200k visits per flush).
+//
+// `SectionCache` is the fix: a per-flush-chunk (per worker turn) read-
+// through cache. Hits resolve in one LOCAL hash lookup and return a plain
+// `&SectionData` — no lock, no shared map probe, no refcount traffic. A
+// miss fills from the shared grid exactly once per section per worker.
+//
+// Epoch-correctness: the cache is created inside the flush native and
+// dropped before it returns. While the native runs, NO invalidation can
+// happen (the drain runs on the same server thread AFTER the native
+// returns), so every local entry is fresh by construction.
+// ---------------------------------------------------------------------------
+
+/// Per-worker-turn read-through cache over a shared [`SectionGrid`].
+pub struct SectionCache<'a> {
+    grid: &'a SectionGrid,
+    provider: SectionProvider<'a>,
+    local: HashMap<u64, Arc<SectionData>, ShardBuild>,
+    /// Section visits served locally (folded into the shared counter once
+    /// per chunk instead of one contended atomic per visit).
+    pub visits: u64,
+}
+
+impl<'a> SectionCache<'a> {
+    pub fn new(grid: &'a SectionGrid, provider: SectionProvider<'a>) -> SectionCache<'a> {
+        SectionCache {
+            grid,
+            provider,
+            local: HashMap::with_capacity_and_hasher(1 << 12, ShardBuild),
+            visits: 0,
+        }
+    }
+
+    #[inline]
+    fn data(&mut self, cx: i32, cy: i32, cz: i32, load: bool) -> Result<&SectionData, ()> {
+        let key = sec_key(cx, cy, cz);
+        if !self.local.contains_key(&key) {
+            let arc = self
+                .grid
+                .get_or_populate(cx, cy, cz, load, &mut *self.provider)?;
+            self.local.insert(key, arc);
+        }
+        Ok(self.local.get(&key).unwrap())
+    }
+
+    /// Gather — same exactness contract as [`SectionGrid::gather`], served
+    /// through the worker-local cache.
+    pub fn gather(
+        &mut self,
+        box_: &Aabb6,
+        min_section_y: i32,
+        max_section_y: i32,
+        out: &mut Vec<Aabb6>,
+    ) -> GatherFlags {
+        let mut flags = GatherFlags::default();
+        out.clear();
+        let min_block_x = mth_floor(box_.x0 - 1.0e-7) - 1;
+        let max_block_x = mth_floor(box_.x1 + 1.0e-7) + 1;
+        let min_block_y = ((min_section_y << 4) - 1).max(mth_floor(box_.y0 - 1.0e-7) - 1);
+        let max_block_y = ((max_section_y << 4) + 16).min(mth_floor(box_.y1 + 1.0e-7) + 1);
+        let min_block_z = mth_floor(box_.z0 - 1.0e-7) - 1;
+        let max_block_z = mth_floor(box_.z1 + 1.0e-7) + 1;
+        if min_block_y > max_block_y {
+            return flags;
+        }
+        let min_chunk_x = min_block_x >> 4;
+        let max_chunk_x = max_block_x >> 4;
+        let min_chunk_y = min_block_y >> 4;
+        let max_chunk_y = max_block_y >> 4;
+        let min_chunk_z = min_block_z >> 4;
+        let max_chunk_z = max_block_z >> 4;
+        for curr_chunk_z in min_chunk_z..=max_chunk_z {
+            for curr_chunk_x in min_chunk_x..=max_chunk_x {
+                for curr_chunk_y in min_chunk_y..=max_chunk_y {
+                    let section_idx = curr_chunk_y - min_section_y;
+                    if !(0..=(max_section_y - min_section_y)).contains(&section_idx) {
+                        continue;
+                    }
+                    let min_x_it = if curr_chunk_x == min_chunk_x {
+                        (min_block_x & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_x_it = if curr_chunk_x == max_chunk_x {
+                        (max_block_x & 15) - 1
+                    } else {
+                        15
+                    };
+                    let min_y_it = if curr_chunk_y == min_chunk_y {
+                        (min_block_y & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_y_it = if curr_chunk_y == max_chunk_y {
+                        (max_block_y & 15) - 1
+                    } else {
+                        15
+                    };
+                    let min_z_it = if curr_chunk_z == min_chunk_z {
+                        (min_block_z & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_z_it = if curr_chunk_z == max_chunk_z {
+                        (max_block_z & 15) - 1
+                    } else {
+                        15
+                    };
+                    if min_x_it > max_x_it || min_y_it > max_y_it || min_z_it > max_z_it {
+                        continue;
+                    }
+                    self.visits += 1;
+                    let data = match self.data(curr_chunk_x, curr_chunk_y, curr_chunk_z, false) {
+                        Ok(d) => d,
+                        Err(()) => {
+                            flags.unloaded = true;
+                            continue;
+                        }
+                    };
+                    if data.complex {
+                        flags.complex = true;
+                        continue;
+                    }
+                    if data.any_fluid {
+                        flags.any_fluid = true;
+                    }
+                    for cy in min_y_it..=max_y_it {
+                        for cz in min_z_it..=max_z_it {
+                            for cx in min_x_it..=max_x_it {
+                                let local = (cx | (cz << 4) | (cy << 8)) as usize;
+                                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
+                                if idx == AIR_IDX {
+                                    continue;
+                                }
+                                let Some(entry) = data.entries.get(idx as usize) else {
+                                    continue;
+                                };
+                                if entry.fall_on_special {
+                                    flags.fall_special = true;
+                                }
+                                let wx = (curr_chunk_x << 4) as f64 + cx as f64;
+                                let wy = (curr_chunk_y << 4) as f64 + cy as f64;
+                                let wz = (curr_chunk_z << 4) as f64 + cz as f64;
+                                for rel in &entry.colliders {
+                                    let world_box = Aabb6::new(
+                                        rel.x0 + wx,
+                                        rel.y0 + wy,
+                                        rel.z0 + wz,
+                                        rel.x1 + wx,
+                                        rel.y1 + wy,
+                                        rel.z1 + wz,
+                                    );
+                                    if voxel_shape_intersect(box_, &world_box) {
+                                        out.push(world_box);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        flags
+    }
+
+    /// Block lookup — same contract as [`SectionGrid::block_at`].
+    #[allow(clippy::type_complexity)]
+    pub fn block_at(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_section_y: i32,
+        max_section_y: i32,
+    ) -> (Option<BlockProps>, bool) {
+        let cx = x >> 4;
+        let cy = y >> 4;
+        let cz = z >> 4;
+        if cy < min_section_y || cy > max_section_y {
+            return (None, false);
+        }
+        self.visits += 1;
+        match self.data(cx, cy, cz, true) {
+            Ok(data) => {
+                let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
+                let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
+                match data.entry(idx) {
+                    Some(e) => (
+                        Some((
+                            e.friction,
+                            e.speed,
+                            e.is_water,
+                            e.has_fluid,
+                            e.cobweb,
+                            e.entity_inside_special,
+                            e.step_on_special,
+                            e.fall_on_special,
+                        )),
+                        false,
+                    ),
+                    None => (None, false),
+                }
+            }
+            Err(()) => (None, true),
+        }
+    }
+
+    /// Supporting-block collider lookup — same contract as
+    /// [`SectionGrid::block_box_at`].
+    pub fn block_box_at(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_section_y: i32,
+        max_section_y: i32,
+    ) -> (Option<Aabb6>, bool) {
+        let cx = x >> 4;
+        let cy = y >> 4;
+        let cz = z >> 4;
+        if cy < min_section_y || cy > max_section_y {
+            return (None, false);
+        }
+        self.visits += 1;
+        match self.data(cx, cy, cz, true) {
             Ok(data) => {
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
                 let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);

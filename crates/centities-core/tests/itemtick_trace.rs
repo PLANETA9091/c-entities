@@ -7,7 +7,7 @@
 //! freezes exactly — reproduced here to the last bit.
 
 use centities_core::itemtick::Aabb6;
-use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, AIR_IDX};
+use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid, AIR_IDX};
 use centities_core::tick::{
     tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome,
 };
@@ -124,7 +124,10 @@ fn resting_item_position_freezes_and_delta_oscillates() {
     for tick in 1..=12i32 {
         st.tick_count = tick; // the dispatcher ++ed before the guard fires (post-increment)
         let before = (st.x, st.y, st.z);
-        let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+        let out = {
+            let mut sc = SectionCache::new(&sg, &mut prov);
+            tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+        };
         // position NEVER changes for a resting item
         assert_eq!(
             (st.x, st.y, st.z),
@@ -175,7 +178,10 @@ fn sliding_item_decays_and_merges_on_floor_change() {
 
     // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: 1 % 40 != 0)
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.x, 0.9);
     assert_eq!(st.dx, 0.5 * (0.6f32 * 0.98f32) as f64, "friction 0.588f32");
@@ -183,7 +189,10 @@ fn sliding_item_decays_and_merges_on_floor_change() {
     assert!(!out.has(TickOutcome::MERGE));
     // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, tickCount 2
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     assert!(out.has(TickOutcome::MOVED));
     assert!(
         out.has(TickOutcome::MERGE),
@@ -218,7 +227,10 @@ fn falling_item_lands_exactly_on_ground_with_land_event() {
 
     // tick 1: gate open (!onGround); dy_g = -0.64; no hit yet (64.36 > 64).
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.y, 64.36);
     assert_eq!(
@@ -233,7 +245,10 @@ fn falling_item_lands_exactly_on_ground_with_land_event() {
 
     // tick 2: dy_g = -0.6672 - eps; collide clamps to the ground: y = 64.0.
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.y, 64.0, "64.36 - 0.36 == 64.0 exactly");
     assert!(out.has(TickOutcome::ON_GROUND));
@@ -257,7 +272,10 @@ fn gate_phase_follows_tick_count_plus_id() {
     st.tick_count = 0;
     for tick in 1..=8i32 {
         st.tick_count = tick;
-        let out = tick_item(&mut st, 1, &env, &sg, &mut scratch, &mut prov);
+        let out = {
+            let mut sc = SectionCache::new(&sg, &mut prov);
+            tick_item(&mut st, 1, &env, &mut sc, &mut scratch)
+        };
         let gate_tick = (tick + 1) % 4 == 0;
         assert_eq!(out.has(TickOutcome::V_COLL), gate_tick, "tick {tick}");
         let k = if tick < 3 { tick } else { (tick + 1) % 4 }; // gravity ticks since the last zeroing
@@ -318,7 +336,10 @@ fn cobweb_sets_stuck_multiplier_natively() {
         ..ItemState::new()
     };
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     assert!(!out.has(TickOutcome::ABORTED));
     assert_eq!(
         st.stuck,
@@ -332,7 +353,10 @@ fn cobweb_sets_stuck_multiplier_natively() {
     );
     // next tick: the move scales by the stuck multiplier, delta zeroes
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
     // vanilla: move() consumed the multiplier (movement was stuck-scaled,
     // delta zeroed), then entityInside RE-APPLIED makeStuckInBlock — the
     // field is (0.25, 0.05, 0.25) after every tick inside the web.
@@ -484,7 +508,10 @@ fn gather_finds_ground_boxes_exactly() {
     // The resting item's swept box (pure-Y cut downwards).
     let b = Aabb6::item_box(0.5, 64.0, 0.5);
     let swept = Aabb6::new(b.x0, b.y0 - 0.16, b.z0, b.x1, b.y0, b.z1);
-    let flags = sg.gather(&swept, MIN_SEC, MAX_SEC, &mut prov, &mut scratch.boxes);
+    let flags = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        sc.gather(&swept, MIN_SEC, MAX_SEC, &mut scratch.boxes)
+    };
     assert!(!flags.unloaded && !flags.complex && !flags.any_fluid);
     // exactly the ground blocks under the 0.5-wide box: the box spans
     // x 0.375..0.625, z 0.375..0.625 -> with the ±1e-7 slop and ±1 expansion
@@ -494,7 +521,10 @@ fn gather_finds_ground_boxes_exactly() {
 
     // A box over the void (chunk 1,0 unloaded) reports unloaded.
     let b2 = Aabb6::item_box(20.0, 64.0, 0.5);
-    let flags2 = sg.gather(&b2, MIN_SEC, MAX_SEC, &mut prov, &mut scratch.boxes);
+    let flags2 = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        sc.gather(&b2, MIN_SEC, MAX_SEC, &mut scratch.boxes)
+    };
     assert!(flags2.unloaded, "chunk (1,0) absent");
     assert!(scratch.boxes.is_empty());
 

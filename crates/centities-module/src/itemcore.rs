@@ -9,7 +9,7 @@
 //! tagged by id so id-slot reuse cannot cross-contaminate.
 
 use centities_core::itemtick::Aabb6;
-use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, SectionProvider, AIR_IDX};
+use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid, AIR_IDX};
 use centities_core::tick::{
     tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome, AB_COMPLEX, AB_FALL,
     AB_FLUID, AB_STUCK, AB_UNLOADED,
@@ -90,10 +90,37 @@ impl ItemEntry {
     }
 }
 
-/// Per-world: the item store + the section cache.
+/// Per-world: the item store + the section cache + the PERSISTENT flush
+/// scratch (L8.2: the per-tick working arrays are reused instead of
+/// reallocated — the previous fresh-Vec-per-flush scheme churned ~25 MB of
+/// touched memory per tick at 100k items, page-faulting it in every time).
 pub struct ItemWorld {
     entries: Vec<ItemEntry>,
     pub grid: SectionGrid,
+    // ---- flush scratch (sized to n; only grows) ----
+    /// Phase-1 hydrated states, mutated in place by phase 2.
+    sts: Vec<ItemState>,
+    tickable: Vec<bool>,
+    aborts_in: Vec<u8>,
+    /// Phase-2 commit records (SoA, L8.2): a slim flag byte + the L6
+    /// persistent parts. The physics fields ride in od/oi as before and are
+    /// NOT duplicated here any more (the old fat CommitRec was ~200B x n
+    /// = ~12MB of per-tick allocation and double-writes).
+    c_flag: Vec<u8>,
+    c_l6: Vec<L6Rec>,
+}
+
+/// The L6 persistent parts of one committed tick (store-only fields the
+/// entity mirror does not carry).
+#[derive(Clone, Copy, Default)]
+struct L6Rec {
+    stuck: [f64; 3],
+    sup: [i32; 3],
+    fr_pos: [i32; 3],
+    friction: f32,
+    speed: f32,
+    /// sup_present | sup_no_blocks<<1 | fr_step_special<<2
+    flags: u8,
 }
 
 /// The full per-entry state snapshot used by the L7 dispatch protocol.
@@ -117,6 +144,11 @@ impl ItemWorld {
         ItemWorld {
             entries: (0..STORE_CAP).map(|_| ItemEntry::fresh(u64::MAX)).collect(),
             grid: SectionGrid::new(),
+            sts: Vec::new(),
+            tickable: Vec::new(),
+            aborts_in: Vec::new(),
+            c_flag: Vec::new(),
+            c_l6: Vec::new(),
         }
     }
 
@@ -419,6 +451,7 @@ pub extern "system" fn n_item_tick(
     ids: jni::jlongArray,
     flags: jni::jintArray,
     in_d: jni::jdoubleArray,
+    cdn: i32,
     in_i: jni::jintArray,
     env_d: jni::jdoubleArray,
     env_i: jni::jintArray,
@@ -429,7 +462,7 @@ pub extern "system" fn n_item_tick(
     // vtable pattern proven in lib.rs.
     return unsafe {
         n_item_tick_impl(
-            env, _cls, wid, n, ids, flags, in_d, in_i, env_d, env_i, out_d, out_i,
+            env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i,
         )
     };
 }
@@ -443,6 +476,7 @@ unsafe fn n_item_tick_impl(
     ids: jni::jlongArray,
     flags: jni::jintArray,
     in_d: jni::jdoubleArray,
+    cdn: i32,
     in_i: jni::jintArray,
     env_d: jni::jdoubleArray,
     env_i: jni::jintArray,
@@ -477,7 +511,6 @@ unsafe fn n_item_tick_impl(
                             let mut fv = tf.borrow_mut();
                             let mut od = tod.borrow_mut();
                             let mut oi = toi.borrow_mut();
-                            d.resize(n * 14, 0.0);
                             iv.resize(n * 4, 0);
                             idv.resize(n, 0);
                             fv.resize(n, 0);
@@ -486,12 +519,8 @@ unsafe fn n_item_tick_impl(
                             // the applier mirrors the dispatcher's tickCount++/totalEntityAge++
                             // for entries whose vanilla dispatcher was suppressed.
                             oi.resize(n * 4, 0);
-                            // L8 phase-2 outputs: one commit record per item (None =
-                            // resync-skipped; the parallel tick fills its slots).
-                            let mut recs: Vec<Option<CommitRec>> = (0..n).map(|_| None).collect();
                             ((*vt).GetLongArrayRegion)(raw, ids, 0, n as i32, idv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
-                            ((*vt).GetDoubleArrayRegion)(raw, in_d, 0, (n * 14) as i32, d.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, in_i, 0, (n * 4) as i32, iv.as_mut_ptr());
                             let mut envv_d = [0.0f64; 6];
                             let mut envv_i = [0i32; 4];
@@ -500,6 +529,30 @@ unsafe fn n_item_tick_impl(
                             if e.exception_check() {
                                 e.exception_clear();
                                 return -1;
+                            }
+                            // L8.2 COMPACT BATCH: dispatch-owned entries (the
+                            // dominant population) carry ONLY id+flags — their
+                            // state lives in the store. Collector-data entries
+                            // (resync / force-vanilla) side-pack their 14-double
+                            // stride into a contiguous segment; the 1-based slot
+                            // number rides in flags bits 6+. The JNI copy
+                            // shrinks from n*14 doubles (~7MB/tick of dead zeros
+                            // at 60k items) to cd_n*14. cdn (the segment count)
+                            // comes from Java and is authoritative.
+                            let cd_n = cdn.max(0) as usize;
+                            d.resize(cd_n * 14, 0.0);
+                            if cd_n > 0 {
+                                ((*vt).GetDoubleArrayRegion)(
+                                    raw,
+                                    in_d,
+                                    0,
+                                    (cd_n * 14) as i32,
+                                    d.as_mut_ptr(),
+                                );
+                                if e.exception_check() {
+                                    e.exception_clear();
+                                    return -1;
+                                }
                             }
                             let tenv = TickEnv {
                                 min_section_y: envv_i[0],
@@ -523,39 +576,16 @@ unsafe fn n_item_tick_impl(
                             // the persistent parts from the store. The store
                             // is touched ONLY here and in phase 3.
                             // Phase 2 (rayon-parallel): the tick itself —
-                            // every item is independent, the section cache is
-                            // thread-safe (&self, sharded Arc payload),
-                            // scratch + section provider are per-chunk. All
-                            // outputs are written by disjoint per-chunk slots,
-                            // so the result is bit-identical to the sequential
-                            // loop regardless of scheduling.
+                            // every item is independent; each chunk gets a
+                            // worker-local SectionCache (no shared locks on
+                            // the hot path) and per-chunk scratch/provider.
+                            // All outputs are written by disjoint per-chunk
+                            // slots, so the result is bit-identical to the
+                            // sequential loop regardless of scheduling.
                             // Phase 3 (sequential): commit the tick results
                             // into the store in batch order (== vanilla tick
                             // order) + the diagnostic fold.
                             // ------------------------------------------------
-                            struct CommitRec {
-                                stuck: (f64, f64, f64),
-                                sup: (i32, i32, i32),
-                                sup_present: bool,
-                                sup_no_blocks: bool,
-                                fr_pos: (i32, i32, i32),
-                                friction: f32,
-                                speed: f32,
-                                fr_step_special: bool,
-                                x: f64,
-                                y: f64,
-                                z: f64,
-                                dx: f64,
-                                dy: f64,
-                                dz: f64,
-                                age: i32,
-                                pickup_delay: i32,
-                                tick_count: i32,
-                                fall_dist: f32,
-                                on_ground: bool,
-                                aborted: bool,
-                                abort_clear: bool,
-                            }
 
                             let mut max_abs_delta: f64 = 0.0f64;
                             let mut max_abs_pos: f64 = 0.0f64;
@@ -565,28 +595,48 @@ unsafe fn n_item_tick_impl(
                             let mut flush_aborts: u64 = 0;
 
                             // ---- phase 1: parse + hydrate (sequential) ----
-                            let mut sts: Vec<ItemState> = Vec::with_capacity(n);
-                            let mut tickable: Vec<bool> = vec![false; n];
-                            // L7 seatbelt state, carried into phase 2 (the store is
-                            // phases-1/3 only): consecutive native aborts; >= 4
-                            // forces a vanilla tick so an imprecise item cannot
-                            // freeze forever.
-                            let mut aborts_in: Vec<u8> = vec![0; n];
+                            // L8.2: the working arrays live in the world and are
+                            // REUSED (resize-only) — a fresh alloc per flush
+                            // churned ~25MB/tick of page-faulting memory.
+                            if world.sts.len() != n {
+                                world.sts.resize(n, ItemState::new());
+                                world.tickable.clear();
+                                world.tickable.resize(n, false);
+                                world.aborts_in.clear();
+                                world.aborts_in.resize(n, 0);
+                                world.c_flag.clear();
+                                world.c_flag.resize(n, 0);
+                                world.c_l6.clear();
+                                world.c_l6.resize(n, L6Rec::default());
+                            } else {
+                                world.tickable.fill(false);
+                                world.aborts_in.fill(0);
+                                world.c_flag.fill(0);
+                                world.c_l6.fill(L6Rec::default());
+                            }
                             for k in 0..n {
                                 let id = idv[k];
-                                let f = fv[k];
+                                let f_raw = fv[k];
+                                let f = f_raw & 0x3F;
+                                // 1-based collector-data slot in flags bits 6+;
+                                // 0 = dispatch-owned (no per-tick fields). The
+                                // clamp is a belt against a malformed batch.
+                                let slot_raw = (f_raw >> 6) as usize;
+                                let cd_slot = if slot_raw > 0 { slot_raw.min(cd_n) } else { 0 };
+                                let has_cd = cd_slot > 0;
+                                let dbo = if has_cd { (cd_slot - 1) * 14 } else { 0 };
                                 let mut st = ItemState {
-                                    x: d[k * 14],
-                                    y: d[k * 14 + 1],
-                                    z: d[k * 14 + 2],
-                                    dx: d[k * 14 + 3],
-                                    dy: d[k * 14 + 4],
-                                    dz: d[k * 14 + 5],
-                                    xo: d[k * 14],
-                                    yo: d[k * 14 + 1],
-                                    zo: d[k * 14 + 2],
+                                    x: if has_cd { d[dbo] } else { 0.0 },
+                                    y: if has_cd { d[dbo + 1] } else { 0.0 },
+                                    z: if has_cd { d[dbo + 2] } else { 0.0 },
+                                    dx: if has_cd { d[dbo + 3] } else { 0.0 },
+                                    dy: if has_cd { d[dbo + 4] } else { 0.0 },
+                                    dz: if has_cd { d[dbo + 5] } else { 0.0 },
+                                    xo: if has_cd { d[dbo] } else { 0.0 },
+                                    yo: if has_cd { d[dbo + 1] } else { 0.0 },
+                                    zo: if has_cd { d[dbo + 2] } else { 0.0 },
                                     on_ground: (f & F_ON_GROUND) != 0,
-                                    fall_dist: d[k * 14 + 6] as f32,
+                                    fall_dist: if has_cd { d[dbo + 6] as f32 } else { 0.0 },
                                     // dispatcher-incremented; the core does NOT ++
                                     tick_count: iv[k * 4],
                                     age: iv[k * 4 + 1],
@@ -613,24 +663,26 @@ unsafe fn n_item_tick_impl(
                                     // dispatch-owned source of truth once the item
                                     // re-arms, so everything must be current here.
                                     let entry = world.entry(id);
-                                    entry.stuck = (d[k * 14 + 7], d[k * 14 + 8], d[k * 14 + 9]);
-                                    entry.sup = (
-                                        d[k * 14 + 10] as i32,
-                                        d[k * 14 + 11] as i32,
-                                        d[k * 14 + 12] as i32,
-                                    );
-                                    entry.sup_present = d[k * 14 + 13] != 0.0;
-                                    entry.x = d[k * 14];
-                                    entry.y = d[k * 14 + 1];
-                                    entry.z = d[k * 14 + 2];
-                                    entry.dx = d[k * 14 + 3];
-                                    entry.dy = d[k * 14 + 4];
-                                    entry.dz = d[k * 14 + 5];
+                                    if has_cd {
+                                        entry.stuck = (d[dbo + 7], d[dbo + 8], d[dbo + 9]);
+                                        entry.sup = (
+                                            d[dbo + 10] as i32,
+                                            d[dbo + 11] as i32,
+                                            d[dbo + 12] as i32,
+                                        );
+                                        entry.sup_present = d[dbo + 13] != 0.0;
+                                    }
+                                    entry.x = st.x;
+                                    entry.y = st.y;
+                                    entry.z = st.z;
+                                    entry.dx = st.dx;
+                                    entry.dy = st.dy;
+                                    entry.dz = st.dz;
                                     entry.age = iv[k * 4 + 1];
                                     entry.pickup_delay = iv[k * 4 + 2];
                                     entry.tick_count = iv[k * 4];
                                     entry.despawn_rate = iv[k * 4 + 3];
-                                    entry.fall_dist = d[k * 14 + 6] as f32;
+                                    entry.fall_dist = st.fall_dist;
                                     entry.on_ground = (f & F_ON_GROUND) != 0;
                                     entry.aborts = 0;
                                     st.stuck = entry.stuck;
@@ -657,7 +709,7 @@ unsafe fn n_item_tick_impl(
                                     oi[k * 4 + 1] = st.pickup_delay;
                                     oi[k * 4 + 2] = bits;
                                     oi[k * 4 + 3] = st.tick_count;
-                                    sts.push(st); // tickable[k] stays false
+                                    world.sts[k] = st; // tickable[k] stays false
                                     continue;
                                 }
                                 // hydrate the persistent parts
@@ -723,39 +775,46 @@ unsafe fn n_item_tick_impl(
                                         st.pickup_delay = es.pickup_delay;
                                     }
                                 }
-                                aborts_in[k] = world.entry(id).aborts;
-                                tickable[k] = true;
-                                sts.push(st);
+                                world.aborts_in[k] = world.entry(id).aborts;
+                                world.tickable[k] = true;
+                                world.sts[k] = st;
                             }
 
                             // ---- phase 2: the tick (rayon-parallel) ----
                             {
-                                let grid = &world.grid;
+                                // Split the world borrow: the grid is read-only for
+                                // the tick, the SoA scratch arrays are chunk-
+                                // disjoint (each parallel chunk touches only its
+                                // own 512 slots).
+                                let ItemWorld { grid, sts, tickable, aborts_in, c_flag, c_l6, .. } =
+                                    world;
+                                let grid = &*grid;
                                 use rayon::prelude::*;
                                 sts.par_chunks_mut(512)
                                     .zip(od.par_chunks_mut(512 * 8))
                                     .zip(oi.par_chunks_mut(512 * 4))
-                                    .zip(recs.par_chunks_mut(512))
+                                    .zip(c_flag.par_chunks_mut(512))
+                                    .zip(c_l6.par_chunks_mut(512))
                                     .zip(tickable.par_chunks(512))
                                     .zip(aborts_in.par_chunks(512))
                                     .zip(idv.par_chunks(512))
                                     .zip(fv.par_chunks(512))
                                     .for_each(
-                                        |(((((((st_c, od_c), oi_c), rec_c), tk_c), ab_c), id_c), f_c)| {
+                                        |((((((((st_c, od_c), oi_c), cf_c), cl_c), tk_c), ab_c), id_c), f_c)| {
                                             let mut scratch = Scratch::new();
                                             let mut provider = make_provider(wid);
-                                            let prov: SectionProvider = &mut provider;
+                                            let mut cache = SectionCache::new(grid, &mut provider);
                                             for j in 0..st_c.len() {
                                                 if !tk_c[j] {
                                                     continue;
                                                 }
                                                 let id = id_c[j];
-                                                let f = f_c[j];
+                                                let f = f_c[j] & 0x3F;
                                                 let st = &mut st_c[j];
                                                 let outcome = if (f & F_INACTIVE) != 0 {
                                                     tick_item_inactive(st)
                                                 } else {
-                                                    tick_item(st, id, &tenv, grid, &mut scratch, prov)
+                                                    tick_item(st, id, &tenv, &mut cache, &mut scratch)
                                                 };
                                                 if outcome.has(TickOutcome::ABORTED) {
                                                     // no commit, no writeback: the item
@@ -770,29 +829,10 @@ unsafe fn n_item_tick_impl(
                                                     let mode =
                                                         if want { B_NATIVE_OK } else { B_VANILLA_NEXT };
                                                     oi_c[j * 4 + 2] = B_ABORTED | mode;
-                                                    rec_c[j] = Some(CommitRec {
-                                                        stuck: st.stuck,
-                                                        sup: (st.sup_x, st.sup_y, st.sup_z),
-                                                        sup_present: st.sup_present,
-                                                        sup_no_blocks: st.on_ground_no_blocks,
-                                                        fr_pos: st.fr_pos,
-                                                        friction: st.friction,
-                                                        speed: st.speed,
-                                                        fr_step_special: st.fr_step_special,
-                                                        x: st.x,
-                                                        y: st.y,
-                                                        z: st.z,
-                                                        dx: st.dx,
-                                                        dy: st.dy,
-                                                        dz: st.dz,
-                                                        age: st.age,
-                                                        pickup_delay: st.pickup_delay,
-                                                        tick_count: st.tick_count,
-                                                        fall_dist: st.fall_dist,
-                                                        on_ground: st.on_ground,
-                                                        aborted: true,
-                                                        abort_clear: !want,
-                                                    });
+                                                    // c_flag: 2 = abort (streak+1),
+                                                    // 3 = abort + clear the streak (the
+                                                    // vanilla tick re-ingests)
+                                                    cf_c[j] = if want { 2 } else { 3 };
                                                     continue;
                                                 }
                                                 od_c[j * 8] = st.dx;
@@ -826,44 +866,48 @@ unsafe fn n_item_tick_impl(
                                                 }
                                                 oi_c[j * 4 + 2] = ob;
                                                 oi_c[j * 4 + 3] = st.tick_count;
-                                                rec_c[j] = Some(CommitRec {
-                                                    stuck: st.stuck,
-                                                    sup: (st.sup_x, st.sup_y, st.sup_z),
-                                                    sup_present: st.sup_present,
-                                                    sup_no_blocks: st.on_ground_no_blocks,
-                                                    fr_pos: st.fr_pos,
+                                                // L6 persistent parts only — the physics
+                                                // fields ride in od/oi (phase 3 reads them
+                                                // back); the fat per-item CommitRec is gone.
+                                                cf_c[j] = 1;
+                                                cl_c[j] = L6Rec {
+                                                    stuck: [st.stuck.0, st.stuck.1, st.stuck.2],
+                                                    sup: [st.sup_x, st.sup_y, st.sup_z],
+                                                    fr_pos: [st.fr_pos.0, st.fr_pos.1, st.fr_pos.2],
                                                     friction: st.friction,
                                                     speed: st.speed,
-                                                    fr_step_special: st.fr_step_special,
-                                                    x: st.x,
-                                                    y: st.y,
-                                                    z: st.z,
-                                                    dx: st.dx,
-                                                    dy: st.dy,
-                                                    dz: st.dz,
-                                                    age: st.age,
-                                                    pickup_delay: st.pickup_delay,
-                                                    tick_count: st.tick_count,
-                                                    fall_dist: st.fall_dist,
-                                                    on_ground: st.on_ground,
-                                                    aborted: false,
-                                                    abort_clear: false,
-                                                });
+                                                    flags: (st.sup_present as u8)
+                                                        | ((st.on_ground_no_blocks as u8) << 1)
+                                                        | ((st.fr_step_special as u8) << 2),
+                                                };
                                             }
+                                            // one shared-counter bump per chunk (not per
+                                            // visit) — the old per-visit atomic was a
+                                            // contended cache line across all workers
+                                            grid.lookups
+                                                .fetch_add(cache.visits, std::sync::atomic::Ordering::Relaxed);
                                         },
                                     );
                             }
 
                             // ---- phase 3: commit + diagnostics (sequential) ----
+                            // c_flag: 0 = nothing (resync/inactive-collected),
+                            // 1 = ok commit, 2 = abort, 3 = abort + clear streak.
+                            // Physics fields are read back from od/oi (written by
+                            // phase 2) instead of a fat per-item record.
                             for k in 0..n {
-                                let Some(rec) = recs[k].take() else { continue };
+                                let flg = world.c_flag[k];
+                                if flg == 0 {
+                                    continue;
+                                }
                                 let id = idv[k];
-                                let f = fv[k];
-                                if rec.aborted {
+                                let f = fv[k] & 0x3F;
+                                if flg >= 2 {
                                     {
+                                        let streak = world.aborts_in[k];
                                         let entry = world.entry(id);
-                                        entry.aborts = aborts_in[k].saturating_add(1);
-                                        if rec.abort_clear {
+                                        entry.aborts = streak.saturating_add(1);
+                                        if flg == 3 {
                                             // L7 seatbelt: the vanilla tick will
                                             // re-ingest; clear the streak with it.
                                             entry.aborts = 0;
@@ -873,28 +917,29 @@ unsafe fn n_item_tick_impl(
                                     continue;
                                 }
                                 flush_ok += 1;
+                                let rec = world.c_l6[k];
                                 {
                                     let entry = world.entry(id);
-                                    entry.stuck = rec.stuck;
-                                    entry.sup = rec.sup;
-                                    entry.sup_present = rec.sup_present;
-                                    entry.sup_no_blocks = rec.sup_no_blocks;
-                                    entry.fr_pos = rec.fr_pos;
+                                    entry.stuck = (rec.stuck[0], rec.stuck[1], rec.stuck[2]);
+                                    entry.sup = (rec.sup[0], rec.sup[1], rec.sup[2]);
+                                    entry.sup_present = rec.flags & 1 != 0;
+                                    entry.sup_no_blocks = rec.flags & 2 != 0;
+                                    entry.fr_pos = (rec.fr_pos[0], rec.fr_pos[1], rec.fr_pos[2]);
                                     entry.friction = rec.friction;
                                     entry.speed = rec.speed;
-                                    entry.fr_step_special = rec.fr_step_special;
+                                    entry.fr_step_special = rec.flags & 4 != 0;
                                     // L7: mirror the full state back (dispatch-owned)
-                                    entry.x = rec.x;
-                                    entry.y = rec.y;
-                                    entry.z = rec.z;
-                                    entry.dx = rec.dx;
-                                    entry.dy = rec.dy;
-                                    entry.dz = rec.dz;
-                                    entry.age = rec.age;
-                                    entry.pickup_delay = rec.pickup_delay;
-                                    entry.tick_count = rec.tick_count;
-                                    entry.fall_dist = rec.fall_dist;
-                                    entry.on_ground = rec.on_ground;
+                                    entry.x = od[k * 8 + 3];
+                                    entry.y = od[k * 8 + 4];
+                                    entry.z = od[k * 8 + 5];
+                                    entry.dx = od[k * 8];
+                                    entry.dy = od[k * 8 + 1];
+                                    entry.dz = od[k * 8 + 2];
+                                    entry.age = oi[k * 4];
+                                    entry.pickup_delay = oi[k * 4 + 1];
+                                    entry.tick_count = oi[k * 4 + 3];
+                                    entry.fall_dist = od[k * 8 + 6] as f32;
+                                    entry.on_ground = (oi[k * 4 + 2] & B_ON_GROUND) != 0;
                                     entry.aborts = 0;
                                     if (f & F_NATIVE) == 0 {
                                         // collector-carried entries refresh despawnRate
@@ -902,11 +947,17 @@ unsafe fn n_item_tick_impl(
                                     }
                                 }
                                 // state extremes (garbage-detector diagnostics)
-                                let ad = rec.dx.abs().max(rec.dy.abs()).max(rec.dz.abs());
+                                let ad = od[k * 8]
+                                    .abs()
+                                    .max(od[k * 8 + 1].abs())
+                                    .max(od[k * 8 + 2].abs());
                                 if ad.is_finite() && ad > max_abs_delta {
                                     max_abs_delta = ad;
                                 }
-                                let ap = rec.x.abs().max(rec.y.abs()).max(rec.z.abs());
+                                let ap = od[k * 8 + 3]
+                                    .abs()
+                                    .max(od[k * 8 + 4].abs())
+                                    .max(od[k * 8 + 5].abs());
                                 if ap.is_finite() && ap > max_abs_pos {
                                     max_abs_pos = ap;
                                 }
@@ -923,10 +974,11 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{} stuck{} unl{} fld{} cpx{} fal{})",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={} cd={} rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{} stuck{} unl{} fld{} cpx{} fal{})",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
+                                        cd_n,
                                         proc_rss_mb(),
                                         SEC_UPCALLS.load(std::sync::atomic::Ordering::Relaxed),
                                         SEC_ERRS.load(std::sync::atomic::Ordering::Relaxed),

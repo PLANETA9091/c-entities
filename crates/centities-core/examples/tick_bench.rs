@@ -1,6 +1,6 @@
 //! L6 core bench: where does the per-item tick time go?
 use centities_core::itemtick::Aabb6;
-use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, AIR_IDX};
+use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid, AIR_IDX};
 use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv};
 use std::time::Instant;
 
@@ -89,13 +89,19 @@ fn main() {
     // warmup
     for (k, st) in states.iter_mut().enumerate() {
         st.tick_count = (k % 4 + 1) as i32;
-        let _ = tick_item(st, k as i64, &env, &mut sg, &mut scratch, &mut prov);
+        let _ = {
+            let mut sc = SectionCache::new(&sg, &mut prov);
+            tick_item(st, k as i64, &env, &mut sc, &mut scratch)
+        };
     }
     let t = Instant::now();
     let mut moved = 0u32;
     for (k, st) in states.iter_mut().enumerate() {
         st.tick_count = (k % 4 + 1) as i32;
-        let o = tick_item(st, k as i64, &env, &mut sg, &mut scratch, &mut prov);
+        let o = {
+            let mut sc = SectionCache::new(&sg, &mut prov);
+            tick_item(st, k as i64, &env, &mut sc, &mut scratch)
+        };
         moved += o.0 as u32 & 1;
     }
     let dt = t.elapsed();
