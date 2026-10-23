@@ -167,3 +167,51 @@ against that behavior. With the anchor fixed the core computes REAL native
 physics every tick; the next paired A/B is the first honest measurement of
 the native core doing actual work (plus the correct LAND events, which the
 shifted bit had silently dropped).
+
+
+## 5. The blob bug and the first honest native-core numbers
+
+### The 18*256 blob (AIOOBE)
+
+The multi-cuboid palette (PAL_STRIDE 24) fixed the abort storm, but the
+section up-call still allocated the Java blob at 18*256 while reading
+24*256 — every flush whose gather missed the cache threw
+ArrayIndexOutOfBoundsException, the applier never ran, the mode never
+armed. One CI leg therefore measured vanilla + guard overhead (p50 83.3 vs
+vanilla 71.5) — with PERFECT merge parity (62,957 vs 63,055 entities,
+mass conserved), which confirms doc 18's merge deficit was the abort
+storm alone.
+
+### The honest native-core verdict (paired, 8502a92+blob-fix, items-100k)
+
+| metric | vanilla | mod | delta |
+|---|---:|---:|---:|
+| mspt p50 | 85.79 | 102.16 | **+19%** |
+| entities @T1600 | 62,996 | 54,651 | −13% (mass conserved 99,936) |
+| flush | — | ~52ms avg, 951ns/item, ab=0 cpx=0 stuck=0 | — |
+
+* The abort storm is fully dead (ab=0 across the whole run; the
+  zero-cuboid shape-override fix handles air/plants; genuine multi-cuboid
+  shapes collide natively).
+* 48.5M dispatch-owned ticks, 45,346 real merges, lastErr clean.
+* The native tick costs ~950ns/item (two gathers + collide + friction) vs
+  vanilla's ~1360ns/item full tick. The added plumbing — the dispatch
+  guard (activation port), the ~10MB/tick JNI batch traffic, the flush
+  apply — eats the physics win: net +19%.
+
+### Next levers (L8.2), ranked
+
+1. **Per-worker section caches** — the sharded RwLock grid pays lock+Arc
+   traffic on every one of ~200k section visits per flush; rayon workers
+   should hold thread-local grids (epoch-checked against the shared
+   invalidation version).
+2. **Compact batch** — dispatch-owned entries carry only id+flags (the
+   store owns the state); the 14-double zero-filled stride costs ~6MB/tick
+   of pure JNI copying. Split the batch: dispatch segment + collector
+   segment (a documented within-tick reordering, like items-tick-last).
+3. **Merge parity at −13% entities** — mass is conserved; the residual
+   delta is candidate order / wave structure. Sort fastQuery candidates by
+   id (≈ vanilla insertion order) if the A/B gate still shows a gap after
+   the perf work.
+4. The complex diag is over-eager (logs now-handled zero-cuboid
+   shape-overrides); restrict it to bs>3 || (shapeOv && bs>0).
