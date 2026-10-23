@@ -275,3 +275,32 @@ the reader masks flag bits with 0x3F everywhere).
 Target: flush 52ms → ~30-35ms at 60k items, flipping items-100k-mod from
 +19% to a solid negative while keeping ab=0 and the mass gate. The
 complex diag is restricted to genuinely-complex entries (lever 4).
+
+
+## 7. L8.2 verdict — the paired A/B (run 39953008088, f46f708)
+
+| scenario | vanilla p50 | mod p50 | delta |
+|---|---:|---:|---:|
+| items-100k | 77.9 | 50.3 | **−35.4%** |
+| spread-100k | 455.6 | 324.7 | **−28.7%** |
+| mobs-25k | 577.2 | 349.3 | **−39.5%** |
+| mixed-150k | 670.1 | 574.8 | **−14.2%** |
+
+* **The flush collapsed: ~52ms → 5.88ms avg** (108ns/item at 54.5k
+  items) — the 1.2GB/s memory churn (fat CommitRec + fresh per-flush
+  allocs) and the contended shared-grid traffic are gone. The flush log:
+  `ab=0 stuck=0 unl=0 fld=0 cpx=0 fal=0` across the whole run, `cd=125-300`
+  (the compact batch carries ~0.5% of the old in-bound bytes).
+* **Mass conserved**: mod 99,973 → 99,973 (vanilla 99,981; the 0.008%
+  cross-leg difference is the documented merge-wave structure).
+  Merge equilibrium is STABLE within the leg (54,568 → 54,568).
+* The +19% honest-A/B deficit is now a **−35% surplus** — with zero
+  frozen ticks (the old L7 seatbelt-freeze behavior would have shown up
+  as ab>0; the counter proves the core computed every tick).
+* Where the remaining items budget goes (JFR, items-100k-mod): the
+  tracker/sync floor (EntityTickList.forEach 10.8%,
+  SynchedEntityData.getItem 10.2%, TrackedEntity.updatePlayer ~11%,
+  ServerEntity.sendChanges 4.1%) — all Java-side, client-visible, NOT
+  touched. The native flush is 12% of the leg. The next compute levers
+  live in the mob brain (GoalSelector/Sensing) and the query path
+  (AABB.intersects 8% + rowQuery/cellOfBox ~5% in mobs-25k-mod).
