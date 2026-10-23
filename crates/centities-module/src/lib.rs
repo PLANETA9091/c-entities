@@ -967,7 +967,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "queryNative2",
-        "(IDDDDDD[JI[J[D)I",
+        "(IDDDDDDI[J[D)I",
         n_query2
             as extern "system" fn(
                 *mut jni::JNIEnv,
