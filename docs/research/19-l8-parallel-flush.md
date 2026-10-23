@@ -215,3 +215,63 @@ storm alone.
    the perf work.
 4. The complex diag is over-eager (logs now-handled zero-cuboid
    shape-overrides); restrict it to bs>3 || (shapeOv && bs>0).
+
+
+## 6. L8.2 — the plumbing strike (f46f708)
+
+The honest A/B (section 5) left no doubt: the core's physics is faster
+than vanilla's, and the +19% is plumbing. Three strikes, all in one
+commit.
+
+### 6.1 Worker-local section caches (`SectionCache`)
+
+The sharded grid paid, per section visit: a shard RwLock acquire/release,
+a hash probe into a shared map, and an Arc refcount inc/dec — ~200k
+visits per flush at 60k items. Worse, the hot sections (the farm floor)
+are touched by EVERY worker, so the Arc counts and shard locks are
+contended cache lines ping-ponging between cores.
+
+`SectionCache<'a>` (sections.rs) is a per-flush-chunk read-through cache:
+a hit resolves in one LOCAL hash lookup and returns a plain `&SectionData`
+— no lock, no shared probe, no refcount traffic. A miss fills from the
+shared grid once per section per worker. `tick_item` and the
+inside-blocks / supporting-block helpers now take `&mut SectionCache`
+(grid + provider inside). The per-visit `grid.lookups` atomic — itself a
+contended cache line — folds into one fetch_add per chunk.
+
+Epoch-safety is structural: the cache is created inside the flush native
+and dropped before it returns; invalidations drain on the same server
+thread AFTER the native returns, so a local entry can never outlive its
+validity.
+
+### 6.2 The flush SoA commit
+
+Phase 2's commit records were a `Vec<Option<CommitRec>>` with a ~200-byte
+struct per item: ~12MB allocated, initialized, written by the tick AND
+re-read by phase 3 — every flush. Replaced by a 1-byte `c_flag` (0 none /
+1 ok / 2 abort / 3 abort+clear) plus a slim `L6Rec` carrying ONLY the
+store-owned L6 parts (stuck, supporting, friction memo). The physics
+fields are read back from od/oi — phase 2 already wrote them there, so
+the fat record was a full duplicate. Phase 3 commits in batch order
+exactly as before (slot-aliasing still rules out a parallel commit).
+
+The working arrays (sts, tickable, aborts_in, c_flag, c_l6) are now
+PERSISTENT per-world scratch (resize + fill): the fresh-alloc-per-flush
+scheme churned ~25MB/tick of page-faulting memory at 100k items.
+
+### 6.3 The compact JNI batch
+
+Dispatch-owned entries — the dominant population — carry ONLY id+flags;
+their state lives in the store. Collector-data entries (resync /
+force-vanilla, the rare population) side-pack the 14-double stride
+contiguously into `IB_CD`; the 1-based slot rides in flags bits 6+
+(0 = none). The in-bound JNI copy shrinks from n*14 doubles (~7MB/tick
+of 99%-dead zeros at 60k items) to cdN*14, and the static 14.7MB IB_D is
+gone. `nativeItemTick` gains an explicit `cdN` (RegisterNatives updated;
+the reader masks flag bits with 0x3F everywhere).
+
+### 6.4 Verdict — pending the paired A/B
+
+Target: flush 52ms → ~30-35ms at 60k items, flipping items-100k-mod from
++19% to a solid negative while keeping ab=0 and the mass gate. The
+complex diag is restricted to genuinely-complex entries (lever 4).
