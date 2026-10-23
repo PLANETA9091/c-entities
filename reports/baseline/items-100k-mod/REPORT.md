@@ -6,31 +6,31 @@ Server: `1.21.8-60-29c8822 (MC: 1.21.8)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 1 -> 1) |
+| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 54651 -> 54651) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 0.595 / 0.754 / 1.119 / 8.442 |
-| MSPT mean, ms | 0.633 |
-| TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 1621.2 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 102.156 / 108.412 / 120.376 / 162.360 |
+| MSPT mean, ms | 103.053 |
+| TPS estimate (1000/p50) | 9.8 |
+| heap used / max, MB | 1036.2 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 3.25% | `dev.planeta9091.centities.CeHooks.cellOfBox(AABB) line: 720` |
-| 2 | 3.07% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate) line: 1203` |
-| 3 | 1.90% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 4 | 1.79% | `net.minecraft.world.entity.item.ItemEntity.getItem() line: 518` |
-| 5 | 1.79% | `java.lang.invoke.MethodHandles$Lookup.<init>(Class, Class, int) line: 1644` |
-| 6 | 1.61% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 7 | 1.46% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 214` |
-| 8 | 1.31% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate) line: 1206` |
-| 9 | 1.24% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 10 | 1.24% | `org.spigotmc.AsyncCatcher.catchOp(String) line: 8` |
-| 11 | 1.09% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 12 | 1.06% | `ca.spottedleaf.concurrentutil.map.ConcurrentLong2ReferenceChainedHashTable.getNode(long) line: 207` |
-| 13 | 1.02% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
-| 14 | 0.88% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 151` |
-| 15 | 0.88% | `net.minecraft.world.item.ItemStack.getMaxStackSize() line: 581` |
+| 1 | 9.45% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 2 | 8.05% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
+| 3 | 7.13% | `net.minecraft.server.level.ChunkMap$TrackedEntity.updatePlayer(ServerPlayer) line: 1289` |
+| 4 | 6.69% | `net.minecraft.world.entity.Entity.moonrise$getChunkData() line: 411` |
+| 5 | 5.44% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 6 | 5.23% | `dev.planeta9091.centities.CeHooks.arenaRef(long) line: 2014` |
+| 7 | 4.60% | `java.lang.invoke.MethodHandles$Lookup.<init>(Class, Class, int) line: 1644` |
+| 8 | 3.57% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 151` |
+| 9 | 2.93% | `java.util.HashMap.getNode(Object) line: 585` |
+| 10 | 2.14% | `net.minecraft.server.level.ChunkMap$TrackedEntity.moonrise$tick(NearbyPlayers$TrackedChunk) line: 1165` |
+| 11 | 2.10% | `net.minecraft.server.level.ChunkMap$TrackedEntity.updatePlayer(ServerPlayer) line: 1302` |
+| 12 | 1.85% | `net.minecraft.server.level.ServerLevel.lambda$tick$4(TickRateManager, ProfilerFiller, Entity) line: 795` |
+| 13 | 1.69% | `net.minecraft.world.entity.item.ItemEntity.getItem() line: 518` |
+| 14 | 1.17% | `net.minecraft.world.level.NaturalSpawner.createState(int, Iterable, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 80` |
+| 15 | 1.17% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 1421` |
 
