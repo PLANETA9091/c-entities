@@ -143,9 +143,9 @@ fn main() {
                 }
                 // one palette entry: a full-cube collider, friction 0.6, speed 1.0
                 let floor = centities_core::sections::PaletteEntry {
-                    collider: Some(centities_core::itemtick::Aabb6::new(
+                    colliders: vec![centities_core::itemtick::Aabb6::new(
                         0.0, 0.0, 0.0, 1.0, 1.0, 1.0,
-                    )),
+                    )],
                     friction: 0.6,
                     speed: 1.0,
                     is_water: false,

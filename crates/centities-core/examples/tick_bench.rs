@@ -34,7 +34,7 @@ fn main() {
             let mut data = SectionData::all_air();
             data.entries = vec![
                 PaletteEntry {
-                    collider: None,
+                    colliders: Vec::new(),
                     friction: 0.6,
                     speed: 1.0,
                     is_water: false,
@@ -45,7 +45,7 @@ fn main() {
                     fall_on_special: false,
                 },
                 PaletteEntry {
-                    collider: Some(Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)),
+                    colliders: vec![Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
                     friction: 0.6,
                     speed: 1.0,
                     is_water: false,
