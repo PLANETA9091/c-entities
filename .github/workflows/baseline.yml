@@ -95,19 +95,7 @@ jobs:
         run: |
           mkdir -p build/viaversion
           URL=$(curl -fsS https://hangar.papermc.io/api/v1/projects/ViaVersion/versions | \
-            python3 -c '
-import json, sys
-raw = sys.stdin.read()
-d, _ = json.JSONDecoder().raw_decode(raw)
-urls = []
-for x in d["result"]:
-    dl = (x.get("downloads") or {}).get("PAPER") or {}
-    u = dl.get("downloadUrl")
-    if u:
-        urls.append((x.get("name") or "", u))
-stable = [u for n, u in urls if "SNAPSHOT" not in n]
-print(stable[0] if stable else (urls[0][1] if urls else ""))
-')
+            python3 -c "import json,sys;raw=sys.stdin.read();d,_=json.JSONDecoder().raw_decode(raw);u=[(x.get('name') or '', (x.get('downloads') or {}).get('PAPER',{}).get('downloadUrl') or '') for x in d.get('result',[])];u=[t for t in u if t[1]];s=[x[1] for x in u if 'SNAPSHOT' not in x[0]];print(s[0] if s else (u[0][1] if u else ''))")
           [ -n "$URL" ] || { echo "FATAL: no ViaVersion download URL"; exit 1; }
           echo "ViaVersion: $URL"
           curl -fsSL -o build/viaversion/ViaVersion.jar "$URL"
