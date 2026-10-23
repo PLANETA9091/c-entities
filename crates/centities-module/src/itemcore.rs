@@ -328,7 +328,19 @@ fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
             step_on_special: flags & F_STEP as i64 != 0,
             fall_on_special: flags & F_FALL as i64 != 0,
         };
-        if shape_override || entry_complex {
+        // ABORT-STORM ROOT CAUSE (run 39927156887, b66f61b diag): cpx ~= 25k
+        // aborts/flush with stuck/unl/fld/fal = 0. The Java provider (L8.2)
+        // deliberately writes ZERO-cuboid shape-override entries (plants,
+        // torches: getShape overridden, getCollisionShape empty everywhere)
+        // with complex=0 — an empty collision shape is natively exact as 0
+        // colliders for every vanilla block (context-sensitive collision
+        // with boxes — fences, walls, chests, snow layers — carries
+        // complex=32 from the Java side). This parser however re-poisoned
+        // the whole section from the bare shape_override bit, undoing the
+        // Java refinement: one tall-grass tuft in a 16^3 section aborted
+        // every item sharing that section (~50% of the bench floor).
+        // FIX: the section-complex decision trusts ONLY the complex bit.
+        if entry_complex {
             complex = true;
         }
         if entry.has_fluid {
@@ -1097,5 +1109,83 @@ unsafe fn n_item_invalidate_impl(
                 e.fr_pos = (i32::MIN, i32::MIN, i32::MIN);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    /// Java writes shapeOv=16 + complex=0 + zero cuboids for zero-collision
+    /// context-dependent shapes (plants, torches). The section must NOT be
+    /// poisoned as complex (the b66f61b-era parser aborted ~50% of the bench
+    /// exactly this way); the entry carries no colliders.
+    #[test]
+    fn plant_shape_override_is_not_section_complex() {
+        let mut d = vec![0.0; 24 * 2];
+        d[24 + 23] = 16.0; // shape_override only, NO complex bit
+        let b = vec![0i32; 4096];
+        let s = parse_section(&d, &b);
+        assert!(!s.complex, "shapeOv with 0 cuboids must not poison the section");
+        assert!(!s.entries[1].colliders.is_empty() == false);
+        assert!(s.entries[1].colliders.is_empty());
+        assert!(!s.entries[1].fall_on_special);
+        assert!(!s.entries[1].step_on_special);
+    }
+
+    /// A genuine complex entry (fence/chest/snow-layer class: shapeOv AND
+    /// boxes, or >3 cuboids) carries complex=32 from the provider and must
+    /// route the section vanilla.
+    #[test]
+    fn complex_bit_routes_section_vanilla() {
+        let mut d = vec![0.0; 24 * 2];
+        d[24 + 23] = 32.0;
+        let b = vec![0i32; 4096];
+        assert!(parse_section(&d, &b).complex);
+        // shapeOv + complex together (Java sets both for boxed shape overrides)
+        let mut d2 = vec![0.0; 24 * 2];
+        d2[24 + 23] = 48.0;
+        let s2 = parse_section(&d2, &b);
+        assert!(s2.complex);
+        assert!(s2.entries[1].colliders.is_empty(), "no cuboids may parse for complex entries");
+    }
+
+    /// A plain full-cube block (no shape override, no special bits) parses
+    /// its single collider and leaves the section natively tickable.
+    #[test]
+    fn plain_block_keeps_single_collider() {
+        let mut d = vec![0.0; 24 * 2];
+        let o = 24;
+        d[o] = 1.0; // 1 cuboid
+        d[o + 1] = 0.0;
+        d[o + 2] = 0.0;
+        d[o + 3] = 0.0;
+        d[o + 4] = 1.0;
+        d[o + 5] = 1.0;
+        d[o + 6] = 1.0;
+        d[o + 19] = 0.6; // friction
+        d[o + 20] = 1.0; // speed
+        let b = vec![0i32; 4096];
+        let s = parse_section(&d, &b);
+        assert!(!s.complex);
+        assert_eq!(s.entries[1].colliders.len(), 1);
+        assert_eq!(s.entries[1].colliders[0].x1, 1.0);
+        assert_eq!(s.entries[1].friction, 0.6);
+    }
+
+    /// stepOn/fallOn override bits (slime, honey, magma) survive the parse
+    /// and stay per-entry (NOT section-complex — the tick core handles the
+    /// routing from the per-block flags during the swept gather).
+    #[test]
+    fn step_fall_bits_stay_per_entry() {
+        let mut d = vec![0.0; 24 * 2];
+        d[24] = 1.0;
+        d[24 + 4] = 1.0; d[24 + 5] = 1.0; d[24 + 6] = 1.0; d[24 + 7] = 1.0;
+        d[24 + 23] = 12.0; // stepOn(4) + fallOn(8)
+        let b = vec![0i32; 4096];
+        let s = parse_section(&d, &b);
+        assert!(!s.complex);
+        assert!(s.entries[1].step_on_special);
+        assert!(s.entries[1].fall_on_special);
     }
 }
