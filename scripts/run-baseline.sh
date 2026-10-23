@@ -43,6 +43,10 @@ spawn-protection=0
 spawn-monsters=false
 max-tick-time=300000
 motd=ce-baseline
+# 26.3 flipped the white-list default to ON (1.21.8 defaulted OFF and the
+# bot joined without this line) — the bench bot must never be gated.
+white-list=false
+enforce-whitelist=false
 EOF
 cat > "$S/spigot.yml" <<'EOF'
 settings:
