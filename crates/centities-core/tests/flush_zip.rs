@@ -9,7 +9,7 @@ use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv, TickOutcome};
 
 fn flat_world() -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
     let ground = PaletteEntry {
-        collider: Some(Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)),
+        colliders: vec![Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
         friction: 0.6,
         speed: 1.0,
         is_water: false,

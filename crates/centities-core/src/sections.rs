@@ -25,10 +25,10 @@ pub const AIR_IDX: u16 = 0xFFFF;
 /// One palette entry, resolved by the Java provider.
 #[derive(Clone, Debug)]
 pub struct PaletteEntry {
-    /// Single-cuboid collision shape relative to the block position
-    /// (None = empty collision shape). Multi-cuboid shapes set
-    /// `SectionData::complex` instead.
-    pub collider: Option<Aabb6>,
+    /// Collision cuboids relative to the block position (0..=3; genuine
+    /// multi-cuboid shapes — stairs, beds, ... — are carried natively).
+    /// Context-dependent shape classes set `SectionData::complex` instead.
+    pub colliders: Vec<Aabb6>,
     /// `Block.getFriction()` (f32).
     pub friction: f32,
     /// `Block.getSpeedFactor()` (f32).
@@ -54,7 +54,7 @@ pub struct PaletteEntry {
 impl PaletteEntry {
     pub fn air() -> PaletteEntry {
         PaletteEntry {
-            collider: None,
+            colliders: Vec::new(),
             friction: 0.6,
             speed: 1.0,
             is_water: false,
@@ -381,20 +381,21 @@ impl SectionGrid {
                                 if entry.fall_on_special {
                                     flags.fall_special = true;
                                 }
-                                let Some(rel) = entry.collider else { continue };
                                 let wx = (curr_chunk_x << 4) as f64 + cx as f64;
                                 let wy = (curr_chunk_y << 4) as f64 + cy as f64;
                                 let wz = (curr_chunk_z << 4) as f64 + cz as f64;
-                                let world_box = Aabb6::new(
-                                    rel.x0 + wx,
-                                    rel.y0 + wy,
-                                    rel.z0 + wz,
-                                    rel.x1 + wx,
-                                    rel.y1 + wy,
-                                    rel.z1 + wz,
-                                );
-                                if voxel_shape_intersect(box_, &world_box) {
-                                    out.push(world_box);
+                                for rel in &entry.colliders {
+                                    let world_box = Aabb6::new(
+                                        rel.x0 + wx,
+                                        rel.y0 + wy,
+                                        rel.z0 + wz,
+                                        rel.x1 + wx,
+                                        rel.y1 + wy,
+                                        rel.z1 + wz,
+                                    );
+                                    if voxel_shape_intersect(box_, &world_box) {
+                                        out.push(world_box);
+                                    }
                                 }
                             }
                         }
@@ -477,7 +478,10 @@ impl SectionGrid {
             Ok(data) => {
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
                 let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
-                (data.entry(idx).and_then(|e| e.collider), false)
+                (
+                    data.entry(idx).and_then(|e| e.colliders.first().copied()),
+                    false,
+                )
             }
             Err(()) => (None, true),
         }

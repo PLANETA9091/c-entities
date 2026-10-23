@@ -17,7 +17,7 @@ const MAX_SEC: i32 = 23;
 
 fn stone_entry() -> PaletteEntry {
     PaletteEntry {
-        collider: Some(Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)),
+        colliders: vec![Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
         friction: 0.6,
         speed: 1.0,
         is_water: false,
@@ -33,7 +33,7 @@ fn cobweb_entry() -> PaletteEntry {
     // WebBlock: EMPTY collision shape (entities sit inside it); the
     // slow-down comes from entityInside -> makeStuckInBlock.
     PaletteEntry {
-        collider: None,
+        colliders: Vec::new(),
         friction: 0.6,
         speed: 1.0,
         is_water: false,

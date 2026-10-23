@@ -26,7 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Checkout CRUSSTY
-        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+        run: |
+          git clone https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+          git -C ../CRUSSTY checkout a34d529  # pinned: the guard-API revision c-entities builds against
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v4
         with:

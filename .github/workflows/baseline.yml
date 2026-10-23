@@ -79,7 +79,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Checkout CRUSSTY (module scenarios)
         if: matrix.AB == '1' || matrix.MODULE == 'on'
-        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+        run: |
+          git clone https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+          git -C ../CRUSSTY checkout a34d529  # pinned: the guard-API revision c-entities builds against
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

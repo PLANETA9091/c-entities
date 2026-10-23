@@ -2107,20 +2107,19 @@ public final class CeHooks {
         net.minecraft.world.level.chunk.LevelChunkSection section = sections[secIdx];
         java.util.HashMap<BlockState, Integer> paletteIdx = new java.util.HashMap<>(32);
         int entryN = 0; // slot 0 = air
-        // AIR entry — the offsets MUST match writeEntry/Rust parse_section:
-        // 0=collider 1-6=box 7=friction 8=speed 9=water 10=fluid 11=cobweb
-        // 12=inside 13=step 14=fall 15=shape 16=complex 17=reserved.
+        // AIR entry — the offsets MUST match writeEntry/Rust parse_section
+        // (PAL_STRIDE=24: 0=collider-count, 1-18=up to 3 cuboids, 19=friction,
+        // 20=speed, 21=water, 22=fluid, 23=flags).
         // BUG (found via the 100k-fill RSS explosion, ~457k cached sections):
         // friction/speed were written at 8/9 and water was left at 1.0 — the
         // parser read air as {friction 0.0, speed 0.6, IS_WATER=1.0}, so every
         // section reported any_fluid and the core's fluid path ran on garbage.
-        outD[0] = 0.0; // air entry: no collider
-        outD[7] = 0.6; // friction
-        outD[8] = 1.0; // speed factor
-        outD[9] = 0.0; // water: NO
-        outD[10] = 0.0; outD[11] = 0.0; outD[12] = 0.0;
-        outD[13] = 0.0; outD[14] = 0.0; outD[15] = 0.0; outD[16] = 0.0;
-        outD[17] = 0.0;
+        outD[0] = 0.0; // air entry: no colliders
+        outD[19] = 0.6; // friction
+        outD[20] = 1.0; // speed factor
+        outD[21] = 0.0; // water: NO
+        outD[22] = 0.0; // fluid: NO
+        outD[23] = 0.0; // flags: none
         entryN = 1;
         try {
             net.minecraft.world.level.block.state.BlockState[] states =
@@ -2143,40 +2142,72 @@ public final class CeHooks {
                     }
                 }
             }
+            if (COMPLEX_DIAG.tryAcquire()) {
+                for (java.util.Map.Entry<BlockState, Integer> en : paletteIdx.entrySet()) {
+                    var be = en.getKey().getBlock();
+                    var bs = en.getKey().getCollisionShape(
+                            net.minecraft.world.level.EmptyBlockGetter.INSTANCE,
+                            BlockPos.ZERO, net.minecraft.world.phys.shapes.CollisionContext.empty())
+                            .toAabbs().size();
+                    if (bs > 3 || overridesShape(en.getKey())) {
+                        System.out.println("[c-entities] section palette complex entry: "
+                                + be.getClass().getName() + " (" + be + ") boxes=" + bs
+                                + " slot=" + en.getValue());
+                    }
+                }
+            }
         } catch (Throwable t) {
             return false;
         }
         return true;
     }
 
+    private static final java.util.concurrent.Semaphore COMPLEX_DIAG =
+            new java.util.concurrent.Semaphore(4);
+
     /** One palette entry -> 18 packed doubles at slot * 18. */
+    /** Palette blob stride: 24 doubles per entry. Layout per slot:
+     *  0=collider-count (0..3), 1-6=cuboid0, 7-12=cuboid1, 13-18=cuboid2
+     *  (unused slots stay 0), 19=friction, 20=speed, 21=water, 22=fluid,
+     *  23=flags packed in the low bits: cobweb=1, entityInside=2, stepOn=4,
+     *  fallOn=8, shapeOverride=16, complex=32. */
+    static final int PAL_STRIDE = 24;
+
     private static void writeEntry(double[] outD, int slot, BlockState st) {
-        int o = slot * 18;
+        int o = slot * PAL_STRIDE;
         var shape = st.getCollisionShape(
                 net.minecraft.world.level.EmptyBlockGetter.INSTANCE,
                 BlockPos.ZERO, net.minecraft.world.phys.shapes.CollisionContext.empty());
         var boxes = shape.toAabbs();
-        int complex = boxes.size() > 1 ? 1 : 0;
-        if (boxes.size() == 1) {
-            var b = boxes.get(0);
-            outD[o] = 1.0;
-            outD[o + 1] = b.minX; outD[o + 2] = b.minY; outD[o + 3] = b.minZ;
-            outD[o + 4] = b.maxX; outD[o + 5] = b.maxY; outD[o + 6] = b.maxZ;
-        } else {
-            outD[o] = 0.0;
+        boolean shapeOv = overridesShape(st);
+        int complex = shapeOv ? 32 : 0;
+        int n = 0;
+        if (!shapeOv) {
+            // genuine multi-cuboid shapes (stairs, beds, ...) are carried
+            // natively: up to 3 cuboids per entry, exact collide.
+            for (int i = 0; i < boxes.size() && n < 3; i++) {
+                var b = boxes.get(i);
+                outD[o + 1 + n * 6] = b.minX;
+                outD[o + 2 + n * 6] = b.minY;
+                outD[o + 3 + n * 6] = b.minZ;
+                outD[o + 4 + n * 6] = b.maxX;
+                outD[o + 5 + n * 6] = b.maxY;
+                outD[o + 6 + n * 6] = b.maxZ;
+                n++;
+            }
+            if (boxes.size() > 3) complex = 32; // >3 cuboids: rare; route vanilla
         }
-        outD[o + 7] = st.getBlock().getFriction();
-        outD[o + 8] = st.getBlock().getSpeedFactor();
-        outD[o + 9] = (st.is(net.minecraft.world.level.block.Blocks.WATER)
+        outD[o] = n;
+        outD[o + 23] = (st.is(net.minecraft.world.level.block.Blocks.COBWEB) ? 1 : 0)
+                | (overrides(st, "entityInside") ? 2 : 0)
+                | (overrides(st, "stepOn") ? 4 : 0)
+                | (overrides(st, "updateEntityMovementAfterFallOn") ? 8 : 0)
+                | complex;
+        outD[o + 19] = st.getBlock().getFriction();
+        outD[o + 20] = st.getBlock().getSpeedFactor();
+        outD[o + 21] = (st.is(net.minecraft.world.level.block.Blocks.WATER)
                 || st.is(net.minecraft.world.level.block.Blocks.BUBBLE_COLUMN)) ? 1.0 : 0.0;
-        outD[o + 10] = st.getFluidState().isEmpty() ? 0.0 : 1.0;
-        outD[o + 11] = st.is(net.minecraft.world.level.block.Blocks.COBWEB) ? 1.0 : 0.0;
-        outD[o + 12] = overrides(st, "entityInside") ? 1.0 : 0.0;
-        outD[o + 13] = overrides(st, "stepOn") ? 1.0 : 0.0;
-        outD[o + 14] = overrides(st, "updateEntityMovementAfterFallOn") ? 1.0 : 0.0;
-        outD[o + 15] = overridesShape(st) ? 1.0 : 0.0;
-        outD[o + 16] = complex;
-        outD[o + 17] = 0.0;
+        outD[o + 22] = st.getFluidState().isEmpty() ? 0.0 : 1.0;
     }
 
     /** true when the block class overrides the (possibly renamed) method.

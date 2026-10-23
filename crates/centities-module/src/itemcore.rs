@@ -211,7 +211,7 @@ unsafe fn item_section_upcall(
             let mut d = sd.borrow_mut();
             let mut b = sb.borrow_mut();
             d.clear();
-            d.resize(18 * 256, 0.0);
+            d.resize(24 * 256, 0.0);
             b.clear();
             b.resize(4096, AIR_IDX as i32);
             let arr_d = ((*vt).NewDoubleArray)(raw, (18 * 256) as i32);
@@ -240,7 +240,7 @@ unsafe fn item_section_upcall(
                 ((*vt).DeleteLocalRef)(raw, arr_b);
                 return Err(());
             }
-            ((*vt).GetDoubleArrayRegion)(raw, arr_d, 0, (18 * 256) as i32, d.as_mut_ptr());
+            ((*vt).GetDoubleArrayRegion)(raw, arr_d, 0, (24 * 256) as i32, d.as_mut_ptr());
             ((*vt).GetIntArrayRegion)(raw, arr_b, 0, 4096, b.as_mut_ptr());
             ((*vt).DeleteLocalRef)(raw, arr_d);
             ((*vt).DeleteLocalRef)(raw, arr_b);
@@ -250,39 +250,51 @@ unsafe fn item_section_upcall(
 }
 
 fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
-    // entries: 18 doubles each: [collider, x0,y0,z0,x1,y1,z1, friction, speed,
-    //          water, fluid, cobweb, insideSpecial, stepSpecial, fallSpecial,
-    //          shapeOverride, complex, reserved]
+    // entries: PAL_STRIDE=24 doubles each: [collider-count (0..3),
+    //          cuboid0 x0..z1, cuboid1 x0..z1, cuboid2 x0..z1,
+    //          friction, speed, water, fluid, flags]
+    // flags bits: cobweb=1, insideSpecial=2, stepSpecial=4, fallSpecial=8,
+    //             shapeOverride=16, complex=32
+    const F_COBWEB: f64 = 1.0;
+    const F_INSIDE: f64 = 2.0;
+    const F_STEP: f64 = 4.0;
+    const F_FALL: f64 = 8.0;
+    const F_SHAPE: f64 = 16.0;
+    const F_COMPLEX: f64 = 32.0;
     let mut entries: Vec<PaletteEntry> = Vec::with_capacity(16);
     let mut complex = false;
     let mut any_fluid = false;
     let mut any_inside = false;
-    for slot in 0..d.len() / 18 {
-        let o = slot * 18;
-        let shape_override = d[o + 15] != 0.0;
-        let entry_complex = d[o + 16] != 0.0;
-        let collider = if d[o] == 1.0 && !shape_override && !entry_complex {
-            Some(Aabb6::new(
-                d[o + 1],
-                d[o + 2],
-                d[o + 3],
-                d[o + 4],
-                d[o + 5],
-                d[o + 6],
-            ))
-        } else {
-            None
-        };
+    for slot in 0..d.len() / 24 {
+        let o = slot * 24;
+        let flags = d[o + 23] as i64;
+        let shape_override = flags & F_SHAPE as i64 != 0;
+        let entry_complex = flags & F_COMPLEX as i64 != 0;
+        let count = d[o].max(0.0).min(3.0) as usize;
+        let mut colliders = Vec::with_capacity(count);
+        if !shape_override && !entry_complex {
+            for c in 0..count {
+                let co = o + 1 + c * 6;
+                colliders.push(Aabb6::new(
+                    d[co],
+                    d[co + 1],
+                    d[co + 2],
+                    d[co + 3],
+                    d[co + 4],
+                    d[co + 5],
+                ));
+            }
+        }
         let entry = PaletteEntry {
-            collider,
-            friction: d[o + 7] as f32,
-            speed: d[o + 8] as f32,
-            is_water: d[o + 9] != 0.0,
-            has_fluid: d[o + 10] != 0.0,
-            cobweb: d[o + 11] != 0.0,
-            entity_inside_special: d[o + 12] != 0.0 && d[o + 11] == 0.0,
-            step_on_special: d[o + 13] != 0.0,
-            fall_on_special: d[o + 14] != 0.0,
+            colliders,
+            friction: d[o + 19] as f32,
+            speed: d[o + 20] as f32,
+            is_water: d[o + 21] != 0.0,
+            has_fluid: d[o + 22] != 0.0,
+            cobweb: flags & F_COBWEB as i64 != 0,
+            entity_inside_special: flags & F_INSIDE as i64 != 0,
+            step_on_special: flags & F_STEP as i64 != 0,
+            fall_on_special: flags & F_FALL as i64 != 0,
         };
         if shape_override || entry_complex {
             complex = true;
