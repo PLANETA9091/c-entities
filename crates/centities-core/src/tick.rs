@@ -157,6 +157,15 @@ impl TickEnv {
     }
 }
 
+/// Abort-reason diagnostics (folded into the module's flush log). Statics
+/// because the abort decisions live deep inside tick_item; diagnostics only,
+/// never read for control flow.
+pub static AB_STUCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AB_UNLOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AB_FLUID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AB_COMPLEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AB_FALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Outcome flags for one computed tick (bitset; packed straight into the
 /// writeback).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -261,6 +270,7 @@ pub fn tick_item(
         .iter()
         .any(|b| voxel_shape_intersect(&deflated, b));
     if stuck_in_block {
+        AB_STUCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // vanilla would run moveTowardsClosestSpace + a noPhysics move;
         // freeze one tick, the vanilla body unsticks next tick (only
         // reachable right after a block change, which routes vanilla at
@@ -334,6 +344,18 @@ pub fn tick_item(
             || swept_flags.any_fluid
             || swept_flags.fall_special
         {
+            if swept_flags.unloaded {
+                AB_UNLOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if swept_flags.any_fluid {
+                AB_FLUID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if swept_flags.complex {
+                AB_COMPLEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if swept_flags.fall_special {
+                AB_FALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // exact collide impossible (or a fallOn bounce override sits in
             // the swept region): freeze + vanilla next tick
             out.set(TickOutcome::ABORTED | TickOutcome::VANILLA_NEXT);

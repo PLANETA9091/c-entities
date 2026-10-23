@@ -11,7 +11,8 @@
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, SectionProvider, AIR_IDX};
 use centities_core::tick::{
-    tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome,
+    tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome, AB_COMPLEX, AB_FALL,
+    AB_FLUID, AB_STUCK, AB_UNLOADED,
 };
 use jvmti_bindings::env::JniEnv;
 use jvmti_bindings::sys::jni;
@@ -370,6 +371,10 @@ static SEC_MAX_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 static SEC_MIN_Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MAX);
 static SEC_MAX_Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
 static SEC_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cst_ab(a: &std::sync::atomic::AtomicU64) -> u64 {
+    a.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn proc_rss_mb() -> u64 {
     // /proc/self/statm: [total, resident, ...] in 4KB pages
@@ -906,7 +911,7 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{})",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={}, rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{} stuck{} unl{} fld{} cpx{} fal{})",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
@@ -928,6 +933,11 @@ unsafe fn n_item_tick_impl(
                                         format_args!("{:e}", max_abs_pos),
                                         flush_ok,
                                         flush_aborts,
+                                        cst_ab(&AB_STUCK),
+                                        cst_ab(&AB_UNLOADED),
+                                        cst_ab(&AB_FLUID),
+                                        cst_ab(&AB_COMPLEX),
+                                        cst_ab(&AB_FALL),
                                     ));
                                 }
                             }
