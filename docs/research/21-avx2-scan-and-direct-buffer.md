@@ -116,12 +116,70 @@ scan + map path remain the fallback.
 * The gate/EMA logic is UNTOUCHED — the parity protector keeps its
   exact feedback dynamics.
 
-## 7. CI A/B verdict (26.3, paired same-runner, mean MSPT)
+## 7. The two integration bugs the first A/B runs caught (and fixed)
 
-PENDING — the paired A/B (`ab-paired.yml`) is dispatched on this
-commit; this table is filled from `reports/ab-paired/SUMMARY.md` when
-the run lands. Expectation from the local numbers: mixed's 20.3M fast
-queries drop from ~11 µs toward the 1-3 µs band (dense cells ~6x
-cheaper natively), which should flip the +15.3% regression to parity
-or better, and every scenario where the gate routed to mirror on price
-(spread) should re-route to fast. The gate, not this doc, decides.
+The e2e kill-switch did its job twice:
+
+1. **register_natives rc=-1** — `queryNative2` was registered with a stale
+   `[J` out-param copied from queryNative's descriptor; RegisterNatives is
+   all-or-nothing, so the WHOLE arm sequence failed and the module stayed
+   vanilla (no crash, exact parity). Guard added:
+   `tests/natives_parity.rs` parses the compiled CeHooks.class methods
+   table and asserts the ACC_NATIVE set equals the Rust-registered table —
+   descriptor drift now fails in `cargo test`, not in a CI boot.
+2. **Byte order** — a direct ByteBuffer defaults to BIG_ENDIAN while the
+   native writes raw little-endian i64 stores: `getLong` byte-reversed
+   every id and the `(int)` cast landed on 0 → ARENA miss + getter null
+   for EVERY candidate (resolved=0; desync stayed 0 because stale>0 reads
+   as the normal batching window). The legacy `set_long_array_region`
+   path converts per-element — that is why the old code resolved 95%+
+   and the buffer path resolved 0%. Telemetry proof: cand=17.1M/0
+   arenaMiss=17.1M (buffer path) vs cand=1.1M/1.09M arenaMiss=1904
+   (doc-20 leg). Fix: `bb.order(LITTLE_ENDIAN)` at both allocation
+   sites; e2e now asserts the candidate resolve ratio (cand=N/M, M >=
+   N/2 when N >= 8) — this failure shape cannot pass e2e again.
+
+## 8. The REAL regression was never the module: ViaBackwards
+
+The first fixed-code A/B still read items +16% / mixed +19% — but the
+scan changes are inert in a playerless world, and the run history held
+the answer: the bench bot was kicked "Outdated client! Please use 26.3"
+in EVERY 26.3 run since the retarget (62 BOT-ERRORs in doc 20's own
+baseline #87). Without a player, Entity Activation Range keeps
+entities inactive — the module pays its fixed costs (probes, flushes,
+merge machinery) and never gets to show a single win. Doc 20's A/B
+verdict table was measured playerless on BOTH legs.
+
+Root cause chain, verified locally on a real Paper 26.3 boot:
+* minecraft-data has NO 26.3 protocol data (npm and master) — the bot
+  cannot speak 26.3;
+* ViaVersion 5.12.2-SNAPSHOT loads fine on 26.3 but "only supports
+  newer client versions" — old client (26.1) on new server (26.3)
+  needs **ViaBackwards**, which nobody staged;
+* + ViaBackwards → BOT-LOGGED-IN + BOT-SPAWNED (local proof);
+* and one more hop: Paper 26.3 flipped the `white-list` default to ON
+  (1.21.8 defaulted OFF) — the whitelisted-kick replaced the outdated-
+  client-kick until `white-list=false` was pinned in the harness.
+
+## 9. CI A/B verdict (26.3, paired same-runner, WITH the bot finally in)
+
+ab-paired run #11 (347e989): **AB-PAIRED-GATE: PASS**
+
+| Scenario | vanilla (off) | module (on) | ratio | verdict |
+|---|---:|---:|---:|---|
+| items-100k (3 reps) | 90.91 | **88.12** | **0.969** | module −3.1% |
+| mixed-150k | 2546.0 | **2057.3** | **0.808** | **module −19.2%** |
+
+BOT-LOGGED-IN + BOT-SPAWNED, ARMED confirmed in every on leg, desync=0.
+Same 2-vCPU runner class where the playerless runs read 1.16-1.22 —
+with a real player the fast paths finally engage and mixed turns a
++19% regression into a −19% win. items stays near-parity (its module
+tax is ~0.2ms/tick against a 90ms floor; the gate margin 1.05 has
+headroom). spread-100k was dropped from that run's table (missing
+samples are tolerated by the gate); its playered verdict lands with the
+next full matrix.
+
+The doc-20 mixed "+15.3% open" is CLOSED: the regression was the
+missing bench player, and the module's own changes (AVX2 scan +
+zero-copy return) are what carry mixed to −19% once the workload is
+real. Next levers (Java floor: tracker/EntityTickList) are untouched.
