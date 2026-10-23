@@ -214,7 +214,7 @@ unsafe fn item_section_upcall(
             d.resize(24 * 256, 0.0);
             b.clear();
             b.resize(4096, AIR_IDX as i32);
-            let arr_d = ((*vt).NewDoubleArray)(raw, (18 * 256) as i32);
+            let arr_d = ((*vt).NewDoubleArray)(raw, (24 * 256) as i32);
             let arr_b = ((*vt).NewIntArray)(raw, 4096 as i32);
             if arr_d.is_null() || arr_b.is_null() {
                 return Err(());

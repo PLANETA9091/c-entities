@@ -2180,9 +2180,13 @@ public final class CeHooks {
                 BlockPos.ZERO, net.minecraft.world.phys.shapes.CollisionContext.empty());
         var boxes = shape.toAabbs();
         boolean shapeOv = overridesShape(st);
-        int complex = shapeOv ? 32 : 0;
+        // context-dependent shapes with actual cuboids (walls, fences, ...)
+        // still route vanilla; ZERO-cuboid shape-overrides (air, plants,
+        // torches — empty collision everywhere) are natively exact as 0
+        // cuboids and must NOT poison the whole section.
+        int complex = (shapeOv && !boxes.isEmpty()) ? 32 : 0;
         int n = 0;
-        if (!shapeOv) {
+        if (!shapeOv || boxes.isEmpty()) {
             // genuine multi-cuboid shapes (stairs, beds, ...) are carried
             // natively: up to 3 cuboids per entry, exact collide.
             for (int i = 0; i < boxes.size() && n < 3; i++) {
