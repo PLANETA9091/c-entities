@@ -122,6 +122,46 @@ postTick, passengers, the L6 collectors — is gone.
   the verdict (CI runner flakiness on ubuntu-26 mitigated: max-parallel 6,
   heap 4G, JFR maxsize, per-leg workflow_dispatch reruns).
 
+## First honest A/B verdict (items-100k, paired, same runner)
+
+| metric | vanilla | mod | delta |
+|---|---:|---:|---:|
+| mspt mean | 101.1 | 16.3 | **−83.9%** |
+| mspt p50 | 95.3 | 12.7 | **−86.7%** |
+| mspt p90 | 126.9 | 31.0 | −75.6% |
+| mspt p99 | 166.6 | 44.5 | −73.3% |
+
+Native flush: ~2.4ms per flush at n≈5.3k items (≈215ns/item), the section
+cache holds 121 sections for the whole farm, RSS flat. The dispatcher owned
+39M+ item ticks over the run.
+
+Three root bugs were found and fixed on the way (the legs used to die with
+runner shutdowns before any of this could be measured):
+
+1. **batch stride 10 vs 14** — the Java collectors wrote entries at `i*10`,
+   the native reader used `d[k*14+...]`: every entry past 0 ingested its
+   neighbours' fields — an item's delta became another item's z-coordinate,
+   items flew at hundreds of blocks/tick, each flying gather touched ~38
+   sections, the section cache consumed 8GB and the runners died.
+2. **SecMap empty sentinel = 0** — `sec_key(0,0,0)` (the spawn sections!) is
+   0, so those sections were uncacheable: one fresh 18KB data slot per
+   lookup.
+3. **air-entry layout** — the Java air-init wrote friction/speed at offsets
+   8/9 and left water=1.0: every air block parsed as water.
+
+Plus the cache diet (empty blocks vec = all-air, exact-size palettes) for
+sparse worlds: a 150x150-chunk fill legitimately touches ~500k sections.
+
+## Open items
+
+- **merge parity**: the mod's live entity count is 21.4k vs vanilla 63.0k —
+  the L3 merge fast path absorbs more neighbours per scan than vanilla's
+  (plus 1.5M stale arena candidates). The p50 win is partly confounded by
+  the entity deficit; one-merge-per-scan + the stale-candidate fix is next.
+- Java floor levers: tracker (ChunkMap$TrackedEntity), NaturalSpawner
+  createState, EntityTickList.forEach iteration.
+- Rayon-parallel flush (the store shards cleanly by id).
+
 ## Next levers (L8+)
 
 - The remaining floor: `EntityTickList.forEach` iteration, tracker
