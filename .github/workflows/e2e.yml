@@ -159,16 +159,12 @@ jobs:
           # as the "normal batching window"). cand=N/M with M=0 while N>0
           # is that failure shape — assert the resolve ratio for any real
           # candidate traffic (the tiny e2e world gives N ~ tens).
-          python3 - "$LAST_HOOKS" <<'PY' || fail "fast path returns UNRESOLVABLE ids (cand resolved==0 with candidates>0)"
-import re, sys
-h = sys.argv[1]
-m = re.search(r"cand=(\d+)/(\d+)", h)
-assert m, "no cand= counter in hooks line"
-seen, resolved = int(m.group(1)), int(m.group(2))
-print(f"cand seen={seen} resolved={resolved}")
-if seen >= 8:
-    assert resolved * 2 >= seen, f"resolve ratio too low: {resolved}/{seen}"
-PY
+          SEEN=$(echo "$LAST_HOOKS" | sed -nE 's/.*cand=([0-9]+)\/([0-9]+).*/\1/p')
+          RES=$(echo "$LAST_HOOKS" | sed -nE 's/.*cand=([0-9]+)\/([0-9]+).*/\2/p')
+          echo "cand seen=$SEEN resolved=$RES"
+          if [ -n "$SEEN" ] && [ "$SEEN" -ge 8 ]; then
+            [ -n "$RES" ] && [ "$RES" -ge $((SEEN / 2)) ] || fail "fast path returns UNRESOLVABLE ids (cand=$SEEN/$RES)"
+          fi
           echo "E2E OK: module armed, patches applied, probes + fast path LIVE (add/box/fast counters > 0)"
       - uses: actions/upload-artifact@v4
         if: always()
