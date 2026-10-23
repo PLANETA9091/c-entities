@@ -9,7 +9,7 @@
 //! tagged by id so id-slot reuse cannot cross-contaminate.
 
 use centities_core::itemtick::Aabb6;
-use centities_core::sections::{ AIR_IDX, PaletteEntry, SectionData, SectionGrid, SectionProvider };
+use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, SectionProvider, AIR_IDX};
 use centities_core::tick::{
     tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome,
 };
@@ -93,7 +93,6 @@ impl ItemEntry {
 pub struct ItemWorld {
     entries: Vec<ItemEntry>,
     pub grid: SectionGrid,
-    pub scratch: Scratch,
 }
 
 /// The full per-entry state snapshot used by the L7 dispatch protocol.
@@ -117,7 +116,6 @@ impl ItemWorld {
         ItemWorld {
             entries: (0..STORE_CAP).map(|_| ItemEntry::fresh(u64::MAX)).collect(),
             grid: SectionGrid::new(),
-            scratch: Scratch::new(),
         }
     }
 
@@ -148,7 +146,9 @@ pub struct ItemCore {
 
 impl ItemCore {
     pub fn new() -> ItemCore {
-        ItemCore { worlds: (0..8).map(|_| None).collect() }
+        ItemCore {
+            worlds: (0..8).map(|_| None).collect(),
+        }
     }
 
     #[inline]
@@ -261,7 +261,14 @@ fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
         let shape_override = d[o + 15] != 0.0;
         let entry_complex = d[o + 16] != 0.0;
         let collider = if d[o] == 1.0 && !shape_override && !entry_complex {
-            Some(Aabb6::new(d[o + 1], d[o + 2], d[o + 3], d[o + 4], d[o + 5], d[o + 6]))
+            Some(Aabb6::new(
+                d[o + 1],
+                d[o + 2],
+                d[o + 3],
+                d[o + 4],
+                d[o + 5],
+                d[o + 6],
+            ))
         } else {
             None
         };
@@ -307,7 +314,13 @@ fn parse_section(d: &[f64], b: &[i32]) -> SectionData {
     };
     let mut entries = entries;
     entries.shrink_to_fit();
-    SectionData { entries, blocks, complex, any_fluid, any_inside_special: any_inside }
+    SectionData {
+        entries,
+        blocks,
+        complex,
+        any_fluid,
+        any_inside_special: any_inside,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +367,9 @@ static SEC_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 fn proc_rss_mb() -> u64 {
     // /proc/self/statm: [total, resident, ...] in 4KB pages
-    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else { return 0 };
+    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
     s.split_whitespace()
         .nth(1)
         .and_then(|v| v.parse::<u64>().ok())
@@ -389,7 +404,11 @@ pub extern "system" fn n_item_tick(
 ) -> i32 {
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
     // vtable pattern proven in lib.rs.
-    return unsafe { n_item_tick_impl(env, _cls, wid, n, ids, flags, in_d, in_i, env_d, env_i, out_d, out_i) };
+    return unsafe {
+        n_item_tick_impl(
+            env, _cls, wid, n, ids, flags, in_d, in_i, env_d, env_i, out_d, out_i,
+        )
+    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,6 +463,9 @@ unsafe fn n_item_tick_impl(
                             // the applier mirrors the dispatcher's tickCount++/totalEntityAge++
                             // for entries whose vanilla dispatcher was suppressed.
                             oi.resize(n * 4, 0);
+                            // L8 phase-2 outputs: one commit record per item (None =
+                            // resync-skipped; the parallel tick fills its slots).
+                            let mut recs: Vec<Option<CommitRec>> = (0..n).map(|_| None).collect();
                             ((*vt).GetLongArrayRegion)(raw, ids, 0, n as i32, idv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
                             ((*vt).GetDoubleArrayRegion)(raw, in_d, 0, (n * 14) as i32, d.as_mut_ptr());
@@ -470,10 +492,54 @@ unsafe fn n_item_tick_impl(
                             let items_native = envv_i[3] != 0;
                             let t0 = std::time::Instant::now();
                             let world = core.world(wid as usize);
+
+                            // ------------------------------------------------
+                            // L8 PARALLEL FLUSH — three phases.
+                            //
+                            // Phase 1 (sequential): parse the batch + hydrate
+                            // the persistent parts from the store. The store
+                            // is touched ONLY here and in phase 3.
+                            // Phase 2 (rayon-parallel): the tick itself —
+                            // every item is independent, the section cache is
+                            // thread-safe (&self, sharded Arc payload),
+                            // scratch + section provider are per-chunk. All
+                            // outputs are written by disjoint per-chunk slots,
+                            // so the result is bit-identical to the sequential
+                            // loop regardless of scheduling.
+                            // Phase 3 (sequential): commit the tick results
+                            // into the store in batch order (== vanilla tick
+                            // order) + the diagnostic fold.
+                            // ------------------------------------------------
+                            struct CommitRec {
+                                stuck: (f64, f64, f64),
+                                sup: (i32, i32, i32),
+                                sup_present: bool,
+                                sup_no_blocks: bool,
+                                fr_pos: (i32, i32, i32),
+                                friction: f32,
+                                speed: f32,
+                                fr_step_special: bool,
+                                x: f64,
+                                y: f64,
+                                z: f64,
+                                dx: f64,
+                                dy: f64,
+                                dz: f64,
+                                age: i32,
+                                pickup_delay: i32,
+                                tick_count: i32,
+                                fall_dist: f32,
+                                on_ground: bool,
+                                aborted: bool,
+                                abort_clear: bool,
+                            }
+
                             let mut max_abs_delta: f64 = 0.0f64;
                             let mut max_abs_pos: f64 = 0.0f64;
-                            let mut provider = make_provider(wid);
-                            let prov: SectionProvider = &mut provider;
+
+                            // ---- phase 1: parse + hydrate (sequential) ----
+                            let mut sts: Vec<ItemState> = Vec::with_capacity(n);
+                            let mut tickable: Vec<bool> = vec![false; n];
                             for k in 0..n {
                                 let id = idv[k];
                                 let f = fv[k];
@@ -508,7 +574,6 @@ unsafe fn n_item_tick_impl(
                                     friction_disabled: (f & F_FRIC_OFF) != 0,
                                     land_fall: 0.0,
                                 };
-                                let mut bits: i32 = 0;
                                 if (f & (F_RESYNC | F_FORCE_VANILLA)) != 0 {
                                     // vanilla body ran this tick: ingest the fresh
                                     // state (incl. stuck/sup) and re-eval the mode.
@@ -541,6 +606,7 @@ unsafe fn n_item_tick_impl(
                                     st.sup_y = entry.sup.1;
                                     st.sup_z = entry.sup.2;
                                     st.sup_present = entry.sup_present;
+                                    let mut bits: i32 = 0;
                                     if items_native
                                         && centities_core::tick::want_native(&st, &tenv)
                                     {
@@ -559,6 +625,7 @@ unsafe fn n_item_tick_impl(
                                     oi[k * 4 + 1] = st.pickup_delay;
                                     oi[k * 4 + 2] = bits;
                                     oi[k * 4 + 3] = st.tick_count;
+                                    sts.push(st); // tickable[k] stays false
                                     continue;
                                 }
                                 // hydrate the persistent parts
@@ -624,103 +691,189 @@ unsafe fn n_item_tick_impl(
                                         st.pickup_delay = es.pickup_delay;
                                     }
                                 }
-                                {
-                                    let ad = st.dx.abs().max(st.dy.abs()).max(st.dz.abs());
-                                    if ad.is_finite() && ad > max_abs_delta { max_abs_delta = ad; }
-                                    let ap = st.x.abs().max(st.y.abs()).max(st.z.abs());
-                                    if ap.is_finite() && ap > max_abs_pos { max_abs_pos = ap; }
-                                }
-                                let outcome = if (f & F_INACTIVE) != 0 {
-                                    tick_item_inactive(&mut st)
-                                } else {
-                                    tick_item(&mut st, id, &tenv, &mut world.grid, &mut world.scratch, prov)
-                                };
-                                if outcome.has(TickOutcome::ABORTED) {
-                                    // no commit, no writeback: the item froze
-                                    // this tick; vanilla computes it next tick.
-                                    // L7 seatbelt: an item that aborts 4 times
-                                    // in a row must not freeze forever — force
-                                    // a vanilla tick (the resync re-ingests and
-                                    // clears the streak).
-                                    let (mode, clear) = {
+                                tickable[k] = true;
+                                sts.push(st);
+                            }
+
+                            // ---- phase 2: the tick (rayon-parallel) ----
+                            {
+                                let grid = &world.grid;
+                                use rayon::prelude::*;
+                                sts.par_chunks_mut(512)
+                                    .zip(od.par_chunks_mut(512 * 8))
+                                    .zip(oi.par_chunks_mut(512 * 4))
+                                    .zip(recs.par_chunks_mut(512))
+                                    .zip(tickable.par_chunks(512))
+                                    .zip(idv.par_chunks(512))
+                                    .zip(fv.par_chunks(512))
+                                    .for_each(
+                                        |((((((st_c, od_c), oi_c), rec_c), tk_c), id_c), f_c)| {
+                                            let mut scratch = Scratch::new();
+                                            let mut provider = make_provider(wid);
+                                            let prov: SectionProvider = &mut provider;
+                                            for j in 0..st_c.len() {
+                                                if !tk_c[j] {
+                                                    continue;
+                                                }
+                                                let id = id_c[j];
+                                                let f = f_c[j];
+                                                let st = &mut st_c[j];
+                                                let outcome = if (f & F_INACTIVE) != 0 {
+                                                    tick_item_inactive(st)
+                                                } else {
+                                                    tick_item(st, id, &tenv, grid, &mut scratch, prov)
+                                                };
+                                                if outcome.has(TickOutcome::ABORTED) {
+                                                    // no commit, no writeback: the item
+                                                    // froze this tick; vanilla computes it
+                                                    // next tick. L7 seatbelt: a run of 4
+                                                    // aborts forces a vanilla tick (the
+                                                    // counter lives in phase 3).
+                                                    let want = items_native
+                                                        && centities_core::tick::want_native(st, &tenv);
+                                                    let mode =
+                                                        if want { B_NATIVE_OK } else { B_VANILLA_NEXT };
+                                                    oi_c[j * 4 + 2] = B_ABORTED | mode;
+                                                    rec_c[j] = Some(CommitRec {
+                                                        stuck: st.stuck,
+                                                        sup: (st.sup_x, st.sup_y, st.sup_z),
+                                                        sup_present: st.sup_present,
+                                                        sup_no_blocks: st.on_ground_no_blocks,
+                                                        fr_pos: st.fr_pos,
+                                                        friction: st.friction,
+                                                        speed: st.speed,
+                                                        fr_step_special: st.fr_step_special,
+                                                        x: st.x,
+                                                        y: st.y,
+                                                        z: st.z,
+                                                        dx: st.dx,
+                                                        dy: st.dy,
+                                                        dz: st.dz,
+                                                        age: st.age,
+                                                        pickup_delay: st.pickup_delay,
+                                                        tick_count: st.tick_count,
+                                                        fall_dist: st.fall_dist,
+                                                        on_ground: st.on_ground,
+                                                        aborted: true,
+                                                        abort_clear: !want,
+                                                    });
+                                                    continue;
+                                                }
+                                                od_c[j * 8] = st.dx;
+                                                od_c[j * 8 + 1] = st.dy;
+                                                od_c[j * 8 + 2] = st.dz;
+                                                od_c[j * 8 + 3] = st.x;
+                                                od_c[j * 8 + 4] = st.y;
+                                                od_c[j * 8 + 5] = st.z;
+                                                od_c[j * 8 + 6] = st.fall_dist as f64;
+                                                od_c[j * 8 + 7] = st.land_fall as f64;
+                                                oi_c[j * 4] = st.age;
+                                                oi_c[j * 4 + 1] = st.pickup_delay;
+                                                let mut ob = 0i32;
+                                                if outcome.has(TickOutcome::MOVED) { ob |= B_MOVED; }
+                                                if outcome.has(TickOutcome::ON_GROUND) { ob |= B_ON_GROUND; }
+                                                if outcome.has(TickOutcome::HAS_IMPULSE) { ob |= B_IMPULSE; }
+                                                if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
+                                                if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
+                                                if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
+                                                if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
+                                                if outcome.has(TickOutcome::VANILLA_NEXT)
+                                                    || !items_native
+                                                    // L7 cadence belt: every 256th tick the
+                                                    // item runs one full vanilla tick +
+                                                    // re-ingest (heals any drift window).
+                                                    || (st.tick_count & 0xFF) == 0
+                                                {
+                                                    ob |= B_VANILLA_NEXT;
+                                                } else {
+                                                    ob |= B_NATIVE_OK;
+                                                }
+                                                oi_c[j * 4 + 2] = ob;
+                                                oi_c[j * 4 + 3] = st.tick_count;
+                                                rec_c[j] = Some(CommitRec {
+                                                    stuck: st.stuck,
+                                                    sup: (st.sup_x, st.sup_y, st.sup_z),
+                                                    sup_present: st.sup_present,
+                                                    sup_no_blocks: st.on_ground_no_blocks,
+                                                    fr_pos: st.fr_pos,
+                                                    friction: st.friction,
+                                                    speed: st.speed,
+                                                    fr_step_special: st.fr_step_special,
+                                                    x: st.x,
+                                                    y: st.y,
+                                                    z: st.z,
+                                                    dx: st.dx,
+                                                    dy: st.dy,
+                                                    dz: st.dz,
+                                                    age: st.age,
+                                                    pickup_delay: st.pickup_delay,
+                                                    tick_count: st.tick_count,
+                                                    fall_dist: st.fall_dist,
+                                                    on_ground: st.on_ground,
+                                                    aborted: false,
+                                                    abort_clear: false,
+                                                });
+                                            }
+                                        },
+                                    );
+                            }
+
+                            // ---- phase 3: commit + diagnostics (sequential) ----
+                            for k in 0..n {
+                                let Some(rec) = recs[k].take() else { continue };
+                                let id = idv[k];
+                                let f = fv[k];
+                                if rec.aborted {
+                                    {
                                         let entry = world.entry(id);
                                         entry.aborts = entry.aborts.saturating_add(1);
-                                        if items_native
-                                            && entry.aborts < 4
-                                            && centities_core::tick::want_native(&st, &tenv)
-                                        {
-                                            (B_NATIVE_OK, false)
-                                        } else {
-                                            (B_VANILLA_NEXT, true)
+                                        if rec.abort_clear {
+                                            // L7 seatbelt: the vanilla tick will
+                                            // re-ingest; clear the streak with it.
+                                            entry.aborts = 0;
                                         }
-                                    };
-                                    if clear {
-                                        world.entry(id).aborts = 0;
                                     }
-                                    oi[k * 4 + 2] = B_ABORTED | mode;
                                     continue;
                                 }
-                                // commit the store
                                 {
                                     let entry = world.entry(id);
-                                    entry.stuck = st.stuck;
-                                    entry.sup = (st.sup_x, st.sup_y, st.sup_z);
-                                    entry.sup_present = st.sup_present;
-                                    entry.sup_no_blocks = st.on_ground_no_blocks;
-                                    entry.fr_pos = st.fr_pos;
-                                    entry.friction = st.friction;
-                                    entry.speed = st.speed;
-                                    entry.fr_step_special = st.fr_step_special;
+                                    entry.stuck = rec.stuck;
+                                    entry.sup = rec.sup;
+                                    entry.sup_present = rec.sup_present;
+                                    entry.sup_no_blocks = rec.sup_no_blocks;
+                                    entry.fr_pos = rec.fr_pos;
+                                    entry.friction = rec.friction;
+                                    entry.speed = rec.speed;
+                                    entry.fr_step_special = rec.fr_step_special;
                                     // L7: mirror the full state back (dispatch-owned)
-                                    entry.x = st.x;
-                                    entry.y = st.y;
-                                    entry.z = st.z;
-                                    entry.dx = st.dx;
-                                    entry.dy = st.dy;
-                                    entry.dz = st.dz;
-                                    entry.age = st.age;
-                                    entry.pickup_delay = st.pickup_delay;
-                                    entry.tick_count = st.tick_count;
-                                    entry.fall_dist = st.fall_dist;
-                                    entry.on_ground = st.on_ground;
+                                    entry.x = rec.x;
+                                    entry.y = rec.y;
+                                    entry.z = rec.z;
+                                    entry.dx = rec.dx;
+                                    entry.dy = rec.dy;
+                                    entry.dz = rec.dz;
+                                    entry.age = rec.age;
+                                    entry.pickup_delay = rec.pickup_delay;
+                                    entry.tick_count = rec.tick_count;
+                                    entry.fall_dist = rec.fall_dist;
+                                    entry.on_ground = rec.on_ground;
                                     entry.aborts = 0;
                                     if (f & F_NATIVE) == 0 {
                                         // collector-carried entries refresh despawnRate
                                         entry.despawn_rate = iv[k * 4 + 3];
                                     }
                                 }
-                                od[k * 8] = st.dx;
-                                od[k * 8 + 1] = st.dy;
-                                od[k * 8 + 2] = st.dz;
-                                od[k * 8 + 3] = st.x;
-                                od[k * 8 + 4] = st.y;
-                                od[k * 8 + 5] = st.z;
-                                od[k * 8 + 6] = st.fall_dist as f64;
-                                od[k * 8 + 7] = st.land_fall as f64;
-                                oi[k * 4] = st.age;
-                                oi[k * 4 + 1] = st.pickup_delay;
-                                let mut ob = 0i32;
-                                if outcome.has(TickOutcome::MOVED) { ob |= B_MOVED; }
-                                if outcome.has(TickOutcome::ON_GROUND) { ob |= B_ON_GROUND; }
-                                if outcome.has(TickOutcome::HAS_IMPULSE) { ob |= B_IMPULSE; }
-                                if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
-                                if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
-                                if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
-                                if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
-                                if outcome.has(TickOutcome::VANILLA_NEXT)
-                                    || !items_native
-                                    // L7 cadence belt: every 256th tick the item runs
-                                    // one full vanilla tick + re-ingest (heals any
-                                    // drift window: probes, hash gaps, plugin writes).
-                                    || (st.tick_count & 0xFF) == 0
-                                {
-                                    ob |= B_VANILLA_NEXT;
-                                } else {
-                                    ob |= B_NATIVE_OK;
+                                // state extremes (garbage-detector diagnostics)
+                                let ad = rec.dx.abs().max(rec.dy.abs()).max(rec.dz.abs());
+                                if ad.is_finite() && ad > max_abs_delta {
+                                    max_abs_delta = ad;
                                 }
-                                oi[k * 4 + 2] = ob;
-                                oi[k * 4 + 3] = st.tick_count;
+                                let ap = rec.x.abs().max(rec.y.abs()).max(rec.z.abs());
+                                if ap.is_finite() && ap > max_abs_pos {
+                                    max_abs_pos = ap;
+                                }
                             }
+
                             ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 8) as i32, od.as_ptr());
                             ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n * 4) as i32, oi.as_ptr());
                             {
@@ -739,8 +892,8 @@ unsafe fn n_item_tick_impl(
                                         proc_rss_mb(),
                                         SEC_UPCALLS.load(std::sync::atomic::Ordering::Relaxed),
                                         SEC_ERRS.load(std::sync::atomic::Ordering::Relaxed),
-                                        g.populated,
-                                        g.lookups,
+                                        g.populated.load(std::sync::atomic::Ordering::Relaxed),
+                                        g.lookups.load(std::sync::atomic::Ordering::Relaxed),
                                         idx_stats.entities,
                                         idx_stats.cells,
                                         idx_stats.oversize,
@@ -769,7 +922,11 @@ unsafe fn n_item_tick_impl(
 #[inline]
 fn fr_key_of(st: &ItemState) -> (i32, i32, i32) {
     if st.sup_present {
-        (st.sup_x, centities_core::itemtick::mth_floor(st.y - 0.999_999f32 as f64), st.sup_z)
+        (
+            st.sup_x,
+            centities_core::itemtick::mth_floor(st.y - 0.999_999f32 as f64),
+            st.sup_z,
+        )
     } else {
         (
             centities_core::itemtick::mth_floor(st.x),
@@ -805,7 +962,9 @@ unsafe fn n_item_invalidate_impl(
     if n == 0 || wid < 0 || wid >= 8 {
         return;
     }
-    let Ok(mut g) = crate::INDEX.try_lock() else { return };
+    let Ok(mut g) = crate::INDEX.try_lock() else {
+        return;
+    };
     let cst = g.get_or_insert_with(crate::new_state);
     if cst.items.is_none() {
         cst.items = Some(ItemCore::new());

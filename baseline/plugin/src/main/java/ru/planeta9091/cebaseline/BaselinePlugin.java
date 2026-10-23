@@ -295,8 +295,19 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 tickDurations.add(new double[]{tickNo, e.getTickDuration()});
                 if (tickNo % 200 == 0) {
                     double heapUsed = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1048576.0;
+                    // L8 parity telemetry: item MASS (sum of stack counts) + live
+                    // item count. Mass conservation is the vanilla-compat gate:
+                    // entity counts can diverge legitimately (merge order), mass
+                    // cannot — a drift here means duplication or loss.
+                    double itemMass = 0.0, itemCount = 0.0;
+                    for (org.bukkit.entity.Entity en : Bukkit.getWorlds().get(0).getEntities()) {
+                        if (en instanceof org.bukkit.entity.Item it) {
+                            itemCount += 1.0;
+                            itemMass += it.getItemStack().getAmount();
+                        }
+                    }
                     samples.add(new double[]{tickNo, Bukkit.getWorlds().get(0).getEntities().size(),
-                            placedHoppers, placedFurnaces, heapUsed});
+                            placedHoppers, placedFurnaces, heapUsed, itemMass, itemCount});
                     String hs = hookStats();
                     if (hs != null) getLogger().info("hooks@" + tickNo + ": " + hs);
                 }
@@ -421,6 +432,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .append(", \"hoppers\": ").append((long) s[2])
                     .append(", \"furnaces\": ").append((long) s[3])
                     .append(", \"heap_mb\": ").append(String.format(Locale.ROOT, "%.1f", s[4]))
+                    .append(", \"item_mass\": ").append((long) s[5])
+                    .append(", \"item_count\": ").append((long) s[6])
                     .append("}").append(i + 1 < samples.size() ? "," : "").append('\n');
         }
         j.append("  ],\n  \"tick_ms\": [");

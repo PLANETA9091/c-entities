@@ -36,9 +36,20 @@ fn cellmap_minimal_break() {
             log.push(format!("rem {k}"));
         }
         if m.keys.iter().filter(|k| **k != 0).count() != truth.len() {
-            eprintln!("BREAK at step {step}: table={} truth={}", m.keys.iter().filter(|k| **k != 0).count(), truth.len());
+            eprintln!(
+                "BREAK at step {step}: table={} truth={}",
+                m.keys.iter().filter(|k| **k != 0).count(),
+                truth.len()
+            );
             eprintln!("last 40 ops: {:?}", &log[log.len().saturating_sub(40)..]);
-            eprintln!("missing keys: {:?}", truth.keys().filter(|k| m.find(**k).is_none()).take(10).collect::<Vec<_>>());
+            eprintln!(
+                "missing keys: {:?}",
+                truth
+                    .keys()
+                    .filter(|k| m.find(**k).is_none())
+                    .take(10)
+                    .collect::<Vec<_>>()
+            );
             panic!("count mismatch");
         }
     }

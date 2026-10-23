@@ -56,19 +56,40 @@ pub struct Aabb6 {
 impl Aabb6 {
     #[inline]
     pub fn new(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Self {
-        Aabb6 { x0, y0, z0, x1, y1, z1 }
+        Aabb6 {
+            x0,
+            y0,
+            z0,
+            x1,
+            y1,
+            z1,
+        }
     }
 
     /// `EntityDimensions.makeBoundingBox` for ItemEntity (w/2 and h are
     /// floats: 0.125 and 0.25 are exact in f32, promotion is exact).
     #[inline]
     pub fn item_box(x: f64, y: f64, z: f64) -> Self {
-        Aabb6 { x0: x - ITEM_HALF_W, y0: y, z0: z - ITEM_HALF_W, x1: x + ITEM_HALF_W, y1: y + ITEM_HEIGHT, z1: z + ITEM_HALF_W }
+        Aabb6 {
+            x0: x - ITEM_HALF_W,
+            y0: y,
+            z0: z - ITEM_HALF_W,
+            x1: x + ITEM_HALF_W,
+            y1: y + ITEM_HEIGHT,
+            z1: z + ITEM_HALF_W,
+        }
     }
 
     #[inline]
     pub fn deflate(&self, d: f64) -> Aabb6 {
-        Aabb6 { x0: self.x0 + d, y0: self.y0 + d, z0: self.z0 + d, x1: self.x1 - d, y1: self.y1 - d, z1: self.z1 - d }
+        Aabb6 {
+            x0: self.x0 + d,
+            y0: self.y0 + d,
+            z0: self.z0 + d,
+            x1: self.x1 - d,
+            y1: self.y1 - d,
+            z1: self.z1 - d,
+        }
     }
 
     #[inline]
@@ -89,7 +110,11 @@ impl Aabb6 {
 /// runs). Axis order: Y first, then the SMALLER of |x|/|z|, then the other;
 /// the reference box shifts after each applied axis exactly as in the
 /// decompiled body.
-pub fn perform_collisions(mv: (f64, f64, f64), box_: &Aabb6, colliders: &[Aabb6]) -> (f64, f64, f64) {
+pub fn perform_collisions(
+    mv: (f64, f64, f64),
+    box_: &Aabb6,
+    colliders: &[Aabb6],
+) -> (f64, f64, f64) {
     let mut x = mv.0;
     let mut y = mv.1;
     let mut z = mv.2;
@@ -162,7 +187,11 @@ pub fn voxel_shape_intersect(a: &Aabb6, b: &Aabb6) -> bool {
 /// moonrise `collideY(AABB target, AABB source, double move)`.
 #[inline]
 fn collide_y_axis(t: &Aabb6, src: &Aabb6, mv: f64) -> f64 {
-    if !(src.x0 - t.x1 < -EPS7) || !(src.x1 - t.x0 > EPS7) || !(src.z0 - t.z1 < -EPS7) || !(src.z1 - t.z0 > EPS7) {
+    if !(src.x0 - t.x1 < -EPS7)
+        || !(src.x1 - t.x0 > EPS7)
+        || !(src.z0 - t.z1 < -EPS7)
+        || !(src.z1 - t.z0 > EPS7)
+    {
         return mv;
     }
     if mv >= 0.0 {
@@ -185,7 +214,11 @@ fn collide_y_axis(t: &Aabb6, src: &Aabb6, mv: f64) -> f64 {
 /// moonrise `collideX(AABB target, AABB source, double move)`.
 #[inline]
 fn collide_x_axis(t: &Aabb6, src: &Aabb6, mv: f64) -> f64 {
-    if !(src.y0 - t.y1 < -EPS7) || !(src.y1 - t.y0 > EPS7) || !(src.z0 - t.z1 < -EPS7) || !(src.z1 - t.z0 > EPS7) {
+    if !(src.y0 - t.y1 < -EPS7)
+        || !(src.y1 - t.y0 > EPS7)
+        || !(src.z0 - t.z1 < -EPS7)
+        || !(src.z1 - t.z0 > EPS7)
+    {
         return mv;
     }
     if mv >= 0.0 {
@@ -208,7 +241,11 @@ fn collide_x_axis(t: &Aabb6, src: &Aabb6, mv: f64) -> f64 {
 /// moonrise `collideZ(AABB target, AABB source, double move)`.
 #[inline]
 fn collide_z_axis(t: &Aabb6, src: &Aabb6, mv: f64) -> f64 {
-    if !(src.x0 - t.x1 < -EPS7) || !(src.x1 - t.x0 > EPS7) || !(src.y0 - t.y1 < -EPS7) || !(src.y1 - t.y0 > EPS7) {
+    if !(src.x0 - t.x1 < -EPS7)
+        || !(src.x1 - t.x0 > EPS7)
+        || !(src.y0 - t.y1 < -EPS7)
+        || !(src.y1 - t.y0 > EPS7)
+    {
         return mv;
     }
     if mv >= 0.0 {

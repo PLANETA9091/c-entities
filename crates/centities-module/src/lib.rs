@@ -11,13 +11,13 @@
 //! any runtime anomaly flips CeHooks.ACTIVE=false → bridges take the
 //! vanilla-mirror path.
 
+pub mod itemcore;
 #[doc(hidden)]
 pub mod patch;
-pub mod itemcore;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
-use jvmti_bindings::sys::jni as jni;
+use jvmti_bindings::sys::jni;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -97,8 +97,14 @@ static NEXT_SEQ: AtomicI64 = AtomicI64::new(1);
 /// the index and the published rows stay single-thread-writer, and the
 /// drain-before-query discipline keeps the flush-in-query window.
 enum DirEv {
-    Upsert { id: i64, wid: u16, b: centities_core::Aabb },
-    Remove { id: i64 },
+    Upsert {
+        id: i64,
+        wid: u16,
+        b: centities_core::Aabb,
+    },
+    Remove {
+        id: i64,
+    },
 }
 static DIRECT_Q: Mutex<Vec<DirEv>> = Mutex::new(Vec::new());
 
@@ -108,9 +114,9 @@ struct Publisher {
     in_dirty: Vec<bool>, // parallel to the index's cell ids
     dense: Vec<bool>,    // sticky: cells that ever exceeded ROW_CAP
     oversize_changed: bool,
-    buf: Vec<i64>,  // row write scratch (2 + ROW_CAP)
-    ids: Vec<i64>,  // cell_scan scratch
-    seq: i64,       // stamp this publisher instance writes into rows
+    buf: Vec<i64>, // row write scratch (2 + ROW_CAP)
+    ids: Vec<i64>, // cell_scan scratch
+    seq: i64,      // stamp this publisher instance writes into rows
 }
 
 struct CeState {
@@ -153,7 +159,10 @@ impl CeState {
         use centities_core::UpsertEv as E;
         match ev {
             E::Same | E::OversizeSame => {}
-            E::New { cell, from_oversize } => {
+            E::New {
+                cell,
+                from_oversize,
+            } => {
                 self.mark_dirty(cell);
                 if from_oversize {
                     self.p.oversize_changed = true;
@@ -285,7 +294,9 @@ fn publish(env: &JniEnv, st: &mut CeState) {
         if st.p.dense.get(ci).copied().unwrap_or(false) {
             continue; // killed rows stay killed; zero publish cost
         }
-        let Some(key) = st.idx.cell_key_of(cell) else { continue };
+        let Some(key) = st.idx.cell_key_of(cell) else {
+            continue;
+        };
         let slot = row_slot(key);
         // L4c windowed rows: entries carry a conservative packed x-interval
         // (id + xLo + xHi, 1/1024-block units, cell-relative) so the Java row
@@ -384,9 +395,7 @@ fn arm_module() {
     // land on a DIFFERENT loader's copy (kernel/paperclip loader labyrinths),
     // arming a class the woven code never calls — the module silently stays
     // vanilla (observed 2026-10-19: ARMED logged, every query mirrored).
-    let Some(Some((loader, hooks_cls))) =
-        cplug_sdk::jni_util::with_attached(define_bridge)
-    else {
+    let Some(Some((loader, hooks_cls))) = cplug_sdk::jni_util::with_attached(define_bridge) else {
         cplug_sdk::log::info("[c-entities] arm: bridge setup failed — staying vanilla");
         return;
     };
@@ -414,11 +423,8 @@ fn arm_module() {
         SERVER_LEVEL_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
-        cplug_sdk::log::info(&format!(
-            "[c-entities] retransform {cls}: rc={rc}"
-        ));
+        cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
     }
-
 
     // Paper re-loads kernel classes after bootstrap: a retransform that
     // landed on a doomed bootstrap class object never reaches the running
@@ -442,13 +448,9 @@ fn arm_module() {
             std::thread::sleep(std::time::Duration::from_millis(2000));
             let snap = read_hook_counters();
             if attempt < 6 || attempt % 25 == 0 {
-                let dbg: Vec<(String, i64)> = snap
-                    .iter()
-                    .map(|(k, v)| (format!("{:?}", k), *v))
-                    .collect();
-                cplug_sdk::log::info(&format!(
-                    "[c-entities] verifier snapshot: {:?}", dbg
-                ));
+                let dbg: Vec<(String, i64)> =
+                    snap.iter().map(|(k, v)| (format!("{:?}", k), *v)).collect();
+                cplug_sdk::log::info(&format!("[c-entities] verifier snapshot: {:?}", dbg));
             }
             let mut pending: Vec<&str> = Vec::new();
             for (cls, c) in targets.iter() {
@@ -519,7 +521,9 @@ fn precompute_level(loader: jni::jobject) {
     let stash = STASH.lock().ok().and_then(|mut s| s.remove(LEVEL_CLASS));
     let Some(bytes) = stash else {
         PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-        cplug_sdk::log::info("[c-entities] precompute Level.getEntities: original bytes not seen at boot");
+        cplug_sdk::log::info(
+            "[c-entities] precompute Level.getEntities: original bytes not seen at boot",
+        );
         return;
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
@@ -536,7 +540,9 @@ fn precompute_level(loader: jni::jobject) {
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] FAILED to precompute Level.getEntities — vanilla kept");
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute Level.getEntities — vanilla kept",
+            );
         }
     }
 }
@@ -591,10 +597,15 @@ fn force_init_item_entity_raw(loader: jni::jobject) {
 static MERGE_WOVEN: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
-    let stash = STASH.lock().ok().and_then(|mut s| s.remove(ITEM_ENTITY_CLASS));
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(ITEM_ENTITY_CLASS));
     let Some(bytes) = stash else {
         PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-        cplug_sdk::log::info("[c-entities] precompute ItemEntity guard: original bytes not seen at boot");
+        cplug_sdk::log::info(
+            "[c-entities] precompute ItemEntity guard: original bytes not seen at boot",
+        );
         return;
     };
     // L6: the tick is COMPUTED natively — a conditional early-return prefix
@@ -659,7 +670,9 @@ fn precompute_item(loader: jni::jobject) {
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] FAILED to precompute ItemEntity guard — vanilla tick kept");
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ItemEntity guard — vanilla tick kept",
+            );
         }
     }
 }
@@ -684,10 +697,15 @@ fn precompute_item(loader: jni::jobject) {
 /// level (the ItemEntity.tick guard computes the tick natively; only the
 /// dispatcher floor stays vanilla).
 fn precompute_serverlevel(loader: jni::jobject) {
-    let stash = STASH.lock().ok().and_then(|mut s| s.remove(SERVER_LEVEL_CLASS));
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(SERVER_LEVEL_CLASS));
     let Some(bytes) = stash else {
         PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-        cplug_sdk::log::info("[c-entities] precompute ServerLevel dispatch: original bytes not seen at boot");
+        cplug_sdk::log::info(
+            "[c-entities] precompute ServerLevel dispatch: original bytes not seen at boot",
+        );
         return;
     };
     let spec = cplug_sdk::asm::EarlyReturnGuard {
@@ -697,10 +715,9 @@ fn precompute_serverlevel(loader: jni::jobject) {
         check_name: "itemDispatch",
         check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
     };
-    let patched =
-        cplug_sdk::jni_util::with_attached(|env| {
-            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
-        });
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+    });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
@@ -718,7 +735,9 @@ fn precompute_serverlevel(loader: jni::jobject) {
 }
 
 fn patch_serverlevel(bytes: &[u8]) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(|| patch_serverlevel_inner(bytes)).ok().flatten()
+    std::panic::catch_unwind(|| patch_serverlevel_inner(bytes))
+        .ok()
+        .flatten()
 }
 
 fn patch_serverlevel_inner(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -726,19 +745,24 @@ fn patch_serverlevel_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         // Boot load: stash the original bytes, stay vanilla. The guard is
         // woven at arm time (precompute_serverlevel) — outside the callback.
         let mut st = STASH.lock().ok()?;
-        st.entry(SERVER_LEVEL_CLASS).or_insert_with(|| bytes.to_vec());
+        st.entry(SERVER_LEVEL_CLASS)
+            .or_insert_with(|| bytes.to_vec());
         return None;
     }
     let pre = PRECOMPUTED.lock().ok()?.get(SERVER_LEVEL_CLASS).cloned();
     match pre {
         Some(b) if !b.is_empty() => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched ServerLevel tickNonPassenger dispatch guard");
+            cplug_sdk::log::info(
+                "[c-entities] patched ServerLevel tickNonPassenger dispatch guard",
+            );
             Some(b)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] FAILED to patch ServerLevel dispatch — vanilla kept");
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to patch ServerLevel dispatch — vanilla kept",
+            );
             None
         }
     }
@@ -814,8 +838,7 @@ fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
     // level_cls.0 is a jclass == an instance of java.lang.Class: getClassLoader
     // must be resolved on java.lang.Class, not on ServerLevel itself.
     let class_class = env.get_object_class(level_cls.0);
-    let Some(mid) =
-        env.get_method_id(class_class, "getClassLoader", "()Ljava/lang/ClassLoader;")
+    let Some(mid) = env.get_method_id(class_class, "getClassLoader", "()Ljava/lang/ClassLoader;")
     else {
         cplug_sdk::log::info("[c-entities] bridge: getClassLoader mid not found");
         return None;
@@ -829,7 +852,9 @@ fn define_bridge(env: &JniEnv) -> Option<(jni::jobject, jni::jobject)> {
         }
         let iname = &name[..name.len() - 6]; // strip ".class"
         if env.define_class(iname, loader, bytes).is_none() {
-            cplug_sdk::log::info(&format!("[c-entities] bridge define_class failed for {iname}"));
+            cplug_sdk::log::info(&format!(
+                "[c-entities] bridge define_class failed for {iname}"
+            ));
             return None;
         }
     }
@@ -870,16 +895,26 @@ fn init_publisher(env: &JniEnv, cls: jni::jclass) -> bool {
             return false;
         }
     }
-    let Some(fid_rows) = env.get_static_field_id(cls, "ROWS", "[[J") else { return false };
-    let Some(fid_seq) = env.get_static_field_id(cls, "PUBLISH_SEQ", "J") else { return false };
-    let Some(fid_pop) = env.get_static_field_id(cls, "OVERSIZE_POP", "I") else { return false };
+    let Some(fid_rows) = env.get_static_field_id(cls, "ROWS", "[[J") else {
+        return false;
+    };
+    let Some(fid_seq) = env.get_static_field_id(cls, "PUBLISH_SEQ", "J") else {
+        return false;
+    };
+    let Some(fid_pop) = env.get_static_field_id(cls, "OVERSIZE_POP", "I") else {
+        return false;
+    };
     let rows = env.get_static_object_field(cls, fid_rows);
     if rows.is_null() {
         return false;
     }
     let rows_g = env.new_global_ref(rows);
     let cls_g = env.new_global_ref(cls);
-    let info = PubInfo { rows: rows_g, cls: cls_g, fid_pop };
+    let info = PubInfo {
+        rows: rows_g,
+        cls: cls_g,
+        fid_pop,
+    };
     // Align Java's PUBLISH_SEQ with the stamp this publisher instance writes.
     let seq = NEXT_SEQ.load(Ordering::Acquire);
     unsafe { set_static_long(env, cls_g as jni::jclass, fid_seq, seq) };
@@ -910,20 +945,75 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             });
         }};
     }
-    push!("queryNative", "(IDDDDDD[JI[J[D)I",
-        n_query as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, f64, f64, f64, f64, f64, f64, jni::jlongArray, i32, jni::jlongArray, jni::jdoubleArray) -> i32);
-    push!("nativeFlush", "(I[J[D)V",
-        n_flush as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, jni::jlongArray, jni::jdoubleArray));
-    push!("nativeBoxDirect", "(JIDDDDDD)V",
-        n_box as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64, i32, f64, f64, f64, f64, f64, f64));
-    push!("nativeRemoveDirect", "(J)V",
-        n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64));
-    push!("nativeReset", "()V",
-        n_reset as extern "system" fn(*mut jni::JNIEnv, jni::jclass));
-    push!("nativeItemTick", "(II[J[I[D[I[D[I[D[I)I",
-        itemcore::n_item_tick as *const c_void);
-    push!("nativeItemInvalidate", "(II[I[I[I)V",
-        itemcore::n_item_invalidate as *const c_void);
+    push!(
+        "queryNative",
+        "(IDDDDDD[JI[J[D)I",
+        n_query
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                jni::jlongArray,
+                i32,
+                jni::jlongArray,
+                jni::jdoubleArray,
+            ) -> i32
+    );
+    push!(
+        "nativeFlush",
+        "(I[J[D)V",
+        n_flush
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                jni::jlongArray,
+                jni::jdoubleArray,
+            )
+    );
+    push!(
+        "nativeBoxDirect",
+        "(JIDDDDDD)V",
+        n_box
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i64,
+                i32,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+            )
+    );
+    push!(
+        "nativeRemoveDirect",
+        "(J)V",
+        n_remove as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64)
+    );
+    push!(
+        "nativeReset",
+        "()V",
+        n_reset as extern "system" fn(*mut jni::JNIEnv, jni::jclass)
+    );
+    push!(
+        "nativeItemTick",
+        "(II[J[I[D[I[D[I[D[I)I",
+        itemcore::n_item_tick as *const c_void
+    );
+    push!(
+        "nativeItemInvalidate",
+        "(II[I[I[I)V",
+        itemcore::n_item_invalidate as *const c_void
+    );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -961,7 +1051,9 @@ fn level_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
 // is wrapped in catch_unwind — a failure degrades to vanilla bytes (class
 // untouched), never a crash. Zero cost on the happy path.
 fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(|| patch_level_inner(bytes)).ok().flatten()
+    std::panic::catch_unwind(|| patch_level_inner(bytes))
+        .ok()
+        .flatten()
 }
 
 fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -986,9 +1078,7 @@ fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                 Ok(b2) => b2,
                 Err(e) => {
                     PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-                    cplug_sdk::log::info(&format!(
-                        "[c-entities] setBlock wake probe refused: {e}"
-                    ));
+                    cplug_sdk::log::info(&format!("[c-entities] setBlock wake probe refused: {e}"));
                     return None;
                 }
             };
@@ -1004,7 +1094,9 @@ fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                 &[(0, b'L')],
             ) {
                 Ok(b3) => {
-                    cplug_sdk::log::info("[c-entities] L6 flush prefix woven (Level.tickBlockEntities)");
+                    cplug_sdk::log::info(
+                        "[c-entities] L6 flush prefix woven (Level.tickBlockEntities)",
+                    );
                     b3
                 }
                 Err(e) => {
@@ -1027,7 +1119,9 @@ fn patch_level_inner(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_lookup(bytes: &[u8]) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(|| patch_lookup_inner(bytes)).ok().flatten()
+    std::panic::catch_unwind(|| patch_lookup_inner(bytes))
+        .ok()
+        .flatten()
 }
 
 fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -1075,19 +1169,24 @@ fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(|| patch_entity_inner(bytes)).ok().flatten()
+    std::panic::catch_unwind(|| patch_entity_inner(bytes))
+        .ok()
+        .flatten()
 }
 
 /// L2a resting items: the tick guard is precomputed at arm time
 /// (precompute_item); the boot-time hook only stashes the bytes.
 fn patch_item(bytes: &[u8]) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(|| patch_item_inner(bytes)).ok().flatten()
+    std::panic::catch_unwind(|| patch_item_inner(bytes))
+        .ok()
+        .flatten()
 }
 
 fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
-        st.entry(ITEM_ENTITY_CLASS).or_insert_with(|| bytes.to_vec());
+        st.entry(ITEM_ENTITY_CLASS)
+            .or_insert_with(|| bytes.to_vec());
         return None;
     }
 
@@ -1203,7 +1302,9 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         Ok(b) => b,
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] setDeltaMovement(Vec3) probe refused: {e}"));
+            cplug_sdk::log::info(&format!(
+                "[c-entities] setDeltaMovement(Vec3) probe refused: {e}"
+            ));
             return None;
         }
     };
@@ -1223,7 +1324,9 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] setDeltaMovement(DDD) probe refused: {e}"));
+            cplug_sdk::log::info(&format!(
+                "[c-entities] setDeltaMovement(DDD) probe refused: {e}"
+            ));
             None
         }
     }
@@ -1269,54 +1372,66 @@ pub extern "system" fn n_query(
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
         let e = JniEnv::from_raw(env);
-        QSCRATCH.with(|q| {
-            let mut q = q.borrow_mut();
-            let mut g = INDEX.lock().ok()?;
-            let st = g.get_or_insert_with(new_state);
-            drain_direct(st);
-            if bn > 0 {
-                BIDBUF.with(|b| {
-                    let mut b = b.borrow_mut();
-                    b.clear();
-                    b.resize(bn, 0);
-                    e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
-                    for l in b.iter() {
-                        if *l < 0 {
-                            let ev = st.idx.remove(*l & 0xFFFF_FFFF);
-                            st.note_remove(ev);
-                        }
-                    }
-                    BBOXBUF.with(|bx| {
-                        let mut bx = bx.borrow_mut();
-                        bx.clear();
-                        bx.resize(bn * 6, 0.0);
-                        jni_get_double_array_region(&e, batch_boxes, 0, (bn * 6) as i32, &mut bx);
-                        for (i, l) in b.iter().enumerate() {
-                            if *l >= 0 {
-                                let wid = ((*l >> 32) & 0xFFFF) as u16;
-                                let o = i * 6;
-                                let ev = st.idx.upsert(
-                                    *l & 0xFFFF_FFFF,
-                                    wid,
-                                    &centities_core::Aabb::new(
-                                        bx[o], bx[o + 1], bx[o + 2], bx[o + 3], bx[o + 4], bx[o + 5],
-                                    ),
-                                );
-                                st.note_upsert(ev);
+        QSCRATCH
+            .with(|q| {
+                let mut q = q.borrow_mut();
+                let mut g = INDEX.lock().ok()?;
+                let st = g.get_or_insert_with(new_state);
+                drain_direct(st);
+                if bn > 0 {
+                    BIDBUF.with(|b| {
+                        let mut b = b.borrow_mut();
+                        b.clear();
+                        b.resize(bn, 0);
+                        e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
+                        for l in b.iter() {
+                            if *l < 0 {
+                                let ev = st.idx.remove(*l & 0xFFFF_FFFF);
+                                st.note_remove(ev);
                             }
                         }
+                        BBOXBUF.with(|bx| {
+                            let mut bx = bx.borrow_mut();
+                            bx.clear();
+                            bx.resize(bn * 6, 0.0);
+                            jni_get_double_array_region(
+                                &e,
+                                batch_boxes,
+                                0,
+                                (bn * 6) as i32,
+                                &mut bx,
+                            );
+                            for (i, l) in b.iter().enumerate() {
+                                if *l >= 0 {
+                                    let wid = ((*l >> 32) & 0xFFFF) as u16;
+                                    let o = i * 6;
+                                    let ev = st.idx.upsert(
+                                        *l & 0xFFFF_FFFF,
+                                        wid,
+                                        &centities_core::Aabb::new(
+                                            bx[o],
+                                            bx[o + 1],
+                                            bx[o + 2],
+                                            bx[o + 3],
+                                            bx[o + 4],
+                                            bx[o + 5],
+                                        ),
+                                    );
+                                    st.note_upsert(ev);
+                                }
+                            }
+                        });
                     });
-                });
-            }
-            publish(&e, st);
-            st.idx.query(
-                world as u16,
-                &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
-                &mut q,
-            );
-            Some(q.len() as i32)
-        })
-        .unwrap_or(-1)
+                }
+                publish(&e, st);
+                st.idx.query(
+                    world as u16,
+                    &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
+                    &mut q,
+                );
+                Some(q.len() as i32)
+            })
+            .unwrap_or(-1)
     };
     if n < 0 {
         return -1;
@@ -1439,7 +1554,11 @@ pub extern "system" fn n_box(
     z1: f64,
 ) {
     let b = centities_core::Aabb::new(x0, y0, z0, x1, y1, z1);
-    push_direct(DirEv::Upsert { id, wid: world as u16, b });
+    push_direct(DirEv::Upsert {
+        id,
+        wid: world as u16,
+        b,
+    });
 }
 
 /// Off-thread remove (worldgen workers): queued like n_box.

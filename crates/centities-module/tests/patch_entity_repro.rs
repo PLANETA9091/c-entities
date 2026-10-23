@@ -41,7 +41,10 @@ fn patch_real_entity_and_lookup() {
         "(Lnet/minecraft/world/entity/Entity;DDD)V",
         &[(0, b'L'), (1, b'D'), (3, b'D'), (5, b'D')],
     );
-    println!("setPos: {:?}", r1.as_ref().map(|b| b.len()).map_err(|e| e.clone()));
+    println!(
+        "setPos: {:?}",
+        r1.as_ref().map(|b| b.len()).map_err(|e| e.clone())
+    );
     assert!(r1.is_ok(), "setPos patch failed: {:?}", r1.err());
 
     // Entity.setBoundingBox(AABB)V — has StackMapTable
@@ -54,7 +57,10 @@ fn patch_real_entity_and_lookup() {
         "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;)V",
         &[(0, b'L'), (1, b'L')],
     );
-    println!("setBoundingBox: {:?}", r2.as_ref().map(|b| b.len()).map_err(|e| e.clone()));
+    println!(
+        "setBoundingBox: {:?}",
+        r2.as_ref().map(|b| b.len()).map_err(|e| e.clone())
+    );
     assert!(r2.is_ok(), "setBoundingBox patch failed: {:?}", r2.err());
 
     // EntityLookup.addEntity(Entity,boolean,boolean)Z — full_frame SMT with
@@ -68,7 +74,10 @@ fn patch_real_entity_and_lookup() {
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(1, b'L')],
     );
-    println!("addEntity: {:?}", r3.as_ref().map(|b| b.len()).map_err(|e| e.clone()));
+    println!(
+        "addEntity: {:?}",
+        r3.as_ref().map(|b| b.len()).map_err(|e| e.clone())
+    );
     assert!(r3.is_ok(), "addEntity patch failed: {:?}", r3.err());
     // probe target must be void; the METHOD may return Z (we pop nothing —
     // wait, probeAdd returns V and is inserted at start: stack-neutral ok).
@@ -83,6 +92,9 @@ fn patch_real_entity_and_lookup() {
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(1, b'L')],
     );
-    println!("removeEntity: {:?}", r4.as_ref().map(|b| b.len()).map_err(|e| e.clone()));
+    println!(
+        "removeEntity: {:?}",
+        r4.as_ref().map(|b| b.len()).map_err(|e| e.clone())
+    );
     assert!(r4.is_ok(), "removeEntity patch failed: {:?}", r4.err());
 }

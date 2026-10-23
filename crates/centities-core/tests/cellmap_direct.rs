@@ -15,15 +15,22 @@ impl Rng {
 }
 
 fn refcheck(m: &CellMap, truth: &std::collections::HashMap<u64, u32>) {
-    assert_eq!(m.keys.iter().filter(|k| **k != 0).count(), truth.len(),
-        "table live count != truth len");
+    assert_eq!(
+        m.keys.iter().filter(|k| **k != 0).count(),
+        truth.len(),
+        "table live count != truth len"
+    );
     for (k, v) in truth {
         assert_eq!(m.find(*k), Some(*v), "find({k}) failed");
     }
     // every table entry must exist in truth
     for i in 0..m.keys.len() {
         if m.keys[i] != 0 {
-            assert_eq!(truth.get(&m.keys[i]), Some(&m.vals[i]), "table slot {i} stale");
+            assert_eq!(
+                truth.get(&m.keys[i]),
+                Some(&m.vals[i]),
+                "table slot {i} stale"
+            );
         }
     }
 }

@@ -48,13 +48,25 @@ pub struct Aabb {
 impl Aabb {
     #[inline]
     pub fn new(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Self {
-        Aabb { x0, y0, z0, x1, y1, z1 }
+        Aabb {
+            x0,
+            y0,
+            z0,
+            x1,
+            y1,
+            z1,
+        }
     }
 
     /// Vanilla `AABB.intersects` semantics: strict inequalities.
     #[inline]
     pub fn intersects(&self, o: &Aabb) -> bool {
-        self.x0 < o.x1 && self.x1 > o.x0 && self.y0 < o.y1 && self.y1 > o.y0 && self.z0 < o.z1 && self.z1 > o.z0
+        self.x0 < o.x1
+            && self.x1 > o.x0
+            && self.y0 < o.y1
+            && self.y1 > o.y0
+            && self.z0 < o.z1
+            && self.z1 > o.z0
     }
 
     #[inline]
@@ -107,7 +119,12 @@ pub struct CellMap {
 impl CellMap {
     pub fn new(cap_pow2: usize) -> Self {
         let n = cap_pow2.max(16);
-        CellMap { keys: vec![0; n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
+        CellMap {
+            keys: vec![0; n],
+            vals: vec![0; n],
+            mask: (n - 1) as u64,
+            len: 0,
+        }
     }
 
     #[inline]
@@ -202,7 +219,12 @@ struct IdMap {
 impl IdMap {
     fn new(cap_pow2: usize) -> Self {
         let n = cap_pow2.max(16);
-        IdMap { keys: vec![0; n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
+        IdMap {
+            keys: vec![0; n],
+            vals: vec![0; n],
+            mask: (n - 1) as u64,
+            len: 0,
+        }
     }
 
     #[inline]
@@ -452,7 +474,10 @@ impl EntityIndex {
             self.cell_add(new_home, slot as usize, b, ncx, ncz);
             self.homes[slot as usize] = new_home;
             self.worlds[slot as usize] = world;
-            return UpsertEv::Moved { old: home, new: new_home };
+            return UpsertEv::Moved {
+                old: home,
+                new: new_home,
+            };
         } else {
             // if it used to be oversize, drop that record
             let mut from_oversize = false;
@@ -473,7 +498,10 @@ impl EntityIndex {
             self.homes[slot as usize] = home;
             self.idmap.insert(id, slot);
             self.stats.entities += 1;
-            return UpsertEv::New { cell: home, from_oversize };
+            return UpsertEv::New {
+                cell: home,
+                from_oversize,
+            };
         }
     }
 
@@ -715,7 +743,10 @@ impl EntityIndex {
     /// The cell key of `cell`, or None if out of range.
     #[inline]
     pub fn cell_key_of(&self, cell: u32) -> Option<u64> {
-        self.cell_keys.get(cell as usize).copied().filter(|k| *k != 0)
+        self.cell_keys
+            .get(cell as usize)
+            .copied()
+            .filter(|k| *k != 0)
     }
 
     /// The count of `cell`: push up to `cap` ids into `out`, return
@@ -823,20 +854,29 @@ impl EntityIndex {
             }
         }
         for s in 0..n {
-            assert_eq!(self.idmap.find(self.ids[s]), Some(s as u32),
-                "idmap: entry {s} id {} not mapped", self.ids[s]);
+            assert_eq!(
+                self.idmap.find(self.ids[s]),
+                Some(s as u32),
+                "idmap: entry {s} id {} not mapped",
+                self.ids[s]
+            );
             assert!(seen_slots.contains(&s), "entry {s} not in any cell");
             let ci = self.homes[s] as usize;
             let p = self.cpos[s] as usize;
-            assert_eq!(self.cell_ids[ci][p], self.ids[s], "cell {ci}[{p}] != ids[{s}]");
+            assert_eq!(
+                self.cell_ids[ci][p], self.ids[s],
+                "cell {ci}[{p}] != ids[{s}]"
+            );
         }
         let mut seen_keys: HS<u64> = HS::new();
         for ci in 1..self.cell_keys.len() {
             if self.cell_keys[ci] == 0 {
                 continue;
             }
-            assert!(self.cellmap.find(self.cell_keys[ci]) == Some(ci as u32),
-                "cellmap does not map cell {ci}");
+            assert!(
+                self.cellmap.find(self.cell_keys[ci]) == Some(ci as u32),
+                "cellmap does not map cell {ci}"
+            );
             assert!(seen_keys.insert(self.cell_keys[ci]), "duplicate cell key");
         }
     }

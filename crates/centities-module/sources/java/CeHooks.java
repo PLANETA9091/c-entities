@@ -200,6 +200,11 @@ public final class CeHooks {
             !"false".equals(System.getProperty("centities.mergeFast", "true"));
     public static volatile long mergeChecks = 0, mergeSelf = 0, mergeFast = 0;
     public static volatile long mergeMirror = 0, mergeCand = 0;
+    /** L8 parity telemetry: successful tryToMerge operations (either side
+     *  discarded). Entity counts can diverge legitimately through merge
+     *  ORDER; the merge RATE + mass conservation (bench samples) decide
+     *  whether the fast path's dynamics match vanilla. */
+    public static volatile long mergeOps = 0;
 
     private static volatile java.lang.invoke.MethodHandle MH_TRY_MERGE;
     private static volatile java.lang.invoke.MethodHandle MH_IS_MERGABLE;
@@ -307,6 +312,7 @@ public final class CeHooks {
                     continue;
                 }
                 MH_TRY_MERGE.invokeExact(e, other);
+                if (e.isRemoved() | other.isRemoved()) mergeOps++;
                 if (e.isRemoved()) return true; // absorbed — vanilla stops
             }
             return true;
@@ -407,7 +413,7 @@ public final class CeHooks {
                 + " restF=" + restFailGround + "/" + restFailDelay + "/" + restFailAge
                 + "/" + restFailFluid + "/" + restFailVel + "/" + restFailChurn
                 + " merge=" + mergeChecks + "/" + mergeSelf + "/" + mergeFast
-                + "/" + mergeMirror + "/" + mergeCand
+                + "/" + mergeMirror + "/" + mergeCand + "/" + mergeOps
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses

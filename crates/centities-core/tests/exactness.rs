@@ -118,7 +118,11 @@ fn boundary_and_cluster_exactness() {
     let mut entities: Vec<(i64, u16, Aabb)> = Vec::new();
 
     for i in 0..2_000u64 {
-        let bx = if i % 3 == 0 { 64.0 * (i as f64) } else { 64.0 * (i as f64) + 32.0 };
+        let bx = if i % 3 == 0 {
+            64.0 * (i as f64)
+        } else {
+            64.0 * (i as f64) + 32.0
+        };
         let cz = 64.0 * ((i % 37) as f64) - 1_000.0;
         let hx = 0.5 + (i % 7) as f64 * 0.25;
         let b = Aabb::new(bx - hx, 64.0, cz - hx, bx + hx, 68.0, cz + hx);
@@ -276,11 +280,11 @@ fn packed_window_is_conservative() {
     // spans several cells around the origin, incl. negative coords
     let id0 = 1i64;
     for _ in 0..20_000i64 {
-        let fx = (rnd() % 4096) as f64 / 1024.0 - 2.0;   // -2..2
+        let fx = (rnd() % 4096) as f64 / 1024.0 - 2.0; // -2..2
         let fz = (rnd() % 4096) as f64 / 1024.0 - 2.0;
-        let w = (rnd() % 1024) as f64 / 1024.0;           // 0..1
+        let w = (rnd() % 1024) as f64 / 1024.0; // 0..1
         let h = (rnd() % 512) as f64 / 1024.0;
-        let x0 = fx * 16.0;                                // stride across cells
+        let x0 = fx * 16.0; // stride across cells
         let z0 = fz * 16.0;
         let b = Aabb::new(x0, 64.0, z0, x0 + w, 64.0 + h, z0 + h);
         idx.upsert(id0, 0, &b);
@@ -288,7 +292,11 @@ fn packed_window_is_conservative() {
         // read back the packed window for the entity's home cell
         let home = {
             let mut probe = Vec::new();
-            idx.query(0, &Aabb::new(x0, 64.0, z0, x0 + 0.01, 64.01, z0 + 0.01), &mut probe);
+            idx.query(
+                0,
+                &Aabb::new(x0, 64.0, z0, x0 + 0.01, 64.01, z0 + 0.01),
+                &mut probe,
+            );
             assert!(probe.contains(&id0));
             probe.clear();
             // find the home cell by scanning the query result's cell — simpler:
@@ -314,11 +322,24 @@ fn packed_window_is_conservative() {
             }
         }
         assert!(found, "home cell not found");
-        let entry = packed.iter().copied().find(|p| (p & 0xFFFF_FFFF) == (id0 & 0xFFFF_FFFF))
+        let entry = packed
+            .iter()
+            .copied()
+            .find(|p| (p & 0xFFFF_FFFF) == (id0 & 0xFFFF_FFFF))
             .expect("entity missing from packed row");
         let lo = (((entry >> 32) & 0xFFFF) as f64 - 32768.0) / 1024.0 + ox;
         let hi = (((entry >> 48) & 0xFFFF) as f64 - 32768.0) / 1024.0 + ox;
-        assert!(lo <= b.x0 + 1e-3, "packed lo {} clips true minX {}", lo, b.x0);
-        assert!(hi >= b.x1 - 1e-3, "packed hi {} clips true maxX {}", hi, b.x1);
+        assert!(
+            lo <= b.x0 + 1e-3,
+            "packed lo {} clips true minX {}",
+            lo,
+            b.x0
+        );
+        assert!(
+            hi >= b.x1 - 1e-3,
+            "packed hi {} clips true maxX {}",
+            hi,
+            b.x1
+        );
     }
 }

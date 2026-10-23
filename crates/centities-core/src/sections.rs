@@ -14,6 +14,8 @@
 //! instead of gathering.
 
 use crate::itemtick::{mth_floor, voxel_shape_intersect, Aabb6};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 
 /// 4096 blocks per section, index = x | z << 4 | y << 8.
 pub const SEC_BLOCKS: usize = 4096;
@@ -106,7 +108,8 @@ impl SectionData {
 /// cx/cz 24 bits suffice for ±8.3M sections.
 #[inline]
 pub fn sec_key(cx: i32, cy: i32, cz: i32) -> u64 {
-    ((((cx as i64) & 0xFF_FFFF) << 40) | (((cz as i64) & 0xFF_FFFF) << 16) | ((cy as i64) & 0xFFFF)) as u64
+    ((((cx as i64) & 0xFF_FFFF) << 40) | (((cz as i64) & 0xFF_FFFF) << 16) | ((cy as i64) & 0xFFFF))
+        as u64
 }
 
 /// Provider result: Ok(data) — populated; Err(()) — chunk absent.
@@ -131,179 +134,141 @@ pub struct GatherFlags {
     pub fall_special: bool,
 }
 
-/// Open-addressed map from section key to data slot (the CellMap pattern:
-/// multiply-shift hash, linear probing, backward-shift deletion — no SipHash
-/// on the L6 hot path).
-struct SecMap {
-    // u64::MAX = empty. sec_key(0,0,0) == 0 (the spawn sections!) — a 0
-    // sentinel made that section UNCACHEABLE: every find() saw an empty
-    // slot, every gather re-called the provider and inserted again, and
-    // get_or_populate pushed a fresh ~18KB data slot per lookup (the 100k
-    // fill burned ~34k slots/tick = the 8GB RSS explosion). Real packed
-    // keys never reach u64::MAX (all three fields maxed simultaneously is
-    // impossible for legal section coords).
-    keys: Vec<u64>,
-    vals: Vec<u32>, // slot+1
-    mask: u64,
-    len: usize,
-}
-
-#[inline]
-fn sec_empty() -> u64 {
-    u64::MAX
-}
-
-impl SecMap {
-    fn new(cap_pow2: usize) -> Self {
-        let n = cap_pow2.max(16);
-        SecMap { keys: vec![sec_empty(); n], vals: vec![0; n], mask: (n - 1) as u64, len: 0 }
-    }
-
-    #[inline]
-    fn find(&self, key: u64) -> Option<u32> {
-        let mut i = (crate::hash64(key) & self.mask) as usize;
-        loop {
-            let k = self.keys[i];
-            if k == sec_empty() {
-                return None;
-            }
-            if k == key {
-                return Some(self.vals[i] - 1);
-            }
-            i = (i + 1) & self.mask as usize;
-        }
-    }
-
-    fn insert(&mut self, key: u64, slot: u32) {
-        if (self.len + 1) * 10 >= self.keys.len() * 7 {
-            self.grow();
-        }
-        let mut i = (crate::hash64(key) & self.mask) as usize;
-        loop {
-            let k = self.keys[i];
-            if k == sec_empty() {
-                self.keys[i] = key;
-                self.vals[i] = slot + 1;
-                self.len += 1;
-                return;
-            }
-            if k == key {
-                self.vals[i] = slot + 1;
-                return;
-            }
-            i = (i + 1) & self.mask as usize;
-        }
-    }
-
-    fn remove(&mut self, key: u64) {
-        let mut i = (crate::hash64(key) & self.mask) as usize;
-        loop {
-            let k = self.keys[i];
-            if k == 0 {
-                return;
-            }
-            if k == key {
-                let n = self.keys.len();
-                let mut hole = i;
-                let mut j = (i + 1) & (n - 1);
-                while self.keys[j] != sec_empty() {
-                    let ideal = (crate::hash64(self.keys[j]) & self.mask) as usize;
-                    let d = (j.wrapping_sub(ideal)) & (n - 1);
-                    let h = (hole.wrapping_sub(ideal)) & (n - 1);
-                    if h < d {
-                        self.keys[hole] = self.keys[j];
-                        self.vals[hole] = self.vals[j];
-                        hole = j;
-                    }
-                    j = (j + 1) & (n - 1);
-                }
-                self.keys[hole] = sec_empty();
-                self.vals[hole] = 0;
-                self.len -= 1;
-                return;
-            }
-            i = (i + 1) & self.mask as usize;
-        }
-    }
-
-    fn grow(&mut self) {
-        let n = self.keys.len() * 2;
-        let old_keys = std::mem::replace(&mut self.keys, vec![sec_empty(); n]);
-        let old_vals = std::mem::replace(&mut self.vals, vec![0; n]);
-        self.mask = (n - 1) as u64;
-        self.len = 0;
-        for i in 0..old_keys.len() {
-            if old_keys[i] != sec_empty() {
-                self.insert(old_keys[i], old_vals[i] - 1);
-            }
-        }
-    }
-}
-
 /// Small per-block property copy for the hot lookups.
 pub type BlockProps = (f32, f32, bool, bool, bool, bool, bool, bool);
 
+// ---------------------------------------------------------------------------
+// L8 — THREAD-SAFE SECTION CACHE.
+//
+// The flush is rayon-parallel (the store shards cleanly by id), so the
+// section cache must serve concurrent gathers. Design:
+//
+//   * 16 shards, each an RwLock<HashMap<u64, Arc<SectionData>>>;
+//   * READS take the shard read-lock only to clone an Arc (~8 bytes) —
+//     the block scan itself runs LOCK-FREE on the Arc payload;
+//   * a MISS runs the provider up-call (JNI) with NO lock held, then takes
+//     the write-lock once to insert (double-check via the entry API, so a
+//     concurrent hydrate of the same section wins cheaply);
+//   * invalidation takes one write-lock — a block change invalidates one
+//     section, never the whole grid.
+//
+// Determinism: a section's payload is immutable once published (block
+// changes invalidate + re-publish a NEW Arc), so a gather never observes a
+// torn or half-updated section. The up-call itself is thread-safe: the
+// Java provider reads loaded chunk sections only (`getChunkNow`, no load)
+// or attaches and loads synchronously for the `load=true` paths.
+// ---------------------------------------------------------------------------
+
+const GRID_SHARDS: usize = 16;
+
+/// Minimal fast hasher (multiply-rotate; the map keys are already-mixed
+/// sec_key values from `hash64`, so a heavy SipHash is pure tax).
+#[derive(Clone, Default)]
+struct ShardHasher(u64);
+
+impl std::hash::Hasher for ShardHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, _bytes: &[u8]) {
+        // unreachable: the map hashes u64 keys only
+        debug_assert!(false, "ShardHasher hashes u64 keys only");
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = crate::hash64(v);
+    }
+}
+
+#[derive(Clone, Default)]
+struct ShardBuild;
+
+impl std::hash::BuildHasher for ShardBuild {
+    type Hasher = ShardHasher;
+    #[inline]
+    fn build_hasher(&self) -> ShardHasher {
+        ShardHasher(0)
+    }
+}
+
+type ShardMap = std::collections::HashMap<u64, Arc<SectionData>, ShardBuild>;
+
 /// Per-world section cache.
 pub struct SectionGrid {
-    map: SecMap,
-    data: Vec<SectionData>, // slot 0 unused
-    free: Vec<u32>,
-    pub populated: u64,
-    pub lookups: u64,
+    shards: Vec<RwLock<ShardMap>>,
+    pub populated: AtomicU64,
+    pub lookups: AtomicU64,
+}
+
+impl Default for SectionGrid {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SectionGrid {
     pub fn new() -> SectionGrid {
         SectionGrid {
-            map: SecMap::new(1 << 10),
-            data: vec![SectionData::all_air()],
-            free: Vec::new(),
-            populated: 0,
-            lookups: 0,
-        }
-    }
-
-    pub fn invalidate_all(&mut self) {
-        self.map = SecMap::new(1 << 10);
-        self.data.truncate(1);
-        self.free.clear();
-    }
-
-    pub fn invalidate(&mut self, cx: i32, cy: i32, cz: i32) {
-        if let Some(slot) = self.map.find(sec_key(cx, cy, cz)) {
-            self.data[slot as usize] = SectionData::all_air(); // keep capacity
-            self.map.remove(sec_key(cx, cy, cz));
-            self.free.push(slot);
+            shards: (0..GRID_SHARDS)
+                .map(|_| {
+                    RwLock::new(std::collections::HashMap::with_capacity_and_hasher(
+                        1 << 10,
+                        ShardBuild,
+                    ))
+                })
+                .collect(),
+            populated: AtomicU64::new(0),
+            lookups: AtomicU64::new(0),
         }
     }
 
     #[inline]
-    fn get_or_populate(&mut self, cx: i32, cy: i32, cz: i32, load: bool, provider: SectionProvider) -> Result<usize, ()> {
+    fn shard(&self, key: u64) -> &RwLock<ShardMap> {
+        &self.shards[(key & (GRID_SHARDS as u64 - 1)) as usize]
+    }
+
+    pub fn invalidate_all(&self) {
+        for s in &self.shards {
+            let mut m = s.write().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+        }
+    }
+
+    pub fn invalidate(&self, cx: i32, cy: i32, cz: i32) {
         let key = sec_key(cx, cy, cz);
-        if let Some(slot) = self.map.find(key) {
-            return Ok(slot as usize);
-        }
-        match provider(cx, cy, cz, load) {
-            Ok(data) => {
-                self.populated += 1;
-                let slot = match self.free.pop() {
-                    Some(s) => {
-                        self.data[s as usize] = data;
-                        s as usize
-                    }
-                    None => {
-                        self.data.push(data);
-                        self.data.len() - 1
-                    }
-                };
-                self.map.insert(key, slot as u32);
-                Ok(slot)
-            }
-            Err(()) => {
-                // Cache absence for THIS query only; do not poison the map.
-                Err(())
+        let mut m = self.shard(key).write().unwrap_or_else(|e| e.into_inner());
+        m.remove(&key);
+    }
+
+    #[inline]
+    fn get_or_populate(
+        &self,
+        cx: i32,
+        cy: i32,
+        cz: i32,
+        load: bool,
+        provider: SectionProvider,
+    ) -> Result<Arc<SectionData>, ()> {
+        let key = sec_key(cx, cy, cz);
+        let shard = self.shard(key);
+        {
+            let m = shard.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(d) = m.get(&key) {
+                return Ok(Arc::clone(d));
             }
         }
+        // Provider up-call with NO lock held (a JNI call must not sit on a
+        // mutex other workers need).
+        let data = provider(cx, cy, cz, load)?;
+        let arc = Arc::new(data);
+        let mut m = shard.write().unwrap_or_else(|e| e.into_inner());
+        self.populated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Double-check insert: a concurrent worker may have published the
+        // same section while the up-call ran — keep exactly one payload.
+        Ok(Arc::clone(m.entry(key).or_insert_with(|| Arc::clone(&arc))))
     }
 
     /// Gather every single-cuboid block collider intersecting `box`, exactly
@@ -311,7 +276,7 @@ impl SectionGrid {
     /// non-special universe (collisionFlags = 4: border handled by the
     /// caller; no chunk loading).
     pub fn gather(
-        &mut self,
+        &self,
         box_: &Aabb6,
         min_section_y: i32,
         max_section_y: i32,
@@ -345,24 +310,54 @@ impl SectionGrid {
                     }
                     // sectionAdjust = 1: our sections are non-special by
                     // construction (special ones make items route vanilla).
-                    let min_x_it = if curr_chunk_x == min_chunk_x { (min_block_x & 15) + 1 } else { 0 };
-                    let max_x_it = if curr_chunk_x == max_chunk_x { (max_block_x & 15) - 1 } else { 15 };
-                    let min_y_it = if curr_chunk_y == min_chunk_y { (min_block_y & 15) + 1 } else { 0 };
-                    let max_y_it = if curr_chunk_y == max_chunk_y { (max_block_y & 15) - 1 } else { 15 };
-                    let min_z_it = if curr_chunk_z == min_chunk_z { (min_block_z & 15) + 1 } else { 0 };
-                    let max_z_it = if curr_chunk_z == max_chunk_z { (max_block_z & 15) - 1 } else { 15 };
+                    let min_x_it = if curr_chunk_x == min_chunk_x {
+                        (min_block_x & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_x_it = if curr_chunk_x == max_chunk_x {
+                        (max_block_x & 15) - 1
+                    } else {
+                        15
+                    };
+                    let min_y_it = if curr_chunk_y == min_chunk_y {
+                        (min_block_y & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_y_it = if curr_chunk_y == max_chunk_y {
+                        (max_block_y & 15) - 1
+                    } else {
+                        15
+                    };
+                    let min_z_it = if curr_chunk_z == min_chunk_z {
+                        (min_block_z & 15) + 1
+                    } else {
+                        0
+                    };
+                    let max_z_it = if curr_chunk_z == max_chunk_z {
+                        (max_block_z & 15) - 1
+                    } else {
+                        15
+                    };
                     if min_x_it > max_x_it || min_y_it > max_y_it || min_z_it > max_z_it {
                         continue;
                     }
-                    self.lookups += 1;
-                    let slot = match self.get_or_populate(curr_chunk_x, curr_chunk_y, curr_chunk_z, false, provider) {
-                        Ok(s) => s,
+                    self.lookups
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let data = match self.get_or_populate(
+                        curr_chunk_x,
+                        curr_chunk_y,
+                        curr_chunk_z,
+                        false,
+                        provider,
+                    ) {
+                        Ok(d) => d,
                         Err(()) => {
                             flags.unloaded = true;
                             continue;
                         }
                     };
-                    let data = &self.data[slot];
                     if data.complex {
                         flags.complex = true;
                         // Multi-cuboid shapes are not stored as boxes; the
@@ -380,7 +375,9 @@ impl SectionGrid {
                                 if idx == AIR_IDX {
                                     continue;
                                 }
-                                let Some(entry) = data.entries.get(idx as usize) else { continue };
+                                let Some(entry) = data.entries.get(idx as usize) else {
+                                    continue;
+                                };
                                 if entry.fall_on_special {
                                     flags.fall_special = true;
                                 }
@@ -388,7 +385,14 @@ impl SectionGrid {
                                 let wx = (curr_chunk_x << 4) as f64 + cx as f64;
                                 let wy = (curr_chunk_y << 4) as f64 + cy as f64;
                                 let wz = (curr_chunk_z << 4) as f64 + cz as f64;
-                                let world_box = Aabb6::new(rel.x0 + wx, rel.y0 + wy, rel.z0 + wz, rel.x1 + wx, rel.y1 + wy, rel.z1 + wz);
+                                let world_box = Aabb6::new(
+                                    rel.x0 + wx,
+                                    rel.y0 + wy,
+                                    rel.z0 + wz,
+                                    rel.x1 + wx,
+                                    rel.y1 + wy,
+                                    rel.z1 + wz,
+                                );
                                 if voxel_shape_intersect(box_, &world_box) {
                                     out.push(world_box);
                                 }
@@ -407,17 +411,25 @@ impl SectionGrid {
     /// speed, is_water, has_fluid, cobweb, entity_inside_special,
     /// step_on_special, fall_on_special) — a small copy, no palette clone.
     #[allow(clippy::type_complexity)]
-    pub fn block_at(&mut self, x: i32, y: i32, z: i32, min_section_y: i32, max_section_y: i32, provider: SectionProvider) -> (Option<BlockProps>, bool) {
+    pub fn block_at(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_section_y: i32,
+        max_section_y: i32,
+        provider: SectionProvider,
+    ) -> (Option<BlockProps>, bool) {
         let cx = x >> 4;
         let cy = y >> 4;
         let cz = z >> 4;
         if cy < min_section_y || cy > max_section_y {
             return (None, false);
         }
-        self.lookups += 1;
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.get_or_populate(cx, cy, cz, true, provider) {
-            Ok(slot) => {
-                let data = &self.data[slot];
+            Ok(data) => {
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
                 let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
                 // copy only the small fields the callers need (no PaletteEntry
@@ -444,17 +456,25 @@ impl SectionGrid {
     }
 
     /// The collider of one block, for find_supporting_block (Aabb6 is Copy).
-    pub fn block_box_at(&mut self, x: i32, y: i32, z: i32, min_section_y: i32, max_section_y: i32, provider: SectionProvider) -> (Option<Aabb6>, bool) {
+    pub fn block_box_at(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_section_y: i32,
+        max_section_y: i32,
+        provider: SectionProvider,
+    ) -> (Option<Aabb6>, bool) {
         let cx = x >> 4;
         let cy = y >> 4;
         let cz = z >> 4;
         if cy < min_section_y || cy > max_section_y {
             return (None, false);
         }
-        self.lookups += 1;
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.get_or_populate(cx, cy, cz, true, provider) {
-            Ok(slot) => {
-                let data = &self.data[slot];
+            Ok(data) => {
                 let local = ((x & 15) | ((z & 15) << 4) | ((y & 15) << 8)) as usize;
                 let idx = data.blocks.get(local).copied().unwrap_or(AIR_IDX);
                 (data.entry(idx).and_then(|e| e.collider), false)

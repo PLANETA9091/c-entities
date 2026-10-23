@@ -29,8 +29,8 @@
 //! flush (TickOutcome::VANILLA_NEXT).
 
 use crate::itemtick::{
-    mth_equal, mth_floor, perform_collisions, voxel_shape_intersect, Aabb6, EPS7, FRICTION_F32_AS_F64,
-    GATE_HORZ_SQR, ITEM_GRAVITY, MOVE_EPS, Y_DRAG,
+    mth_equal, mth_floor, perform_collisions, voxel_shape_intersect, Aabb6, EPS7,
+    FRICTION_F32_AS_F64, GATE_HORZ_SQR, ITEM_GRAVITY, MOVE_EPS, Y_DRAG,
 };
 use crate::sections::{SectionGrid, SectionProvider};
 
@@ -197,7 +197,10 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new() -> Scratch {
-        Scratch { boxes: Vec::with_capacity(64), visited: Vec::with_capacity(32) }
+        Scratch {
+            boxes: Vec::with_capacity(64),
+            visited: Vec::with_capacity(32),
+        }
     }
 }
 
@@ -222,7 +225,7 @@ pub fn tick_item(
     st: &mut ItemState,
     id: i64,
     env: &TickEnv,
-    sg: &mut SectionGrid,
+    sg: &SectionGrid,
     scratch: &mut Scratch,
     provider: SectionProvider,
 ) -> TickOutcome {
@@ -243,11 +246,20 @@ pub fn tick_item(
     // The probe happens after gravity in vanilla but reads only the box, so
     // hoisting it before the mutation phase is exact.
     let deflated = box_now.deflate(1.0e-7);
-    let flags_np = sg.gather(&deflated, env.min_section_y, env.max_section_y, provider, &mut scratch.boxes);
+    let flags_np = sg.gather(
+        &deflated,
+        env.min_section_y,
+        env.max_section_y,
+        provider,
+        &mut scratch.boxes,
+    );
     if flags_np.unloaded || flags_np.complex || flags_np.any_fluid {
         out.set(TickOutcome::VANILLA_NEXT);
     }
-    let stuck_in_block = scratch.boxes.iter().any(|b| voxel_shape_intersect(&deflated, b));
+    let stuck_in_block = scratch
+        .boxes
+        .iter()
+        .any(|b| voxel_shape_intersect(&deflated, b));
     if stuck_in_block {
         // vanilla would run moveTowardsClosestSpace + a noPhysics move;
         // freeze one tick, the vanilla body unsticks next tick (only
@@ -262,7 +274,9 @@ pub fn tick_item(
     let delta_pre_gravity = (st.dx, st.dy, st.dz);
     let mv0 = (st.dx, dy_g, st.dz);
     let horiz_sqr = st.dx * st.dx + st.dz * st.dz;
-    let gate = !st.on_ground || horiz_sqr > GATE_HORZ_SQR || (st.tick_count.wrapping_add(id as i32) % 4) == 0;
+    let gate = !st.on_ground
+        || horiz_sqr > GATE_HORZ_SQR
+        || (st.tick_count.wrapping_add(id as i32) % 4) == 0;
 
     // collide inputs (read-only)
     let mut mv = mv0;
@@ -286,16 +300,40 @@ pub fn tick_item(
         let swept = if mv.0 == 0.0 && mv.2 == 0.0 {
             if mv.1 < 0.0 {
                 // cutDownwards
-                Aabb6::new(box_now.x0, box_now.y0 + mv.1, box_now.z0, box_now.x1, box_now.y0, box_now.z1)
+                Aabb6::new(
+                    box_now.x0,
+                    box_now.y0 + mv.1,
+                    box_now.z0,
+                    box_now.x1,
+                    box_now.y0,
+                    box_now.z1,
+                )
             } else {
                 // cutUpwards
-                Aabb6::new(box_now.x0, box_now.y1, box_now.z0, box_now.x1, box_now.y1 + mv.1, box_now.z1)
+                Aabb6::new(
+                    box_now.x0,
+                    box_now.y1,
+                    box_now.z0,
+                    box_now.x1,
+                    box_now.y1 + mv.1,
+                    box_now.z1,
+                )
             }
         } else {
             Aabb6::expand_towards(&box_now, mv.0, mv.1, mv.2)
         };
-        let swept_flags = sg.gather(&swept, env.min_section_y, env.max_section_y, provider, &mut scratch.boxes);
-        if swept_flags.unloaded || swept_flags.complex || swept_flags.any_fluid || swept_flags.fall_special {
+        let swept_flags = sg.gather(
+            &swept,
+            env.min_section_y,
+            env.max_section_y,
+            provider,
+            &mut scratch.boxes,
+        );
+        if swept_flags.unloaded
+            || swept_flags.complex
+            || swept_flags.any_fluid
+            || swept_flags.fall_special
+        {
             // exact collide impossible (or a fallOn bounce override sits in
             // the swept region): freeze + vanilla next tick
             out.set(TickOutcome::ABORTED | TickOutcome::VANILLA_NEXT);
@@ -311,24 +349,67 @@ pub fn tick_item(
 
         // friction/speed resolution at the NEW position (read-only; memo
         // first — the memo is invalidated by resyncs and position changes)
-        let probe = ItemState { x: new_pos.0, y: new_pos.1, z: new_pos.2, sup_x: st.sup_x, sup_y: st.sup_y, sup_z: st.sup_z, sup_present: st.sup_present, ..*st };
+        let probe = ItemState {
+            x: new_pos.0,
+            y: new_pos.1,
+            z: new_pos.2,
+            sup_x: st.sup_x,
+            sup_y: st.sup_y,
+            sup_z: st.sup_z,
+            sup_present: st.sup_present,
+            ..*st
+        };
         let (bx, by, bz) = get_on_pos_friction(&probe);
         if st.fr_pos == (bx, by, bz) {
             below_friction = st.friction;
             below_speed = st.speed;
             below_step_special = st.fr_step_special;
         } else {
-            let (entry, _unloaded) = sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
-            let below = entry.unwrap_or((AIR_FRICTION, AIR_SPEED, false, false, false, false, false, false));
+            let (entry, _unloaded) =
+                sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
+            let below = entry.unwrap_or((
+                AIR_FRICTION,
+                AIR_SPEED,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ));
             below_friction = below.0;
             below_speed = below.1;
             below_step_special = below.6;
         }
 
-        let at = (mth_floor(new_pos.0), mth_floor(new_pos.1), mth_floor(new_pos.2));
-        let (entry_at, _u) = sg.block_at(at.0, at.1, at.2, env.min_section_y, env.max_section_y, provider);
-        let at_e = entry_at.unwrap_or((AIR_FRICTION, AIR_SPEED, false, false, false, false, false, false));
-        at_speed = if !at_e.2 && at_e.1 == 1.0 { below_speed } else { at_e.1 };
+        let at = (
+            mth_floor(new_pos.0),
+            mth_floor(new_pos.1),
+            mth_floor(new_pos.2),
+        );
+        let (entry_at, _u) = sg.block_at(
+            at.0,
+            at.1,
+            at.2,
+            env.min_section_y,
+            env.max_section_y,
+            provider,
+        );
+        let at_e = entry_at.unwrap_or((
+            AIR_FRICTION,
+            AIR_SPEED,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        at_speed = if !at_e.2 && at_e.1 == 1.0 {
+            below_speed
+        } else {
+            at_e.1
+        };
         at_is_water = at_e.2;
 
         // checkInsideBlocks path scan (movement < 1 block for native items;
@@ -433,7 +514,16 @@ pub fn tick_item(
                            // kept faithful)
         }
         // memo update
-        let (bx, by, bz) = get_on_pos_friction(&ItemState { x: st.x, y: st.y, z: st.z, sup_x: st.sup_x, sup_y: st.sup_y, sup_z: st.sup_z, sup_present: st.sup_present, ..*st });
+        let (bx, by, bz) = get_on_pos_friction(&ItemState {
+            x: st.x,
+            y: st.y,
+            z: st.z,
+            sup_x: st.sup_x,
+            sup_y: st.sup_y,
+            sup_z: st.sup_z,
+            sup_present: st.sup_present,
+            ..*st
+        });
         st.fr_pos = (bx, by, bz);
         st.friction = below_friction;
         st.speed = below_speed;
@@ -513,7 +603,7 @@ fn new_on_ground(mv: (f64, f64, f64), collided: (f64, f64, f64)) -> bool {
 /// axisStepOrder, the box at each segment end deflated by 1e-5, blocks in
 /// floor ranges, shared visited set, air skipped. Returns (special, cobweb).
 fn check_inside_blocks(
-    sg: &mut SectionGrid,
+    sg: &SectionGrid,
     env: &TickEnv,
     from: (f64, f64, f64),
     to: (f64, f64, f64),
@@ -553,7 +643,8 @@ fn check_inside_blocks(
                         continue;
                     }
                     scratch.visited.push((bx, by, bz));
-                    let (entry, unloaded) = sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
+                    let (entry, unloaded) =
+                        sg.block_at(bx, by, bz, env.min_section_y, env.max_section_y, provider);
                     // (fr, speed, water, fluid, cobweb, inside, step, fall)
                     // air (or unloaded -> vanilla reads air) yields None
                     if let Some(e) = (match (entry, unloaded) {
@@ -575,7 +666,15 @@ fn check_inside_blocks(
 
 /// `Level.findSupportingBlock` (Paper): min distToCenterSqr, ties by
 /// BlockPos compareTo (Y, then Z, then X), over the section cache.
-fn find_supporting_block(sg: &mut SectionGrid, env: &TickEnv, box_: &Aabb6, ex: f64, ey: f64, ez: f64, provider: SectionProvider) -> Option<(i32, i32, i32)> {
+fn find_supporting_block(
+    sg: &SectionGrid,
+    env: &TickEnv,
+    box_: &Aabb6,
+    ex: f64,
+    ey: f64,
+    ez: f64,
+    provider: SectionProvider,
+) -> Option<(i32, i32, i32)> {
     let min_block_x = mth_floor(box_.x0 - EPS7) - 1;
     let max_block_x = mth_floor(box_.x1 + EPS7) + 1;
     let min_block_y = ((env.min_section_y << 4) - 1).max(mth_floor(box_.y0 - EPS7) - 1);
@@ -590,7 +689,8 @@ fn find_supporting_block(sg: &mut SectionGrid, env: &TickEnv, box_: &Aabb6, ex: 
     for cy in min_block_y..=max_block_y {
         for cz in min_block_z..=max_block_z {
             for cx in min_block_x..=max_block_x {
-                let (rel, unloaded) = sg.block_box_at(cx, cy, cz, env.min_section_y, env.max_section_y, provider);
+                let (rel, unloaded) =
+                    sg.block_box_at(cx, cy, cz, env.min_section_y, env.max_section_y, provider);
                 let rel = match (rel, unloaded) {
                     (Some(r), false) => r,
                     _ => continue,
@@ -627,9 +727,24 @@ fn find_supporting_block(sg: &mut SectionGrid, env: &TickEnv, box_: &Aabb6, ex: 
 }
 
 /// `Entity.checkSupportingBlock(onGround, movement)`.
-fn check_supporting_block(sg: &mut SectionGrid, env: &TickEnv, st: &mut ItemState, box_: &Aabb6, movement: (f64, f64, f64), _scratch: &mut Scratch, provider: SectionProvider) {
+fn check_supporting_block(
+    sg: &SectionGrid,
+    env: &TickEnv,
+    st: &mut ItemState,
+    box_: &Aabb6,
+    movement: (f64, f64, f64),
+    _scratch: &mut Scratch,
+    provider: SectionProvider,
+) {
     if st.on_ground {
-        let slab = Aabb6::new(box_.x0, box_.y0 - 1.0e-6, box_.z0, box_.x1, box_.y0, box_.z1);
+        let slab = Aabb6::new(
+            box_.x0,
+            box_.y0 - 1.0e-6,
+            box_.z0,
+            box_.x1,
+            box_.y0,
+            box_.z1,
+        );
         let mut final_found = find_supporting_block(sg, env, &slab, st.x, st.y, st.z, provider);
         if final_found.is_none() && !st.on_ground_no_blocks {
             let slab2 = Aabb6::new(

@@ -8,7 +8,9 @@
 
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, AIR_IDX};
-use centities_core::tick::{tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome};
+use centities_core::tick::{
+    tick_item, tick_item_inactive, ItemState, Scratch, TickEnv, TickOutcome,
+};
 
 const MIN_SEC: i32 = 0;
 const MAX_SEC: i32 = 23;
@@ -49,7 +51,9 @@ fn air_entry() -> PaletteEntry {
 
 /// Flat world: chunk (0,0) only; ground = one full-cube layer at y=63
 /// (section 3), air everywhere above; chunks beyond (0,0) are unloaded.
-fn flat_world(cobweb_at: Option<(i32, i32, i32)>) -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
+fn flat_world(
+    cobweb_at: Option<(i32, i32, i32)>,
+) -> impl FnMut(i32, i32, i32, bool) -> Result<SectionData, ()> {
     move |cx, cy, cz, _load| {
         if cx != 0 || cz != 0 {
             return Err(()); // unloaded
@@ -120,9 +124,13 @@ fn resting_item_position_freezes_and_delta_oscillates() {
     for tick in 1..=12i32 {
         st.tick_count = tick; // the dispatcher ++ed before the guard fires (post-increment)
         let before = (st.x, st.y, st.z);
-        let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+        let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
         // position NEVER changes for a resting item
-        assert_eq!((st.x, st.y, st.z), before, "tick {tick}: resting position moved");
+        assert_eq!(
+            (st.x, st.y, st.z),
+            before,
+            "tick {tick}: resting position moved"
+        );
         assert!(!out.has(TickOutcome::MOVED), "tick {tick}");
         assert!(out.has(TickOutcome::ON_GROUND), "tick {tick}");
         assert_eq!(st.age, tick);
@@ -130,7 +138,10 @@ fn resting_item_position_freezes_and_delta_oscillates() {
             // gate tick: gravity accumulated 3 ticks then the move zeroes dy
             assert_eq!(st.dy, 0.0, "tick {tick}");
             assert!(out.has(TickOutcome::V_COLL), "tick {tick}");
-            assert!(out.has(TickOutcome::HAS_IMPULSE), "tick {tick}: |ddelta|^2 > 0.01");
+            assert!(
+                out.has(TickOutcome::HAS_IMPULSE),
+                "tick {tick}: |ddelta|^2 > 0.01"
+            );
         } else {
             let k = tick % 4; // gravity ticks since the last zeroing
             assert_eq!(st.dy, -(k as f64) * 0.04, "tick {tick}");
@@ -164,7 +175,7 @@ fn sliding_item_decays_and_merges_on_floor_change() {
 
     // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: 1 % 40 != 0)
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.x, 0.9);
     assert_eq!(st.dx, 0.5 * (0.6f32 * 0.98f32) as f64, "friction 0.588f32");
@@ -172,12 +183,19 @@ fn sliding_item_decays_and_merges_on_floor_change() {
     assert!(!out.has(TickOutcome::MERGE));
     // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, tickCount 2
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     assert!(out.has(TickOutcome::MOVED));
-    assert!(out.has(TickOutcome::MERGE), "floor changed -> cadence 2, tick 2 fires");
+    assert!(
+        out.has(TickOutcome::MERGE),
+        "floor changed -> cadence 2, tick 2 fires"
+    );
     assert!(out.has(TickOutcome::MERGE2));
     let f = (0.6f32 * 0.98f32) as f64;
-    assert_eq!(st.x, 0.9 + 0.5 * f, "tick 2 moves by tick 1's post-friction delta");
+    assert_eq!(
+        st.x,
+        0.9 + 0.5 * f,
+        "tick 2 moves by tick 1's post-friction delta"
+    );
     assert_eq!(st.dx, 0.5 * f * f, "friction applies after the move");
 }
 
@@ -200,22 +218,31 @@ fn falling_item_lands_exactly_on_ground_with_land_event() {
 
     // tick 1: gate open (!onGround); dy_g = -0.64; no hit yet (64.36 > 64).
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.y, 64.36);
-    assert_eq!(st.dy, -0.6272, "air Y drag is the double literal 0.98 (not f32)");
+    assert_eq!(
+        st.dy, -0.6272,
+        "air Y drag is the double literal 0.98 (not f32)"
+    );
     assert!(!out.has(TickOutcome::ON_GROUND));
-    assert!((st.fall_dist - 0.64f32).abs() < 1e-9, "fallDistance += 0.64 (float)");
+    assert!(
+        (st.fall_dist - 0.64f32).abs() < 1e-9,
+        "fallDistance += 0.64 (float)"
+    );
 
     // tick 2: dy_g = -0.6672 - eps; collide clamps to the ground: y = 64.0.
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.y, 64.0, "64.36 - 0.36 == 64.0 exactly");
     assert!(out.has(TickOutcome::ON_GROUND));
     assert!(out.has(TickOutcome::LAND), "landed with fallDistance > 0");
     assert_eq!(st.fall_dist, 0.0, "resetFallDistance");
-    assert!(st.land_fall > 0.0, "pre-reset fallDistance preserved for the Java fallOn");
+    assert!(
+        st.land_fall > 0.0,
+        "pre-reset fallDistance preserved for the Java fallOn"
+    );
     assert_eq!(st.dy, 0.0);
 }
 
@@ -230,11 +257,15 @@ fn gate_phase_follows_tick_count_plus_id() {
     st.tick_count = 0;
     for tick in 1..=8i32 {
         st.tick_count = tick;
-        let out = tick_item(&mut st, 1, &env, &mut sg, &mut scratch, &mut prov);
+        let out = tick_item(&mut st, 1, &env, &sg, &mut scratch, &mut prov);
         let gate_tick = (tick + 1) % 4 == 0;
         assert_eq!(out.has(TickOutcome::V_COLL), gate_tick, "tick {tick}");
         let k = if tick < 3 { tick } else { (tick + 1) % 4 }; // gravity ticks since the last zeroing
-        assert_eq!(st.dy, if gate_tick { 0.0 } else { -(k as f64) * 0.04 }, "tick {tick}");
+        assert_eq!(
+            st.dy,
+            if gate_tick { 0.0 } else { -(k as f64) * 0.04 },
+            "tick {tick}"
+        );
     }
 }
 
@@ -262,7 +293,10 @@ fn inactive_tick_mirrors_vanilla() {
     assert_eq!(st.age, 6000);
     assert!(out.has(TickOutcome::DESPAWN));
     // 32767 pickup delay never decays
-    let mut inf = ItemState { pickup_delay: 32767, ..ItemState::new() };
+    let mut inf = ItemState {
+        pickup_delay: 32767,
+        ..ItemState::new()
+    };
     tick_item_inactive(&mut inf);
     assert_eq!(inf.pickup_delay, 32767);
 }
@@ -284,24 +318,39 @@ fn cobweb_sets_stuck_multiplier_natively() {
         ..ItemState::new()
     };
     st.tick_count = 1;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     assert!(!out.has(TickOutcome::ABORTED));
-    assert_eq!(st.stuck, (0.25, 0.05, 0.25), "makeStuckInBlock(0.25, 0.05, 0.25)");
+    assert_eq!(
+        st.stuck,
+        (0.25, 0.05, 0.25),
+        "makeStuckInBlock(0.25, 0.05, 0.25)"
+    );
     assert_eq!(st.fall_dist, 0.0, "resetFallDistance");
-    assert_eq!(st.y, 64.06, "tick 1 moved by dy_g = -0.14 (web has no collision)");
+    assert_eq!(
+        st.y, 64.06,
+        "tick 1 moved by dy_g = -0.14 (web has no collision)"
+    );
     // next tick: the move scales by the stuck multiplier, delta zeroes
     st.tick_count = 2;
-    let out = tick_item(&mut st, 0, &env, &mut sg, &mut scratch, &mut prov);
+    let out = tick_item(&mut st, 0, &env, &sg, &mut scratch, &mut prov);
     // vanilla: move() consumed the multiplier (movement was stuck-scaled,
     // delta zeroed), then entityInside RE-APPLIED makeStuckInBlock — the
     // field is (0.25, 0.05, 0.25) after every tick inside the web.
-    assert_eq!(st.stuck, (0.25, 0.05, 0.25), "re-applied every tick inside the web");
+    assert_eq!(
+        st.stuck,
+        (0.25, 0.05, 0.25),
+        "re-applied every tick inside the web"
+    );
     assert_eq!(st.dy, 0.0, "setDeltaMovement(Vec3.ZERO) inside move");
     // dy after tick 1: -0.14 * 0.98 (air drag double); tick 2: dy_g = that - 0.04,
     // movement scaled by stuck.y = 0.05
     let dy1 = -0.14 * 0.98;
     let expected = 64.06 + (dy1 - 0.04) * 0.05;
-    assert_eq!(st.y, expected, "stuck-scaled movement applied: {} vs {expected}", st.y);
+    assert_eq!(
+        st.y, expected,
+        "stuck-scaled movement applied: {} vs {expected}",
+        st.y
+    );
 }
 
 #[test]
@@ -312,13 +361,24 @@ fn collide_matches_bruteforce_reference() {
         // (moved-axis src lo/hi, moved-axis target lo/hi,
         //  perp1 src lo/hi, perp1 target lo/hi,
         //  perp2 src lo/hi, perp2 target lo/hi)
-        let (s_lo, s_hi, m_lo, m_hi, o1_lo, o1_hi, o1t_lo, o1t_hi, o2_lo, o2_hi, o2t_lo, o2t_hi) = match axis {
-            0 => (src.x0, src.x1, t.x0, t.x1, src.y0, src.y1, t.y0, t.y1, src.z0, src.z1, t.z0, t.z1),
-            1 => (src.y0, src.y1, t.y0, t.y1, src.x0, src.x1, t.x0, t.x1, src.z0, src.z1, t.z0, t.z1),
-            _ => (src.z0, src.z1, t.z0, t.z1, src.x0, src.x1, t.x0, t.x1, src.y0, src.y1, t.y0, t.y1),
-        };
+        let (s_lo, s_hi, m_lo, m_hi, o1_lo, o1_hi, o1t_lo, o1t_hi, o2_lo, o2_hi, o2t_lo, o2t_hi) =
+            match axis {
+                0 => (
+                    src.x0, src.x1, t.x0, t.x1, src.y0, src.y1, t.y0, t.y1, src.z0, src.z1, t.z0,
+                    t.z1,
+                ),
+                1 => (
+                    src.y0, src.y1, t.y0, t.y1, src.x0, src.x1, t.x0, t.x1, src.z0, src.z1, t.z0,
+                    t.z1,
+                ),
+                _ => (
+                    src.z0, src.z1, t.z0, t.z1, src.x0, src.x1, t.x0, t.x1, src.y0, src.y1, t.y0,
+                    t.y1,
+                ),
+            };
         let eps = 1.0e-7;
-        let perp = (o1_lo - o1t_hi < -eps && o1_hi - o1t_lo > eps) && (o2_lo - o2t_hi < -eps && o2_hi - o2t_lo > eps);
+        let perp = (o1_lo - o1t_hi < -eps && o1_hi - o1t_lo > eps)
+            && (o2_lo - o2t_hi < -eps && o2_hi - o2t_lo > eps);
         if !perp {
             return mv;
         }
@@ -408,7 +468,10 @@ fn collide_matches_bruteforce_reference() {
         );
         let got = centities_core::itemtick::perform_collisions(mv, &b, &boxes);
         let want = ref_collide(mv, &b, &boxes);
-        assert_eq!(got, want, "case {case}: collide mismatch (mv={mv:?}, box={b:?}, boxes={boxes:?})");
+        assert_eq!(
+            got, want,
+            "case {case}: collide mismatch (mv={mv:?}, box={b:?}, boxes={boxes:?})"
+        );
     }
 }
 

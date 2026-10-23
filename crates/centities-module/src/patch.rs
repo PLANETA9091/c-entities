@@ -47,35 +47,35 @@ struct CpInfo {
 fn code_has_switch_or_wide(code: &[u8]) -> bool {
     fn fixed_len(op: u8) -> Option<usize> {
         Some(match op {
-            0x00..=0x0f => 1,                  // consts, aconst_null
-            0x10 => 2,                         // bipush
-            0x11 => 3,                         // sipush
-            0x12 => 2,                         // ldc
-            0x13 | 0x14 => 3,                  // ldc_w, ldc2_w
-            0x15..=0x19 => 2,                  // xload n
-            0x1a..=0x35 => 1,                  // xload_n, array loads
-            0x36..=0x3a => 2,                  // xstore n
-            0x3b..=0x56 => 1,                  // xstore_n, array stores
-            0x57..=0x5f => 1,                  // stack ops
-            0x60..=0x83 => 1,                  // arithmetic, bitwise
-            0x84 => 3,                         // iinc
-            0x85..=0x93 => 1,                  // conversions
-            0x94..=0x98 => 1,                  // lcmp, fcmpl..dcmpg
-            0x99..=0xa8 => 3,                  // if*, goto, jsr
-            0xa9 => 2,                         // ret
-            0xac..=0xb1 => 1,                  // returns
-            0xb2..=0xb8 => 3,                  // field/method accesses
-            0xb9 | 0xba => 5,                  // invokeinterface, invokedynamic
-            0xbb => 3,                         // new
-            0xbc => 2,                         // newarray
-            0xbd => 3,                         // anewarray
-            0xbe | 0xbf => 1,                  // arraylength, athrow
-            0xc0 | 0xc1 => 3,                  // checkcast, instanceof
-            0xc2 | 0xc3 => 1,                  // monitor enter/exit
-            0xc5 => 4,                         // multianewarray
-            0xc6 | 0xc7 => 3,                  // ifnull, ifnonnull
-            0xc8 | 0xc9 => 5,                  // goto_w, jsr_w
-            _ => return None,                  // unknown/reserved — refuse
+            0x00..=0x0f => 1, // consts, aconst_null
+            0x10 => 2,        // bipush
+            0x11 => 3,        // sipush
+            0x12 => 2,        // ldc
+            0x13 | 0x14 => 3, // ldc_w, ldc2_w
+            0x15..=0x19 => 2, // xload n
+            0x1a..=0x35 => 1, // xload_n, array loads
+            0x36..=0x3a => 2, // xstore n
+            0x3b..=0x56 => 1, // xstore_n, array stores
+            0x57..=0x5f => 1, // stack ops
+            0x60..=0x83 => 1, // arithmetic, bitwise
+            0x84 => 3,        // iinc
+            0x85..=0x93 => 1, // conversions
+            0x94..=0x98 => 1, // lcmp, fcmpl..dcmpg
+            0x99..=0xa8 => 3, // if*, goto, jsr
+            0xa9 => 2,        // ret
+            0xac..=0xb1 => 1, // returns
+            0xb2..=0xb8 => 3, // field/method accesses
+            0xb9 | 0xba => 5, // invokeinterface, invokedynamic
+            0xbb => 3,        // new
+            0xbc => 2,        // newarray
+            0xbd => 3,        // anewarray
+            0xbe | 0xbf => 1, // arraylength, athrow
+            0xc0 | 0xc1 => 3, // checkcast, instanceof
+            0xc2 | 0xc3 => 1, // monitor enter/exit
+            0xc5 => 4,        // multianewarray
+            0xc6 | 0xc7 => 3, // ifnull, ifnonnull
+            0xc8 | 0xc9 => 5, // goto_w, jsr_w
+            _ => return None, // unknown/reserved — refuse
         })
     }
     let mut pc = 0usize;
@@ -192,7 +192,9 @@ fn find_code(bytes: &[u8], cp: &CpInfo, name: &str, desc: &str) -> Result<CodeRe
                 1 => {
                     let len = u16at(bytes, i) as usize;
                     if cur == idx {
-                        return Some(String::from_utf8_lossy(&bytes[i + 2..i + 2 + len]).into_owned());
+                        return Some(
+                            String::from_utf8_lossy(&bytes[i + 2..i + 2 + len]).into_owned(),
+                        );
                     }
                     i += 2 + len;
                 }
@@ -300,7 +302,7 @@ fn load_op(ty: u8, slot: u16) -> Result<Vec<u8>, String> {
 /// Insert a stack-neutral static call prefix with loaded arguments.
 /// `args`: (local slot, type char) in call order. Returns patched bytes.
 pub fn insert_static_call_at_start(
-bytes: Vec<u8>,
+    bytes: Vec<u8>,
     method_name: &str,
     method_desc: &str,
     target_class: &str,
@@ -426,7 +428,8 @@ bytes: Vec<u8>,
                     let frame_type = out[q];
                     q += 1;
                     match frame_type {
-                        0..=63 => { // same_frame — no offset field... except it IS the offset
+                        0..=63 => {
+                            // same_frame — no offset field... except it IS the offset
                             if k == 0 {
                                 // same_frame encodes the absolute offset-1; shift it
                                 // by rewriting the whole entry as same_frame with new offset
@@ -438,7 +441,8 @@ bytes: Vec<u8>,
                                 out[q - 1] = new_off as u8;
                             }
                         }
-                        64..=127 => { // same_locals_1_stack_item
+                        64..=127 => {
+                            // same_locals_1_stack_item
                             if k == 0 {
                                 let new_off = (frame_type as u32) - 64 + delta as u32;
                                 if new_off > 63 {
@@ -448,7 +452,8 @@ bytes: Vec<u8>,
                             }
                             q += skip_verification_info(&out, q, 1);
                         }
-                        247 => { // same_locals_1_stack_item_frame_extended
+                        247 => {
+                            // same_locals_1_stack_item_frame_extended
                             if k == 0 {
                                 let v = u16at(&out, q) + delta as u16;
                                 w16(&mut out, q, v);
@@ -456,21 +461,24 @@ bytes: Vec<u8>,
                             q += 2;
                             q += skip_verification_info(&out, q, 1);
                         }
-                        248..=250 => { // chop_frame
+                        248..=250 => {
+                            // chop_frame
                             if k == 0 {
                                 let v = u16at(&out, q) + delta as u16;
                                 w16(&mut out, q, v);
                             }
                             q += 2;
                         }
-                        251 => { // same_frame_extended
+                        251 => {
+                            // same_frame_extended
                             if k == 0 {
                                 let v = u16at(&out, q) + delta as u16;
                                 w16(&mut out, q, v);
                             }
                             q += 2;
                         }
-                        252..=254 => { // append_frame
+                        252..=254 => {
+                            // append_frame
                             if k == 0 {
                                 let v = u16at(&out, q) + delta as u16;
                                 w16(&mut out, q, v);
@@ -478,7 +486,8 @@ bytes: Vec<u8>,
                             q += 2;
                             q += skip_verification_info(&out, q, (frame_type - 251) as usize);
                         }
-                        255 => { // full_frame
+                        255 => {
+                            // full_frame
                             if k == 0 {
                                 let v = u16at(&out, q) + delta as u16;
                                 w16(&mut out, q, v);

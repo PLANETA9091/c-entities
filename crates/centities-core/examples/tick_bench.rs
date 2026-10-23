@@ -1,7 +1,7 @@
 //! L6 core bench: where does the per-item tick time go?
+use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionData, SectionGrid, AIR_IDX};
 use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv};
-use centities_core::itemtick::Aabb6;
 use std::time::Instant;
 
 const MIN_SEC: i32 = 0;
@@ -34,15 +34,26 @@ fn main() {
             let mut data = SectionData::all_air();
             data.entries = vec![
                 PaletteEntry {
-                    collider: None, friction: 0.6, speed: 1.0, is_water: false,
-                    has_fluid: false, cobweb: false, entity_inside_special: false,
-                    step_on_special: false, fall_on_special: false,
+                    collider: None,
+                    friction: 0.6,
+                    speed: 1.0,
+                    is_water: false,
+                    has_fluid: false,
+                    cobweb: false,
+                    entity_inside_special: false,
+                    step_on_special: false,
+                    fall_on_special: false,
                 },
                 PaletteEntry {
                     collider: Some(Aabb6::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)),
-                    friction: 0.6, speed: 1.0, is_water: false, has_fluid: false,
-                    cobweb: false, entity_inside_special: false,
-                    step_on_special: false, fall_on_special: false,
+                    friction: 0.6,
+                    speed: 1.0,
+                    is_water: false,
+                    has_fluid: false,
+                    cobweb: false,
+                    entity_inside_special: false,
+                    step_on_special: false,
+                    fall_on_special: false,
                 },
             ];
             data.blocks = vec![1u16; 4096];
@@ -58,9 +69,15 @@ fn main() {
         let x = ((i % 316) as f64) * 0.5 + 0.25;
         let z = ((i / 316) as f64) * 0.5 + 0.25;
         states.push(ItemState {
-            x, y: 64.0, z,
-            dx: 0.0, dy: -0.04, dz: 0.0,
-            xo: x, yo: 64.0, zo: z,
+            x,
+            y: 64.0,
+            z,
+            dx: 0.0,
+            dy: -0.04,
+            dz: 0.0,
+            xo: x,
+            yo: 64.0,
+            zo: z,
             on_ground: true,
             tick_count: 4,
             age: 100,
@@ -87,7 +104,7 @@ fn main() {
         n,
         dt.as_nanos() as f64 / n as f64,
         moved,
-        sg.lookups,
-        sg.populated
+        sg.lookups.load(std::sync::atomic::Ordering::Relaxed),
+        sg.populated.load(std::sync::atomic::Ordering::Relaxed)
     );
 }

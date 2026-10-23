@@ -133,21 +133,32 @@ fn prefix_patch_is_structurally_sound() {
     let utf8_2 = 3 + "probeTest".len();
     let utf8_3 = 3 + "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)V".len();
     let additions = utf8_1 + utf8_2 + utf8_3 + 3 + 5 + 5; // utf8*3 + Class(3) + NAT(5) + Methodref(5)
-    assert_eq!(new_cs, old_cs + additions, "code_start shifts by CP additions only");
+    assert_eq!(
+        new_cs,
+        old_cs + additions,
+        "code_start shifts by CP additions only"
+    );
     let prefix_len = (new_ce - new_cs) - (old_ce - old_cs);
     // prefix = 4x(2-byte aload/dload) + 3-byte invokestatic = 11
     assert_eq!(prefix_len, 11, "prefix size");
     assert_eq!(new_len, old_len + 11);
 
     // 2. prefix bytes: aload 0..3 (indexed, 8 bytes) + invokestatic (0xb8, 3 bytes)
-    assert_eq!(&patched[new_cs..new_cs + 8], &[0x19, 0, 0x19, 1, 0x19, 2, 0x19, 3]);
+    assert_eq!(
+        &patched[new_cs..new_cs + 8],
+        &[0x19, 0, 0x19, 1, 0x19, 2, 0x19, 3]
+    );
     assert_eq!(patched[new_cs + 8], 0xb8, "invokestatic opcode");
 
     // 3. cp count grew by 6 (utf8 class, utf8 name, utf8 desc, Class, NAT, Methodref)
     assert_eq!(u16at(&patched, 8), u16at(LEVEL, 8) + 6, "cp count");
 
     // 4. total file size delta: CP additions + prefix
-    assert_eq!(patched.len(), LEVEL.len() + additions + 11, "file size delta");
+    assert_eq!(
+        patched.len(),
+        LEVEL.len() + additions + 11,
+        "file size delta"
+    );
 }
 
 #[test]
@@ -240,25 +251,47 @@ fn dump_double_patched_artifacts() {
     const H: &str = "dev/planeta9091/centities/CeHooks";
     // exactly what patch_entity does at runtime
     let e1 = insert_static_call_at_start(
-        ENTITY.to_vec(), "setPos", "(DDD)V", H, "probePos",
+        ENTITY.to_vec(),
+        "setPos",
+        "(DDD)V",
+        H,
+        "probePos",
         "(Lnet/minecraft/world/entity/Entity;DDD)V",
         &[(0, b'L'), (1, b'D'), (3, b'D'), (5, b'D')],
-    ).expect("setPos");
+    )
+    .expect("setPos");
     let e2 = insert_static_call_at_start(
-        e1, "setBoundingBox", "(Lnet/minecraft/world/phys/AABB;)V", H, "probeBox",
+        e1,
+        "setBoundingBox",
+        "(Lnet/minecraft/world/phys/AABB;)V",
+        H,
+        "probeBox",
         "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;)V",
         &[(0, b'L'), (1, b'L')],
-    ).expect("setBoundingBox");
+    )
+    .expect("setBoundingBox");
     std::fs::write("/tmp/EntityPatched.class", e2).unwrap();
     // exactly what patch_lookup does at runtime
     let l1 = insert_static_call_at_start(
-        LOOKUP.to_vec(), "addEntity", "(Lnet/minecraft/world/entity/Entity;ZZ)Z", H, "probeAdd",
-        "(Lnet/minecraft/world/entity/Entity;)V", &[(1, b'L')],
-    ).expect("addEntity");
+        LOOKUP.to_vec(),
+        "addEntity",
+        "(Lnet/minecraft/world/entity/Entity;ZZ)Z",
+        H,
+        "probeAdd",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    )
+    .expect("addEntity");
     let l2 = insert_static_call_at_start(
-        l1, "removeEntity", "(Lnet/minecraft/world/entity/Entity;)V", H, "probeRemove",
-        "(Lnet/minecraft/world/entity/Entity;)V", &[(1, b'L')],
-    ).expect("removeEntity");
+        l1,
+        "removeEntity",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        H,
+        "probeRemove",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    )
+    .expect("removeEntity");
     std::fs::write("/tmp/EntityLookupPatched.class", l2).unwrap();
 }
 
@@ -266,26 +299,48 @@ fn dump_double_patched_artifacts() {
 fn dump_single_patched_artifacts() {
     const H: &str = "dev/planeta9091/centities/CeHooks";
     let a = insert_static_call_at_start(
-        ENTITY.to_vec(), "setPos", "(DDD)V", H, "probePos",
+        ENTITY.to_vec(),
+        "setPos",
+        "(DDD)V",
+        H,
+        "probePos",
         "(Lnet/minecraft/world/entity/Entity;DDD)V",
         &[(0, b'L'), (1, b'D'), (3, b'D'), (5, b'D')],
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write("/tmp/EntityOnlySetPos.class", a).unwrap();
     let b = insert_static_call_at_start(
-        ENTITY.to_vec(), "setBoundingBox", "(Lnet/minecraft/world/phys/AABB;)V", H, "probeBox",
+        ENTITY.to_vec(),
+        "setBoundingBox",
+        "(Lnet/minecraft/world/phys/AABB;)V",
+        H,
+        "probeBox",
         "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;)V",
         &[(0, b'L'), (1, b'L')],
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write("/tmp/EntityOnlySetBB.class", b).unwrap();
     let c = insert_static_call_at_start(
-        LOOKUP.to_vec(), "addEntity", "(Lnet/minecraft/world/entity/Entity;ZZ)Z", H, "probeAdd",
-        "(Lnet/minecraft/world/entity/Entity;)V", &[(1, b'L')],
-    ).unwrap();
+        LOOKUP.to_vec(),
+        "addEntity",
+        "(Lnet/minecraft/world/entity/Entity;ZZ)Z",
+        H,
+        "probeAdd",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    )
+    .unwrap();
     std::fs::write("/tmp/LookupOnlyAdd.class", c).unwrap();
     let d = insert_static_call_at_start(
-        LOOKUP.to_vec(), "removeEntity", "(Lnet/minecraft/world/entity/Entity;)V", H, "probeRemove",
-        "(Lnet/minecraft/world/entity/Entity;)V", &[(1, b'L')],
-    ).unwrap();
+        LOOKUP.to_vec(),
+        "removeEntity",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        H,
+        "probeRemove",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    )
+    .unwrap();
     std::fs::write("/tmp/LookupOnlyRemove.class", d).unwrap();
 }
 
@@ -295,10 +350,15 @@ const ENTITY_RT: &[u8] = include_bytes!("fixtures/EntityRT.class");
 fn dump_rt_input_patched() {
     const H: &str = "dev/planeta9091/centities/CeHooks";
     let a = insert_static_call_at_start(
-        ENTITY_RT.to_vec(), "setPos", "(DDD)V", H, "probePos",
+        ENTITY_RT.to_vec(),
+        "setPos",
+        "(DDD)V",
+        H,
+        "probePos",
         "(Lnet/minecraft/world/entity/Entity;DDD)V",
         &[(0, b'L'), (1, b'D'), (3, b'D'), (5, b'D')],
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write("/tmp/EntityRTPatched.class", a).unwrap();
 }
 
@@ -312,9 +372,7 @@ fn lvt_entry_spans_are_not_shifted() {
     fn lvt_spans(bytes: &[u8], mname: &str, mdesc: &str) -> Vec<(u16, u16)> {
         // minimal walker: cp parse -> methods -> Code -> LVT entries
         let u16at = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
-        let u32at = |b: &[u8], i: usize| {
-            u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-        };
+        let u32at = |b: &[u8], i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
         let mut utf = |idx: u16| -> String {
             let mut i = 10usize;
             let mut cur = 1u16;

@@ -55,7 +55,12 @@ fn main() {
         .status()
         .expect("javac (JDK 17+) must be on PATH");
     assert!(st.success(), "javac failed for CeHooks.java");
-    println!("cargo:rustc-env=CE_HOOKS_CLASS={}", classes.join("dev/planeta9091/centities/CeHooks.class").display());
+    println!(
+        "cargo:rustc-env=CE_HOOKS_CLASS={}",
+        classes
+            .join("dev/planeta9091/centities/CeHooks.class")
+            .display()
+    );
 
     // Embed ALL classes (the bridge may declare nested/helper classes): a
     // simple length-prefixed blob — [u32 count][u16 nameLen][name][u32 len][bytes]...
@@ -72,7 +77,11 @@ fn main() {
     let mut blob: Vec<u8> = Vec::new();
     blob.extend_from_slice(&(names.len() as u32).to_be_bytes());
     for n in &names {
-        let rel = n.strip_prefix(&classes).expect("rel").to_str().expect("utf8");
+        let rel = n
+            .strip_prefix(&classes)
+            .expect("rel")
+            .to_str()
+            .expect("utf8");
         let bytes = std::fs::read(n).expect("class bytes");
         blob.extend_from_slice(&(rel.len() as u16).to_be_bytes());
         blob.extend_from_slice(rel.as_bytes());
