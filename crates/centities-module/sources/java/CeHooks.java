@@ -1427,9 +1427,11 @@ public final class CeHooks {
                 return false;
             }
             // cheap fresh-flag gates: always plain field reads
+            // (stackEmptyDispatch: the cached empty bit replaces the
+            // SynchedEntityData read — 6.55% MSPT on items-100k)
             if (e.isRemoved() || e.noPhysics
                     || e.portalProcess != null || e.portalCooldown > 0
-                    || e.getItem().isEmpty()) {
+                    || stackEmptyDispatch(e)) {
                 dispPass++;
                 return false;
             }
@@ -1576,6 +1578,40 @@ public final class CeHooks {
     private static final int[] MODE_GEN = new int[1 << 22];
     private static volatile int MODE_EPOCH = 1;
     private static final int MAMASK = (1 << 22) - 1;
+
+    // ---- L8.4 empty-stack dispatch cache ----
+    // The tick guard must keep vanilla's FIRST-instruction parity:
+    // ItemEntity.tick() starts with getItem().isEmpty() -> discard(DESPAWN)
+    // (javap-verified on the shipped 1.21.8-60 jar), so empty-stack items
+    // route vanilla. That check costs a SynchedEntityData read per item per
+    // tick — measured 6.55% MSPT (721/11003 samples) on items-100k-mod.
+    // EVERY stack write in ItemEntity goes through setItem (both ctors,
+    // readAdditionalSaveData, merge absorb — javap: 4 call sites, all
+    // invokevirtual setItem), so a prefix probe there keeps an O(1) byte
+    // fresh. Values: 0 = never probed (fall back to the synched read),
+    // 1 = non-empty, 2 = empty. Entity ids are globally monotonic per run,
+    // and any genuinely-empty item was written empty through setItem, so a
+    // probed slot cannot go stale in the empty->native direction.
+    private static final byte[] STACK_EMPTY = new byte[1 << 22];
+
+    /** Woven prefix probe on ItemEntity.setItem — refreshes the dispatch
+     *  cache. Pure cache write: no mode changes, no wake, no state. */
+    public static void probeSetItem(net.minecraft.world.entity.item.ItemEntity e,
+            net.minecraft.world.item.ItemStack st) {
+        try {
+            STACK_EMPTY[e.getId() & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
+        } catch (Throwable ignored) {
+            // cache is an optimization only; the dispatch falls back to the
+            // synched read for unseen slots
+        }
+    }
+
+    /** Empty-stack parity check for the dispatch guard: cached bit when the
+     *  item has been seen by the setItem probe, synched read otherwise. */
+    private static boolean stackEmptyDispatch(net.minecraft.world.entity.item.ItemEntity e) {
+        byte v = STACK_EMPTY[e.getId() & MAMASK];
+        return v == 0 ? e.getItem().isEmpty() : v == (byte) 2;
+    }
 
     // ---- VarHandles (lazy; the bridge class lives in the kernel loader
     // with Paper fully visible) ----

@@ -1214,9 +1214,33 @@ fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                     return None;
                 }
             };
+            // L8.4 empty-stack dispatch cache: EVERY ItemEntity stack write
+            // goes through setItem (both ctors, NBT load, merge absorb —
+            // javap-verified), so this prefix probe keeps the guard's
+            // empty-parity bit fresh and the dispatch off the SynchedEntityData
+            // read (6.55% MSPT on items-100k-mod). Pure cache refresh — the
+            // woven call must never fail arming (the fallback read is exact).
+            let pre3 = match patch::insert_static_call_at_start(
+                pre2,
+                "setItem",
+                "(Lnet/minecraft/world/item/ItemStack;)V",
+                HOOKS_CLASS,
+                "probeSetItem",
+                "(Lnet/minecraft/world/entity/item/ItemEntity;Lnet/minecraft/world/item/ItemStack;)V",
+                &[(0, b'L'), (1, b'L')],
+            ) {
+                Ok(b3) => b3,
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] ItemEntity.setItem probe refused: {e}"
+                    ));
+                    return None;
+                }
+            };
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched ItemEntity.tick guard + hurt probe");
-            Some(pre2)
+            cplug_sdk::log::info("[c-entities] patched ItemEntity.tick guard + hurt/setItem probes");
+            Some(pre3)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
