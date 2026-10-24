@@ -2885,6 +2885,7 @@ public final class CeHooks {
         } catch (Throwable t) {
             SE_VH_FAILED = true;
             lastError = System.nanoTime();
+            lastErrorText = "sevh: " + t;
             return false;
         }
     }
@@ -2980,12 +2981,28 @@ public final class CeHooks {
             VH_TL_ENTITIES = new RefField(
                     Class.forName("net.minecraft.world.level.entity.EntityTickList"),
                     "entities");
+            // SELF-TEST: prove the handle actually READS before the weave is
+            // installed — the replaced forEach body has no vanilla escape, so
+            // a handle that builds but cannot read would crash the first tick.
+            Object probe = new net.minecraft.world.level.entity.EntityTickList();
+            VH_TL_ENTITIES.getObj(probe);
             return true;
         } catch (Throwable t) {
             TL_VH_FAILED = true;
             lastError = System.nanoTime();
+            lastErrorText = "tlvh: " + t;
             return false;
         }
+    }
+
+    /** Precompute-time probe result (read via GetStaticBooleanField — the
+     *  variadic boolean-method slot is unusable from the Rust bindings). */
+    public static volatile boolean TL_HANDLES_OK = false;
+
+    /** Precompute-time probe: the private-handle set must be PROVEN before
+     *  the forEach body is replaced (doc 25). Refusal keeps vanilla. */
+    public static void initTickListHandles() {
+        TL_HANDLES_OK = initTickListVh();
     }
 
     @SuppressWarnings("unchecked")
@@ -3014,7 +3031,9 @@ public final class CeHooks {
             // outcome this weave must never produce.
             tickListErr++;
             lastError = System.nanoTime();
+            lastErrorText = "tlwalk: " + t;
             VH_TL_ENTITIES = null;
+            TL_VH_FAILED = false; // the retry deserves a fresh build attempt
             if (initTickListVh()) {
                 try {
                     ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity> set =

@@ -1106,6 +1106,44 @@ fn precompute_entityticklist(loader: jni::jobject) {
         );
         return;
     }
+    // PROVE the private-handle set before the body is replaced: the mirror
+    // has no vanilla escape, so a runtime handle failure would crash the
+    // first tick (the first CI run crashed exactly there — the lazy init was
+    // never wired into the mirror). Refusal here keeps vanilla forever.
+    let handles_ok: Option<bool> =
+        cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+            let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+            if hooks_cls == 0 {
+                return None;
+            }
+            let cls = hooks_cls as jni::jclass;
+            // void call (the variadic boolean-method slot is *mut c_void in
+            // these bindings) + the result read back through a static field.
+            let mid = env.get_static_method_id(cls, "initTickListHandles", "()V")?;
+            env.call_static_void_method(cls, mid, &[]);
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+                return None;
+            }
+            let fid = env.get_static_field_id(cls, "TL_HANDLES_OK", "Z")?;
+            let raw = env.raw();
+            // SAFETY: `raw` is a live JNI env inside this attach scope; the
+            // vtable deref mirrors the counter reads in read_hook_counters.
+            let v = unsafe {
+                let vt = *raw;
+                ((*vt).GetStaticBooleanField)(raw, cls, fid)
+            };
+            Some(v != 0)
+        })
+        .flatten();
+    if handles_ok != Some(true) {
+        TL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] L13 handle probe failed — vanilla forEach kept (lastErr in stats)",
+        );
+        return;
+    }
     let stash = STASH
         .lock()
         .ok()
