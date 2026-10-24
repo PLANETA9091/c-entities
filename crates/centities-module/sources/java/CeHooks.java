@@ -1176,7 +1176,14 @@ public final class CeHooks {
             }
         }
         if (prof) resolveNanos += System.nanoTime() - t2;
-        candidatesResolved += resolved;
+        // "resolved" for the parity assert means "the id mapped to a LIVE
+        // entity" — the source self-hit (srcSkip) is exactly that (the
+        // vanilla exclusion skips the PUSH, not the resolution). The L12
+        // era shifted the e2e query mix toward merge scans (the zombies'
+        // own pushes route the kernel now), which made self-hits dominate
+        // the counters and the old resolved-only ratio read as a
+        // resolution failure.
+        candidatesResolved += resolved + srcSkip;
         staleCand += stale;
         // Desync means the index disagrees with the WORLD about LIVING
         // entities. All-stale candidates are the normal batching window, not
