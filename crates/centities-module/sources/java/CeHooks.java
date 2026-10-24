@@ -1711,7 +1711,7 @@ public final class CeHooks {
                 int ncolMirror = nativePushNcol(le.getId());
                 if (ncolMirror >= 0 && MH_NCOL != null) {
                     try {
-                        MH_NCOL.invokeExact(le, ncolMirror);
+                        MH_NCOL.invokeExact((Entity) le, ncolMirror);
                     } catch (Throwable ignore) { /* vanilla counter stays */ }
                 }
                 return false;
@@ -1729,7 +1729,7 @@ public final class CeHooks {
                 return false; // cannot maintain the counter — vanilla next tick
             }
             try {
-                MH_NCOL.invokeExact(le, ncolNew);
+                MH_NCOL.invokeExact((Entity) le, ncolNew);
             } catch (Throwable t) {
                 lastError = System.nanoTime();
                 lastErrorText = "pushNcol: " + t;
