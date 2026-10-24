@@ -3013,13 +3013,18 @@ public final class CeHooks {
             ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity> set =
                 (ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>)
                     VH_TL_ENTITIES.getObj(tl);
-            Entity[] arr = set.getListRaw();
+            // getListRaw() erases to Object[] (the no-arg ctor allocates
+            // Object[]; the E[] signature is an unchecked moonrise-side cast —
+            // assigning it to Entity[] threw ClassCastException on the first
+            // world tick). Walk it as Object[] with an instanceof filter —
+            // vanilla's BaseIterator does the same checkcast after next().
+            Object[] arr = set.getListRaw();
             int maxIndex = set.getListSize();   // the snapshot semantics
             set.createRawIterator();            // iteratorCount++ (+ empty probe)
             try {
                 for (int i = 0; i < maxIndex; i++) {
-                    Entity e = arr[i];
-                    if (e != null) consumer.accept(e);
+                    Object o = arr[i];
+                    if (o instanceof Entity e) consumer.accept(e);
                 }
             } finally {
                 set.finishRawIterator();        // iteratorCount-- + defrag check
@@ -3039,13 +3044,13 @@ public final class CeHooks {
                     ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity> set =
                         (ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>)
                             VH_TL_ENTITIES.getObj(tl);
-                    Entity[] arr = set.getListRaw();
+                    Object[] arr = set.getListRaw();
                     int maxIndex = set.getListSize();
                     set.createRawIterator();
                     try {
                         for (int i = 0; i < maxIndex; i++) {
-                            Entity e = arr[i];
-                            if (e != null) consumer.accept(e);
+                            Object o = arr[i];
+                            if (o instanceof Entity e) consumer.accept(e);
                         }
                     } finally {
                         set.finishRawIterator();
