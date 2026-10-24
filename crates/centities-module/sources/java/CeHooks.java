@@ -769,13 +769,19 @@ public final class CeHooks {
      *  window is documented in docs/research/23 and is behaviorally inert
      *  (deltas of non-traveling entities never integrate into position). */
     private static int pushFlags(net.minecraft.world.entity.LivingEntity le) {
+        // THROW-PROOF BY CONTRACT: the first A/B round lost the whole module
+        // to `le.isSpectator()` NPE'ing on a MID-CONSTRUCTION ServerPlayer
+        // (this.gameMode is null during early boot) — the probeBox catch
+        // then flipped ACTIVE=false permanently and the leg measured a
+        // vanilla-plus-probe-tax world. Every flag read lives inside one
+        // try; any throwable just drops the entity from the push view.
         int f = 0;
-        if (le instanceof net.minecraft.server.level.ServerPlayer) f |= PF_PLAYER;
-        if (le.isPassenger()) f |= PF_PASSENGER;
-        if (le.isVehicle()) f |= PF_VEHICLE;
-        if (le.noPhysics) f |= PF_NOPHYSICS;
-        if (le.isSpectator()) f |= PF_SPECTATOR;
         try {
+            if (le instanceof net.minecraft.server.level.ServerPlayer) f |= PF_PLAYER;
+            if (le.isPassenger()) f |= PF_PASSENGER;
+            if (le.isVehicle()) f |= PF_VEHICLE;
+            if (le.noPhysics) f |= PF_NOPHYSICS;
+            if (le.isSpectator()) f |= PF_SPECTATOR;
             if (!le.isAlwaysTicking()
                     && le.level() instanceof net.minecraft.server.level.ServerLevel sl
                     && sl.isPositionEntityTicking(le.blockPosition())
@@ -787,7 +793,8 @@ public final class CeHooks {
             }
         } catch (Throwable t) {
             // uncertain -> NOT pushable: the entity drops out of the push
-            // view (a missed push candidate, never a spurious one)
+            // view (a missed push candidate, never a spurious one). The
+            // bits computed so far stay (they are plain field reads).
         }
         return f;
     }

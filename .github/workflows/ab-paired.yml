@@ -88,6 +88,10 @@ jobs:
                 if [ "$M" = "on" ]; then
                   LOG="bench/abp-r$r-$SC-on/results/server.log"
                   grep -q "ARMED" "$LOG" || { echo "FATAL: not armed (r$r $SC)"; exit 1; }
+                  # a mid-run disarm (active=false) means the leg measured a
+                  # vanilla-plus-probe-tax world — the first kernel round
+                  # lost every leg to a boot-phase NPE this way
+                  grep "hooks@" "$LOG" | tail -1 | grep -q "active=true" || { echo "FATAL: module DISARMED mid-run (r$r $SC)"; grep "hooks@" "$LOG" | tail -1; exit 1; }
                   if grep -q "NOT armed" "$LOG"; then echo "FATAL: NOT armed (r$r $SC)"; exit 1; fi
                   if grep -q "FAILED to patch" "$LOG"; then echo "FATAL: patch failed (r$r $SC)"; exit 1; fi
                   grep -q "desync=0" <(grep "hooks@" "$LOG" | tail -1) || { echo "FATAL: desync (r$r $SC)"; grep "hooks@" "$LOG" | tail -1; exit 1; }
