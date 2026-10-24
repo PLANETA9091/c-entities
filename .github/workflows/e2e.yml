@@ -120,6 +120,8 @@ jobs:
           grep -q  "\[c-entities\] precomputed ServerLevel dispatch guard" e2e.log || fail "L7 dispatch guard not precomputed"
           grep -q  "\[c-entities\] patched ServerLevel tickNonPassenger dispatch guard" e2e.log || fail "L7 dispatch guard not applied"
           grep -q  "\[c-entities\] patched LivingEntity pushEntities dispatch guard" e2e.log || fail "L12 push dispatch guard not applied"
+          grep -q  "\[c-entities\] patched ServerEntity.sendChanges fast gate" e2e.log || fail "L14 tracker fast gate not applied"
+          grep -q  "\[c-entities\] patched EntityTickList.forEach raw walk" e2e.log || fail "L13 tick-list raw walk not applied"
           grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
@@ -153,6 +155,15 @@ jobs:
           # additionally requires the density gate to pass, which a small
           # e2e soak cannot — the A/B gate covers engagement.
           echo "$LAST_HOOKS" | grep -Eq "push=[1-9]" || fail "push guard never executed (linkage or weave dead)"
+          # L14: every entity's sendChanges passes the tracker gate; in a
+          # playerless soak trackedPlayers is empty for every entity, so the
+          # provable-no-op path MUST serve traffic (fast>0). err>0 alone is
+          # tolerable (self-healing stale RefField) but checks==0 means the
+          # weave never linked — the doc-24 silent-discard failure shape.
+          echo "$LAST_HOOKS" | grep -Eq "tracker=[1-9]"          || fail "tracker gate never executed (linkage or weave dead)"
+          echo "$LAST_HOOKS" | grep -Eq "tracker=[0-9]+/[1-9]"   || fail "tracker gate never served a provable no-op"
+          # L13: the tick phase walks through the raw-array mirror every tick.
+          echo "$LAST_HOOKS" | grep -Eq "ticklist=[1-9]"         || fail "tick-list raw walk never executed"
           if [ "$LIVE" != "1" ]; then
             sleep 45
             LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)

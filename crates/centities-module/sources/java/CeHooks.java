@@ -5,6 +5,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerEntity;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
@@ -423,6 +424,9 @@ public final class CeHooks {
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
+                + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
+                + "/" + trackerErr
+                + " ticklist=" + tickListChecks + "/" + tickListErr
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -2812,4 +2816,229 @@ public final class CeHooks {
             double[] outD, int[] outI);
     public static native void nativeItemInvalidate(
             int wid, int n, int[] xs, int[] ys, int[] zs);
+
+    // ===================================================================
+    // L14 — the tracker fast gate (ServerEntity.sendChanges)
+    //
+    // javap-verified against the shipped 26.3 build (doc 25): on the path
+    // where NOTHING is sent, sendChanges performs exactly three observable
+    // effects —
+    //   1. entity.updateDataBeforeSync()   (virtual; LivingEntity adds
+    //      updateDirtyEffects)
+    //   2. interpolationTracker.updateTracking(trackingPosition()) — the
+    //      NO_OP tracker's updateTracking is an empty body, so skipping the
+    //      Vec3 allocation for NO_OP entities is exact
+    //   3. tickCount++                     (the unconditional tail, bc 1106)
+    // Everything else is gated behind conditions the guard re-evaluates in
+    // the vanilla order (bc 347-390): hardColliding → vanilla (teleportDelay
+    // bookkeeping); syncPosition → vanilla (interval reset side effect);
+    // needsSync / syncVelocity / forceStateResync → vanilla; then the pure
+    // gate reads: updateInterval.test (PURE: n % period == 0, javap'd both
+    // implementations), SynchedEntityData.isDirty (a flag read). The
+    // passenger compare (bc 34-44) routes vanilla whenever it differs —
+    // vanilla writes lastPassengers and emits the packet there. ItemFrame
+    // map ticks and all emit paths live behind trackedPlayers.isEmpty(),
+    // which the guard requires.
+    //
+    // FALLBACK CONTRACT: any surprise routes vanilla (return false — the
+    // vanilla body is intact behind the early-return weave). A THROW inside
+    // the guard would propagate into the tick loop and kill the server, so
+    // the catch is mandatory, not cosmetic.
+    public static volatile long trackerChecks = 0;   // guard calls (weave proof)
+    public static volatile long trackerFast = 0;     // provable no-ops served
+    public static volatile long trackerVanilla = 0;  // routed to the body
+    public static volatile long trackerErr = 0;      // unexpected → vanilla
+
+    /** L14 kill switch: -Dcentities.trackerFast=false keeps the vanilla
+     *  sendChanges body for every entity. */
+    public static final boolean TRACKER_ON =
+            !"false".equals(System.getProperty("centities.trackerFast", "true"));
+
+    // ServerEntity privates (the guard runs from a different package).
+    private static volatile RefField VH_SE_ENTITY, VH_SE_TICK_COUNT,
+            VH_SE_LAST_PAX, VH_SE_TRACKED_PLAYERS, VH_SE_INTERP,
+            VH_SE_INTERVAL, VH_SE_RESYNC;
+    private static volatile boolean SE_VH_FAILED = false;
+
+    private static synchronized boolean initTrackerVh() {
+        if (SE_VH_FAILED) return false;
+        if (VH_SE_TICK_COUNT != null) return true;
+        // ATOMIC: build all seven into locals; publish only on complete
+        // success (the L12 lesson: a half-published handle set NPEs mid-tick)
+        try {
+            Class<?> se = Class.forName("net.minecraft.server.level.ServerEntity");
+            RefField en = new RefField(se, "entity");
+            RefField tc = new RefField(se, "tickCount");
+            RefField lp = new RefField(se, "lastPassengers");
+            RefField tp = new RefField(se, "trackedPlayers");
+            RefField it = new RefField(se, "interpolationTracker");
+            RefField iv = new RefField(se, "updateInterval");
+            RefField rs = new RefField(se, "forceStateResync");
+            VH_SE_ENTITY = en;
+            VH_SE_TICK_COUNT = tc;
+            VH_SE_LAST_PAX = lp;
+            VH_SE_TRACKED_PLAYERS = tp;
+            VH_SE_INTERP = it;
+            VH_SE_INTERVAL = iv;
+            VH_SE_RESYNC = rs;
+            return true;
+        } catch (Throwable t) {
+            SE_VH_FAILED = true;
+            lastError = System.nanoTime();
+            return false;
+        }
+    }
+
+    public static boolean trackerDispatch(ServerEntity se) {
+        trackerChecks++;
+        if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
+        if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
+        try {
+            Entity e = (Entity) VH_SE_ENTITY.getObj(se);
+            // bc 0-16: hard-colliding entities own the teleportDelay path
+            if (e.moonrise$isHardColliding()) return false;
+            // bc 312-346: syncPosition resets the interval (side effect);
+            // bc 1116+: syncVelocity owns the tail's emit block
+            if (e.syncPosition || e.syncVelocity || e.needsSync) return false;
+            // bc 302-311: the snapshot only matters for real trackers; the
+            // NO_OP implementation (javap'd) is an empty body — skipping its
+            // trackingPosition() Vec3 allocation is exact
+            if (VH_SE_INTERP.getObj(se)
+                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                return false;
+            }
+            // bc 34-44: passengers changed → vanilla (writes lastPassengers,
+            // emits ClientboundSetPassengersPacket)
+            Object pax = e.getPassengers();
+            if (!pax.equals(VH_SE_LAST_PAX.getObj(se))) return false;
+            // bc 107-116: non-empty tracking → ItemFrame map tick + emit paths
+            java.util.Set<?> tracked =
+                    (java.util.Set<?>) VH_SE_TRACKED_PLAYERS.getObj(se);
+            if (tracked == null || !tracked.isEmpty()) return false;
+            // bc 347: forceStateResync → the full resync body
+            if (VH_SE_RESYNC.getObj(se) == Boolean.TRUE) return false;
+            // bc 364-377: updateInterval.test is PURE (n % period == 0)
+            net.minecraft.world.entity.UpdateInterval interval =
+                    (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
+            int tickCount = VH_SE_TICK_COUNT.getInt(se);
+            if (interval == null || interval.test(tickCount)) return false;
+            // bc 384-390: dirty data → sendDirtyEntityData path
+            if (e.getEntityData().isDirty()) return false;
+            // ALL conditions passed: this tick emits nothing. Reproduce the
+            // unconditional effects in vanilla order:
+            e.updateDataBeforeSync();                       // bc 19-23
+            VH_SE_TICK_COUNT.setInt(se, tickCount + 1);     // bc 1106-1113
+            trackerFast++;
+            return true;
+        } catch (Throwable t) {
+            // A stale RefField (class reload) is the only realistic failure:
+            // rebuild once against the live class object, then give up —
+            // vanilla is the only safe direction.
+            trackerErr++;
+            lastError = System.nanoTime();
+            VH_SE_TICK_COUNT = null; // forces initTrackerVh() to rebuild
+            initTrackerVh();
+            return false;
+        }
+    }
+
+    // ===================================================================
+    // L13 — the tick-list raw walk (EntityTickList.forEach)
+    //
+    // javap-verified against 26.3 (doc 25): vanilla forEach = iterator()
+    // (BaseIterator, canFinish=true, maxIndex = the listSize SNAPSHOT at
+    // creation) + hasNext/next + accept + finishedIterating in a
+    // try/finally. The mirror reproduces the exact visit sequence with the
+    // PUBLIC raw API of the moonrise set:
+    //   - visit order = array order (insertion), nulls skipped — remove()
+    //     nulls the slot immediately (bc 51-57), even mid-iteration
+    //   - entities ADDED during the walk are NOT visited (the snapshot cap;
+    //     BaseIterator caps at min(maxIndex, listSize) the same way)
+    //   - iteratorCount++/-- and the defrag-on-finish bookkeeping ride on
+    //     createRawIterator()/finishRawIterator() — same counters, same
+    //     defrag condition (iteratorCount==0 → frag-factor check)
+    //   - a consumer exception still passes finishRawIterator (try/finally)
+    //     before propagating, exactly like vanilla's exception table
+    // This path is behaviorally exact with the module ARMED or DISARMED
+    // (it only changes the iteration strategy), so it does not read ACTIVE:
+    // both A/B legs walk the same way and the gate stays honest.
+    public static volatile long tickListChecks = 0;  // mirror calls (weave proof)
+    public static volatile long tickListErr = 0;     // retries served
+
+    /** L13 kill switch: -Dcentities.tickListRaw=false refuses the weave at
+     *  precompute time (vanilla forEach stays). */
+    public static final boolean TICKLIST_ON =
+            !"false".equals(System.getProperty("centities.tickListRaw", "true"));
+
+    private static volatile RefField VH_TL_ENTITIES;
+    private static volatile boolean TL_VH_FAILED = false;
+
+    private static synchronized boolean initTickListVh() {
+        if (TL_VH_FAILED) return false;
+        if (VH_TL_ENTITIES != null) return true;
+        try {
+            VH_TL_ENTITIES = new RefField(
+                    Class.forName("net.minecraft.world.level.entity.EntityTickList"),
+                    "entities");
+            return true;
+        } catch (Throwable t) {
+            TL_VH_FAILED = true;
+            lastError = System.nanoTime();
+            return false;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static void tickListForEach(net.minecraft.world.level.entity.EntityTickList tl,
+                                       java.util.function.Consumer<Entity> consumer) {
+        tickListChecks++;
+        try {
+            ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity> set =
+                (ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>)
+                    VH_TL_ENTITIES.getObj(tl);
+            Entity[] arr = set.getListRaw();
+            int maxIndex = set.getListSize();   // the snapshot semantics
+            set.createRawIterator();            // iteratorCount++ (+ empty probe)
+            try {
+                for (int i = 0; i < maxIndex; i++) {
+                    Entity e = arr[i];
+                    if (e != null) consumer.accept(e);
+                }
+            } finally {
+                set.finishRawIterator();        // iteratorCount-- + defrag check
+            }
+        } catch (Throwable t) {
+            // A stale RefField (class reload) is the only realistic failure.
+            // Rebuild once against the live class and retry; a second failure
+            // rethrows — silently skipping the entity tick phase is the one
+            // outcome this weave must never produce.
+            tickListErr++;
+            lastError = System.nanoTime();
+            VH_TL_ENTITIES = null;
+            if (initTickListVh()) {
+                try {
+                    ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity> set =
+                        (ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>)
+                            VH_TL_ENTITIES.getObj(tl);
+                    Entity[] arr = set.getListRaw();
+                    int maxIndex = set.getListSize();
+                    set.createRawIterator();
+                    try {
+                        for (int i = 0; i < maxIndex; i++) {
+                            Entity e = arr[i];
+                            if (e != null) consumer.accept(e);
+                        }
+                    } finally {
+                        set.finishRawIterator();
+                    }
+                    return;
+                } catch (Throwable fatal) {
+                    // fall through to the honest rethrow
+                }
+            }
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new IllegalStateException("tickListForEach mirror failed", t);
+        }
+    }
 }

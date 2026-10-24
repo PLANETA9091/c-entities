@@ -30,6 +30,8 @@ const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/e
 const ITEM_ENTITY_CLASS: &str = "net/minecraft/world/entity/item/ItemEntity";
 const SERVER_LEVEL_CLASS: &str = "net/minecraft/server/level/ServerLevel";
 const LIVING_ENTITY_CLASS: &str = "net/minecraft/world/entity/LivingEntity";
+const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
+const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTickList";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -378,6 +380,8 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(ITEM_ENTITY_CLASS, |_n, b| patch_item(b));
     cplug_sdk::hooks::register_bytes(SERVER_LEVEL_CLASS, |_n, b| patch_serverlevel(b));
     cplug_sdk::hooks::register_bytes(LIVING_ENTITY_CLASS, |_n, b| patch_livingentity(b));
+    cplug_sdk::hooks::register_bytes(SERVER_ENTITY_CLASS, |_n, b| patch_serverentity(b));
+    cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -421,6 +425,8 @@ fn arm_module() {
     precompute_item(loader);
     precompute_serverlevel(loader);
     precompute_livingentity(loader);
+    precompute_serverentity(loader);
+    precompute_entityticklist(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -432,6 +438,8 @@ fn arm_module() {
         ITEM_ENTITY_CLASS,
         SERVER_LEVEL_CLASS,
         LIVING_ENTITY_CLASS,
+        SERVER_ENTITY_CLASS,
+        ENTITY_TICK_LIST_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -453,11 +461,57 @@ fn arm_module() {
             (ITEM_ENTITY_CLASS, Counter::ItemChecks),
             (SERVER_LEVEL_CLASS, Counter::DispChecks),
             (LIVING_ENTITY_CLASS, Counter::PushChecks),
+            (SERVER_ENTITY_CLASS, Counter::TrackerChecks),
         ];
+        // The L13 weave is optional (-Dcentities.tickListRaw=false refuses it
+        // at precompute time); the verifier must not chase a target that was
+        // deliberately never installed.
+        let tl_woven = TL_WOVEN.load(Ordering::Acquire);
+        let mut targets: Vec<(&str, Counter)> = targets.to_vec();
+        if tl_woven {
+            targets.push((ENTITY_TICK_LIST_CLASS, Counter::TickListChecks));
+        }
         let merge_woven = MERGE_WOVEN.load(Ordering::Acquire);
         let mut logged_done = false;
         for attempt in 0..180 {
             std::thread::sleep(std::time::Duration::from_millis(2000));
+            // Deferred weaves (L14 ServerEntity / L13 EntityTickList): the
+            // classes may load AFTER the arm; once the byte hook has stashed
+            // their bytes, redo the precompute OUTSIDE any ClassFileLoadHook
+            // callback (the ASM helper's loadClass deadlocks inside one) and
+            // retransform to apply.
+            let loader = LOADER.load(Ordering::Acquire);
+            if loader != 0 {
+                if !SE_WOVEN.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(SERVER_ENTITY_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_serverentity(loader as jni::jobject);
+                    if SE_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(SERVER_ENTITY_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred ServerEntity weave applied, rc={rc}"
+                        ));
+                    }
+                }
+                if !TL_WOVEN.load(Ordering::Acquire)
+                    && !TL_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(ENTITY_TICK_LIST_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_entityticklist(loader as jni::jobject);
+                    if TL_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(ENTITY_TICK_LIST_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred EntityTickList weave applied, rc={rc}"
+                        ));
+                    }
+                }
+            }
             let snap = read_hook_counters();
             if attempt < 6 || attempt % 25 == 0 {
                 let dbg: Vec<(String, i64)> =
@@ -607,6 +661,18 @@ fn force_init_item_entity_raw(loader: jni::jobject) {
 /// bytes. The patch verifier only demands its counter when this is set —
 /// a refused merge weave must NOT block arming (the tick guard stays live).
 static MERGE_WOVEN: AtomicBool = AtomicBool::new(false);
+/// L14: set when the sendChanges early-return guard was woven. The class
+/// may load AFTER the arm (it is only referenced by ChunkMap once a level
+/// instance exists) — the precompute then defers and the patch verifier
+/// completes the weave once the boot hook has stashed the bytes.
+static SE_WOVEN: AtomicBool = AtomicBool::new(false);
+/// L13: set when the tickListForEach replacement was actually prepared —
+/// gates the patch verifier so a -Dcentities.tickListRaw=false refusal does
+/// not send it chasing a target that will never be woven.
+static TL_WOVEN: AtomicBool = AtomicBool::new(false);
+/// L13: set when the weave was deliberately declined (flag off) — the
+/// verifier stops retrying the precompute for it.
+static TL_DECLINED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -847,6 +913,231 @@ fn patch_livingentity(bytes: &[u8]) -> Option<Vec<u8>> {
         .flatten()
 }
 
+/// L14 tracker fast gate: boot-time hook stashes the original bytes; the
+/// guard is woven at arm time (precompute_serverentity). The weave is an
+/// early-return prefix — the vanilla sendChanges body stays intact behind
+/// it, so any refusal is vanilla by construction.
+fn patch_serverentity(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_serverentity_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_serverentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(SERVER_ENTITY_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(SERVER_ENTITY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ServerEntity.sendChanges fast gate");
+            Some(b)
+        }
+        _ if !SE_WOVEN.load(Ordering::Acquire) => {
+            // Not woven YET (the class loaded after the arm — its bytes are
+            // stashed here and the patch verifier completes the weave outside
+            // any ClassFileLoadHook callback). Vanilla until then.
+            let mut st = STASH.lock().ok()?;
+            st.entry(SERVER_ENTITY_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] ServerEntity bytes stashed post-arm — verifier will weave",
+            );
+            None
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to patch ServerEntity.sendChanges — vanilla kept",
+            );
+            None
+        }
+    }
+}
+
+/// L13 tick-list raw walk: the body of EntityTickList.forEach is REPLACED
+/// (not prefixed) — the vanilla body cannot stay behind a full-body
+/// replacement, so the exactness burden sits entirely on the mirror. The
+/// -Dcentities.tickListRaw=false refusal happens at precompute time and
+/// leaves the class untouched (no PATCHES_FAIL: a deliberate disable is not
+/// a failure).
+fn patch_entityticklist(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_entityticklist_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_entityticklist_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(ENTITY_TICK_LIST_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(ENTITY_TICK_LIST_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched EntityTickList.forEach raw walk");
+            Some(b)
+        }
+        _ if !TL_WOVEN.load(Ordering::Acquire) => {
+            // Deliberate disable (-Dcentities.tickListRaw=false), a refused
+            // precompute, or a post-arm class load — the class stays vanilla
+            // for now; stashed bytes let the verifier complete (or reject)
+            // the weave outside any ClassFileLoadHook callback. None of these
+            // is a genuine weave error, so the FAIL ledger stays untouched
+            // (a FAIL here would block arming of the whole module).
+            let mut st = STASH.lock().ok()?;
+            st.entry(ENTITY_TICK_LIST_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] EntityTickList bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to patch EntityTickList.forEach — vanilla kept",
+            );
+            None
+        }
+    }
+}
+
+fn serverentity_spec() -> cplug_sdk::asm::EarlyReturnGuard<'static> {
+    // NOTE (the L12 lesson): check_desc must equal the Java method's exact
+    // receiver type — sendChanges is declared on ServerEntity, so the guard
+    // takes the ServerEntity itself byte-for-byte, or the woven call fails
+    // to LINK at runtime.
+    cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "sendChanges",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "trackerDispatch",
+        check_desc: "(Lnet/minecraft/server/level/ServerEntity;)Z",
+    }
+}
+
+fn precompute_serverentity(loader: jni::jobject) {
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(SERVER_ENTITY_CLASS));
+    let Some(bytes) = stash else {
+        // The class has not loaded yet (it is only referenced once a level
+        // instance exists). DEFER — the boot/post-arm hook stashes the bytes
+        // whenever they appear and the patch verifier calls this again.
+        cplug_sdk::log::info(
+            "[c-entities] ServerEntity not loaded yet — tracker gate deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &serverentity_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(SERVER_ENTITY_CLASS, b);
+            }
+            SE_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed ServerEntity.sendChanges fast gate");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ServerEntity tracker gate — vanilla kept",
+            );
+        }
+    }
+}
+
+fn ticklist_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "forEach",
+        method_desc: "(Ljava/util/function/Consumer;)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "tickListForEach",
+        bridge_desc:
+            "(Lnet/minecraft/world/level/entity/EntityTickList;Ljava/util/function/Consumer;)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+        ],
+    }
+}
+
+fn precompute_entityticklist(loader: jni::jobject) {
+    // Honor the kill switch BEFORE any weaving: read CeHooks.TICKLIST_ON
+    // (a Java system property folded into a static final at class init).
+    let flag_on: Option<bool> =
+        cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return None;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let fid = env.get_static_field_id(cls, "TICKLIST_ON", "Z")?;
+        let raw = env.raw();
+        // SAFETY: `raw` is a live JNI env inside this attach scope; the
+        // vtable deref mirrors the counter reads in read_hook_counters.
+        let v = unsafe {
+            let vt = *raw;
+            ((*vt).GetStaticBooleanField)(raw, cls, fid)
+        };
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return None;
+        }
+        Some(v != 0)
+    })
+    .flatten();
+    if flag_on != Some(true) {
+        TL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] L13 disabled (centities.tickListRaw) — vanilla forEach kept",
+        );
+        return;
+    }
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(ENTITY_TICK_LIST_CLASS));
+    let Some(bytes) = stash else {
+        // DEFERRED: the class may load after the arm; the boot/post-arm hook
+        // stashes the bytes and the patch verifier retries this precompute.
+        cplug_sdk::log::info(
+            "[c-entities] EntityTickList not loaded yet — raw walk deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &ticklist_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(ENTITY_TICK_LIST_CLASS, b);
+            }
+            TL_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed EntityTickList.forEach raw walk");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute EntityTickList.forEach — vanilla kept",
+            );
+        }
+    }
+}
+
 fn patch_livingentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         // Boot load: stash the original bytes, stay vanilla. The guard is
@@ -883,6 +1174,8 @@ enum Counter {
     ItemChecks,
     DispChecks,
     PushChecks,
+    TrackerChecks,
+    TickListChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -907,6 +1200,8 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::ItemChecks, ("itemChecks", "J")),
             (Counter::DispChecks, ("dispChecks", "J")),
             (Counter::PushChecks, ("pushChecks", "J")),
+            (Counter::TrackerChecks, ("trackerChecks", "J")),
+            (Counter::TickListChecks, ("tickListChecks", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
