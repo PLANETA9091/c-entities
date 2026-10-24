@@ -234,9 +234,17 @@ fn query_expansion_is_bounded_and_correct() {
     idx.query(0, &Aabb::new(70.0, 60.0, 70.0, 72.0, 70.0, 72.0), &mut out);
     assert!(out.is_empty());
 
+    // v0.2 contract: the index filters exactly (within MARGIN) — a 0.5-block
+    // gap means the entity must NOT be offered (the old expanded-box query
+    // reported it as a false positive; the Java shim then filtered it).
     idx.query(0, &Aabb::new(65.5, 60.0, 65.5, 70.0, 70.0, 70.0), &mut out);
+    assert!(!out.contains(&1), "non-intersecting entity returned (stale expansion FP)");
+
+    // body actually reaches the query box from a neighboring home cell:
+    // single-home expansion must still find it (no false negatives).
+    idx.query(0, &Aabb::new(64.5, 60.0, 64.5, 70.0, 70.0, 70.0), &mut out);
     assert!(out.contains(&1), "border-crossing entity missed");
-    assert!(idx.max_half_span() <= MAX_HALF_SPAN);
+    assert!(idx.max_half_span(0) <= MAX_HALF_SPAN);
 }
 
 #[test]

@@ -14,10 +14,24 @@ usage — and **100% vanilla behavior for players**. Base server:
 | Phase | What | Status |
 |-------|------|--------|
 | 0 | Understand the Paper 1.21.8 tick pipeline from real sources | ✅ `docs/research/01-vanilla-tick-pipeline.md` |
-| 1 | **Baseline benchmark of unmodified Paper** on GitHub Actions: what costs what | 🚧 `baseline.yml` |
-| 2 | Design the Rust core from phase-1 data (not guesses) | ⏳ |
-| 3 | `centities-engine` (core) + `centities-module` (weave injection) | ⏳ |
-| 4 | A/B on the same pipeline: Paper vs Paper+module | ⏳ |
+| 1 | **Baseline benchmark of unmodified Paper** on GitHub Actions: what costs what | ✅ `reports/baseline/` (9 scenarios, JFR) |
+| 2 | Design the Rust core from phase-1 data (not guesses) | ✅ `docs/research/05-module-design.md` |
+| 3 | `centities-core` (Rust index) + `centities-module` (weave injection) | ✅ armed on a live server |
+| 4 | A/B on the same pipeline: Paper vs Paper+module | ✅ `docs/research/06-module-results.md` |
+
+## Results (live A/B, Paper 1.21.8, exact vanilla-equivalent results)
+
+| scenario | vanilla | + c-entities | Δ |
+|----------|---------|--------------|---|
+| control (empty world) | 0.29 ms/t | 0.23 ms/t | parity |
+| items-100k | 86.7 ms/t | 86.9 ms/t | parity |
+| **mobs-25k** | 942.5 ms/t | **591.1 ms/t** | **−37.3 %** |
+| **mixed-150k** | 1386.9 ms/t | **854.7 ms/t** | **−38.4 %** |
+
+2080 differential checks (index vs vanilla, full id-set comparison): **0
+mismatches**. No tick skipping, no entity freezing, kill-switch +
+vanilla-mirror fallbacks at every level. Details:
+`docs/research/06-module-results.md`.
 
 No optimization code is written before phase 1 produces numbers.
 

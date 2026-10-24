@@ -1,11 +1,14 @@
-//! c-entities CRUSSTY module (v0.1): exact entity proximity index.
+//! c-entities CRUSSTY module (v0.2): exact entity proximity index.
 //!
 //! Weave targets (Paper 1.21.8, mojang-mapped):
 //!   1. Level.getEntities(Entity, AABB, Predicate)  — replace_body → CeHooks.getEntities
-//!   2. EntityLookup.addEntity(Entity, boolean, boolean) — prefix probe
-//!   3. EntityLookup.removeEntity(Entity)               — prefix probe
-//!   4. Entity.setPos(double,double,double)             — prefix probe
-//!   5. Entity.setBoundingBox(AABB)                     — prefix probe (exact box)
+//!      (covers push via Level.getPushableEntities and the raw overload)
+//!   2. Level.getEntitiesOfClass(Class, AABB, Predicate) — replace_body →
+//!      CeHooks.getEntitiesOfClass (covers item merge, mob sensor scans)
+//!   3. EntityLookup.addEntity(Entity, boolean, boolean) — prefix probe
+//!   4. EntityLookup.removeEntity(Entity)               — prefix probe
+//!   5. Entity.setPos(double,double,double)             — prefix probe
+//!   6. Entity.setBoundingBox(AABB)                     — prefix probe (exact box)
 //!
 //! Kill switch: any patch failure leaves the class untouched (vanilla runs);
 //! any runtime anomaly flips CeHooks.ACTIVE=false → bridges take the
@@ -77,34 +80,126 @@ fn arm_module() {
     }
     BRIDGE_READY.store(true, Ordering::Release);
 
-    // Retransform → ClassFileLoadHook → our byte hooks patch the classes.
-    for cls in [LEVEL_CLASS, ENTITY_CLASS, LOOKUP_CLASS] {
-        let rc = cplug_sdk::retransform_class(cls);
-        cplug_sdk::log::info(&format!(
-            "[c-entities] retransform {cls}: rc={rc}"
-        ));
+    // 1. Wait for the server to be FULLY booted before any retransform:
+    //    retransforming classes mid-boot (while worlds load) deadlocks the
+    //    VM. Steady-state ticking reaches the safepoint instantly.
+    let mut ready = false;
+    for _ in 0..240 {
+        // poll up to 120s
+        let r = cplug_sdk::jni_util::with_attached(|env| {
+            let cls = cplug_sdk::classes::find_class(HOOKS_CLASS)?;
+            let Some(mid) = env.get_static_method_id(cls.0, "serverReady", "()I") else {
+                cplug_sdk::jni_util::clear_exception(env);
+                return None;
+            };
+            Some(env.call_static_int_method(cls.0, mid, &[]))
+        });
+        if r == Some(Some(1)) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if !ready {
+        cplug_sdk::log::info("[c-entities] arm: server never became ready — staying vanilla");
+        return;
     }
 
+    // 2. Weave the mutation probes (add/remove/setPos/setBoundingBox). They
+    //    are no-ops while ACTIVE=false, so behavior is unchanged.
+    for cls in [ENTITY_CLASS, LOOKUP_CLASS] {
+        let rc = cplug_sdk::retransform_class(cls);
+        cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
+    }
+    cplug_sdk::jni_util::with_attached(cplug_sdk::jni_util::clear_exception);
+    let fail_n = PATCHES_FAIL.load(Ordering::Acquire);
+    if fail_n > 0 {
+        cplug_sdk::log::info(&format!(
+            "[c-entities] NOT armed (probe patches failed: {fail_n}) — vanilla behavior kept"
+        ));
+        return;
+    }
+
+    // 3. Fill the index from the live world state (still vanilla queries).
+    let boot = cplug_sdk::jni_util::with_attached(|env| {
+        let cls = cplug_sdk::classes::find_class(HOOKS_CLASS)?;
+        let Some(mid) = env.get_static_method_id(cls.0, "bootstrap", "()V") else {
+            cplug_sdk::jni_util::clear_exception(env);
+            return None;
+        };
+        env.call_static_void_method(cls.0, mid, &[]);
+        Some(())
+    });
+    if boot.is_none() {
+        cplug_sdk::log::info("[c-entities] arm: bootstrap fill failed — staying vanilla");
+        return;
+    }
+    let Some(s) = with_index(|idx| idx.stats()) else { return };
+    cplug_sdk::log::info(&format!(
+        "[c-entities] bootstrap filled: entities={} cells={}", s.entities, s.cells
+    ));
+
+    // 4. Flip the kill switch: probes start feeding the (complete) index;
+    //    queries are still vanilla until step 5 lands.
+    let armed = cplug_sdk::jni_util::with_attached(|env| {
+        let cls = cplug_sdk::classes::find_class(HOOKS_CLASS)?;
+        let Some(mid) = env.get_static_method_id(cls.0, "setActive", "(Z)V") else {
+            cplug_sdk::jni_util::clear_exception(env);
+            return None;
+        };
+        env.call_static_void_method(cls.0, mid, &[jni::jvalue { z: 1 }]);
+        Some(())
+    })
+    .is_some();
+    if !armed {
+        cplug_sdk::log::info("[c-entities] arm: setActive failed — staying vanilla");
+        return;
+    }
+
+    // 5. Swap the query paths (Level.getEntities + getEntitiesOfClass).
+    let rc = cplug_sdk::retransform_class(LEVEL_CLASS);
+    cplug_sdk::log::info(&format!("[c-entities] retransform {LEVEL_CLASS}: rc={rc}"));
+    cplug_sdk::jni_util::with_attached(cplug_sdk::jni_util::clear_exception);
     let ok_n = PATCHES_OK.load(Ordering::Acquire);
     let fail_n = PATCHES_FAIL.load(Ordering::Acquire);
-    if ok_n >= 3 && fail_n == 0 {
-        // CeHooks.setActive(true)
-        let armed = cplug_sdk::jni_util::with_attached(|env| {
-            let cls = cplug_sdk::classes::find_class(HOOKS_CLASS)?;
-            let mid = env.get_static_method_id(cls.0, "setActive", "(Z)V")?;
-            env.call_static_void_method(cls.0, mid, &[jni::jvalue { z: 1 }]);
-            Some(())
-        })
-        .is_some();
-        if armed {
-            ARMED.store(true, Ordering::Release);
-            cplug_sdk::log::info("[c-entities] ARMED: index fast path active");
-            return;
-        }
+    if ok_n < 3 || fail_n > 0 {
+        // queries never swapped: stop feeding the index and stay vanilla
+        cplug_sdk::jni_util::with_attached(|env| {
+            if let Some(cls) = cplug_sdk::classes::find_class(HOOKS_CLASS) {
+                if let Some(mid) = env.get_static_method_id(cls.0, "setActive", "(Z)V") {
+                    env.call_static_void_method(cls.0, mid, &[jni::jvalue { z: 0 }]);
+                }
+            }
+        });
+        cplug_sdk::log::info(&format!(
+            "[c-entities] NOT armed (ok={ok_n}, fail={fail_n}) — vanilla behavior kept"
+        ));
+        return;
     }
-    cplug_sdk::log::info(&format!(
-        "[c-entities] NOT armed (ok={ok_n}, fail={fail_n}) — vanilla behavior kept"
-    ));
+
+    ARMED.store(true, Ordering::Release);
+    cplug_sdk::log::info("[c-entities] ARMED: index fast path active");
+    spawn_stats_loop();
+}
+
+/// Periodic diagnostic heartbeat: index size + patch health. Takes the
+/// index lock briefly every 30 s — irrelevant at that cadence.
+fn spawn_stats_loop() {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if !ARMED.load(Ordering::Acquire) {
+                break; // disarmed → stop the heartbeat
+            }
+            let Some(s) = with_index(|idx| idx.stats()) else { break };
+            cplug_sdk::log::info(&format!(
+                "[c-entities] stats: entities={} cells={} oversize={} ok={} fail={}",
+                s.entities, s.cells, s.oversize,
+                PATCHES_OK.load(Ordering::Acquire),
+                PATCHES_FAIL.load(Ordering::Acquire),
+            ));
+        }
+    });
 }
 
 fn define_bridge(env: &JniEnv) -> bool {
@@ -116,12 +211,25 @@ fn define_bridge(env: &JniEnv) -> bool {
         cplug_sdk::log::info("[c-entities] bridge: Level not found");
         return false;
     };
-    let Some(mid) = env.get_method_id(level_cls.0, "getClassLoader", "()Ljava/lang/ClassLoader;")
-    else {
+    // getClassLoader() is declared on java.lang.Class, NOT on Level:
+    // GetMethodID must target the Class class, invoked on the Level jclass
+    // object (a java.lang.Class instance).
+    let Some(class_cls) = cplug_sdk::classes::find_class("java/lang/Class") else {
+        cplug_sdk::log::info("[c-entities] bridge: java/lang/Class not found");
+        return false;
+    };
+    let Some(mid) = env.get_method_id(
+        class_cls.0,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+    ) else {
+        cplug_sdk::jni_util::clear_exception(env);
+        cplug_sdk::log::info("[c-entities] bridge: getClassLoader not resolved");
         return false;
     };
     let loader = env.call_object_method(level_cls.0, mid, &[]);
     let Some(cls) = env.define_class(HOOKS_CLASS, loader, HOOKS_CLASS_BYTES) else {
+        cplug_sdk::jni_util::clear_exception(env);
         cplug_sdk::log::info("[c-entities] bridge define_class failed");
         return false;
     };
@@ -174,33 +282,46 @@ fn patch_level(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None; // boot load stays vanilla; we patch via retransform
     }
-    let spec = cplug_sdk::asm::ReplaceBody {
-        method_name: "getEntities",
-        method_desc: "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
-        bridge_owner: HOOKS_CLASS,
-        bridge_name: "getEntities",
-        bridge_desc: "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
-        args: &[
-            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
-            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
-            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
-            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
-        ],
-    };
-    let patched = cplug_sdk::jni_util::with_attached(|env| {
-        let level_cls = cplug_sdk::classes::find_class(LEVEL_CLASS)?;
-        let loader = class_loader_of(env, level_cls.0)?;
-        cplug_sdk::asm::replace_body(env, loader, bytes, &spec)
-    });
+    // Pure-Rust body replacement: straight-line bridge calls, no SMT, no
+    // exception table, and ZERO JVM calls inside this hook — the ASM path
+    // (defineClass inside a retransform while the world is stopped) is a
+    // proven deadlock, so it must not be used from here.
+    let patched = (|| {
+        let b = patch::replace_body_with_static(
+            bytes.to_vec(),
+            "getEntities",
+            "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+            HOOKS_CLASS,
+            "getEntities",
+            "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+            &[0, 1, 2, 3],
+        )?;
+        patch::replace_body_with_static(
+            b,
+            "getEntitiesOfClass",
+            "(Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+            HOOKS_CLASS,
+            "getEntitiesOfClass",
+            "(Lnet/minecraft/world/level/Level;Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+            &[0, 1, 2, 3],
+        )
+    })();
     match patched {
-        Some(Some(b)) if !b.is_empty() => {
+        Ok(b) if !b.is_empty() => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Level.getEntities");
+            cplug_sdk::log::info("[c-entities] patched Level.getEntities + getEntitiesOfClass");
             Some(b)
         }
-        _ => {
+        Ok(_) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] FAILED to patch Level.getEntities — vanilla kept");
+            cplug_sdk::log::info("[c-entities] FAILED to patch Level query methods — vanilla kept");
+            None
+        }
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] FAILED to patch Level query methods ({e}) — vanilla kept"
+            ));
             None
         }
     }
@@ -213,7 +334,7 @@ fn patch_lookup(bytes: &[u8]) -> Option<Vec<u8>> {
     let add = patch::insert_static_call_at_start(
         bytes.to_vec(),
         "addEntity",
-        "(Lnet/minecraft/world/entity/Entity;ZZ)V",
+        "(Lnet/minecraft/world/entity/Entity;ZZ)Z",
         HOOKS_CLASS,
         "probeAdd",
         "(Lnet/minecraft/world/entity/Entity;)V",
@@ -292,19 +413,12 @@ fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn class_loader_of(env: &JniEnv, cls: jni::jclass) -> Option<jni::jobject> {
-    let mid = env.get_method_id(cls, "getClassLoader", "()Ljava/lang/ClassLoader;")?;
-    let loader = env.call_object_method(cls, mid, &[]);
-    if loader.is_null() {
-        None
-    } else {
-        Some(loader)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // natives — all AABB doubles arrive as arguments (no JNI field reads)
 // ---------------------------------------------------------------------------
+
+const ESTIMATE_CAP: usize = 8192;
 
 pub extern "system" fn n_query(
     env: *mut jni::JNIEnv,
@@ -317,23 +431,53 @@ pub extern "system" fn n_query(
     y1: f64,
     z1: f64,
 ) -> jni::jlongArray {
-    let mut out: Vec<i64> = Vec::new();
-    let hit = with_index(|idx| {
-        idx.query(
+    let (out, visited): (Vec<i64>, usize) = match with_index(|idx| {
+        // pre-walk cost estimate: for huge dense queries the native walk
+        // itself (~3 ns/entry) is worth skipping — let Java mirror directly
+        let est = idx.query_population(world as u16, &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1));
+        if est > ESTIMATE_CAP {
+            return None;
+        }
+        let mut buf = Vec::new();
+        let v = idx.query(
             world as u16,
             &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
-            &mut out,
+            &mut buf,
         );
-    });
-    if hit.is_none() {
-        return std::ptr::null_mut();
-    }
+        Some((buf, v))
+    }) {
+        Some(Some((b, v))) => (b, v),
+        _ => {
+            // marker reply: [0] = -1, [1] = estimated population
+            let est = with_index(|idx| {
+                idx.query_population(world as u16, &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1))
+            })
+            .unwrap_or(0);
+            unsafe {
+                let e = JniEnv::from_raw(env);
+                let Some(arr) = e.new_long_array(2) else {
+                    return std::ptr::null_mut();
+                };
+                let buf: Vec<jni::jlong> = vec![-1, est as jni::jlong];
+                e.set_long_array_region(arr, 0, 2, &buf);
+                return arr;
+            }
+        }
+    };
     unsafe {
         let e = JniEnv::from_raw(env);
-        let Some(arr) = e.new_long_array(out.len() as i32) else {
+        // layout: [0] = candidate count, [1] = entries walked (for the
+        // Java-side fast-vs-mirror cost heuristic), [2..] = candidate ids
+        let n = out.len();
+        let Some(arr) = e.new_long_array((n + 2) as i32) else {
             return std::ptr::null_mut();
         };
-        let buf: Vec<jni::jlong> = out.iter().map(|v| *v as jni::jlong).collect();
+        let mut buf: Vec<jni::jlong> = Vec::with_capacity(n + 2);
+        buf.push(n as jni::jlong);
+        buf.push(visited as jni::jlong);
+        for v in out.iter() {
+            buf.push(*v as jni::jlong);
+        }
         e.set_long_array_region(arr, 0, buf.len() as i32, &buf);
         arr
     }

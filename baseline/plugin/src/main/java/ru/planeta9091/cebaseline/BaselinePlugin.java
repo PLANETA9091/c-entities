@@ -66,6 +66,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private int spawnedItems = 0, spawnedStands = 0, spawnedZombies = 0;
     private int placedHoppers = 0, placedFurnaces = 0;
 
+    // CE_DIFF=1: differential correctness test (index fast path vs vanilla
+    // mirror) — runs during WARMUP only, so the MEASURE window stays clean.
+    private boolean ceDiff = false;
+    private long diffChecks = 0, diffMismatch = 0;
+    private Class<?> ceHooksCls = null;
+    private java.lang.reflect.Field ceActive, ceFast, ceMirror;
+
     private Location anchor = null;
     private int groundY = -60;
     private double entityCarry = 0.0, tileCarry = 0.0;
@@ -108,6 +115,19 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         getLogger().info(String.format(Locale.ROOT,
                 "ce-baseline config: run=%s scale=%d items=%.2f stands=%.2f tiles(h=%d,f=%d) measure=%d",
                 runName, scale, pctItems, pctStands, tileHoppers, tileFurnaces, measureTicks));
+
+        ceDiff = "1".equals(System.getenv("CE_DIFF"));
+        if (ceDiff) {
+            try {
+                ceHooksCls = Class.forName("dev.planeta9091.centities.CeHooks");
+                ceActive = ceHooksCls.getField("ACTIVE");
+                ceFast = ceHooksCls.getField("queriesFast");
+                ceMirror = ceHooksCls.getField("queriesMirror");
+                getLogger().info("ce-diff: CeHooks present (module loaded)");
+            } catch (Throwable t) {
+                getLogger().info("ce-diff: CeHooks absent (vanilla run) — plumbing check only");
+            }
+        }
 
         // Failsafe: if the fake player never joins, start anyway (marked no-player).
         Bukkit.getScheduler().runTaskLater(this, () -> {
@@ -279,9 +299,11 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         tickNo++;
         switch (phase) {
             case "WARMUP" -> {
+                if (ceDiff && tickNo % 5 == 0) runDiffBatch(8);
                 if (tickNo >= measureEndTick - measureTicks) {
                     phase = "MEASURE";
-                    getLogger().info("measure window open");
+                    getLogger().info(String.format(Locale.ROOT,
+                            "measure window open (diff: checks=%d mismatches=%d)", diffChecks, diffMismatch));
                 }
             }
             case "MEASURE" -> {
@@ -301,6 +323,78 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         if (sorted.length == 0) return 0;
         int i = (int) Math.min(sorted.length - 1, Math.max(0, (int) Math.round(p * (sorted.length - 1))));
         return sorted[i];
+    }
+
+    // ------------------------------------------------------------------
+    // Differential test: index fast path must return EXACTLY the vanilla
+    // entity-id set for random query boxes (order-insensitive).
+    // ------------------------------------------------------------------
+    private void runDiffBatch(int n) {
+        try {
+            World w = Bukkit.getWorlds().get(0);
+            net.minecraft.server.level.ServerLevel sl =
+                    ((org.bukkit.craftbukkit.CraftWorld) w).getHandle();
+            java.util.Random r = java.util.concurrent.ThreadLocalRandom.current();
+            for (int i = 0; i < n; i++) {
+                double x = anchor.getX() + (r.nextDouble() * 2 - 1) * innerRadius;
+                double z = anchor.getZ() + (r.nextDouble() * 2 - 1) * innerRadius;
+                double y = groundY - 2 + r.nextDouble() * 8;
+                double s = 1.0 + r.nextDouble() * 8;
+                net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                        x - s / 2, y, z - s / 2, x + s / 2, y + 2 + r.nextDouble() * 2, z + s / 2);
+                java.util.function.Predicate<net.minecraft.world.entity.Entity> pred =
+                        e -> e.isAlive();
+
+                // vanilla body of Level.getEntities(Entity, AABB, Predicate)
+                java.util.List<net.minecraft.world.entity.Entity> vanilla = new java.util.ArrayList<>();
+                sl.moonrise$getEntityLookup().getEntities(
+                        (net.minecraft.world.entity.Entity) null, box, vanilla, pred);
+                ca.spottedleaf.moonrise.common.PlatformHooks.get()
+                        .addToGetEntities(sl, null, box, pred, vanilla);
+
+                // woven path (fast when armed; bridge mirror otherwise)
+                java.util.List<net.minecraft.world.entity.Entity> woven =
+                        sl.getEntities((net.minecraft.world.entity.Entity) null, box, pred);
+
+                diffChecks++;
+                if (!sameIds(vanilla, woven)) {
+                    diffMismatch++;
+                    if (diffMismatch <= 3) getLogger().warning(String.format(Locale.ROOT,
+                            "CE-DIFF entity mismatch: vanilla=%d woven=%d box=%s",
+                            vanilla.size(), woven.size(), box));
+                }
+
+                // vanilla body of Level.getEntitiesOfClass(Class, AABB, Predicate)
+                java.util.function.Predicate<net.minecraft.world.entity.item.ItemEntity> predI =
+                        ie -> ie.isAlive();
+                java.util.List<net.minecraft.world.entity.item.ItemEntity> vanillaI =
+                        new java.util.ArrayList<>();
+                sl.moonrise$getEntityLookup().getEntities(
+                        net.minecraft.world.entity.item.ItemEntity.class, null, box, vanillaI, predI);
+                java.util.List<net.minecraft.world.entity.item.ItemEntity> wovenI =
+                        sl.getEntitiesOfClass(net.minecraft.world.entity.item.ItemEntity.class, box, predI);
+                diffChecks++;
+                if (!sameIds(vanillaI, wovenI)) {
+                    diffMismatch++;
+                    if (diffMismatch <= 3) getLogger().warning(String.format(Locale.ROOT,
+                            "CE-DIFF item mismatch: vanilla=%d woven=%d box=%s",
+                            vanillaI.size(), wovenI.size(), box));
+                }
+            }
+        } catch (Throwable t) {
+            getLogger().warning("ce-diff batch failed: " + t);
+        }
+    }
+
+    private static boolean sameIds(java.util.List<?> a, java.util.List<?> b) {
+        if (a.size() != b.size()) return false;
+        long[] ia = new long[a.size()];
+        for (int i = 0; i < ia.length; i++) ia[i] = ((net.minecraft.world.entity.Entity) a.get(i)).getId();
+        long[] ib = new long[b.size()];
+        for (int i = 0; i < ib.length; i++) ib[i] = ((net.minecraft.world.entity.Entity) b.get(i)).getId();
+        Arrays.sort(ia);
+        Arrays.sort(ib);
+        return Arrays.equals(ia, ib);
     }
 
     private void finish() {
@@ -342,6 +436,26 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 .append(", \"n\": ").append(ds.length).append("},\n");
         j.append("  \"heap_mb\": {\"used\": ").append(String.format(Locale.ROOT, "%.1f", heapUsed))
                 .append(", \"max\": ").append(String.format(Locale.ROOT, "%.1f", heapMax)).append("},\n");
+        j.append("  \"ce_diff\": {\"enabled\": ").append(ceDiff)
+                .append(", \"checks\": ").append(diffChecks)
+                .append(", \"mismatches\": ").append(diffMismatch).append("},\n");
+        j.append("  \"ce_module\": {");
+        if (ceHooksCls != null) {
+            try {
+                j.append("\"loaded\": true, \"active\": ").append(ceActive.getBoolean(null))
+                        .append(", \"fast\": ").append(ceFast.getLong(null))
+                        .append(", \"mirror\": ").append(ceMirror.getLong(null))
+                        .append(", \"pos\": ").append(ceHooksCls.getField("probesPos").getLong(null))
+                        .append(", \"posDedupHits\": ").append(ceHooksCls.getField("posDedupHits").getLong(null))
+                        .append(", \"posNative\": ").append(ceHooksCls.getField("posNative").getLong(null))
+                        .append(", \"fallback\": ").append(ceHooksCls.getField("queriesFallback").getLong(null));
+            } catch (Throwable t) {
+                j.append("\"loaded\": true, \"active\": false");
+            }
+        } else {
+            j.append("\"loaded\": false");
+        }
+        j.append("},\n");
         j.append("  \"samples\": [\n");
         for (int i = 0; i < samples.size(); i++) {
             double[] s = samples.get(i);

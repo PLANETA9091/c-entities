@@ -180,3 +180,127 @@ fn switch_methods_are_refused() {
     )
     .expect("second patch ok (patcher is offset-robust)");
 }
+
+/// The replace_body weave targets must exist with EXACT descriptors in the
+/// shipped Level.class — catches descriptor typos before a live boot.
+#[test]
+fn level_weave_targets_exist() {
+    let targets: [(&str, &str); 2] = [
+        (
+            "getEntities",
+            "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        ),
+        (
+            "getEntitiesOfClass",
+            "(Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        ),
+    ];
+    let cp_count = u16at(LEVEL, 8);
+    let utf8 = |idx: u16| -> String {
+        // locate the Utf8 constant at cp index `idx` (1-based, long/double
+        // take two slots — walk from 1)
+        let mut i = 10usize;
+        let mut cur = 1u16;
+        while cur < cp_count {
+            let tag = LEVEL[i];
+            match tag {
+                1 => {
+                    let l = u16at(LEVEL, i + 1) as usize;
+                    if cur == idx {
+                        return String::from_utf8_lossy(&LEVEL[i + 3..i + 3 + l]).into_owned();
+                    }
+                    i += 3 + l;
+                    cur += 1;
+                }
+                5 | 6 => {
+                    i += 9;
+                    cur += 2;
+                }
+                7 | 8 | 16 | 19 | 20 => {
+                    i += 3;
+                    cur += 1;
+                }
+                3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
+                    i += 5;
+                    cur += 1;
+                }
+                15 => {
+                    i += 4;
+                    cur += 1;
+                }
+                _ => panic!("unknown cp tag {tag}"),
+            }
+        }
+        panic!("utf8 #{idx} not found");
+    };
+    // methods section: reuse the header walk from find_get_entities_code
+    // (CP end + interfaces + fields), then scan all (name, desc) pairs.
+    let mut i = 10usize;
+    let mut cur = 1u16;
+    while cur < cp_count {
+        let tag = LEVEL[i];
+        match tag {
+            1 => {
+                let l = u16at(LEVEL, i + 1) as usize;
+                i += 3 + l;
+                cur += 1;
+            }
+            5 | 6 => {
+                i += 9;
+                cur += 2;
+            }
+            7 | 8 | 16 | 19 | 20 => {
+                i += 3;
+                cur += 1;
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
+                i += 5;
+                cur += 1;
+            }
+            15 => {
+                i += 4;
+                cur += 1;
+            }
+            _ => panic!("unknown cp tag {tag}"),
+        }
+    }
+    let cp_end = i;
+    let mut j = cp_end + 6;
+    let icount = u16at(LEVEL, j);
+    j += 2 + icount as usize * 2;
+    let fcount = u16at(LEVEL, j);
+    j += 2;
+    for _ in 0..fcount {
+        j += 6;
+        let ac = u16at(LEVEL, j);
+        j += 2;
+        for _ in 0..ac {
+            j += 2;
+            let l = u32at(LEVEL, j) as usize;
+            j += 4 + l;
+        }
+    }
+    let mcount = u16at(LEVEL, j);
+    j += 2;
+    let mut found: Vec<bool> = vec![false; targets.len()];
+    for _ in 0..mcount {
+        let mname = utf8(u16at(LEVEL, j + 2));
+        let mdesc = utf8(u16at(LEVEL, j + 4));
+        j += 6;
+        let ac = u16at(LEVEL, j);
+        j += 2;
+        for t in 0..targets.len() {
+            if mname == targets[t].0 && mdesc == targets[t].1 {
+                found[t] = true;
+            }
+        }
+        for _ in 0..ac {
+            j += 2;
+            let l = u32at(LEVEL, j) as usize; // length right after the name
+            j += 4 + l;
+        }
+    }
+    for (t, ok) in found.iter().enumerate() {
+        assert!(ok, "weave target {}{} missing in Level.class", targets[t].0, targets[t].1);
+    }
+}
