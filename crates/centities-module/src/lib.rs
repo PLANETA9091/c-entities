@@ -809,12 +809,18 @@ fn precompute_livingentity(loader: jni::jobject) {
         );
         return;
     };
+    // NOTE: check_desc MUST equal the Java method's exact descriptor —
+    // pushDispatch(Entity) — or the woven call fails to LINK at runtime
+    // (NoSuchMethodError per entity tick, and Paper 26.3 DISCARDS entities
+    // that throw in their tick; the first CI run lost every zombie to
+    // exactly this). Passing the receiver as the base Entity type is the
+    // itemDispatch pattern (widening is verifier-clean).
     let spec = cplug_sdk::asm::EarlyReturnGuard {
         method_name: "pushEntities",
         method_desc: "()V",
         check_class: HOOKS_CLASS,
         check_name: "pushDispatch",
-        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;)Z",
+        check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
