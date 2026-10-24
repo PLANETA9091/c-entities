@@ -6,31 +6,31 @@ Server: `26.3-218-1b9bf5c (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 19967 -> 19934) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 192.965 / 236.525 / 272.259 / 319.863 |
-| MSPT mean, ms | 201.980 |
-| TPS estimate (1000/p50) | 5.2 |
-| heap used / max, MB | 1745.2 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 0.331 / 0.538 / 1.528 / 4.249 |
+| MSPT mean, ms | 0.392 |
+| TPS estimate (1000/p50) | 20.0 |
+| heap used / max, MB | 1787.9 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 14.11% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 2.77% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 3 | 2.10% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 4 | 1.50% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
-| 5 | 1.49% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 6 | 1.46% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4706` |
-| 7 | 1.34% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 8 | 1.21% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 9 | 1.21% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
-| 10 | 1.16% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
-| 11 | 1.10% | `java.util.HashMap.getNode(Object) line: 586` |
-| 12 | 1.01% | `java.util.EnumMap.get(Object) line: 248` |
-| 13 | 0.99% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3907` |
-| 14 | 0.97% | `net.minecraft.world.entity.LivingEntity.getHealth() line: 1395` |
-| 15 | 0.95% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
+| 1 | 2.82% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
+| 2 | 2.37% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 3 | 1.13% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 714` |
+| 4 | 0.79% | `com.sun.crypto.provider.CounterMode.implCrypt(byte[], int, int, byte[], int) line: 209` |
+| 5 | 0.79% | `sun.security.provider.DigestBase.implCompressMultiBlock0(byte[], int, int) line: 148` |
+| 6 | 0.79% | `net.minecraft.util.StaticCache2D.<init>(int, int, int, int, StaticCache2D$Initializer) line: 26` |
+| 7 | 0.68% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 281` |
+| 8 | 0.62% | `ca.spottedleaf.moonrise.patches.fast_palette.FastHashMapPalette.getEntry(Object) line: 88` |
+| 9 | 0.56% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupBlock() line: 824` |
+| 10 | 0.56% | `java.lang.invoke.DirectMethodHandle.allocateInstance(Object) line: 500` |
+| 11 | 0.51% | `ca.spottedleaf.concurrentutil.lock.ReentrantAreaLock.unlock(ReentrantAreaLock$Node) line: 266` |
+| 12 | 0.45% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 758` |
+| 13 | 0.45% | `net.minecraft.world.level.levelgen.Heightmap.update(int, int, int, BlockState) line: 101` |
+| 14 | 0.45% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder.getCurrentGenStatus() line: 1322` |
+| 15 | 0.39% | `com.sun.crypto.provider.GHASH.processBlocks(byte[], int, int, long[], long[]) line: 284` |
 
