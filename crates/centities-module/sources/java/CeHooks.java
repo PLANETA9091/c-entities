@@ -436,6 +436,7 @@ public final class CeHooks {
                 + "/" + gsFloorStops + "/" + gsMirrorTicks + "/" + gsFloorCollide
                 + " froz=" + frozenCalls + "/" + frozenGate + "/" + frozenWrites
                 + " conv=" + convCalls + "/" + convGate + "/" + convWrites
+                + " tt=" + ttCalls + "/" + ttGate
                 + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
@@ -1533,6 +1534,10 @@ public final class CeHooks {
         CONV_ON = on;
     }
 
+    public static void setTrackerTickGateOn(boolean on) {
+        TT_ON = on;
+    }
+
     /** Both init passes succeeded — L6 may arm. Volatile: read by the
      *  collectors on the server thread, written by the arm thread. */
     private static volatile boolean cplugReady = false;
@@ -2190,6 +2195,13 @@ public final class CeHooks {
         int getInt(Object o) {
             try {
                 return vh != null ? (int) vh.get(o) : f.getInt(o);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        long getLong(Object o) {
+            try {
+                return vh != null ? (long) vh.get(o) : f.getLong(o);
             } catch (IllegalAccessException neverWithSetAccessible) {
                 throw new IllegalStateException(neverWithSetAccessible);
             }
@@ -3566,6 +3578,66 @@ public final class CeHooks {
             lastError = System.nanoTime();
             lastErrorText = "initConvHandles: " + t;
             CONV_HANDLES_OK = false;
+        }
+    }
+
+    // ==================================================================
+    // L15c — the tracker-tick no-op gate (doc 26 §6).
+    //
+    // ChunkMap$TrackedEntity.moonrise$tick(chunk) in a playerless world:
+    // chunkData.nearbyPlayers is null for every chunk, so the whole call is
+    // `moonrise$clearPlayers()` — two idempotent writes (lastChunkUpdate =
+    // -1, lastTrackedChunk = null) + a seenBy.isEmpty() early return
+    // (javap-verified). The items-100k-mod profile puts 14% of the leg's
+    // CPU in that call chain (100k trackers × 20+ ticks/s), plus the
+    // moonrise$tick entry frames around it. The gate returns TRUE only
+    // when the tracker is ALREADY in the cleared state — the writes vanilla
+    // would perform are provable no-ops — and NULL-chunk is the only shape
+    // it skips: any non-null chunk (real players nearby) routes vanilla
+    // wholesale. seenBy non-empty or stale bookkeeping fields route
+    // vanilla too, so the clearPlayers side effects always run exactly
+    // when vanilla would run them with a different result.
+    // ==================================================================
+
+    public static volatile boolean TT_ON = false;
+    public static volatile boolean TT_HANDLES_OK = false;
+    public static final boolean TT_FLAG_ON =
+            !"false".equals(System.getProperty("centities.trackerTick", "true"));
+    public static long ttCalls = 0, ttGate = 0;
+
+    private static volatile RefField VH_TE_SEEN; // TrackedEntity.seenBy
+    private static volatile RefField VH_TE_LCU;  // TrackedEntity.lastChunkUpdate
+    private static volatile RefField VH_TE_LTC;  // TrackedEntity.lastTrackedChunk
+
+    public static void initTTHandles() {
+        try {
+            Class<?> te = Class.forName("net.minecraft.server.level.ChunkMap$TrackedEntity");
+            VH_TE_SEEN = new RefField(te, "seenBy");
+            VH_TE_LCU = new RefField(te, "lastChunkUpdate");
+            VH_TE_LTC = new RefField(te, "lastTrackedChunk");
+            TT_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initTTHandles: " + t;
+            TT_HANDLES_OK = false;
+        }
+    }
+
+    /** moonrise$tick guard: (TrackedEntity this, NearbyPlayers$TrackedChunk chunk)Z.
+     *  TRUE = the vanilla body is a provable no-op (skip it wholesale). */
+    public static boolean trackerTickNoOp(Object te, Object chunk) {
+        ttCalls++;
+        if (!TT_ON || !TT_HANDLES_OK) return false;
+        try {
+            if (chunk != null) return false;
+            java.util.Set<?> seen = (java.util.Set<?>) VH_TE_SEEN.getObj(te);
+            if (seen == null || !seen.isEmpty()) return false;
+            if (VH_TE_LCU.getLong(te) != -1L) return false;
+            if (VH_TE_LTC.getObj(te) != null) return false;
+            ttGate++;
+            return true;
+        } catch (Throwable gateFail) {
+            return false; // route vanilla — never break tracking
         }
     }
 

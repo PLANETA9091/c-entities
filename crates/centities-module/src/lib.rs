@@ -34,6 +34,7 @@ const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
 const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTickList";
 const GOAL_SELECTOR_CLASS: &str = "net/minecraft/world/entity/ai/goal/GoalSelector";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
+const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -386,6 +387,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
     cplug_sdk::hooks::register_bytes(GOAL_SELECTOR_CLASS, |_n, b| patch_goalselector(b));
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
+    cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -434,6 +436,7 @@ fn arm_module() {
     precompute_entity(loader);
     precompute_goalselector(loader);
     precompute_conversion(loader);
+    precompute_trackedentity();
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -449,6 +452,7 @@ fn arm_module() {
         ENTITY_TICK_LIST_CLASS,
         GOAL_SELECTOR_CLASS,
         CONVERSION_TRACKER_CLASS,
+        TRACKED_ENTITY_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -567,6 +571,21 @@ fn arm_module() {
                         ));
                     }
                 }
+                if !TT_WOVEN.load(Ordering::Acquire)
+                    && !TT_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(TRACKED_ENTITY_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_trackedentity();
+                    if TT_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(TRACKED_ENTITY_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred TrackedEntity gate applied, rc={rc}"
+                        ));
+                    }
+                }
             }
             let snap = read_hook_counters();
             // L15 arming: flip a gate ON only when its replaced body is
@@ -599,6 +618,15 @@ fn arm_module() {
                 if set_java_bool("setConvGateOn", true) {
                     CONV_ARMED.store(true, Ordering::Release);
                     cplug_sdk::log::info("[c-entities] conv gate ARMED (verified live)");
+                }
+            }
+            if TT_WOVEN.load(Ordering::Acquire)
+                && !TT_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::TTChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setTrackerTickGateOn", true) {
+                    TT_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] tracker-tick gate ARMED (verified live)");
                 }
             }
             if attempt < 6 || attempt % 25 == 0 {
@@ -775,6 +803,10 @@ static FROZEN_ARMED: AtomicBool = AtomicBool::new(false);
 static CONV_WOVEN: AtomicBool = AtomicBool::new(false);
 static CONV_DECLINED: AtomicBool = AtomicBool::new(false);
 static CONV_ARMED: AtomicBool = AtomicBool::new(false);
+/// L15c: the TrackedEntity.moonrise$tick no-op gate weave is prepared.
+static TT_WOVEN: AtomicBool = AtomicBool::new(false);
+static TT_DECLINED: AtomicBool = AtomicBool::new(false);
+static TT_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -1655,6 +1687,91 @@ fn precompute_conversion(loader: jni::jobject) {
     }
 }
 
+/// L15c: the TrackedEntity.moonrise$tick guard — pure RUST byte surgery (the
+/// branch target is the body start = the implicit entry frame, so no new
+/// StackMapTable entry is needed), applied to the stashed original bytes at
+/// precompute time. ChunkMap loads at boot (pre-arm); if it ever loads
+/// post-arm the hook stashes and the verifier retries.
+fn precompute_trackedentity() {
+    if read_java_flag("TT_FLAG_ON") != Some(true) {
+        TT_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] tracker-tick gate disabled (centities.trackerTick) — vanilla kept",
+        );
+        return;
+    }
+    if prove_handles("initTTHandles", "TT_HANDLES_OK") != Some(true) {
+        TT_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info("[c-entities] tracker-tick handle probe failed — vanilla kept");
+        return;
+    }
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|s| s.get(TRACKED_ENTITY_CLASS).cloned())
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] TrackedEntity not stashed yet — gate deferred to the verifier",
+        );
+        return;
+    };
+    match patch::insert_early_return_guard(
+        bytes,
+        "moonrise$tick",
+        "(Lca/spottedleaf/moonrise/common/misc/NearbyPlayers$TrackedChunk;)V",
+        HOOKS_CLASS,
+        "trackerTickNoOp",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        &[(0, b'L'), (1, b'L')],
+    ) {
+        Ok(guarded) => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(TRACKED_ENTITY_CLASS, guarded);
+            }
+            TT_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed TrackedEntity.moonrise$tick no-op gate");
+        }
+        Err(e) => {
+            cplug_sdk::log::info(&format!(
+                "[c-entities] FAILED to precompute TrackedEntity gate: {e} — vanilla kept"
+            ));
+        }
+    }
+}
+
+fn patch_trackedentity(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_trackedentity_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_trackedentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(TRACKED_ENTITY_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(TRACKED_ENTITY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched TrackedEntity tracker-tick gate");
+            Some(b)
+        }
+        _ if !TT_WOVEN.load(Ordering::Acquire) && !TT_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(TRACKED_ENTITY_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] TrackedEntity bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 fn patch_livingentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         // Boot load: stash the original bytes, stay vanilla. The guard is
@@ -1696,6 +1813,7 @@ enum Counter {
     GoalChecks,
     FrozenChecks,
     ConvChecks,
+    TTChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -1728,6 +1846,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::GoalChecks, ("gsMirrorTicks", "J")),
             (Counter::FrozenChecks, ("frozenCalls", "J")),
             (Counter::ConvChecks, ("convCalls", "J")),
+            (Counter::TTChecks, ("ttCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
