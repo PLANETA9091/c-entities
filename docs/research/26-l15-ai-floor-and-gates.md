@@ -111,3 +111,34 @@ normally — a failed AI floor must never disable the push kernel. The e2e
 asserts the full chain (precomputed + patched + ARMED markers and
 `gs=`/`froz=`/`conv=` traffic); the first e2e zombie now spawns WITHOUT
 `no_ai` so the goal pipeline actually runs.
+
+## 6. L15b/L15c — the tracker path (added after the first green e2e)
+
+The items-100k-mod profile put OUR OWN gate at the top of the leg:
+
+* `trackerDispatch` self ≈ 16.8% across 3 lines + `MethodHandle*Accessor`
+  3.3% — the L14 guard itself. Two fixes: the pure-read REORDER (the
+  cheapest sufficient no-send discriminators first — `isDirty` rejects a
+  resting item before any RefField/interface work; every read in the guard
+  is pure, so the read order is free — the two unconditional effects stay
+  at the tail in vanilla order), and the per-call counters went from
+  volatile to PLAIN (a volatile add per entity per tick was 1-2ms/tick on
+  items-100k; the verifier/e2e readers tolerate eventual visibility).
+* `ChunkMap$TrackedEntity.moonrise$clearPlayers` 14.00% — the whole
+  `moonrise$tick` early path (100k trackers × null nearbyPlayers chunk →
+  clearPlayers = two idempotent writes + `seenBy.isEmpty()` early return,
+  javap-verified). L15c gates `moonrise$tick` with a RUST early-return
+  guard (patch.rs `insert_early_return_guard`: loads (this, chunk),
+  invokestatic check, ifne over the method's own return opcode). The
+  branch target is the original body START — the implicit entry frame —
+  so NO new StackMapTable entry is needed; the existing first-frame +delta
+  shift suffices. The check (`trackerTickNoOp`) returns true ONLY for
+  chunk==null && seenBy empty && lastChunkUpdate==-1 &&
+  lastTrackedChunk==null — the exact pre-cleared state where vanilla's
+  writes are provable no-ops. Any other shape (real players, stale
+  bookkeeping) routes vanilla wholesale.
+
+The guard patcher required no SDK change: the SDK's op-4 passes only the
+first ref arg, but the rust patcher builds arbitrary prefixes — the same
+splice/shift machinery the probe builder uses, refactored into
+`splice_prefix` shared by both.

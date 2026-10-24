@@ -436,7 +436,7 @@ fn arm_module() {
     precompute_entity(loader);
     precompute_goalselector(loader);
     precompute_conversion(loader);
-    precompute_trackedentity();
+    precompute_trackedentity(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -578,7 +578,7 @@ fn arm_module() {
                         .map(|s| s.contains_key(TRACKED_ENTITY_CLASS))
                         .unwrap_or(false)
                 {
-                    precompute_trackedentity();
+                    precompute_trackedentity(loader as jni::jobject);
                     if TT_WOVEN.load(Ordering::Acquire) {
                         let rc = cplug_sdk::retransform_class(TRACKED_ENTITY_CLASS);
                         cplug_sdk::log::info(&format!(
@@ -1687,12 +1687,13 @@ fn precompute_conversion(loader: jni::jobject) {
     }
 }
 
-/// L15c: the TrackedEntity.moonrise$tick guard — pure RUST byte surgery (the
-/// branch target is the body start = the implicit entry frame, so no new
-/// StackMapTable entry is needed), applied to the stashed original bytes at
-/// precompute time. ChunkMap loads at boot (pre-arm); if it ever loads
-/// post-arm the hook stashes and the verifier retries.
-fn precompute_trackedentity() {
+/// L15c: the TrackedEntity.moonrise$tick guard via the SDK's op-5
+/// (receiver + first argument; COMPUTE_FRAMES rebuilds the frames — the
+/// hand-rolled rust branch FAILED_VERIFICATION because a branch merge at
+/// the original body start needs an explicit full frame). ChunkMap loads
+/// at boot (pre-arm); if it ever loads post-arm the hook stashes and the
+/// verifier retries.
+fn precompute_trackedentity(loader: jni::jobject) {
     if read_java_flag("TT_FLAG_ON") != Some(true) {
         TT_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
@@ -1715,26 +1716,29 @@ fn precompute_trackedentity() {
         );
         return;
     };
-    match patch::insert_early_return_guard(
-        bytes,
-        "moonrise$tick",
-        "(Lca/spottedleaf/moonrise/common/misc/NearbyPlayers$TrackedChunk;)V",
-        HOOKS_CLASS,
-        "trackerTickNoOp",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-        &[(0, b'L'), (1, b'L')],
-    ) {
-        Ok(guarded) => {
+    let spec = cplug_sdk::asm::EarlyReturnGuard2 {
+        method_name: "moonrise$tick",
+        method_desc: "(Lca/spottedleaf/moonrise/common/misc/NearbyPlayers$TrackedChunk;)V",
+        check_class: HOOKS_CLASS,
+        check_name: "trackerTickNoOp",
+        check_desc: "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &spec)
+    })
+    .flatten();
+    match patched {
+        Some(b) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(TRACKED_ENTITY_CLASS, guarded);
+                pc.insert(TRACKED_ENTITY_CLASS, b);
             }
             TT_WOVEN.store(true, Ordering::Release);
             cplug_sdk::log::info("[c-entities] precomputed TrackedEntity.moonrise$tick no-op gate");
         }
-        Err(e) => {
-            cplug_sdk::log::info(&format!(
-                "[c-entities] FAILED to precompute TrackedEntity gate: {e} — vanilla kept"
-            ));
+        _ => {
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute TrackedEntity gate — vanilla kept",
+            );
         }
     }
 }

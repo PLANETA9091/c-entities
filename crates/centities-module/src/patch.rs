@@ -339,69 +339,6 @@ pub fn insert_static_call_at_start(
     )
 }
 
-/// Insert a conditional early-return guard with loaded arguments (the rust
-/// twin of the SDK's op-4, minus its receiver-only limit):
-///
-///   <arg loads>
-///   invokestatic checkClass.checkName(checkDesc)   // (args...)Z
-///   ifeq +4                                        // false -> original body
-///   <return opcode of method_desc>                 // true  -> done
-///   <original body>
-///
-/// The branch target is the ORIGINAL BODY START (the method's first
-/// instruction). JVMS treats the frame at the method's first instruction as
-/// IMPLICIT (derived from the descriptor) — a branch to it needs NO extra
-/// StackMapTable entry, so the existing first-frame +delta shift is all the
-/// verification data this prefix requires. The check must therefore be a
-/// PURE read: `true` skips the body wholesale.
-pub fn insert_early_return_guard(
-    bytes: Vec<u8>,
-    method_name: &str,
-    method_desc: &str,
-    check_class: &str,
-    check_name: &str,
-    check_desc: &str,
-    args: &[(u16, u8)],
-) -> Result<Vec<u8>, String> {
-    let cp = parse_cp(&bytes)?;
-    let region = find_code(&bytes, &cp, method_name, method_desc)?;
-
-    // the check must return Z (the guard consumes it with ifeq)
-    if !check_desc.ends_with(")Z") {
-        return Err("guard check must return boolean".into());
-    }
-    let (mref_idx, additions) = build_methodref(&cp, check_class, check_name, check_desc);
-
-    // return opcode from the METHOD's own descriptor
-    let ret = match method_desc.as_bytes()[method_desc.len() - 1] {
-        b'V' => 0xb1u8,                           // return
-        b'I' | b'Z' | b'B' | b'C' | b'S' => 0xac, // ireturn
-        b'J' => 0xad,                             // lreturn
-        b'F' => 0xae,                             // freturn
-        b'D' => 0xaf,                             // dreturn
-        b'L' | b'[' => 0xb0,                      // areturn
-        t => return Err(format!("bad return type {t}")),
-    };
-
-    let mut prefix: Vec<u8> = Vec::new();
-    for (slot, ty) in args {
-        prefix.extend_from_slice(&load_op(*ty, *slot)?);
-    }
-    prefix.push(0xb8); // invokestatic
-    prefix.extend_from_slice(&mref_idx.to_be_bytes());
-    prefix.push(0x99); // ifne — true skips the body
-    prefix.extend_from_slice(&4u16.to_be_bytes()); // +4: over the return byte
-    prefix.push(ret); // 1 byte: the method's own return
-    splice_prefix(
-        bytes,
-        &cp,
-        &region,
-        prefix,
-        additions,
-        args.len() as u16 + 1,
-    )
-}
-
 /// Compute the constant-pool additions for a Methodref (class/name/desc)
 /// and return (new_methodref_index, addition_bytes). The caller splices the
 /// bytes at `cp.end` AFTER the code-region edits (the CP precedes the code,
