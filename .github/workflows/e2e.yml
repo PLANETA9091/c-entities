@@ -147,8 +147,12 @@ jobs:
           # the patch applied but the woven call failed to LINK —
           # check_desc said LivingEntity while the Java method takes Entity —
           # and Paper 26.3 discards entities that throw in their tick,
-          # which silently killed every mob). pushNative>0 = linked + live.
-          echo "$LAST_HOOKS" | grep -Eq "push=[0-9]+/[1-9]" || fail "push guard never executed (linkage or weave dead)"
+          # which silently killed every mob). A linkage failure leaves
+          # pushChecks at 0 (the woven call never enters the method), so
+          # pushChecks>0 proves the weave is live AND linked. pushNative>0
+          # additionally requires the density gate to pass, which a small
+          # e2e soak cannot — the A/B gate covers engagement.
+          echo "$LAST_HOOKS" | grep -Eq "push=[1-9]" || fail "push guard never executed (linkage or weave dead)"
           if [ "$LIVE" != "1" ]; then
             sleep 45
             LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)
