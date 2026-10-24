@@ -1065,6 +1065,11 @@ public final class CeHooks {
                 // capacity hint: the batch was consumed — regrow and retry
                 // WITHOUT re-applying (same contract as the legacy regrow).
                 if (growOutBuffer(-n)) {
+                    // REBIND: dbb still points at the OLD registered buffer;
+                    // the retry writes into the NEW one and the read loop
+                    // below would IOOBE (and disarm the module) on the first
+                    // regrow that actually grows — latent since doc 21.
+                    dbb = IDS_BUF;
                     n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
                             0, B_IDS, B_BOX);
                 }
@@ -1078,6 +1083,9 @@ public final class CeHooks {
                 return null; // regrow failed — mirror
             }
             if (n > 0) {
+                // paranoia guard: the read window must fit BOTH the Java
+                // mirror array and the registered direct buffer — a mismatch
+                // routes mirror (never IOOBEs, never disarms)
                 if (n > ids.length) {
                     if (n > (1 << 20)) {
                         mRegrowFail++;
@@ -1085,6 +1093,10 @@ public final class CeHooks {
                     }
                     ids = new long[n];
                     QBUF.set(ids);
+                }
+                if ((long) n << 3 > dbb.capacity()) {
+                    mRegrowFail++;
+                    return null;
                 }
                 for (int k = 0; k < n; k++) {
                     ids[k] = dbb.getLong(k << 3);
