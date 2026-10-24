@@ -200,7 +200,11 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static final boolean MERGE_ON =
             !"false".equals(System.getProperty("centities.mergeFast", "true"));
-    public static volatile long mergeChecks = 0, mergeSelf = 0, mergeFast = 0;
+    // L15b: hot-path counters are PLAIN longs — a volatile add per call cost
+    // 1-2ms/tick on items-100k (100k merge checks); the JNI verifier and the
+    // e2e reader tolerate eventual visibility, and these are write-only from
+    // the single server thread.
+    public static long mergeChecks = 0, mergeSelf = 0, mergeFast = 0;
     public static volatile long mergeMirror = 0, mergeCand = 0;
     /** L8 parity telemetry: successful tryToMerge operations (either side
      *  discarded). Entity counts can diverge legitimately through merge
@@ -1629,7 +1633,8 @@ public final class CeHooks {
     // ==================================================================
 
     public static final boolean ITEM_TICK_ON = !"0".equals(System.getenv("CE_ITEM_TICK"));
-    public static volatile long itemChecks = 0, itemNative = 0, itemInactive = 0,
+    // L15b: PLAIN (per item-tick, 100k/tick) — see the mergeChecks note.
+    public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
             itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0;
 
@@ -1669,7 +1674,8 @@ public final class CeHooks {
     /** L12 kernel outputs (server-thread confined): the post-tick delta and
      *  the packed verdict of the last nativePush call. */
     public static double PUSH_SDX = 0.0, PUSH_SDY = 0.0, PUSH_SDZ = 0.0;
-    public static volatile long pushChecks = 0, pushNative = 0, pushMirror = 0,
+    // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
+    public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
             pushCramming = 0, pushSelfDelta = 0;
     /** L12 kill switch: -Dcentities.pushNative=false keeps every push vanilla. */
     public static final boolean PUSH_ON =
@@ -1916,7 +1922,8 @@ public final class CeHooks {
     // L6 tick guard collects exactly as before (graceful degradation to L6
     // if this weave is refused).
     // ==================================================================
-    public static volatile long dispChecks = 0, dispNative = 0,
+    // L15b: PLAIN (per non-player tick) — see the mergeChecks note.
+    public static long dispChecks = 0, dispNative = 0,
             dispInactive = 0, dispPass = 0, dispGate = 0;
 
     /** World revision: bumped by the flush whenever any section changed
@@ -2884,7 +2891,9 @@ public final class CeHooks {
     // vanilla body is intact behind the early-return weave). A THROW inside
     // the guard would propagate into the tick loop and kill the server, so
     // the catch is mandatory, not cosmetic.
-    public static volatile long trackerChecks = 0;   // guard calls (weave proof)
+    // L15b: bumped per sendChanges (100k/tick on items-100k) — PLAIN, same
+    // rationale as mergeChecks above (verifier/e2e tolerate eventual visibility).
+    public static long trackerChecks = 0;   // guard calls (weave proof)
     public static volatile long trackerFast = 0;     // provable no-ops served
     public static volatile long trackerVanilla = 0;  // routed to the body
     public static volatile long trackerErr = 0;      // unexpected → vanilla
@@ -2931,16 +2940,27 @@ public final class CeHooks {
     }
 
     public static boolean trackerDispatch(ServerEntity se) {
+        // L15b: volatile increment per entity per tick = 100k lock-xadds/tick
+        // on items-100k (~1-2ms) — plain like the other hot-path counters
+        // (the JNI verifier tolerates staleness).
         trackerChecks++;
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
         try {
             Entity e = (Entity) VH_SE_ENTITY.getObj(se);
+            // L15b REORDER: every read below is PURE (no side effects — the
+            // two unconditional effects ride at the tail in vanilla order),
+            // so the ORDER of the reads is free. The cheapest sufficient
+            // no-send discriminators go first: for a resting item the
+            // entity-data dirty flag is clear ~always — one volatile chain
+            // read rejects before any RefField/interface work. Vanilla's
+            // decision ORDER still decides nothing observable here: a
+            // throw from any read propagates with zero state changed
+            // either way.
+            if (e.getEntityData().isDirty()) return false;      // bc 384-390
+            if (e.syncPosition || e.syncVelocity || e.needsSync) return false; // bc 312-346
             // bc 0-16: hard-colliding entities own the teleportDelay path
             if (e.moonrise$isHardColliding()) return false;
-            // bc 312-346: syncPosition resets the interval (side effect);
-            // bc 1116+: syncVelocity owns the tail's emit block
-            if (e.syncPosition || e.syncVelocity || e.needsSync) return false;
             // bc 302-311: the snapshot only matters for real trackers; the
             // NO_OP implementation (javap'd) is an empty body — skipping its
             // trackingPosition() Vec3 allocation is exact
@@ -2963,8 +2983,6 @@ public final class CeHooks {
                     (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
             int tickCount = VH_SE_TICK_COUNT.getInt(se);
             if (interval == null || interval.test(tickCount)) return false;
-            // bc 384-390: dirty data → sendDirtyEntityData path
-            if (e.getEntityData().isDirty()) return false;
             // ALL conditions passed: this tick emits nothing. Reproduce the
             // unconditional effects in vanilla order:
             e.updateDataBeforeSync();                       // bc 19-23
@@ -3003,7 +3021,9 @@ public final class CeHooks {
     // This path is behaviorally exact with the module ARMED or DISARMED
     // (it only changes the iteration strategy), so it does not read ACTIVE:
     // both A/B legs walk the same way and the gate stays honest.
-    public static volatile long tickListChecks = 0;  // mirror calls (weave proof)
+    // L15b: PLAIN (per level tick — cheap, but the read cadence is the same
+    // eventual-visibility contract).
+    public static long tickListChecks = 0;  // mirror calls (weave proof)
     public static volatile long tickListErr = 0;     // retries served
 
     /** L13 kill switch: -Dcentities.tickListRaw=false refuses the weave at
