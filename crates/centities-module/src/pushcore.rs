@@ -133,14 +133,22 @@ impl PushCore {
         dz: f64,
         flags: u8,
         vid: i64,
-    ) {
+    ) -> Option<i64> {
         let s = (id as usize) & PS_MASK;
+        let mut evicted = None;
         if self.key[s] != id {
-            if self.key[s] == 0 {
+            if self.key[s] != 0 {
+                // slot collision (id & MASK): the previous owner loses its
+                // arena slot — the caller must drop it from the push index
+                // too, or its candidates would silently miss the mirror
+                evicted = Some(self.key[s]);
+            } else {
                 self.population += 1;
             }
             self.key[s] = id;
             self.ncol[s] = 0; // a fresh id starts the counter at zero
+            self.kadd_dx[s] = 0.0;
+            self.kadd_dz[s] = 0.0;
         }
         let o = s * 6;
         self.box6[o] = b.x0;
@@ -158,6 +166,7 @@ impl PushCore {
         self.dy[s] = dy;
         self.flags[s] = flags;
         self.vid[s] = vid;
+        evicted
     }
 
     /// Delta-only refresh (probeDelta events without a box change). The

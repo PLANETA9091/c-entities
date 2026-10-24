@@ -1885,9 +1885,7 @@ pub extern "system" fn n_flush(
                     let ev = st.idx.upsert(id, wid, &b);
                     st.note_upsert(ev);
                     if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
-                        let ev2 = st.pidx.upsert(id, wid, &b);
-                        let _ = ev2;
-                        st.push.upsert(
+                        let evicted = st.push.upsert(
                             id as i64,
                             &b,
                             pxz_buf[i * 2],
@@ -1898,6 +1896,15 @@ pub extern "system" fn n_flush(
                             pf_buf[i] as u8,
                             vid_buf[i] as i64,
                         );
+                        if let Some(old) = evicted {
+                            // arena slot collision: the previous owner lost
+                            // its mirror slot — it must leave the push index
+                            // too (it routes vanilla via the guard's mirror
+                            // miss from now on)
+                            st.pidx.remove(old);
+                        }
+                        let ev2 = st.pidx.upsert(id as i64, wid, &b);
+                        let _ = ev2;
                     } else {
                         // reclassified non-pushable (or a plain living): drop
                         // it from the push view (no-ops when absent)
