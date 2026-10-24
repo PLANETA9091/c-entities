@@ -1973,11 +1973,12 @@ pub extern "system" fn n_push(
                 self_id as i64,
                 slot,
                 self_vehicle != 0,
-                self_player != 0,
+                self_player != 0, // now carries the enablePlayerCollisions config
                 only_players != 0,
-                true, // player collisions enabled (Java gates the config flip)
+                self_player != 0,
                 max_ec,
                 cramming,
+                pushcore::GATE_MIN,
                 cur_tick as u64,
                 &mut o,
             );

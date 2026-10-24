@@ -704,6 +704,21 @@ impl EntityIndex {
         self.cellmap.find(cell_key(world, cx, cz))
     }
 
+    /// L12 density gate: the pushable-row population of ONE cell (0 if
+    /// absent). The kernel sums this over the covered cells and routes
+    /// vanilla below GATE_MIN — the kernel's fixed cost (JNI crossing +
+    /// lock + scan setup) beats vanilla only when the local candidate
+    /// density is high (measured break-even ~50-80 rows; the A/B spread
+    /// legs lost +27ms/tick to the fixed cost at ~10-30 rows/cell).
+    #[inline]
+    pub fn cell_population(&self, world: u16, cx: i32, cz: i32) -> usize {
+        let key = cell_key(world, cx, cz);
+        match self.cellmap.find(key) {
+            Some(cid) => self.cell_ids[cid as usize].len(),
+            None => 0,
+        }
+    }
+
     /// L12 push kernel support: sort one cell's entries by id, in place,
     /// rebuilding the blocked-SoA box store and fixing every entry's cpos.
     ///

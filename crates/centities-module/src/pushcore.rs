@@ -52,6 +52,12 @@ pub const PUSH_QUANTUM: f64 = 0.05000000074505806;
 pub const R_MIRROR: i64 = 0; // kernel declined — vanilla body must run
 pub const R_OK: i64 = 1;
 
+/// The density gate (see centities-core::cell_population): below this many
+/// pushable rows in the covered cells the vanilla body is cheaper than the
+/// kernel's fixed cost. Measured: break-even ~50-80 rows; the A/B spread
+/// legs (10-30 rows/cell) lost +27ms/tick without the gate.
+pub const GATE_MIN: usize = 96;
+
 /// Per-entity push mirror. Slots are addressed `id & PS_MASK` with the full
 /// id stored for exactness (the Java ARENA pattern). A slot is live iff
 /// `key[slot] == id` — removals null the key synchronously, so a removed
@@ -231,6 +237,7 @@ pub fn push_tick(
     player_collisions: bool,
     max_ec: i32,
     cramming: i32,
+    gate_min: usize,
     tick: u64,
     out: &mut PushOut,
 ) {
@@ -253,6 +260,23 @@ pub fn push_tick(
     let spz = pc.pz[self_slot];
     let self_pushable = pc.flags[self_slot] & PF_PUSHABLE != 0;
     let self_nophys = pc.flags[self_slot] & PF_NOPHYSICS != 0;
+
+    // Density gate FIRST (before any scanning work): sum the covered
+    // cells' pushable-row populations; sparse worlds route vanilla.
+    let ex_gate = pidx.max_half_span() + centities_core::MARGIN as f64;
+    let gx0 = ((sx0 - ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
+    let gx1 = ((sx1 + ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
+    let gz0 = ((sz0 - ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
+    let gz1 = ((sz1 + ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
+    let mut rows = 0usize;
+    for cx in gx0..=gx1 {
+        for cz in gz0..=gz1 {
+            rows += pidx.cell_population(world, cx, cz);
+        }
+    }
+    if rows < gate_min {
+        return; // out.ok stays false -> the caller routes vanilla
+    }
 
     // numCollisions reset (vanilla: max(0, ncol - maxEC) BEFORE the loop).
     let mut ncol_self = pc.ncol[self_slot];
@@ -472,7 +496,7 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert!(out.ok);
         let want = sq * 0.05000000074505806;
         assert!((out.ddx - (-want)).abs() < 1e-18, "ddx={} want -{want}", out.ddx);
@@ -497,7 +521,7 @@ mod tests {
         pc.upsert(2, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert_eq!(out.non_passengers, 1);
         assert_eq!(out.ncol, 1, "ncol++ happens before doPush");
         let s2 = pc.slot_of(2).unwrap();
@@ -519,7 +543,7 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out);
         assert_eq!(out.non_passengers, 5, "all hits audited despite the cap");
         assert_eq!(out.ncol, 2, "the cap stops pair processing at maxEC");
         for k in 2..7i64 {
@@ -542,7 +566,7 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert_eq!(out.non_passengers, 30);
         assert!(out.cramming);
     }
@@ -556,7 +580,7 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE | PF_PASSENGER, 1);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
         assert_eq!(out.ddx, 0.0, "no force for same-vehicle pairs");
@@ -571,7 +595,7 @@ mod tests {
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert_eq!(out.non_passengers, 0);
         assert_eq!(out.ncol, 0);
     }
@@ -590,7 +614,7 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out);
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
             let s = pc.slot_of(k).unwrap();
@@ -609,7 +633,7 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         let s2 = pc.slot_of(2).unwrap();
         let pushed = pc.dx[s2];
         assert!(pushed > 0.0);
@@ -625,6 +649,27 @@ mod tests {
         assert!((pc.dx[s2] - (0.1 + pushed)).abs() < 1e-18);
     }
 
+    /// The density gate: below gate_min rows the kernel declines (ok=false)
+    /// without touching any state; at/above it, the tick runs.
+    #[test]
+    fn density_gate_routes_sparse_worlds() {
+        let mut pidx = idx_with(2, 0.5, 0.0);
+        let mut pc = core_with(1, 0.0, 0.0);
+        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        let mut out = PushOut::default();
+        let s1 = pc.slot_of(1).unwrap();
+        // gate_min=96 with 2 rows -> decline, NO state changes
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, &mut out);
+        assert!(!out.ok, "sparse world must route vanilla");
+        assert_eq!(out.ncol, 0);
+        let s2 = pc.slot_of(2).unwrap();
+        assert_eq!(pc.ncol[s2], 0, "declined call must not touch mirrors");
+        // gate_min=0 -> the tick runs
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        assert!(out.ok);
+        assert_eq!(out.ncol, 1);
+    }
+
     /// The dy axis is untouched by pushes (y force is always 0).
     #[test]
     fn dy_untouched() {
@@ -635,7 +680,7 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.03, -0.08, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 1, &mut out);
+        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
         assert_eq!(out.ddy, 0.0);
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(pc.dy[s2], -0.08);

@@ -1682,6 +1682,34 @@ public final class CeHooks {
      * the Java field), the decline path re-syncs the mirror into the field
      * so the vanilla body starts from the right counter.
      */
+    /** Per-tick config cache: gamerules/paperConfig/listener checks are
+     *  map lookups + array scans; 15k pushers/tick paid ~2-3ms for them.
+     *  Refreshed by the first pusher of each tick (server-thread confined). */
+    private static int PUSH_CFG_TICK = -1;
+    private static int PUSH_CFG_MAXEC = 0;
+    private static int PUSH_CFG_CRAMMING = 0;
+    private static boolean PUSH_CFG_ONLYPLAYERS = false;
+    private static boolean PUSH_CFG_PLAYERS = true;
+    private static boolean PUSH_CFG_EVENTS = false;
+
+    private static void refreshPushCfg(net.minecraft.server.level.ServerLevel sl) {
+        int t = net.minecraft.server.MinecraftServer.currentTick;
+        if (PUSH_CFG_TICK == t) return;
+        PUSH_CFG_TICK = t;
+        PUSH_CFG_MAXEC = sl.paperConfig().collisions.maxEntityCollisions;
+        PUSH_CFG_CRAMMING = sl.getGameRules()
+                .get(net.minecraft.world.level.gamerules.GameRules.MAX_ENTITY_CRAMMING);
+        PUSH_CFG_ONLYPLAYERS = sl.paperConfig().collisions.onlyPlayersCollide;
+        PUSH_CFG_PLAYERS = io.papermc.paper.configuration.GlobalConfiguration
+                .get().collisions.enablePlayerCollisions;
+        try {
+            PUSH_CFG_EVENTS = io.papermc.paper.event.entity.EntityCollideWithEntityEvent
+                    .getHandlerList().getRegisteredListeners().length != 0;
+        } catch (Throwable t2) {
+            PUSH_CFG_EVENTS = true; // uncertain -> vanilla
+        }
+    }
+
     public static boolean pushDispatch(Entity ent) {
         pushChecks++;
         if (!ACTIVE || !PUSH_ON || !cplugReady) return false;
@@ -1695,34 +1723,21 @@ public final class CeHooks {
                 return false;
             }
             if (le.isRemoved() || le.noPhysics || le.isPassenger()) return false;
-            // byte-faithful isPushable() slice (the vanilla body's own gate):
-            // a false here means vanilla no-ops anyway — route vanilla.
-            if ((pushFlags(le) & PF_PUSHABLE) == 0) return false;
             // team collision rules: the predicate folds per-pair team logic;
-            // any team on either side routes vanilla.
+            // any team on either side routes vanilla. (The isPushable slice
+            // lives in the ARENA flags now — refreshed per box/add event —
+            // the per-call recompute cost 15k pushers their chunk lookups.)
             if (le.getTeam() != null) return false;
-            int cramming = sl.getGameRules()
-                    .get(net.minecraft.world.level.gamerules.GameRules.MAX_ENTITY_CRAMMING);
-            int maxEC = w.paperConfig().collisions.maxEntityCollisions;
-            if (cramming <= 0 && maxEC <= 0) return false;
-            // Entity.push fires EntityCollideWithEntityEvent when listeners
-            // exist; push(DDD) fires EntityPushedByEntityAttackEvent only for
-            // a non-null source (never here) — listener presence routes vanilla.
-            if (io.papermc.paper.event.entity.EntityCollideWithEntityEvent
-                    .getHandlerList().getRegisteredListeners().length != 0) {
-                return false;
-            }
+            refreshPushCfg(sl);
+            if (PUSH_CFG_EVENTS) return false;
             int wid = worldId(w);
             if (wid < 0) return false;
-            boolean onlyPlayers = w.paperConfig().collisions.onlyPlayersCollide;
-            boolean playerCollisions = io.papermc.paper.configuration.GlobalConfiguration
-                    .get().collisions.enablePlayerCollisions;
             boolean selfVehicle = le.isVehicle();
             // the kernel reads the mirror: drain the pending probe batches first
             flushIfPending();
             long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
-                    0, onlyPlayers ? 1 : 0, maxEC, cramming,
-                    net.minecraft.server.MinecraftServer.currentTick);
+                    PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
+                    PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK);
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.
@@ -1769,7 +1784,7 @@ public final class CeHooks {
                     ACTIVE = false;
                     return false;
                 }
-                if (roll == 0 && nonPass > cramming - 1) {
+                if (roll == 0 && nonPass > PUSH_CFG_CRAMMING - 1) {
                     le.hurtServer(sl, sl.damageSources().cramming(), 6.0f);
                 }
             }
