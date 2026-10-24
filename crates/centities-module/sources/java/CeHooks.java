@@ -1637,29 +1637,40 @@ public final class CeHooks {
 
     private static synchronized boolean initNcolMh(Entity sample) {
         if (MH_NCOL_FAILED) return false;
-        if (MH_NCOL != null) return true;
+        if (MH_NCOL != null && MH_RANDOM != null && MH_NEXT_INT != null) return true;
+        // ATOMIC: build ALL handles into locals; publish only on complete
+        // success (the first kernel round died on a half-published set —
+        // MH_NCOL live, MH_RANDOM null — and the cramming branch NPE'd)
         try {
             java.lang.reflect.Field f = net.minecraft.world.entity.Entity.class
                     .getDeclaredField("numCollisions");
             f.setAccessible(true);
-            MH_NCOL = java.lang.invoke.MethodHandles.lookup().unreflectSetter(f)
-                    .asType(java.lang.invoke.MethodType.methodType(
-                            void.class, Entity.class, int.class));
-            java.lang.reflect.Field rf = net.minecraft.world.entity.LivingEntity.class
-                    .getDeclaredField("random");
-            rf.setAccessible(true);
-            MH_RANDOM = java.lang.invoke.MethodHandles.lookup().unreflectGetter(rf)
-                    .asType(java.lang.invoke.MethodType.methodType(
-                            net.minecraft.util.RandomSource.class,
-                            net.minecraft.world.entity.LivingEntity.class));
+            java.lang.invoke.MethodHandle ncol =
+                    java.lang.invoke.MethodHandles.lookup().unreflectSetter(f)
+                            .asType(java.lang.invoke.MethodType.methodType(
+                                    void.class, Entity.class, int.class));
+            // the PUBLIC getter — no setAccessible on the protected field
+            java.lang.reflect.Method g = net.minecraft.world.entity.LivingEntity.class
+                    .getDeclaredMethod("getRandom");
+            java.lang.invoke.MethodHandle rnd =
+                    java.lang.invoke.MethodHandles.lookup().unreflect(g)
+                            .asType(java.lang.invoke.MethodType.methodType(
+                                    net.minecraft.util.RandomSource.class,
+                                    net.minecraft.world.entity.LivingEntity.class));
             java.lang.reflect.Method ni = net.minecraft.util.RandomSource.class
                     .getDeclaredMethod("nextInt", int.class);
-            ni.setAccessible(true);
-            MH_NEXT_INT = java.lang.invoke.MethodHandles.lookup().unreflect(ni)
-                    .asType(java.lang.invoke.MethodType.methodType(
-                            int.class, net.minecraft.util.RandomSource.class, int.class));
+            java.lang.invoke.MethodHandle next =
+                    java.lang.invoke.MethodHandles.lookup().unreflect(ni)
+                            .asType(java.lang.invoke.MethodType.methodType(
+                                    int.class, net.minecraft.util.RandomSource.class, int.class));
+            MH_NCOL = ncol;
+            MH_RANDOM = rnd;
+            MH_NEXT_INT = next;
             return true;
         } catch (Throwable t) {
+            MH_NCOL = null;
+            MH_RANDOM = null;
+            MH_NEXT_INT = null;
             MH_NCOL_FAILED = true;
             lastError = System.nanoTime();
             lastErrorText = "ncolMh: " + t;
@@ -1772,7 +1783,13 @@ public final class CeHooks {
             }
             if ((res & 2L) != 0L) {
                 // vanilla: list.size() > cramming-1 && random.nextInt(4) == 0
-                // && nonPassengers > cramming-1 -> hurtServer(cramming, 6f)
+                // && nonPassengers > cramming-1 -> hurtServer(cramming, 6f).
+                // The RNG handles are part of the kernel contract: without
+                // them the tick cannot consume the entity's RandomSource in
+                // the vanilla condition -> route vanilla entirely.
+                if (MH_RANDOM == null || MH_NEXT_INT == null) {
+                    return false;
+                }
                 pushCramming++;
                 int roll = -1;
                 try {
