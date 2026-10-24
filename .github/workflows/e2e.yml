@@ -89,7 +89,12 @@ jobs:
           # snake_case since 1.21.5 (no_ai / persistence_required / marker),
           # while the item stack key stays Item:{id:...,count:1}.
           (sleep 90;
-           echo "summon minecraft:zombie 8 -59 8 {no_ai:1b,persistence_required:1b}";
+           # the FIRST zombie has NO no_ai: it runs the real goal pipeline
+           # (GoalSelector tick/mirror traffic → the L15 AI floor arms) —
+           # the no_ai ones never reach serverAiStep, so they cannot prove
+           # the floor live. persistence_required keeps it from despawning;
+           # a burning zombie is fine — it only needs a few goal ticks.
+           echo "summon minecraft:zombie 8 -59 8 {persistence_required:1b}";
            echo "summon minecraft:armor_stand 10 -59 10 {marker:1b,gravity:0b}";
            sleep 2;
            echo 'summon minecraft:item 0 50 0 {Item:{id:"minecraft:stone",count:1},PickupDelay:32767}';
@@ -122,6 +127,11 @@ jobs:
           grep -q  "\[c-entities\] patched LivingEntity pushEntities dispatch guard" e2e.log || fail "L12 push dispatch guard not applied"
           grep -q  "\[c-entities\] patched ServerEntity.sendChanges fast gate" e2e.log || fail "L14 tracker fast gate not applied"
           grep -q  "\[c-entities\] patched EntityTickList.forEach raw walk" e2e.log || fail "L13 tick-list raw walk not applied"
+          grep -q  "\[c-entities\] precomputed GoalSelector microkernel" e2e.log || fail "L15 AI floor not precomputed"
+          grep -q  "\[c-entities\] patched GoalSelector microkernel"     e2e.log || fail "L15 AI floor not applied"
+          grep -q  "\[c-entities\] AI floor ARMED"                       e2e.log || fail "L15 AI floor never armed (GoalSelector loads with the first mob; the AI zombie must tick)"
+          grep -q  "\[c-entities\] frozen gate ARMED"                    e2e.log || fail "L15 frozen gate never armed"
+          grep -q  "\[c-entities\] conv gate ARMED"                      e2e.log || fail "L15 conv gate never armed"
           grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
@@ -164,6 +174,11 @@ jobs:
           echo "$LAST_HOOKS" | grep -Eq "tracker=[0-9]+/[1-9]"   || fail "tracker gate never served a provable no-op"
           # L13: the tick phase walks through the raw-array mirror every tick.
           echo "$LAST_HOOKS" | grep -Eq "ticklist=[1-9]"         || fail "tick-list raw walk never executed"
+          # L15: the goal bridge executed (mirror while disarmed / floor after)
+          # and the no-op write gates served traffic.
+          echo "$LAST_HOOKS" | grep -Eq "gs=[1-9]"               || fail "goal-selector bridge never executed (linkage or weave dead)"
+          echo "$LAST_HOOKS" | grep -Eq "froz=[0-9]+/[1-9]"      || fail "frozen gate never served a provable no-op"
+          echo "$LAST_HOOKS" | grep -Eq "conv=[0-9]+/[1-9]"      || fail "conv gate never served a provable no-op"
           if [ "$LIVE" != "1" ]; then
             sleep 45
             LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)

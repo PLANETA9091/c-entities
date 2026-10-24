@@ -68,6 +68,7 @@ public final class CeHooks {
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
+    public static volatile long mWorldSlotClash = 0; // L15: worldId slot collision (map-path fallback)
     public static volatile long lastError = 0;
     private static volatile String lastErrorText = "";
     // Parity-gate counters (diagnostics).
@@ -427,6 +428,11 @@ public final class CeHooks {
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
+                + " gs=" + gsFloorTicks + "/" + gsFloorRunning + "/" + gsFloorStarts
+                + "/" + gsFloorStops + "/" + gsMirrorTicks + "/" + gsFloorCollide
+                + " froz=" + frozenCalls + "/" + frozenGate + "/" + frozenWrites
+                + " conv=" + convCalls + "/" + convGate + "/" + convWrites
+                + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -1225,6 +1231,7 @@ public final class CeHooks {
     // L4c windowed rows: the UNWRAPPED cell x-origin of each covered row
     // (world blocks) — the reference frame for the packed candidate windows.
     private static final long[] MQ_CELL_X0 = new long[4];
+    private static final long[] MQ_CELL_Z0 = new long[4];
     // Pending row-neutral ids homed in a covered cell: their packed windows
     // are stale until the next publish, so the window test must not skip them.
     // Sized to PENDING_CAP: every pending row-neutral id of a covered cell
@@ -1267,6 +1274,7 @@ public final class CeHooks {
                 MQ_ROWS[nr] = row;
                 MQ_CELL[nr] = (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 MQ_CELL_X0[nr] = (long) cx << 4;
+                MQ_CELL_Z0[nr] = (long) cz << 4;
                 nr++;
                 total += n;
             }
@@ -1350,6 +1358,8 @@ public final class CeHooks {
             // the answer. Typical push query: ~2.6 blocks wide in a 16-block
             // cell -> ~85% of candidates skipped at ~3ns each.
             long cellX0 = MQ_CELL_X0[r];
+            double x0 = (double) cellX0;          // exact: |cx| << 49
+            double z0 = (double) MQ_CELL_Z0[r];
             int qLo = ((int) Math.floor((box.minX - cellX0) * 1024.0)) - 2 + 32768;
             int qHi = ((int) Math.ceil((box.maxX - cellX0) * 1024.0)) + 2 + 32768;
             for (int k = 0; k < n; k++) {
@@ -1378,8 +1388,20 @@ public final class CeHooks {
                 // home re-check (exactness): the entity's CURRENT home must
                 // still be the cell whose row we are reading; a pending
                 // cross-cell move drops out here exactly like vanilla's
-                // section semantics.
-                if (cellOfBox(eb) != packed) {
+                // section semantics. L15: the row's exact origins are known,
+                // so the floor(center/16)==cell test becomes interval tests —
+                // no per-candidate division (the cellOfBox form cost 1.26%
+                // caller CPU in the 26.3 mobs-25k-mod profile). Equivalence:
+                // floor(center)==c as doubles <=> center in [c*16, c*16+16),
+                // and (min+max)*0.5 is exact (division by 2), so comparing
+                // center against the [x0, x0+16) interval is the SAME test.
+                double ecx = (eb.minX + eb.maxX) * 0.5;
+                if (ecx < x0 || ecx >= x0 + 16.0) {
+                    homeMiss++;
+                    continue;
+                }
+                double ecz = (eb.minZ + eb.maxZ) * 0.5;
+                if (ecz < z0 || ecz >= z0 + 16.0) {
                     homeMiss++;
                     continue;
                 }
@@ -1406,33 +1428,30 @@ public final class CeHooks {
             new java.util.concurrent.atomic.AtomicInteger();
 
     // 4b.1: identity memo for worldId — every query (fast AND mirror) pays
-    // gateCell → worldId, and a ConcurrentHashMap.get costs ~40-60ns while an
-    // identity scan over 4 slots is ~3-5ns. Slot w is bound to THE level whose
-    // world id is w, published only AFTER the WORLDS registration completed,
-    // and never rebound (world ids are never reassigned) — so concurrent
-    // first-writers write the same value (benign race, reference writes are
-    // atomic) and a reader can never observe a torn pair: worst case it sees
-    // a not-yet-published slot and takes the map path.
-    private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[4];
-
-    // doc 21: 1-slot LRU pair cache. Queries (and merge scans) come in
-    // same-level bursts — the world alternates at most a few times per tick —
-    // so ONE identity compare hits ~always, and the 4-slot scan + map path
-    // become the fallback. The pair publishes ATOMICALLY (one volatile
-    // reference swap can never tear level/wid apart, unlike two fields).
-    private static final java.util.concurrent.atomic.AtomicReference<Object[]> LAST_WORLD =
-            new java.util.concurrent.atomic.AtomicReference<>();
+    // gateCell → worldId. History: a ConcurrentHashMap.get cost ~40-60ns; the
+    // 4-slot scan + 1-slot LRU pair fixed the common case but the JFR profile
+    // of the 26.3 mobs-25k-mod leg still showed 2.05% self time at the
+    // putIfAbsent line: with MORE live worlds than the 4 slots (overworld +
+    // nether + end exist by default) and alternating callers, the 1-slot LRU
+    // missed on every alternation and ALLOCATED a fresh Object[2] per hit,
+    // while worlds with id >= 4 fell through to the map on EVERY call.
+    //
+    // L15: one flat identity scan over 16 slots, zero allocation on any hit,
+    // map only on the very first sight of a level. Slots are published once
+    // (world ids are never reassigned) and never rebound, so a reader racing
+    // a publisher sees a null slot and takes the map path — never a wrong id.
+    // Plain arrays + benign races: reference writes are atomic, both racers
+    // write the same immutable pair, and the slot order is stable because a
+    // slot is claimed only when null (winner writes its own id there).
+    private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[16];
 
     public static int worldId(net.minecraft.world.level.Level level) {
-        Object[] last = LAST_WORLD.get();
-        if (last != null && last[0] == level) {
-            return (Integer) last[1];
-        }
-        for (int w = 0; w < WID_SLOTS.length; w++) {
+        // hot loop: ~4 identity compares typical (1-3 live query worlds)
+        for (int w = 0; w < 16; w++) {
             if (WID_SLOTS[w] == level) {
-                LAST_WORLD.set(new Object[]{level, w});
                 return w;
             }
+            if (WID_SLOTS[w] == null) break; // no slots beyond the first null
         }
         Integer got = WORLDS.get(level);
         int w;
@@ -1443,10 +1462,16 @@ public final class CeHooks {
             Integer prev = WORLDS.putIfAbsent(level, nw);
             w = prev != null ? prev : nw;
         }
-        if (w < WID_SLOTS.length && WID_SLOTS[w] == null) {
-            WID_SLOTS[w] = level;
+        if (w < 16) {
+            if (WID_SLOTS[w] == null) WID_SLOTS[w] = level;
+            else if (WID_SLOTS[w] != level) {
+                // slot collision (should be impossible: slot w is only ever
+                // claimed by world w): keep the table sound by leaving it —
+                // this world stays on the map path.
+                mWorldSlotClash++;
+                return w;
+            }
         }
-        LAST_WORLD.set(new Object[]{level, w});
         return w;
     }
 
@@ -1487,6 +1512,21 @@ public final class CeHooks {
         if (!on) {
             cplugReady = false;
         }
+    }
+
+    /** L15 arm switches — called by the native verifier after the
+     *  corresponding replace_body weave is PROVEN live (counters move).
+     *  Each gate arms independently; a refusal keeps vanilla forever. */
+    public static void setAiFloorOn(boolean on) {
+        AI_ON = on;
+    }
+
+    public static void setFrozenGateOn(boolean on) {
+        FROZEN_ON = on;
+    }
+
+    public static void setConvGateOn(boolean on) {
+        CONV_ON = on;
     }
 
     /** Both init passes succeeded — L6 may arm. Volatile: read by the
@@ -3064,5 +3104,488 @@ public final class CeHooks {
             if (t instanceof Error err) throw err;
             throw new IllegalStateException("tickListForEach mirror failed", t);
         }
+    }
+
+    // ==================================================================
+    // L15 — the AI floor: GoalSelector microkernel (doc 26).
+    //
+    // Profile of the 26.3 mobs-25k-mod leg: the vanilla scheduler burns
+    // ~4.2% of self CPU across GoalSelector.tick (1.33) + EnumMap.get
+    // (1.12, the lockedFlags getOrDefault chains) + tickRunningGoals
+    // (0.72) + AbstractCollection.containsAll (0.70, the removeIf path)
+    // + WrappedGoal.getFlags (0.37) — plus the callee side of every
+    // EnumSet-sized lambda the map churn creates. The floor rewrites the
+    // scheduler bookkeeping as flat long-bitmask arithmetic over a
+    // per-thread lock table and a running-goal shadow, while calling the
+    // goal objects in the EXACT vanilla order:
+    //
+    //  * same live-set iteration (ObjectLinkedOpenHashSet insertion order),
+    //    same conditions, same short-circuit order — canUse/canContinueToUse
+    //    are called iff vanilla calls them;
+    //  * the lock table is REBUILT each cleanup from the running goals'
+    //    current flags — exact for vanilla goals (javap-verified: every
+    //    setFlags call in the shipped goal classes sits in a constructor,
+    //    never in tick/canUse/start/stop). A table collision (two running
+    //    goals holding one flag — impossible under vanilla semantics)
+    //    disarms the floor globally and falls back to the mirror;
+    //  * lockedFlags is private with no readers outside GoalSelector
+    //    (decompile-verified) — the mirror reproduces it via RefField;
+    //  * tickRunningGoals(false) walks the RUNNING shadow (insertion
+    //    order, built each even tick) with a live isRunning re-check and
+    //    lazy pruning, so a goal stopped between ticks is skipped exactly
+    //    as vanilla skips it; the force=true tail walks the full set
+    //    (identical to vanilla's tickRunningGoals(true));
+    //  * profiler sections (goalCleanup/goalUpdate/goalTick) are kept —
+    //    /debug tracer parity;
+    //  * the floor is armed only after the replace_body weave is verified
+    //    live (counters move), the handles are proven at precompute time,
+    //    and -Dcentities.aiFloor=false keeps vanilla forever.
+    // ==================================================================
+
+    public static volatile boolean AI_ON = false;
+    public static volatile boolean AI_HANDLES_OK = false;
+    // per-tick counters are PLAIN (server-thread writes; the JNI verifier
+    // reads tolerate staleness) — a volatile add per selector per tick would
+    // burn ~0.3ms of the ~3ms the floor saves.
+    public static long gsFloorTicks = 0, gsFloorRunning = 0, gsFloorStarts = 0,
+            gsFloorStops = 0, gsFloorCollide = 0, gsMirrorTicks = 0;
+
+    private static volatile RefField VH_GS_DISABLED; // GoalSelector.goalTypes
+    private static volatile RefField VH_GS_LOCKED;   // GoalSelector.lockedFlags (mirror only)
+    private static volatile int FLAG_N = -1;
+    /** Cached Flag.values() — the mirror's EnumMap keys (ordinals map 1:1).
+     *  Lazy: a static-init reference would force-load Goal during the module
+     *  arm (a bootstrap-time class-load side effect we refuse to take). */
+    private static volatile net.minecraft.world.entity.ai.goal.Goal.Flag[] GOAL_FLAGS;
+
+    private static net.minecraft.world.entity.ai.goal.Goal.Flag[] goalFlags() {
+        net.minecraft.world.entity.ai.goal.Goal.Flag[] f = GOAL_FLAGS;
+        if (f == null) {
+            f = net.minecraft.world.entity.ai.goal.Goal.Flag.values();
+            GOAL_FLAGS = f;
+        }
+        return f;
+    }
+
+    /** Running-goal shadow: the running subset of availableGoals in the
+     *  set's insertion order, rebuilt by every floor tick() pass. Held in
+     *  a weak-keys identity map — an entry dies with its selector, and the
+     *  per-call lookup (~20ns) replaces the impossible alternative (adding
+     *  a field to a class the JVM already loaded: retransform forbids
+     *  schema changes). */
+    private static final class AIShadow {
+        net.minecraft.world.entity.ai.goal.WrappedGoal[] goals =
+                new net.minecraft.world.entity.ai.goal.WrappedGoal[8];
+        int n;
+    }
+
+    private static final java.util.concurrent.ConcurrentMap<Object, AIShadow> AI_SHADOWS =
+            new com.google.common.collect.MapMaker().weakKeys().makeMap();
+
+    private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_LOCK_TABLE =
+            ThreadLocal.withInitial(
+                () -> new net.minecraft.world.entity.ai.goal.WrappedGoal[32]);
+
+    /** Precompute-time proof: the private-handle set must resolve BEFORE
+     *  the GoalSelector bodies are replaced (doc-25 rule — the mirror has
+     *  no vanilla escape, so a lazy handle failure would crash the first
+     *  mob tick). */
+    public static void initAIHandles() {
+        try {
+            VH_GS_DISABLED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "goalTypes");
+            VH_GS_LOCKED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "lockedFlags");
+            FLAG_N = net.minecraft.world.entity.ai.goal.Goal.Flag.values().length;
+            if (FLAG_N < 1 || FLAG_N > 32) {
+                throw new IllegalStateException("unexpected Flag enum size: " + FLAG_N);
+            }
+            AI_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initAIHandles: " + t;
+            AI_HANDLES_OK = false;
+        }
+    }
+
+    private static AIShadow shadowOf(Object gs) {
+        AIShadow sh = AI_SHADOWS.get(gs);
+        if (sh == null) {
+            sh = new AIShadow();
+            AIShadow race = AI_SHADOWS.putIfAbsent(gs, sh);
+            if (race != null) sh = race;
+        }
+        return sh;
+    }
+
+    private static long disabledBacking(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
+        ca.spottedleaf.moonrise.common.set.OptimizedSmallEnumSet disabled =
+                (ca.spottedleaf.moonrise.common.set.OptimizedSmallEnumSet)
+                        VH_GS_DISABLED.getObj(gs);
+        return disabled.getBackingSet();
+    }
+
+    private static boolean canReplaceAll(
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] lock,
+            net.minecraft.world.entity.ai.goal.WrappedGoal cand) {
+        long fb = cand.getFlags().getBackingSet();
+        int fs = cand.getFlags().size();
+        for (int i = 0; i < fs; i++) {
+            int ord = Long.numberOfTrailingZeros(fb);
+            fb &= fb - 1;
+            net.minecraft.world.entity.ai.goal.WrappedGoal holder = lock[ord];
+            if (holder != null && !holder.canBeReplacedBy(cand)) return false;
+        }
+        return true;
+    }
+
+    /** tickRunningGoals body shared by the force tail of tick() and the
+     *  direct weave. force=true walks the full live set (vanilla-identical);
+     *  force=false walks the running shadow with live re-checks. */
+    private static void tickRunningImpl(net.minecraft.world.entity.ai.goal.GoalSelector gs,
+                                        boolean force) {
+        net.minecraft.util.profiling.ProfilerFiller profiler =
+                net.minecraft.util.profiling.Profiler.get();
+        profiler.push("goalTick");
+        if (force) {
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : gs.getAvailableGoals()) {
+                if (g.isRunning()) g.tick();
+            }
+        } else {
+            gsFloorRunning++;
+            AIShadow sh = AI_SHADOWS.get(gs);
+            if (sh == null) {
+                // first odd-tick visit of a fresh selector: build the shadow
+                // with a silent full pass (isRunning reads only — no calls)
+                sh = shadowOf(gs);
+                sh.n = 0;
+                for (net.minecraft.world.entity.ai.goal.WrappedGoal g : gs.getAvailableGoals()) {
+                    if (g.isRunning()) {
+                        if (sh.n == sh.goals.length) {
+                            sh.goals = java.util.Arrays.copyOf(sh.goals, sh.n * 2);
+                        }
+                        sh.goals[sh.n++] = g;
+                    }
+                }
+            }
+            int w = 0;
+            for (int i = 0; i < sh.n; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
+                if (g.isRunning()) {
+                    sh.goals[w++] = g;
+                    if (g.requiresUpdateEveryTick()) g.tick();
+                }
+            }
+            sh.n = w; // prune the skipped tails
+        }
+        profiler.pop();
+    }
+
+    /** Replacement body of GoalSelector.tick() — the vanilla algorithm with
+     *  flat-lock-table bookkeeping and the exact vanilla call sequence. */
+    public static void goalSelectorTick(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
+        if (!AI_ON || !AI_HANDLES_OK) {
+            gsMirrorTick(gs);
+            return;
+        }
+        gsFloorTicks++;
+        try {
+            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> goals =
+                    gs.getAvailableGoals();
+            net.minecraft.util.profiling.ProfilerFiller profiler =
+                    net.minecraft.util.profiling.Profiler.get();
+            long disabled = disabledBacking(gs);
+            // cleanup — vanilla conditions and short-circuit order
+            profiler.push("goalCleanup");
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (g.isRunning()
+                        && (((g.getFlags().getBackingSet() & disabled) != 0L)
+                            || !g.canContinueToUse())) {
+                    g.stop();
+                    gsFloorStops++;
+                }
+            }
+            profiler.pop();
+            // rebuild the lock table + running shadow (silent pass)
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] lock = AI_LOCK_TABLE.get();
+            for (int i = 0; i < FLAG_N; i++) lock[i] = null;
+            AIShadow sh = shadowOf(gs);
+            sh.n = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (g.isRunning()) {
+                    long fb = g.getFlags().getBackingSet();
+                    int fs = g.getFlags().size();
+                    for (int i = 0; i < fs; i++) {
+                        int ord = Long.numberOfTrailingZeros(fb);
+                        fb &= fb - 1;
+                        if (lock[ord] != null) {
+                            // vanilla's lock table can never hold two running
+                            // goals on one flag; a plugin goal that mutates
+                            // flags while running could — disarm, stay exact.
+                            gsFloorCollide++;
+                            AI_ON = false;
+                            gsMirrorTick(gs);
+                            return;
+                        }
+                        lock[ord] = g;
+                    }
+                    if (sh.n == sh.goals.length) {
+                        sh.goals = java.util.Arrays.copyOf(sh.goals, sh.n * 2);
+                    }
+                    sh.goals[sh.n++] = g;
+                }
+            }
+            // update — vanilla conditions and short-circuit order
+            profiler.push("goalUpdate");
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (!g.isRunning()) {
+                    long fb = g.getFlags().getBackingSet();
+                    if ((fb & disabled) == 0L && canReplaceAll(lock, g) && g.canUse()) {
+                        long it = fb;
+                        int fs = g.getFlags().size();
+                        for (int i = 0; i < fs; i++) {
+                            int ord = Long.numberOfTrailingZeros(it);
+                            it &= it - 1;
+                            net.minecraft.world.entity.ai.goal.WrappedGoal cur = lock[ord];
+                            if (cur != null) {
+                                cur.stop();
+                                gsFloorStops++;
+                            }
+                            lock[ord] = g;
+                        }
+                        g.start();
+                        gsFloorStarts++;
+                    }
+                }
+            }
+            profiler.pop();
+            // vanilla tick() ends with tickRunningGoals(true) — full-set walk
+            tickRunningImpl(gs, true);
+        } catch (Throwable t) {
+            // The mirror path is for KILL-SWITCH states only; a live floor
+            // tick must propagate exceptions exactly like vanilla (a goal
+            // throwing is a vanilla crash too). Disarm so the next tick is
+            // clean, then rethrow the original.
+            AI_ON = false;
+            lastError = System.nanoTime();
+            lastErrorText = "gsFloor: " + t;
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new IllegalStateException("goalSelectorTick floor failed", t);
+        }
+    }
+
+    /** Replacement body of GoalSelector.tickRunningGoals(boolean). */
+    public static void goalSelectorTickRunning(
+            net.minecraft.world.entity.ai.goal.GoalSelector gs, boolean force) {
+        if (!AI_ON || !AI_HANDLES_OK) {
+            gsMirrorTickRunning(gs, force);
+            return;
+        }
+        try {
+            tickRunningImpl(gs, force);
+        } catch (Throwable t) {
+            AI_ON = false;
+            lastError = System.nanoTime();
+            lastErrorText = "gsFloorRun: " + t;
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new IllegalStateException("goalSelectorTickRunning floor failed", t);
+        }
+    }
+
+    // ---- mirrors: byte-exact vanilla ports (kill-switch + pre-arm path) ----
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void gsMirrorTick(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
+        gsMirrorTicks++;
+        java.util.Set goals = gs.getAvailableGoals();
+        java.util.EnumMap locked = (java.util.EnumMap) VH_GS_LOCKED.getObj(gs);
+        ca.spottedleaf.moonrise.common.set.OptimizedSmallEnumSet disabled =
+                (ca.spottedleaf.moonrise.common.set.OptimizedSmallEnumSet)
+                        VH_GS_DISABLED.getObj(gs);
+        net.minecraft.util.profiling.ProfilerFiller profiler =
+                net.minecraft.util.profiling.Profiler.get();
+        profiler.push("goalCleanup");
+        for (Object o : goals) {
+            net.minecraft.world.entity.ai.goal.WrappedGoal g =
+                    (net.minecraft.world.entity.ai.goal.WrappedGoal) o;
+            if (g.isRunning()
+                    && (g.getFlags().hasCommonElements(disabled) || !g.canContinueToUse())) {
+                g.stop();
+            }
+        }
+        locked.entrySet().removeIf(
+                e -> !((net.minecraft.world.entity.ai.goal.WrappedGoal)
+                        ((java.util.Map.Entry) e).getValue()).isRunning());
+        profiler.pop();
+        profiler.push("goalUpdate");
+        for (Object o : goals) {
+            net.minecraft.world.entity.ai.goal.WrappedGoal g =
+                    (net.minecraft.world.entity.ai.goal.WrappedGoal) o;
+            if (!g.isRunning() && !g.getFlags().hasCommonElements(disabled)
+                    && mirrorCanBeReplacedForAllFlags(g, locked) && g.canUse()) {
+                long it = g.getFlags().getBackingSet();
+                int fs = g.getFlags().size();
+                for (int i = 0; i < fs; i++) {
+                    int ord = Long.numberOfTrailingZeros(it);
+                    it &= it - 1;
+                    Object flag = goalFlags()[ord];
+                    net.minecraft.world.entity.ai.goal.WrappedGoal cur =
+                            (net.minecraft.world.entity.ai.goal.WrappedGoal)
+                                    locked.getOrDefault(flag, null);
+                    if (cur != null) cur.stop();
+                    locked.put(flag, g);
+                }
+                g.start();
+            }
+        }
+        profiler.pop();
+        // vanilla tail: tickRunningGoals(true)
+        profiler.push("goalTick");
+        for (Object o : goals) {
+            net.minecraft.world.entity.ai.goal.WrappedGoal g =
+                    (net.minecraft.world.entity.ai.goal.WrappedGoal) o;
+            if (g.isRunning()) g.tick();
+        }
+        profiler.pop();
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static boolean mirrorCanBeReplacedForAllFlags(
+            net.minecraft.world.entity.ai.goal.WrappedGoal g, java.util.EnumMap locked) {
+        long it = g.getFlags().getBackingSet();
+        int fs = g.getFlags().size();
+        for (int i = 0; i < fs; i++) {
+            int ord = Long.numberOfTrailingZeros(it);
+            it &= it - 1;
+            Object flag = goalFlags()[ord];
+            net.minecraft.world.entity.ai.goal.WrappedGoal cur =
+                    (net.minecraft.world.entity.ai.goal.WrappedGoal)
+                            locked.getOrDefault(flag, null);
+            // vanilla: getOrDefault(flag, NO_GOAL) — NO_GOAL is replaceable
+            if (cur != null && !cur.canBeReplacedBy(g)) return false;
+        }
+        return true;
+    }
+
+    private static void gsMirrorTickRunning(net.minecraft.world.entity.ai.goal.GoalSelector gs,
+                                            boolean force) {
+        net.minecraft.util.profiling.ProfilerFiller profiler =
+                net.minecraft.util.profiling.Profiler.get();
+        profiler.push("goalTick");
+        for (net.minecraft.world.entity.ai.goal.WrappedGoal g : gs.getAvailableGoals()) {
+            if (g.isRunning() && (force || g.requiresUpdateEveryTick())) g.tick();
+        }
+        profiler.pop();
+    }
+
+    // ==================================================================
+    // L15 — micro-gates on pure no-op writes (doc 26).
+    //
+    // setTicksFrozen: the vanilla body is exactly
+    // `entityData.set(DATA_TICKS_FROZEN, Integer.valueOf(i))` (javap) and
+    // SynchedEntityData.set already no-ops the write when the value equals
+    // (ObjectUtils.notEqual gate, onSyncedDataUpdated skipped). The profile
+    // still shows 1.83% self time — the whole inlined chain (getItem +
+    // notEqual + boxing) paid per entity per tick for the same value. The
+    // gate compares the live data value first; on equality the body is a
+    // provable no-op and is skipped whole.
+    //
+    // ConversionTracker.setConverting: same shape — every non-afflicted mob
+    // pays `getEntityData().set(conversionId, false)` every tick (1.26%
+    // self in mobs-25k-mod). The gate reads the live Boolean (cached
+    // TRUE/FALSE — no boxing) and skips the equal write.
+    // Both bridges keep the exact vanilla write when the value differs, and
+    // are armed only after their handle sets are proven at precompute time.
+    // ==================================================================
+
+    public static volatile boolean FROZEN_ON = false;
+    public static volatile boolean FROZEN_HANDLES_OK = false;
+    public static long frozenGate = 0, frozenWrites = 0;
+    public static volatile boolean CONV_ON = false;
+    public static volatile boolean CONV_HANDLES_OK = false;
+    public static long convGate = 0, convWrites = 0;
+    // liveness counters: bumped on EVERY bridge entry (the verifier proves
+    // the weave by watching these BEFORE the gates are armed — frozenGate/
+    // convGate move only after arming). PLAIN longs, same reasoning as gsFloorTicks.
+    public static long frozenCalls = 0, convCalls = 0;
+    // system-property kill switches, folded to static finals at class init
+    public static final boolean AI_FLAG_ON = java.lang.Boolean.getBoolean("centities.aiFloor");
+    public static final boolean FROZEN_FLAG_ON = java.lang.Boolean.getBoolean("centities.frozenGate");
+    public static final boolean CONV_FLAG_ON = java.lang.Boolean.getBoolean("centities.convGate");
+
+    private static volatile RefField VH_ENT_DATA;  // Entity.entityData
+    private static volatile RefField VH_CONV_MOB;  // ConversionTracker.mob
+    private static volatile RefField VH_CONV_ID;   // ConversionTracker.conversionId
+
+    public static void initFrozenHandles() {
+        try {
+            VH_ENT_DATA = new RefField(Entity.class, "entityData");
+            FROZEN_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initFrozenHandles: " + t;
+            FROZEN_HANDLES_OK = false;
+        }
+    }
+
+    public static void initConvHandles() {
+        try {
+            VH_CONV_MOB = new RefField(net.minecraft.world.entity.ConversionTracker.class, "mob");
+            VH_CONV_ID = new RefField(
+                    net.minecraft.world.entity.ConversionTracker.class, "conversionId");
+            CONV_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initConvHandles: " + t;
+            CONV_HANDLES_OK = false;
+        }
+    }
+
+    /** Replacement body of Entity.setTicksFrozen(int). */
+    public static void setTicksFrozen$(Entity e, int i) {
+        frozenCalls++;
+        if (FROZEN_ON && FROZEN_HANDLES_OK) {
+            try {
+                if (e.getTicksFrozen() == i) {
+                    frozenGate++;
+                    return;
+                }
+            } catch (Throwable gateFail) {
+                // never swallow the write — fall through to the vanilla body
+            }
+            frozenWrites++;
+        }
+        ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e))
+                .set(Entity.DATA_TICKS_FROZEN, Integer.valueOf(i));
+    }
+
+    /** Replacement body of ConversionTracker.setConverting(boolean). */
+    @SuppressWarnings("unchecked")
+    public static void setConverting$(Object tracker, boolean z) {
+        convCalls++;
+        if (CONV_ON && CONV_HANDLES_OK) {
+            try {
+                net.minecraft.world.entity.Mob m =
+                        (net.minecraft.world.entity.Mob) VH_CONV_MOB.getObj(tracker);
+                net.minecraft.network.syncher.EntityDataAccessor<Boolean> id =
+                        (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
+                                VH_CONV_ID.getObj(tracker);
+                if (m.getEntityData().get(id) == z) {
+                    convGate++;
+                    return;
+                }
+            } catch (Throwable gateFail) {
+                // fall through to the vanilla write
+            }
+            convWrites++;
+        }
+        net.minecraft.world.entity.Mob m =
+                (net.minecraft.world.entity.Mob) VH_CONV_MOB.getObj(tracker);
+        net.minecraft.network.syncher.EntityDataAccessor<Boolean> id =
+                (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
+                        VH_CONV_ID.getObj(tracker);
+        m.getEntityData().set(id, z);
     }
 }

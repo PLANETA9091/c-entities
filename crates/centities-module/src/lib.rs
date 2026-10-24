@@ -12,9 +12,9 @@
 //! vanilla-mirror path.
 
 pub mod itemcore;
-pub mod pushcore;
 #[doc(hidden)]
 pub mod patch;
+pub mod pushcore;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
@@ -32,6 +32,8 @@ const SERVER_LEVEL_CLASS: &str = "net/minecraft/server/level/ServerLevel";
 const LIVING_ENTITY_CLASS: &str = "net/minecraft/world/entity/LivingEntity";
 const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
 const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTickList";
+const GOAL_SELECTOR_CLASS: &str = "net/minecraft/world/entity/ai/goal/GoalSelector";
+const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -382,6 +384,8 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(LIVING_ENTITY_CLASS, |_n, b| patch_livingentity(b));
     cplug_sdk::hooks::register_bytes(SERVER_ENTITY_CLASS, |_n, b| patch_serverentity(b));
     cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
+    cplug_sdk::hooks::register_bytes(GOAL_SELECTOR_CLASS, |_n, b| patch_goalselector(b));
+    cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -427,6 +431,9 @@ fn arm_module() {
     precompute_livingentity(loader);
     precompute_serverentity(loader);
     precompute_entityticklist(loader);
+    precompute_entity(loader);
+    precompute_goalselector(loader);
+    precompute_conversion(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -440,6 +447,8 @@ fn arm_module() {
         LIVING_ENTITY_CLASS,
         SERVER_ENTITY_CLASS,
         ENTITY_TICK_LIST_CLASS,
+        GOAL_SELECTOR_CLASS,
+        CONVERSION_TRACKER_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -511,8 +520,87 @@ fn arm_module() {
                         ));
                     }
                 }
+                // L15 deferred weaves: the GoalSelector/ConversionTracker
+                // classes load with the first mobs — usually AFTER the arm.
+                if !GOAL_WOVEN.load(Ordering::Acquire)
+                    && !GOAL_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(GOAL_SELECTOR_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_goalselector(loader as jni::jobject);
+                    if GOAL_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(GOAL_SELECTOR_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred GoalSelector floor applied, rc={rc}"
+                        ));
+                    }
+                }
+                if !FROZEN_WOVEN.load(Ordering::Acquire)
+                    && !FROZEN_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(ENTITY_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_entity(loader as jni::jobject);
+                    // retransform is idempotent and safe even when only the
+                    // probes were re-prepared (no gate) — apply unconditionally
+                    let rc = cplug_sdk::retransform_class(ENTITY_CLASS);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] verifier: deferred Entity weave re-applied, rc={rc}"
+                    ));
+                }
+                if !CONV_WOVEN.load(Ordering::Acquire)
+                    && !CONV_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(CONVERSION_TRACKER_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_conversion(loader as jni::jobject);
+                    if CONV_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(CONVERSION_TRACKER_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred ConversionTracker gate applied, rc={rc}"
+                        ));
+                    }
+                }
             }
             let snap = read_hook_counters();
+            // L15 arming: flip a gate ON only when its replaced body is
+            // PROVEN live (its liveness counter moved — the GoalSelector
+            // bodies bump gsMirrorTicks while disarmed; frozen/conv bump
+            // frozenCalls/convCalls on every entry). PLAIN longs may lag a
+            // moment behind on another core — the verifier retries anyway.
+            if GOAL_WOVEN.load(Ordering::Acquire)
+                && !AI_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::GoalChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setAiFloorOn", true) {
+                    AI_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] AI floor ARMED (verified live)");
+                }
+            }
+            if FROZEN_WOVEN.load(Ordering::Acquire)
+                && !FROZEN_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::FrozenChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setFrozenGateOn", true) {
+                    FROZEN_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] frozen gate ARMED (verified live)");
+                }
+            }
+            if CONV_WOVEN.load(Ordering::Acquire)
+                && !CONV_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::ConvChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setConvGateOn", true) {
+                    CONV_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] conv gate ARMED (verified live)");
+                }
+            }
             if attempt < 6 || attempt % 25 == 0 {
                 let dbg: Vec<(String, i64)> =
                     snap.iter().map(|(k, v)| (format!("{:?}", k), *v)).collect();
@@ -673,6 +761,20 @@ static TL_WOVEN: AtomicBool = AtomicBool::new(false);
 /// L13: set when the weave was deliberately declined (flag off) — the
 /// verifier stops retrying the precompute for it.
 static TL_DECLINED: AtomicBool = AtomicBool::new(false);
+/// L15: the AI floor (GoalSelector microkernel) weave is prepared. The floor
+/// itself arms LATER — the verifier flips CeHooks.setAiFloorOn(true) only
+/// after the replaced bodies are proven live (gsMirrorTicks moves).
+static GOAL_WOVEN: AtomicBool = AtomicBool::new(false);
+static GOAL_DECLINED: AtomicBool = AtomicBool::new(false);
+static AI_ARMED: AtomicBool = AtomicBool::new(false);
+/// L15: the Entity.setTicksFrozen no-op gate weave is prepared.
+static FROZEN_WOVEN: AtomicBool = AtomicBool::new(false);
+static FROZEN_DECLINED: AtomicBool = AtomicBool::new(false);
+static FROZEN_ARMED: AtomicBool = AtomicBool::new(false);
+/// L15: the ConversionTracker.setConverting no-op gate weave is prepared.
+static CONV_WOVEN: AtomicBool = AtomicBool::new(false);
+static CONV_DECLINED: AtomicBool = AtomicBool::new(false);
+static CONV_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -971,6 +1073,79 @@ fn patch_entityticklist(bytes: &[u8]) -> Option<Vec<u8>> {
         .flatten()
 }
 
+/// L15: GoalSelector byte hook — stash before the arm / serve precomputed
+/// after the retransform. The bodies themselves carry the pre-arm mirror.
+fn patch_goalselector(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_goalselector_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_goalselector_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(GOAL_SELECTOR_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(GOAL_SELECTOR_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched GoalSelector microkernel");
+            Some(b)
+        }
+        _ if !GOAL_WOVEN.load(Ordering::Acquire) && !GOAL_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(GOAL_SELECTOR_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] GoalSelector bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// L15: ConversionTracker byte hook — same stash/serve pattern.
+fn patch_conversion(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_conversion_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_conversion_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(CONVERSION_TRACKER_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED
+        .lock()
+        .ok()?
+        .get(CONVERSION_TRACKER_CLASS)
+        .cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ConversionTracker conv gate");
+            Some(b)
+        }
+        _ if !CONV_WOVEN.load(Ordering::Acquire) && !CONV_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(CONVERSION_TRACKER_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] ConversionTracker bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 fn patch_entityticklist_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
@@ -978,7 +1153,11 @@ fn patch_entityticklist_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             .or_insert_with(|| bytes.to_vec());
         return None;
     }
-    let pre = PRECOMPUTED.lock().ok()?.get(ENTITY_TICK_LIST_CLASS).cloned();
+    let pre = PRECOMPUTED
+        .lock()
+        .ok()?
+        .get(ENTITY_TICK_LIST_CLASS)
+        .cloned();
     match pre {
         Some(b) if !b.is_empty() => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
@@ -1076,8 +1255,7 @@ fn ticklist_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
 fn precompute_entityticklist(loader: jni::jobject) {
     // Honor the kill switch BEFORE any weaving: read CeHooks.TICKLIST_ON
     // (a Java system property folded into a static final at class init).
-    let flag_on: Option<bool> =
-        cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+    let flag_on: Option<bool> = cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
         let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
         if hooks_cls == 0 {
             return None;
@@ -1110,33 +1288,32 @@ fn precompute_entityticklist(loader: jni::jobject) {
     // has no vanilla escape, so a runtime handle failure would crash the
     // first tick (the first CI run crashed exactly there — the lazy init was
     // never wired into the mirror). Refusal here keeps vanilla forever.
-    let handles_ok: Option<bool> =
-        cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
-            let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
-            if hooks_cls == 0 {
-                return None;
-            }
-            let cls = hooks_cls as jni::jclass;
-            // void call (the variadic boolean-method slot is *mut c_void in
-            // these bindings) + the result read back through a static field.
-            let mid = env.get_static_method_id(cls, "initTickListHandles", "()V")?;
-            env.call_static_void_method(cls, mid, &[]);
-            if env.exception_check() {
-                env.exception_describe();
-                env.exception_clear();
-                return None;
-            }
-            let fid = env.get_static_field_id(cls, "TL_HANDLES_OK", "Z")?;
-            let raw = env.raw();
-            // SAFETY: `raw` is a live JNI env inside this attach scope; the
-            // vtable deref mirrors the counter reads in read_hook_counters.
-            let v = unsafe {
-                let vt = *raw;
-                ((*vt).GetStaticBooleanField)(raw, cls, fid)
-            };
-            Some(v != 0)
-        })
-        .flatten();
+    let handles_ok: Option<bool> = cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return None;
+        }
+        let cls = hooks_cls as jni::jclass;
+        // void call (the variadic boolean-method slot is *mut c_void in
+        // these bindings) + the result read back through a static field.
+        let mid = env.get_static_method_id(cls, "initTickListHandles", "()V")?;
+        env.call_static_void_method(cls, mid, &[]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return None;
+        }
+        let fid = env.get_static_field_id(cls, "TL_HANDLES_OK", "Z")?;
+        let raw = env.raw();
+        // SAFETY: `raw` is a live JNI env inside this attach scope; the
+        // vtable deref mirrors the counter reads in read_hook_counters.
+        let v = unsafe {
+            let vt = *raw;
+            ((*vt).GetStaticBooleanField)(raw, cls, fid)
+        };
+        Some(v != 0)
+    })
+    .flatten();
     if handles_ok != Some(true) {
         TL_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
@@ -1171,6 +1348,308 @@ fn precompute_entityticklist(loader: jni::jobject) {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
             cplug_sdk::log::info(
                 "[c-entities] FAILED to precompute EntityTickList.forEach — vanilla kept",
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L15 — the AI floor + the no-op write gates (doc 26).
+//
+// Three optional weaves, each with its own kill switch, handle-proof and
+// verifier counter:
+//   * GoalSelector.tick / tickRunningGoals -> CeHooks.goalSelectorTick{,Running}
+//     (the scheduler microkernel; the bodies carry an internal mirror for the
+//     pre-arm state, so the weave is provably live BEFORE the floor arms —
+//     gsMirrorTicks moves first);
+//   * Entity.setTicksFrozen -> CeHooks.setTicksFrozen$ (chained onto the
+//     existing Entity probe surgery — one precompute for both);
+//   * ConversionTracker.setConverting -> CeHooks.setConverting$.
+// Failure policy: OPTIONAL features — a refusal logs + declines and the rest
+// of the module arms normally (a failed AI floor must never disable the push
+// kernel). PATCHES_FAIL is left untouched here on purpose.
+// ---------------------------------------------------------------------------
+
+fn read_java_flag(field: &str) -> Option<bool> {
+    cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return None;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let fid = env.get_static_field_id(cls, field, "Z")?;
+        let raw = env.raw();
+        // SAFETY: `raw` is a live JNI env inside this attach scope; the
+        // vtable deref mirrors the counter reads in read_hook_counters.
+        let v = unsafe {
+            let vt = *raw;
+            ((*vt).GetStaticBooleanField)(raw, cls, fid)
+        };
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return None;
+        }
+        Some(v != 0)
+    })
+    .flatten()
+}
+
+/// Call a no-arg void static on CeHooks (the handle-proof inits) and report
+/// whether the referenced *HANDLES_OK flag flipped true.
+fn prove_handles(init_method: &str, ok_field: &str) -> Option<bool> {
+    cplug_sdk::jni_util::with_attached(|env| -> Option<bool> {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return None;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let mid = env.get_static_method_id(cls, init_method, "()V")?;
+        env.call_static_void_method(cls, mid, &[]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return None;
+        }
+        let fid = env.get_static_field_id(cls, ok_field, "Z")?;
+        let raw = env.raw();
+        // SAFETY: `raw` is a live JNI env inside this attach scope; the
+        // vtable deref mirrors the counter reads in read_hook_counters.
+        let v = unsafe {
+            let vt = *raw;
+            ((*vt).GetStaticBooleanField)(raw, cls, fid)
+        };
+        Some(v != 0)
+    })
+    .flatten()
+}
+
+/// Flip a boolean static setter on CeHooks (the L15 arm switches). Returns
+/// false on any JNI trouble — the caller then retries on a later pass.
+fn set_java_bool(setter: &str, value: bool) -> bool {
+    cplug_sdk::jni_util::with_attached(|env| -> bool {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, setter, "(Z)V") else {
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[jni::jvalue { z: value as u8 }]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return false;
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+fn goal_tick_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "tick",
+        method_desc: "()V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "goalSelectorTick",
+        bridge_desc: "(Lnet/minecraft/world/entity/ai/goal/GoalSelector;)V",
+        args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+    }
+}
+
+fn goal_tick_running_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "tickRunningGoals",
+        method_desc: "(Z)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "goalSelectorTickRunning",
+        bridge_desc: "(Lnet/minecraft/world/entity/ai/goal/GoalSelector;Z)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'Z' },
+        ],
+    }
+}
+
+fn frozen_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "setTicksFrozen",
+        method_desc: "(I)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "setTicksFrozen$",
+        bridge_desc: "(Lnet/minecraft/world/entity/Entity;I)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'I' },
+        ],
+    }
+}
+
+fn conv_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "setConverting",
+        method_desc: "(Z)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "setConverting$",
+        bridge_desc: "(Ljava/lang/Object;Z)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'Z' },
+        ],
+    }
+}
+
+fn precompute_goalselector(loader: jni::jobject) {
+    if read_java_flag("AI_FLAG_ON") != Some(true) {
+        GOAL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] AI floor disabled (centities.aiFloor) — vanilla GoalSelector kept",
+        );
+        return;
+    }
+    if prove_handles("initAIHandles", "AI_HANDLES_OK") != Some(true) {
+        GOAL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] AI floor handle probe failed — vanilla GoalSelector kept",
+        );
+        return;
+    }
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(GOAL_SELECTOR_CLASS))
+    else {
+        // GoalSelector loads with the first mob — frequently AFTER the arm;
+        // the boot/post-arm hook stashes the bytes and the verifier retries.
+        cplug_sdk::log::info(
+            "[c-entities] GoalSelector not loaded yet — AI floor deferred to the verifier",
+        );
+        return;
+    };
+    // Two bodies, chained: tick() first, then tickRunningGoals on its output.
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        let one = cplug_sdk::asm::replace_body(env, loader, &bytes, &goal_tick_spec());
+        match one {
+            Some(b) if !b.is_empty() => {
+                cplug_sdk::asm::replace_body(env, loader, &b, &goal_tick_running_spec())
+            }
+            other => other,
+        }
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(GOAL_SELECTOR_CLASS, b);
+            }
+            GOAL_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] precomputed GoalSelector microkernel (tick + tickRunningGoals)",
+            );
+        }
+        _ => {
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute GoalSelector floor — vanilla kept",
+            );
+        }
+    }
+}
+
+/// The Entity.setTicksFrozen gate rides the SAME precomputed Entity bytes as
+/// the probe surgery: replace_body first (JNI helper), then the rust probe
+/// prefixes on top. `bytes` = the stashed ORIGINAL Entity class file.
+fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<Vec<u8>> {
+    let gated = if read_java_flag("FROZEN_FLAG_ON") == Some(true)
+        && prove_handles("initFrozenHandles", "FROZEN_HANDLES_OK") == Some(true)
+    {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::replace_body(env, loader, bytes, &frozen_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => b,
+            _ => {
+                cplug_sdk::log::info(
+                    "[c-entities] setTicksFrozen replace refused — Entity keeps probes only",
+                );
+                bytes.to_vec()
+            }
+        }
+    } else {
+        FROZEN_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] frozen gate disabled/refused (centities.frozenGate) — vanilla write kept",
+        );
+        bytes.to_vec()
+    };
+    // the existing rust probe prefixes (box/impulse probes), on the gated bytes
+    entity_probes(gated).ok()
+}
+
+fn precompute_entity(loader: jni::jobject) {
+    let Some(bytes) = STASH.lock().ok().and_then(|s| s.get(ENTITY_CLASS).cloned()) else {
+        // Entity loads at boot before the arm in every observed run; if it
+        // ever loads post-arm the in-hook path applies the probes and the
+        // verifier retries this precompute for the frozen gate.
+        cplug_sdk::log::info(
+            "[c-entities] Entity not stashed yet — frozen gate deferred to the verifier",
+        );
+        return;
+    };
+    let Some(gated) = apply_entity_frozen_and_probes(loader, &bytes) else {
+        cplug_sdk::log::info(
+            "[c-entities] Entity probe surgery refused in precompute — vanilla kept",
+        );
+        return;
+    };
+    if let Ok(mut pc) = PRECOMPUTED.lock() {
+        pc.insert(ENTITY_CLASS, gated);
+    }
+    if !FROZEN_DECLINED.load(Ordering::Acquire) {
+        FROZEN_WOVEN.store(true, Ordering::Release);
+        cplug_sdk::log::info("[c-entities] precomputed Entity probes + setTicksFrozen gate");
+    } else {
+        cplug_sdk::log::info("[c-entities] precomputed Entity probes (frozen gate off)");
+    }
+}
+
+fn precompute_conversion(loader: jni::jobject) {
+    if read_java_flag("CONV_FLAG_ON") != Some(true) {
+        CONV_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] conv gate disabled (centities.convGate) — vanilla setConverting kept",
+        );
+        return;
+    }
+    if prove_handles("initConvHandles", "CONV_HANDLES_OK") != Some(true) {
+        CONV_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] conv gate handle probe failed — vanilla setConverting kept",
+        );
+        return;
+    }
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(CONVERSION_TRACKER_CLASS))
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] ConversionTracker not loaded yet — conv gate deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &conv_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CONVERSION_TRACKER_CLASS, b);
+            }
+            CONV_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed ConversionTracker.setConverting gate");
+        }
+        _ => {
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ConversionTracker gate — vanilla kept",
             );
         }
     }
@@ -1214,6 +1693,9 @@ enum Counter {
     PushChecks,
     TrackerChecks,
     TickListChecks,
+    GoalChecks,
+    FrozenChecks,
+    ConvChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -1240,6 +1722,12 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::PushChecks, ("pushChecks", "J")),
             (Counter::TrackerChecks, ("trackerChecks", "J")),
             (Counter::TickListChecks, ("tickListChecks", "J")),
+            // L15 liveness counters: the GoalSelector bridge bumps gsMirrorTicks
+            // while the floor is disarmed (proving the weave BEFORE arming);
+            // frozenCalls/convCalls bump on every gated-body entry.
+            (Counter::GoalChecks, ("gsMirrorTicks", "J")),
+            (Counter::FrozenChecks, ("frozenCalls", "J")),
+            (Counter::ConvChecks, ("convCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
@@ -1488,7 +1976,19 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     push!(
         "nativePush",
         "(IIIIIIII)J",
-        n_push as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i32, i32, i32, i32, i32, i32, i32) -> i64
+        n_push
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            ) -> i64
     );
     push!(
         "nativePushNcol",
@@ -1784,27 +2284,57 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         return None;
     }
+    // stash the originals for the precompute (frozen gate + probes chained);
+    // idempotent — JVMTI hands the hook the ORIGINAL bytes on every pass
+    if let Ok(mut st) = STASH.lock() {
+        st.entry(ENTITY_CLASS).or_insert_with(|| bytes.to_vec());
+    }
+    // Post-arm retransform pass: serve the precomputed rewrite when present.
+    if let Some(pre) = PRECOMPUTED
+        .lock()
+        .ok()
+        .and_then(|pc| pc.get(ENTITY_CLASS).cloned())
+    {
+        if !pre.is_empty() {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] patched Entity (probes + setTicksFrozen gate, precomputed)",
+            );
+            return Some(pre);
+        }
+    }
+    // First post-arm define (frozen gate still pending — the verifier will
+    // complete it): apply the probes inline exactly like the old path.
+    match entity_probes(bytes.to_vec()) {
+        Ok(b) => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched Entity box probe + wake-on-impulse");
+            Some(b)
+        }
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!("[c-entities] Entity probe refused: {e}"));
+            None
+        }
+    }
+}
 
+/// The Entity probe prefixes (box + impulse), factored out so the frozen-gate
+/// precompute can chain them onto the replace_body output.
+fn entity_probes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // setBoundingBox is the SINGLE box-change choke point in 1.21.8
     // (setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox,
     // javap-verified on the shipped jar). One probe covers every move with
     // the EXACT new box — no separate setPos probe, half the JNI traffic.
-    let boxed = match patch::insert_static_call_at_start(
-        bytes.to_vec(),
+    let boxed = patch::insert_static_call_at_start(
+        bytes,
         "setBoundingBox",
         "(Lnet/minecraft/world/phys/AABB;)V",
         HOOKS_CLASS,
         "probeBox",
         "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;)V",
         &[(0, b'L'), (1, b'L')],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] setBoundingBox probe refused: {e}"));
-            return None;
-        }
-    };
+    )?;
 
     // L3.2 wake-on-impulse: a RESTING item's tick is skipped, so ANY external
     // velocity change (a zombie/boat pushing it, knockback, plugin velocity)
@@ -1816,7 +2346,7 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     // both overloads write the field directly). Waking a NON-resting entity
     // is a no-op (one array read + branch, ~3ns — the common case for every
     // mob/stacked item), so the probe is free outside the rest guard.
-    let d1 = match patch::insert_static_call_at_start(
+    let d1 = patch::insert_static_call_at_start(
         boxed,
         "setDeltaMovement",
         "(Lnet/minecraft/world/phys/Vec3;)V",
@@ -1824,17 +2354,8 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         "probeDelta",
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(0, b'L')],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!(
-                "[c-entities] setDeltaMovement(Vec3) probe refused: {e}"
-            ));
-            return None;
-        }
-    };
-    match patch::insert_static_call_at_start(
+    )?;
+    patch::insert_static_call_at_start(
         d1,
         "setDeltaMovement",
         "(DDD)V",
@@ -1842,20 +2363,7 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         "probeDelta",
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(0, b'L')],
-    ) {
-        Ok(b) => {
-            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched Entity box probe + wake-on-impulse");
-            Some(b)
-        }
-        Err(e) => {
-            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!(
-                "[c-entities] setDeltaMovement(DDD) probe refused: {e}"
-            ));
-            None
-        }
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2254,8 +2762,12 @@ pub extern "system" fn n_flush(
             }
             for (j, l) in db_buf.iter().enumerate() {
                 let id = (*l & 0xFFFF_FFFF) as i64;
-                st.push
-                    .set_delta(id, dbdv_buf[j * 3], dbdv_buf[j * 3 + 1], dbdv_buf[j * 3 + 2]);
+                st.push.set_delta(
+                    id,
+                    dbdv_buf[j * 3],
+                    dbdv_buf[j * 3 + 1],
+                    dbdv_buf[j * 3 + 2],
+                );
             }
             // Mid-tick cap flush: publish now, or the rows would be
             // stale-with-valid-stamp until the next native query.
@@ -2335,11 +2847,7 @@ pub extern "system" fn n_push(
         });
         unsafe {
             let e = JniEnv::from_raw(env);
-            for (name, v) in [
-                ("PUSH_SDX", dx),
-                ("PUSH_SDY", dy),
-                ("PUSH_SDZ", dz),
-            ] {
+            for (name, v) in [("PUSH_SDX", dx), ("PUSH_SDY", dy), ("PUSH_SDZ", dz)] {
                 if let Some(fid) = e.get_static_field_id(cls, name, "D") {
                     let raw = e.raw();
                     let vt = *raw;
@@ -2356,11 +2864,7 @@ pub extern "system" fn n_push(
 
 /// The numCollisions mirror value for `id`, or -1 (mirror miss). The Java
 /// decline path uses this to re-sync the field before running vanilla.
-pub extern "system" fn n_push_ncol(
-    _env: *mut jni::JNIEnv,
-    _cls: jni::jclass,
-    id: i32,
-) -> i32 {
+pub extern "system" fn n_push_ncol(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i32) -> i32 {
     with_state(|st| match st.push.slot_of(id as i64) {
         Some(s) => st.push.ncol[s],
         None => -1,

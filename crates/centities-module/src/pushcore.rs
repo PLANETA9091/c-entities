@@ -280,7 +280,11 @@ pub fn push_tick(
 
     // numCollisions reset (vanilla: max(0, ncol - maxEC) BEFORE the loop).
     let mut ncol_self = pc.ncol[self_slot];
-    ncol_self = if ncol_self > max_ec { ncol_self - max_ec } else { 0 };
+    ncol_self = if ncol_self > max_ec {
+        ncol_self - max_ec
+    } else {
+        0
+    };
 
     // Candidate scan over the pushable-only index, cell by cell, each
     // cell served in id order (sorted at most once per (cell, tick)).
@@ -310,9 +314,7 @@ pub fn push_tick(
                 pc.sorted_at.insert(key, tick);
             }
             cell_hits.clear();
-            pidx.query_cell(
-                world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits,
-            );
+            pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits);
             for &id in cell_hits.iter() {
                 if id == self_id {
                     continue;
@@ -496,10 +498,16 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert!(out.ok);
         let want = sq * 0.05000000074505806;
-        assert!((out.ddx - (-want)).abs() < 1e-18, "ddx={} want -{want}", out.ddx);
+        assert!(
+            (out.ddx - (-want)).abs() < 1e-18,
+            "ddx={} want -{want}",
+            out.ddx
+        );
         assert_eq!(out.ddz, 0.0);
         // the OTHER gained +force on X
         let s2 = pc.slot_of(2).unwrap();
@@ -521,7 +529,9 @@ mod tests {
         pc.upsert(2, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.non_passengers, 1);
         assert_eq!(out.ncol, 1, "ncol++ happens before doPush");
         let s2 = pc.slot_of(2).unwrap();
@@ -543,7 +553,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.non_passengers, 5, "all hits audited despite the cap");
         assert_eq!(out.ncol, 2, "the cap stops pair processing at maxEC");
         for k in 2..7i64 {
@@ -566,7 +578,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.non_passengers, 30);
         assert!(out.cramming);
     }
@@ -577,10 +591,22 @@ mod tests {
     fn same_vehicle_candidate_no_force_but_counters() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE | PF_PASSENGER, 1);
+        pc.upsert(
+            2,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE | PF_PASSENGER,
+            1,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
         assert_eq!(out.ddx, 0.0, "no force for same-vehicle pairs");
@@ -595,7 +621,9 @@ mod tests {
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.non_passengers, 0);
         assert_eq!(out.ncol, 0);
     }
@@ -614,7 +642,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
             let s = pc.slot_of(k).unwrap();
@@ -633,13 +663,18 @@ mod tests {
         pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         let s2 = pc.slot_of(2).unwrap();
         let pushed = pc.dx[s2];
         assert!(pushed > 0.0);
         // Java writes its (pre-kernel) view of entity 2's delta: 0.0
         pc.set_delta(2, 0.0, 0.0, 0.0);
-        assert_eq!(pc.dx[s2], pushed, "the pending kernel push survives the rebase");
+        assert_eq!(
+            pc.dx[s2], pushed,
+            "the pending kernel push survives the rebase"
+        );
         // and the ledger matches the mirror-minus-java
         assert_eq!(pc.kadd_dx[s2], pushed);
         // self: the writeback resets the ledger
@@ -659,13 +694,17 @@ mod tests {
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         // gate_min=96 with 2 rows -> decline, NO state changes
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, &mut out,
+        );
         assert!(!out.ok, "sparse world must route vanilla");
         assert_eq!(out.ncol, 0);
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(pc.ncol[s2], 0, "declined call must not touch mirrors");
         // gate_min=0 -> the tick runs
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert!(out.ok);
         assert_eq!(out.ncol, 1);
     }
@@ -677,10 +716,22 @@ mod tests {
         let mut pc = core_with(1, 0.0, 0.0);
         let s1 = pc.slot_of(1).unwrap();
         pc.dy[s1] = -0.0784;
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.03, -0.08, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(
+            2,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.03,
+            -0.08,
+            0.0,
+            PF_PUSHABLE,
+            0,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
-        push_tick(&mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out);
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+        );
         assert_eq!(out.ddy, 0.0);
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(pc.dy[s2], -0.08);
