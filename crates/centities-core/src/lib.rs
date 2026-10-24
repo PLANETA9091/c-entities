@@ -96,7 +96,13 @@ impl Aabb {
     }
 }
 
+/// L12 push kernel: the public cell-key builder (module-side sort stamps
+/// are keyed by it).
 #[inline]
+pub fn cell_key_pub(world: u16, cx: i32, cz: i32) -> u64 {
+    cell_key(world, cx, cz)
+}
+
 pub fn hash64(mut x: u64) -> u64 {
     // splitmix64 finalizer: good avalanche, constant-time, dependency-free
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -643,6 +649,128 @@ impl EntityIndex {
     }
 
     // ---- internals ----
+
+    /// L12 push kernel: exact candidate scan of ONE cell (f32 AVX2
+    /// prefilter + exact f64 re-check), appending ids in the cell's block
+    /// order — id order after [`EntityIndex::sort_cell_by_id`]. Same
+    /// superset contract as [`EntityIndex::query`] (MARGIN-expanded bounds,
+    /// no oversize walk — oversize entities are never pushable candidates
+    /// here because the pushable filter classifies them separately).
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_cell(
+        &self,
+        world: u16,
+        cx: i32,
+        cz: i32,
+        x0: f64,
+        y0: f64,
+        z0: f64,
+        x1: f64,
+        y1: f64,
+        z1: f64,
+        out: &mut Vec<i64>,
+    ) {
+        let key = cell_key(world, cx, cz);
+        let Some(cid) = self.cellmap.find(key) else {
+            return;
+        };
+        let cid = cid as usize;
+        let ids = &self.cell_ids[cid];
+        let n = ids.len();
+        if n == 0 {
+            return;
+        }
+        let bx = &self.cell_box[cid];
+        let (ox, oz) = cell_origin(cx, cz);
+        // The prefilter + scan_cells' internal f64-promoted compare judge
+        // the F32-STORED boxes, whose cell-relative rounding is up to
+        // ULP(96) ~ 7.6e-6 off the exact f64 mirror. Expanding the bounds
+        // by 1e-2 (the doc-21 EPSF) keeps this scan a provable SUPERSET of
+        // the kernel's exact f64 test — no false negatives can escape.
+        const QEPS: f64 = 1.0e-2;
+        let qx0 = x0 - QEPS;
+        let qx1 = x1 + QEPS;
+        let qz0 = z0 - QEPS;
+        let qz1 = z1 + QEPS;
+        let my0 = (y0 - QEPS) as f32;
+        let my1 = (y1 + QEPS) as f32;
+        simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+    }
+
+    /// L12 push kernel: the public cell-key builder (module-side sort
+    /// stamps are keyed by it).
+    #[inline]
+    pub fn cell_lookup(&self, world: u16, cx: i32, cz: i32) -> Option<u32> {
+        self.cellmap.find(cell_key(world, cx, cz))
+    }
+
+    /// L12 push kernel support: sort one cell's entries by id, in place,
+    /// rebuilding the blocked-SoA box store and fixing every entry's cpos.
+    ///
+    /// WHY: vanilla's per-section candidate order is section-insertion
+    /// order; for the farm populations that equals entity-id order. The
+    /// push kernel serves its candidate loop in this order so the
+    /// maxEntityCollisions cap picks the same neighbors and the f64 force
+    /// accumulation runs in the same order (bit-parity for static piles).
+    /// Amortized: callers sort at most once per (cell, tick).
+    pub fn sort_cell_by_id(&mut self, world: u16, cx: i32, cz: i32) {
+        let key = cell_key(world, cx, cz);
+        let Some(cid) = self.cellmap.find(key) else {
+            return;
+        };
+        let cid = cid as usize;
+        let n = self.cell_ids[cid].len();
+        if n <= 1 {
+            return;
+        }
+        let bx = &self.cell_box[cid];
+        let mut rows: Vec<(i64, u32, [f32; 6])> = Vec::with_capacity(n);
+        for p in 0..n {
+            let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            rows.push((
+                self.cell_ids[cid][p],
+                self.cell_slots[cid][p],
+                [
+                    bx[base],
+                    bx[base + 8],
+                    bx[base + 16],
+                    bx[base + 24],
+                    bx[base + 32],
+                    bx[base + 40],
+                ],
+            ));
+        }
+        rows.sort_unstable_by_key(|r| r.0);
+        let mut blocks: Vec<f32> = Vec::with_capacity(((n + 7) >> 3) * BLOCK_F32);
+        let mut chunk: [f32; 6] = [0.0; 6];
+        for (i, (_id, slot, b6)) in rows.iter().enumerate() {
+            let lane = i & 7;
+            if lane == 0 {
+                // fresh block: self-rejecting padding for unallocated lanes
+                let mut blk = [0.0f32; BLOCK_F32];
+                for l in 0..8 {
+                    blk[l] = PAD_X0;
+                    blk[24 + l] = PAD_X1;
+                }
+                blocks.extend_from_slice(&blk);
+            }
+            let base = (i >> 3) * BLOCK_F32 + lane;
+            chunk.copy_from_slice(b6);
+            let bl = &mut blocks[base..base + 41];
+            bl[0] = chunk[0];
+            bl[8] = chunk[1];
+            bl[16] = chunk[2];
+            bl[24] = chunk[3];
+            bl[32] = chunk[4];
+            bl[40] = chunk[5];
+            self.cpos[*slot as usize] = i as u32;
+        }
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let slots: Vec<u32> = rows.iter().map(|r| r.1).collect();
+        self.cell_ids[cid] = ids;
+        self.cell_slots[cid] = slots;
+        self.cell_box[cid] = blocks;
+    }
 
     /// Create-or-get the 1-based cell id for the key. Cells are never
     /// freed (the publisher's dirty-marking relies on stable cell ids).

@@ -119,6 +119,7 @@ jobs:
           grep -q  "\[c-entities\] patched EntityLookup"      e2e.log || fail "EntityLookup probes not patched"
           grep -q  "\[c-entities\] precomputed ServerLevel dispatch guard" e2e.log || fail "L7 dispatch guard not precomputed"
           grep -q  "\[c-entities\] patched ServerLevel tickNonPassenger dispatch guard" e2e.log || fail "L7 dispatch guard not applied"
+          grep -q  "\[c-entities\] patched LivingEntity pushEntities dispatch guard" e2e.log || fail "L12 push dispatch guard not applied"
           grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"

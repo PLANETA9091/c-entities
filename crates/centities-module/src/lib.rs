@@ -12,6 +12,7 @@
 //! vanilla-mirror path.
 
 pub mod itemcore;
+pub mod pushcore;
 #[doc(hidden)]
 pub mod patch;
 
@@ -28,6 +29,7 @@ const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
 const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup";
 const ITEM_ENTITY_CLASS: &str = "net/minecraft/world/entity/item/ItemEntity";
 const SERVER_LEVEL_CLASS: &str = "net/minecraft/server/level/ServerLevel";
+const LIVING_ENTITY_CLASS: &str = "net/minecraft/world/entity/LivingEntity";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -121,6 +123,10 @@ struct Publisher {
 
 struct CeState {
     idx: centities_core::EntityIndex,
+    /// L12: pushable-only index + the per-entity push mirror (the kernel's
+    /// arena). Fed by the same probe batches, read by nativePush.
+    pidx: centities_core::EntityIndex,
+    push: pushcore::PushCore,
     p: Publisher,
     items: Option<itemcore::ItemCore>,
 }
@@ -128,6 +134,8 @@ struct CeState {
 pub(crate) fn new_state() -> CeState {
     CeState {
         idx: centities_core::EntityIndex::new(),
+        pidx: centities_core::EntityIndex::new(),
+        push: pushcore::PushCore::new(),
         items: None,
         p: Publisher {
             info: PUB_INFO.lock().ok().and_then(|g| *g),
@@ -369,6 +377,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(LOOKUP_CLASS, |_n, b| patch_lookup(b));
     cplug_sdk::hooks::register_bytes(ITEM_ENTITY_CLASS, |_n, b| patch_item(b));
     cplug_sdk::hooks::register_bytes(SERVER_LEVEL_CLASS, |_n, b| patch_serverlevel(b));
+    cplug_sdk::hooks::register_bytes(LIVING_ENTITY_CLASS, |_n, b| patch_livingentity(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -411,6 +420,7 @@ fn arm_module() {
     force_init_item_entity_raw(loader);
     precompute_item(loader);
     precompute_serverlevel(loader);
+    precompute_livingentity(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -421,6 +431,7 @@ fn arm_module() {
         LOOKUP_CLASS,
         ITEM_ENTITY_CLASS,
         SERVER_LEVEL_CLASS,
+        LIVING_ENTITY_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -441,6 +452,7 @@ fn arm_module() {
             (LOOKUP_CLASS, Counter::Adds),
             (ITEM_ENTITY_CLASS, Counter::ItemChecks),
             (SERVER_LEVEL_CLASS, Counter::DispChecks),
+            (LIVING_ENTITY_CLASS, Counter::PushChecks),
         ];
         let merge_woven = MERGE_WOVEN.load(Ordering::Acquire);
         let mut logged_done = false;
@@ -768,6 +780,93 @@ fn patch_serverlevel_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// L12 push dispatch takeover: a conditional early-return prefix on
+/// `LivingEntity.pushEntities()`:
+///
+///   if (CeHooks.pushDispatch(this)) return;
+///   ...vanilla pushEntities: isPushable gate, team rule, cramming audit,
+///      getPushableEntities query, the doPush force loop...
+///
+/// For a kernel-owned living entity the Rust push core computes the ENTIRE
+/// body natively (pushable-only index scan, exact f64 intersects, the
+/// Entity.push force math in vanilla candidate order, numCollisions
+/// bookkeeping); the Java guard applies the self writeback + cramming hurt.
+/// The doc-21 profile put 79.95% of the mixed-150k server thread inside the
+/// vanilla body's section scans — this weave removes the query and the
+/// per-pair Java floor while the observable push semantics stay byte-faithful
+/// (constants, order, RNG consumption all ported from the 26.3 bytecode).
+///
+/// BEST-EFFORT: a refusal here keeps the module armed with vanilla pushes.
+fn precompute_livingentity(loader: jni::jobject) {
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(LIVING_ENTITY_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info(
+            "[c-entities] precompute LivingEntity push guard: original bytes not seen at boot",
+        );
+        return;
+    };
+    let spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "pushEntities",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "pushDispatch",
+        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(LIVING_ENTITY_CLASS, b);
+            }
+            cplug_sdk::log::info("[c-entities] precomputed LivingEntity push dispatch guard");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute LivingEntity push guard — vanilla pushes kept",
+            );
+        }
+    }
+}
+
+fn patch_livingentity(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_livingentity_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_livingentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The guard is
+        // woven at arm time (precompute_livingentity).
+        let mut st = STASH.lock().ok()?;
+        st.entry(LIVING_ENTITY_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(LIVING_ENTITY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched LivingEntity pushEntities dispatch guard");
+            Some(b)
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to patch LivingEntity pushEntities — vanilla kept",
+            );
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Counter {
     Queries,
@@ -777,6 +876,7 @@ enum Counter {
     MergeChecks,
     ItemChecks,
     DispChecks,
+    PushChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -800,6 +900,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::MergeChecks, ("mergeChecks", "J")),
             (Counter::ItemChecks, ("itemChecks", "J")),
             (Counter::DispChecks, ("dispChecks", "J")),
+            (Counter::PushChecks, ("pushChecks", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
@@ -991,11 +1092,18 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeFlush",
-        "(I[J[D)V",
+        "(I[J[D[I[D[D[II[J[D)V",
         n_flush
             as extern "system" fn(
                 *mut jni::JNIEnv,
                 jni::jclass,
+                i32,
+                jni::jlongArray,
+                jni::jdoubleArray,
+                jni::jintArray,
+                jni::jdoubleArray,
+                jni::jdoubleArray,
+                jni::jintArray,
                 i32,
                 jni::jlongArray,
                 jni::jdoubleArray,
@@ -1037,6 +1145,16 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         "nativeItemInvalidate",
         "(II[I[I[I)V",
         itemcore::n_item_invalidate as *const c_void
+    );
+    push!(
+        "nativePush",
+        "(IIIIIIII)J",
+        n_push as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i32, i32, i32, i32, i32, i32, i32) -> i64
+    );
+    push!(
+        "nativePushNcol",
+        "(I)I",
+        n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> i32
     );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
@@ -1699,22 +1817,48 @@ unsafe fn jni_get_double_array_region(
 
 /// Apply one packed batch: entries with bit63 set are removals
 /// ([remove:1][world:16][id:32]), the rest are upserts with 6 doubles each.
+/// L12: the same call applies the push-state extension (flags/pxz/delta/vid
+/// per entry) and the delta-only batch into the push mirror + the
+/// pushable-only index.
 pub extern "system" fn n_flush(
     env: *mut jni::JNIEnv,
     _cls: jni::jclass,
     n: i32,
     ids: jni::jlongArray,
     boxes: jni::jdoubleArray,
+    pf: jni::jintArray,
+    pxz: jni::jdoubleArray,
+    dv: jni::jdoubleArray,
+    vid: jni::jintArray,
+    dbn: i32,
+    db_ids: jni::jlongArray,
+    db_dv: jni::jdoubleArray,
 ) {
-    if n <= 0 {
+    if n <= 0 && dbn <= 0 {
         return;
     }
     unsafe {
         let e = JniEnv::from_raw(env);
-        let mut id_buf: Vec<i64> = vec![0; n as usize];
-        let mut box_buf: Vec<f64> = vec![0.0; n as usize * 6];
-        e.get_long_array_region(ids, 0, n, &mut id_buf);
-        jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
+        let mut id_buf: Vec<i64> = vec![0; n.max(0) as usize];
+        let mut box_buf: Vec<f64> = vec![0.0; n.max(0) as usize * 6];
+        let mut pf_buf: Vec<i32> = vec![0; n.max(0) as usize];
+        let mut pxz_buf: Vec<f64> = vec![0.0; n.max(0) as usize * 2];
+        let mut dv_buf: Vec<f64> = vec![0.0; n.max(0) as usize * 3];
+        let mut vid_buf: Vec<i32> = vec![0; n.max(0) as usize];
+        if n > 0 {
+            e.get_long_array_region(ids, 0, n, &mut id_buf);
+            jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
+            e.get_int_array_region(pf, 0, n, &mut pf_buf);
+            jni_get_double_array_region(&e, pxz, 0, n * 2, &mut pxz_buf);
+            jni_get_double_array_region(&e, dv, 0, n * 3, &mut dv_buf);
+            e.get_int_array_region(vid, 0, n, &mut vid_buf);
+        }
+        let mut db_buf: Vec<i64> = vec![0; dbn.max(0) as usize];
+        let mut dbdv_buf: Vec<f64> = vec![0.0; dbn.max(0) as usize * 3];
+        if dbn > 0 {
+            e.get_long_array_region(db_ids, 0, dbn, &mut db_buf);
+            jni_get_double_array_region(&e, db_dv, 0, dbn * 3, &mut dbdv_buf);
+        }
         let _ = with_state(|st| {
             drain_direct(st);
             for (i, l) in id_buf.iter().enumerate() {
@@ -1722,6 +1866,11 @@ pub extern "system" fn n_flush(
                 if *l < 0 {
                     let ev = st.idx.remove(id);
                     st.note_remove(ev);
+                    // the push view drops removals unconditionally (a no-op
+                    // for entities that were never pushable)
+                    st.push.remove(id as i64);
+                    let ev2 = st.pidx.remove(id as i64);
+                    let _ = ev2;
                 } else {
                     let wid = ((*l >> 32) & 0xFFFF) as u16;
                     let o = i * 6;
@@ -1735,13 +1884,141 @@ pub extern "system" fn n_flush(
                     );
                     let ev = st.idx.upsert(id, wid, &b);
                     st.note_upsert(ev);
+                    if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
+                        let ev2 = st.pidx.upsert(id, wid, &b);
+                        let _ = ev2;
+                        st.push.upsert(
+                            id as i64,
+                            &b,
+                            pxz_buf[i * 2],
+                            pxz_buf[i * 2 + 1],
+                            dv_buf[i * 3],
+                            dv_buf[i * 3 + 1],
+                            dv_buf[i * 3 + 2],
+                            pf_buf[i] as u8,
+                            vid_buf[i] as i64,
+                        );
+                    } else {
+                        // reclassified non-pushable (or a plain living): drop
+                        // it from the push view (no-ops when absent)
+                        st.push.remove(id as i64);
+                        st.pidx.remove(id as i64);
+                    }
                 }
+            }
+            for (j, l) in db_buf.iter().enumerate() {
+                let id = (*l & 0xFFFF_FFFF) as i64;
+                st.push
+                    .set_delta(id, dbdv_buf[j * 3], dbdv_buf[j * 3 + 1], dbdv_buf[j * 3 + 2]);
             }
             // Mid-tick cap flush: publish now, or the rows would be
             // stale-with-valid-stamp until the next native query.
             publish(&e, st);
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// L12 — the native push kernel.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static PUSH_OUT: std::cell::RefCell<pushcore::PushOut> =
+        std::cell::RefCell::new(pushcore::PushOut::default());
+}
+
+/// Compute one `LivingEntity.pushEntities()` natively. Returns the packed
+/// verdict (bit0 ok, bit1 cramming, bits 2..21 non-passenger hits,
+/// bits 22..53 numCollisions); the full post-tick delta is written into the
+/// PUSH_SDX/SDY/SDZ statics. The caller's pending probe batches were flushed
+/// by the Java guard (flushIfPending) BEFORE this call, so the mirror is
+/// current.
+pub extern "system" fn n_push(
+    env: *mut jni::JNIEnv,
+    cls: jni::jclass,
+    world: i32,
+    self_id: i32,
+    self_vehicle: i32,
+    self_player: i32,
+    only_players: i32,
+    max_ec: i32,
+    cramming: i32,
+    cur_tick: i32,
+) -> i64 {
+    let res = with_state(|st| {
+        drain_direct(st);
+        let slot = match st.push.slot_of(self_id as i64) {
+            Some(s) if st.push.flags[s] & pushcore::PF_PUSHABLE != 0 => s,
+            _ => return 0i64, // mirror: vanilla body runs
+        };
+        PUSH_OUT.with(|o| {
+            let mut o = o.borrow_mut();
+            pushcore::push_tick(
+                &mut st.push,
+                &mut st.pidx,
+                world as u16,
+                self_id as i64,
+                slot,
+                self_vehicle != 0,
+                self_player != 0,
+                only_players != 0,
+                true, // player collisions enabled (Java gates the config flip)
+                max_ec,
+                cramming,
+                cur_tick as u64,
+                &mut o,
+            );
+            if o.ok {
+                (1i64)
+                    | ((o.cramming as i64) << 1)
+                    | (((o.non_passengers.max(0) as i64) & 0xF_FFFF) << 2)
+                    | (((o.ncol.max(0) as i64) & 0xFFFF_FFFF) << 22)
+            } else {
+                0i64
+            }
+        })
+    })
+    .unwrap_or(0i64);
+    if res & 1 == 1 {
+        // write the delta statics OUTSIDE the state borrow (server-thread
+        // confined statics, no race)
+        let (dx, dy, dz) = PUSH_OUT.with(|o| {
+            let o = o.borrow();
+            (o.dx, o.dy, o.dz)
+        });
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            for (name, v) in [
+                ("PUSH_SDX", dx),
+                ("PUSH_SDY", dy),
+                ("PUSH_SDZ", dz),
+            ] {
+                if let Some(fid) = e.get_static_field_id(cls, name, "D") {
+                    let raw = e.raw();
+                    let vt = *raw;
+                    ((*vt).SetStaticDoubleField)(raw, cls, fid, v);
+                }
+            }
+            if e.exception_check() {
+                e.exception_clear();
+            }
+        }
+    }
+    res
+}
+
+/// The numCollisions mirror value for `id`, or -1 (mirror miss). The Java
+/// decline path uses this to re-sync the field before running vanilla.
+pub extern "system" fn n_push_ncol(
+    _env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    id: i32,
+) -> i32 {
+    with_state(|st| match st.push.slot_of(id as i64) {
+        Some(s) => st.push.ncol[s],
+        None => -1,
+    })
+    .unwrap_or(-1)
 }
 
 // bridge class bytes (compiled by build.rs against the paper jar)

@@ -421,6 +421,8 @@ public final class CeHooks {
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
+                + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
+                + "/" + pushCramming + "/" + pushSelfDelta
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
     }
@@ -573,6 +575,27 @@ public final class CeHooks {
             l7ExternalMutation(e);
             if (e != null) {
                 int m = e.getId() & AMASK;
+                // L12 push mirror: keep the native delta fresh. Only living
+                // entities are push-kernel state; the delta events of items
+                // are the item core's business. Off-thread callers skip (the
+                // next server-thread box event refreshes the mirror).
+                if (ACTIVE && INDEXING && e instanceof net.minecraft.world.entity.LivingEntity
+                        && SERVER_THREAD.get()) {
+                    int pw = worldId(e.level());
+                    if (pw >= 0 && ARENA[m] == e) {
+                        if (dbN >= BATCH_CAP) {
+                            flush();
+                        }
+                        Vec3 dv = e.getDeltaMovement();
+                        DB_IDS[dbN] = ((pw & 0xFFFFL) << 32)
+                                | (e.getId() & 0xFFFF_FFFFL);
+                        DB_DV[dbN * 3] = dv.x;
+                        DB_DV[dbN * 3 + 1] = dv.y;
+                        DB_DV[dbN * 3 + 2] = dv.z;
+                        dbN++;
+                        if (dbN >= DRAIN_CAP) flush();
+                    }
+                }
                 if (REST_GEN[m] != 0) { // resting: decide whether the impulse
                     // is self-physics (this item's own marking tick) or an
                     // external push; only the latter may break the rest.
@@ -599,7 +622,7 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
                 ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), worldId(e.level()), e.getBoundingBox(), false);
+                batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -654,7 +677,7 @@ public final class CeHooks {
                 AABB oldBox = e.getBoundingBox();
                 boolean rowNeutral = oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
-                batchUpsert(e.getId(), worldId(e.level()), newBox, rowNeutral);
+                batchUpsert(e.getId(), worldId(e.level()), e, newBox, rowNeutral);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -687,12 +710,26 @@ public final class CeHooks {
     private static final int DRAIN_CAP = 64;
     private static final long[] B_IDS = new long[BATCH_CAP];
     private static final double[] B_BOX = new double[BATCH_CAP * 6];
+    // L12 push-state extension: per entry — flag bits, exact x/z, delta xyz,
+    // direct vehicle id. Zero-filled for non-LivingEntity entries.
+    private static final int[] B_PF = new int[BATCH_CAP];
+    private static final double[] B_PXZ = new double[BATCH_CAP * 2];
+    private static final double[] B_DV = new double[BATCH_CAP * 3];
+    private static final int[] B_VID = new int[BATCH_CAP];
+    // L12 delta-only batch (probeDelta events without a box change)
+    private static final long[] DB_IDS = new long[BATCH_CAP];
+    private static final double[] DB_DV = new double[BATCH_CAP * 3];
+    private static int dbN = 0;
     private static int bN = 0;
     private static final ThreadLocal<Boolean> SERVER_THREAD =
             ThreadLocal.withInitial(() -> "Server thread".equals(Thread.currentThread().getName()));
 
-    private static void batchUpsert(int id, int wid, AABB b, boolean rowNeutral) {
+    private static void batchUpsert(int id, int wid, Entity e, AABB b, boolean rowNeutral) {
         if (!SERVER_THREAD.get()) {
+            // off-thread: the push mirror is server-thread state; off-thread
+            // spawns refresh it on the next server-thread box event (every
+            // entity is box-probed at least once after spawn) — the exactness
+            // contract is documented in docs/research/23.
             nativeBoxDirect(id, wid,
                     b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
             return;
@@ -702,8 +739,57 @@ public final class CeHooks {
         int o = bN * 6;
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
+        if (e instanceof net.minecraft.world.entity.LivingEntity le) {
+            B_PF[bN] = pushFlags(le);
+            B_PXZ[bN * 2] = le.getX();
+            B_PXZ[bN * 2 + 1] = le.getZ();
+            Vec3 dv = le.getDeltaMovement();
+            B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
+            Entity veh = le.isPassenger() ? le.getVehicle() : null;
+            B_VID[bN] = veh != null ? veh.getId() : 0;
+        } else {
+            B_PF[bN] = 0;
+            B_PXZ[bN * 2] = 0.0;
+            B_PXZ[bN * 2 + 1] = 0.0;
+            B_DV[bN * 3] = 0.0; B_DV[bN * 3 + 1] = 0.0; B_DV[bN * 3 + 2] = 0.0;
+            B_VID[bN] = 0;
+        }
         bN++;
         if (bN >= DRAIN_CAP) flush();
+    }
+
+    /** L12: the pushableBy predicate's stateful slice, folded into flag bits
+     *  (javap-verified against 26.3 LivingEntity.isPushable ->
+     *  isCollidable(false): isAlwaysTicking false, ServerLevel,
+     *  isPositionEntityTicking(blockPosition), isAlive, !isSpectator,
+     *  collides, !onClimbable). The team-rule slice is NOT folded — any
+     *  entity WITH a team routes the whole push vanilla (the guard checks).
+     *  Rare state flips without a box event (sleeping villager, spectator
+     *  flip) re-classify on the entity's next box probe; the deviation
+     *  window is documented in docs/research/23 and is behaviorally inert
+     *  (deltas of non-traveling entities never integrate into position). */
+    private static int pushFlags(net.minecraft.world.entity.LivingEntity le) {
+        int f = 0;
+        if (le instanceof net.minecraft.server.level.ServerPlayer) f |= PF_PLAYER;
+        if (le.isPassenger()) f |= PF_PASSENGER;
+        if (le.isVehicle()) f |= PF_VEHICLE;
+        if (le.noPhysics) f |= PF_NOPHYSICS;
+        if (le.isSpectator()) f |= PF_SPECTATOR;
+        try {
+            if (!le.isAlwaysTicking()
+                    && le.level() instanceof net.minecraft.server.level.ServerLevel sl
+                    && sl.isPositionEntityTicking(le.blockPosition())
+                    && le.isAlive()
+                    && !le.isSpectator()
+                    && le.collides
+                    && !le.onClimbable()) {
+                f |= PF_PUSHABLE;
+            }
+        } catch (Throwable t) {
+            // uncertain -> NOT pushable: the entity drops out of the push
+            // view (a missed push candidate, never a spurious one)
+        }
+        return f;
     }
 
     /** Batch entry flag (bit 62): the upsert keeps the entity's home cell
@@ -735,11 +821,13 @@ public final class CeHooks {
      *  flushed before every query, so queries always see all changes made
      *  before them. Off-thread changes went through the direct path. */
     private static void flush() {
-        if (bN > 0) {
+        if (bN > 0 || dbN > 0) {
             batchesFlushed++;
             batchEntries += bN;
-            nativeFlush(bN, B_IDS, B_BOX);
+            nativeFlush(bN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID,
+                    dbN, DB_IDS, DB_DV);
             bN = 0;
+            dbN = 0;
         }
     }
 
@@ -1388,7 +1476,18 @@ public final class CeHooks {
     public static native int queryNative(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
             long[] out, int batchN, long[] batchIds, double[] batchBoxes);
-    public static native void nativeFlush(int n, long[] ids, double[] boxes);
+    public static native void nativeFlush(
+            int n, long[] ids, double[] boxes,
+            int[] pf, double[] pxz, double[] dv, int[] vid,
+            int dbn, long[] dbIds, double[] dbDv);
+    /** L12 push kernel: compute one `LivingEntity.pushEntities()` natively.
+     *  Returns a packed long: bit0 = ok (vanilla body suppressed), bit1 =
+     *  cramming audit needed, bits 2..21 = non-passenger hit count,
+     *  bits 22..53 = numCollisions after the tick. The post-tick delta is
+     *  written into PUSH_SDX/SDY/SDZ (server-thread confined statics). */
+    public static native long nativePush(
+            int wid, int selfId, int selfVehicle, int selfPlayer,
+            int onlyPlayers, int maxEC, int cramming, int curTick);
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
@@ -1488,6 +1587,194 @@ public final class CeHooks {
     public static final int IF_FRIC_OFF = 8;        // frictionState == FALSE -> f = 1.0
     public static final int IF_FORCE_VANILLA = 16;  // fresh-flag gate: vanilla this tick
     public static final int IF_ON_GROUND = 32;      // e.onGround() at collect time
+
+    // L12 push flag bits (must match pushcore.rs PF_*)
+    public static final int PF_PUSHABLE = 1;
+    public static final int PF_SPECTATOR = 2;
+    public static final int PF_NOPHYSICS = 4;
+    public static final int PF_PASSENGER = 8;
+    public static final int PF_VEHICLE = 16;
+    public static final int PF_PLAYER = 32;
+    public static final int PF_NEEDSSYNC = 64;
+    /** L12 kernel outputs (server-thread confined): the post-tick delta and
+     *  the packed verdict of the last nativePush call. */
+    public static double PUSH_SDX = 0.0, PUSH_SDY = 0.0, PUSH_SDZ = 0.0;
+    public static volatile long pushChecks = 0, pushNative = 0, pushMirror = 0,
+            pushCramming = 0, pushSelfDelta = 0;
+    /** L12 kill switch: -Dcentities.pushNative=false keeps every push vanilla. */
+    public static final boolean PUSH_ON =
+            !"false".equals(System.getProperty("centities.pushNative", "true"));
+    /** Lazy private-access setter for the PROTECTED Entity.numCollisions field
+     *  (the vanilla pushEntities counter — the only reader/writer outside is
+     *  that body, javap-verified, so the kernel mirror is authoritative and
+     *  this setter only re-syncs the Java field). */
+    private static volatile java.lang.invoke.MethodHandle MH_NCOL;
+    /** The PROTECTED LivingEntity.random field + RandomSource.nextInt(int) —
+     *  the cramming audit's RNG must be the entity's own source, consumed in
+     *  exactly the vanilla conditions. */
+    private static volatile java.lang.invoke.MethodHandle MH_RANDOM;
+    private static volatile java.lang.invoke.MethodHandle MH_NEXT_INT;
+    private static volatile boolean MH_NCOL_FAILED = false;
+
+    private static synchronized boolean initNcolMh(Entity sample) {
+        if (MH_NCOL_FAILED) return false;
+        if (MH_NCOL != null) return true;
+        try {
+            java.lang.reflect.Field f = net.minecraft.world.entity.Entity.class
+                    .getDeclaredField("numCollisions");
+            f.setAccessible(true);
+            MH_NCOL = java.lang.invoke.MethodHandles.lookup().unreflectSetter(f)
+                    .asType(java.lang.invoke.MethodType.methodType(
+                            void.class, Entity.class, int.class));
+            java.lang.reflect.Field rf = net.minecraft.world.entity.LivingEntity.class
+                    .getDeclaredField("random");
+            rf.setAccessible(true);
+            MH_RANDOM = java.lang.invoke.MethodHandles.lookup().unreflectGetter(rf)
+                    .asType(java.lang.invoke.MethodType.methodType(
+                            net.minecraft.util.RandomSource.class,
+                            net.minecraft.world.entity.LivingEntity.class));
+            java.lang.reflect.Method ni = net.minecraft.util.RandomSource.class
+                    .getDeclaredMethod("nextInt", int.class);
+            ni.setAccessible(true);
+            MH_NEXT_INT = java.lang.invoke.MethodHandles.lookup().unreflect(ni)
+                    .asType(java.lang.invoke.MethodType.methodType(
+                            int.class, net.minecraft.util.RandomSource.class, int.class));
+            return true;
+        } catch (Throwable t) {
+            MH_NCOL_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "ncolMh: " + t;
+            return false;
+        }
+    }
+
+    /**
+     * L12 — PUSH DISPATCH TAKEOVER. Woven as an EarlyReturnGuard on
+     * LivingEntity.pushEntities(): true = the vanilla body is suppressed,
+     * the Rust kernel computed this entity's whole push tick (candidate
+     * scan over the pushable-only index, exact f64 intersects, the Entity.push
+     * force math in vanilla candidate order, numCollisions bookkeeping, the
+     * cramming audit inputs). The Java tail below applies the self writeback
+     * (delta + needsSync + numCollisions) and the cramming hurt with the
+     * entity's own RandomSource, in the vanilla order.
+     *
+     * Any uncertainty returns false — the vanilla body runs. When the kernel
+     * HAS run for this entity before (its numCollisions mirror is ahead of
+     * the Java field), the decline path re-syncs the mirror into the field
+     * so the vanilla body starts from the right counter.
+     */
+    public static boolean pushDispatch(Entity ent) {
+        pushChecks++;
+        if (!ACTIVE || !PUSH_ON || !cplugReady) return false;
+        if (!(ent instanceof net.minecraft.world.entity.LivingEntity le)
+                || ent instanceof net.minecraft.server.level.ServerPlayer) {
+            return false;
+        }
+        try {
+            net.minecraft.world.level.Level w = le.level();
+            if (w.isClientSide() || !(w instanceof net.minecraft.server.level.ServerLevel sl)) {
+                return false;
+            }
+            if (le.isRemoved() || le.noPhysics || le.isPassenger()) return false;
+            // byte-faithful isPushable() slice (the vanilla body's own gate):
+            // a false here means vanilla no-ops anyway — route vanilla.
+            if ((pushFlags(le) & PF_PUSHABLE) == 0) return false;
+            // team collision rules: the predicate folds per-pair team logic;
+            // any team on either side routes vanilla.
+            if (le.getTeam() != null) return false;
+            int cramming = sl.getGameRules()
+                    .get(net.minecraft.world.level.gamerules.GameRules.MAX_ENTITY_CRAMMING);
+            int maxEC = w.paperConfig().collisions.maxEntityCollisions;
+            if (cramming <= 0 && maxEC <= 0) return false;
+            // Entity.push fires EntityCollideWithEntityEvent when listeners
+            // exist; push(DDD) fires EntityPushedByEntityAttackEvent only for
+            // a non-null source (never here) — listener presence routes vanilla.
+            if (io.papermc.paper.event.entity.EntityCollideWithEntityEvent
+                    .getHandlerList().getRegisteredListeners().length != 0) {
+                return false;
+            }
+            int wid = worldId(w);
+            if (wid < 0) return false;
+            boolean onlyPlayers = w.paperConfig().collisions.onlyPlayersCollide;
+            boolean playerCollisions = io.papermc.paper.configuration.GlobalConfiguration
+                    .get().collisions.enablePlayerCollisions;
+            boolean selfVehicle = le.isVehicle();
+            // the kernel reads the mirror: drain the pending probe batches first
+            flushIfPending();
+            long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
+                    0, onlyPlayers ? 1 : 0, maxEC, cramming,
+                    net.minecraft.server.MinecraftServer.currentTick);
+            if ((res & 1L) == 0L) {
+                // kernel declined (arena miss / index not ready): sync the
+                // mirror's numCollisions into the Java field, then vanilla.
+                pushMirror++;
+                int ncolMirror = nativePushNcol(le.getId());
+                if (ncolMirror >= 0 && MH_NCOL != null) {
+                    try {
+                        MH_NCOL.invokeExact(le, ncolMirror);
+                    } catch (Throwable ignore) { /* vanilla counter stays */ }
+                }
+                return false;
+            }
+            pushNative++;
+            int ncolNew = (int) ((res >>> 22) & 0xFFFF_FFFFL);
+            int nonPass = (int) ((res >>> 2) & 0xF_FFFFL);
+            // self writeback — the same calls the vanilla body would have
+            // made, in the same order (setDeltaMovement allocates a fresh
+            // Vec3 exactly like vanilla; needsSync marks the tracker)
+            le.setDeltaMovement(new Vec3(PUSH_SDX, PUSH_SDY, PUSH_SDZ));
+            le.needsSync = true;
+            pushSelfDelta++;
+            if (MH_NCOL == null && !initNcolMh(le)) {
+                return false; // cannot maintain the counter — vanilla next tick
+            }
+            try {
+                MH_NCOL.invokeExact(le, ncolNew);
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = "pushNcol: " + t;
+                ACTIVE = false;
+                return false;
+            }
+            if ((res & 2L) != 0L) {
+                // vanilla: list.size() > cramming-1 && random.nextInt(4) == 0
+                // && nonPassengers > cramming-1 -> hurtServer(cramming, 6f)
+                pushCramming++;
+                int roll = -1;
+                try {
+                    net.minecraft.util.RandomSource rnd = (net.minecraft.util.RandomSource) MH_RANDOM.invokeExact(le);
+                    roll = (int) MH_NEXT_INT.invokeExact(rnd, 4);
+                } catch (Throwable t) {
+                    lastError = System.nanoTime();
+                    lastErrorText = "pushRng: " + t;
+                    ACTIVE = false;
+                    return false;
+                }
+                if (roll == 0 && nonPass > cramming - 1) {
+                    le.hurtServer(sl, sl.damageSources().cramming(), 6.0f);
+                }
+            }
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "pushDispatch: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+            return false;
+        }
+    }
+
+    /** The numCollisions mirror value for `id`, or -1 (mirror miss). Read
+     *  through a tiny native so the decline path can re-sync the field. */
+    private static native int nativePushNcol(int id);
+
+    /** Drain any pending probe batches before a kernel call: the kernel
+     *  reads the push mirror, so its view must be current. No-op when the
+     *  batch is empty (the steady state — the DRAIN_CAP=64 policy keeps the
+     *  batch small, and the kernel call is per-entity). */
+    static void flushIfPending() {
+        flush();
+    }
 
     // ==================================================================
     // L7 — DISPATCH TAKEOVER.

@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  SCENARIOS: items-100k mixed-150k spread-100k
+  SCENARIOS: items-100k mobs-25k mixed-150k spread-100k
   REPEATS: '3'
   MEASURE: '400'
   GATE_MARGIN: '1.05'
@@ -62,6 +62,7 @@ jobs:
           for SC in $SCENARIOS; do
             case "$SC" in
               items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0; REPS=3;;
+              mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0; REPS=1;;
               mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1;;
               spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1;;
             esac
@@ -146,6 +147,6 @@ jobs:
           sys.exit(1 if fails else 0)
           PY
         env:
-          SCENARIOS: items-100k mixed-150k spread-100k
+          SCENARIOS: items-100k mobs-25k mixed-150k spread-100k
           REPEATS: '3'
           GATE_MARGIN: '1.05'
