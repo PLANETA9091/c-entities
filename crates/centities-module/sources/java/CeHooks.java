@@ -3510,10 +3510,16 @@ public final class CeHooks {
     // the weave by watching these BEFORE the gates are armed — frozenGate/
     // convGate move only after arming). PLAIN longs, same reasoning as gsFloorTicks.
     public static long frozenCalls = 0, convCalls = 0;
-    // system-property kill switches, folded to static finals at class init
-    public static final boolean AI_FLAG_ON = java.lang.Boolean.getBoolean("centities.aiFloor");
-    public static final boolean FROZEN_FLAG_ON = java.lang.Boolean.getBoolean("centities.frozenGate");
-    public static final boolean CONV_FLAG_ON = java.lang.Boolean.getBoolean("centities.convGate");
+    // system-property kill switches, folded to static finals at class init.
+    // NOTE the idiom: Boolean.getBoolean(name) returns FALSE when the
+    // property is ABSENT — the first CI e2e armed with the floor disabled
+    // because of exactly that. Default-ON must read the property explicitly.
+    public static final boolean AI_FLAG_ON =
+            !"false".equals(System.getProperty("centities.aiFloor", "true"));
+    public static final boolean FROZEN_FLAG_ON =
+            !"false".equals(System.getProperty("centities.frozenGate", "true"));
+    public static final boolean CONV_FLAG_ON =
+            !"false".equals(System.getProperty("centities.convGate", "true"));
 
     private static volatile RefField VH_ENT_DATA;  // Entity.entityData
     private static volatile RefField VH_CONV_MOB;  // ConversionTracker.mob
