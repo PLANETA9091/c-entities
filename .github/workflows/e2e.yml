@@ -28,7 +28,7 @@ jobs:
       - name: Checkout CRUSSTY
         run: |
           git clone https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
-          git -C ../CRUSSTY checkout a34d529  # pinned: the guard-API revision c-entities builds against
+          git -C ../CRUSSTY checkout c315a1b  # pinned: the guard-API revision c-entities builds against (op-5 EARLY_RETURN_GUARD2)
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v4
         with:
