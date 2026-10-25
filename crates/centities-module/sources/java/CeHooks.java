@@ -597,7 +597,7 @@ public final class CeHooks {
                 // next server-thread box event refreshes the mirror).
                 if (ACTIVE && INDEXING && e instanceof net.minecraft.world.entity.LivingEntity
                         && SERVER_THREAD.get()) {
-                    int pw = widFast(e.level());
+                    int pw = worldId(e.level());
                     if (pw >= 0 && ARENA[m] == e) {
                         if (dbN >= BATCH_CAP) {
                             flush();
@@ -943,7 +943,7 @@ public final class CeHooks {
             mNotServerLevel++;
             return -1;
         }
-        int wid = widFast(level);
+        int wid = worldId(level);
         if (wid < 0 || wid >= GWORLDS) {
             mBadWorld++;
             return -1; // no gate cell — vanilla, guaranteed parity
@@ -1039,7 +1039,7 @@ public final class CeHooks {
             mOffThread++;
             return null;
         }
-        int wid = widFast(sl);
+        int wid = worldId(sl);
         if (wid < 0) {
             mBadWorld++;
             return null;
@@ -1848,7 +1848,7 @@ public final class CeHooks {
             if (le.getTeam() != null) return false;
             refreshPushCfg(sl);
             if (PUSH_CFG_EVENTS) return false;
-            int wid = widFast(w);
+            int wid = worldId(w);
             if (wid < 0) return false;
             boolean selfVehicle = le.isVehicle();
             // the kernel reads the mirror: drain the pending probe batches first
@@ -2532,7 +2532,7 @@ public final class CeHooks {
         }
         try {
             itemFlushes++;
-            int wid = widFast(level);
+            int wid = worldId(level);
             boolean isNether = level.dimension() == Level.NETHER;
 
             // pass 1: resync entries re-read state POST vanilla tick
@@ -3135,9 +3135,7 @@ public final class CeHooks {
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
         try {
-            Entity e = SE_FAST
-                    ? (Entity) refAt(se, O_SE_ENTITY)
-                    : (Entity) VH_SE_ENTITY.getObj(se);
+            Entity e = (Entity) VH_SE_ENTITY.getObj(se);
             // L15b REORDER: every read below is PURE (no side effects — the
             // two unconditional effects ride at the tail in vanilla order),
             // so the ORDER of the reads is free. The cheapest sufficient
@@ -3154,43 +3152,29 @@ public final class CeHooks {
             // bc 302-311: the snapshot only matters for real trackers; the
             // NO_OP implementation (javap'd) is an empty body — skipping its
             // trackingPosition() Vec3 allocation is exact
-            Object interp = SE_FAST
-                    ? refAt(se, O_SE_INTERP)
-                    : VH_SE_INTERP.getObj(se);
-            if (interp
+            if (VH_SE_INTERP.getObj(se)
                     != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
                 return false;
             }
             // bc 34-44: passengers changed → vanilla (writes lastPassengers,
             // emits ClientboundSetPassengersPacket)
             Object pax = e.getPassengers();
-            Object lastPax = SE_FAST
-                    ? refAt(se, O_SE_LAST_PAX)
-                    : VH_SE_LAST_PAX.getObj(se);
-            if (!pax.equals(lastPax)) return false;
+            if (!pax.equals(VH_SE_LAST_PAX.getObj(se))) return false;
             // bc 107-116: non-empty tracking → ItemFrame map tick + emit paths
-            java.util.Set<?> tracked = SE_FAST
-                    ? (java.util.Set<?>) refAt(se, O_SE_TRACKED_PLAYERS)
-                    : (java.util.Set<?>) VH_SE_TRACKED_PLAYERS.getObj(se);
+            java.util.Set<?> tracked =
+                    (java.util.Set<?>) VH_SE_TRACKED_PLAYERS.getObj(se);
             if (tracked == null || !tracked.isEmpty()) return false;
             // bc 347: forceStateResync → the full resync body
-            Object resync = SE_FAST
-                    ? refAt(se, O_SE_RESYNC)
-                    : VH_SE_RESYNC.getObj(se);
-            if (resync == Boolean.TRUE) return false;
+            if (VH_SE_RESYNC.getObj(se) == Boolean.TRUE) return false;
             // bc 364-377: updateInterval.test is PURE (n % period == 0)
-            net.minecraft.world.entity.UpdateInterval interval = SE_FAST
-                    ? (net.minecraft.world.entity.UpdateInterval) refAt(se, O_SE_INTERVAL)
-                    : (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
-            int tickCount = SE_FAST
-                    ? intAt(se, O_SE_TICK_COUNT)
-                    : VH_SE_TICK_COUNT.getInt(se);
+            net.minecraft.world.entity.UpdateInterval interval =
+                    (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
+            int tickCount = VH_SE_TICK_COUNT.getInt(se);
             if (interval == null || interval.test(tickCount)) return false;
             // ALL conditions passed: this tick emits nothing. Reproduce the
             // unconditional effects in vanilla order:
             e.updateDataBeforeSync();                       // bc 19-23
-            if (SE_FAST) putIntAt(se, O_SE_TICK_COUNT, tickCount + 1);
-            else VH_SE_TICK_COUNT.setInt(se, tickCount + 1); // bc 1106-1113
+            VH_SE_TICK_COUNT.setInt(se, tickCount + 1);     // bc 1106-1113
             trackerFast++;
             return true;
         } catch (Throwable t) {
@@ -3200,7 +3184,6 @@ public final class CeHooks {
             trackerErr++;
             lastError = System.nanoTime();
             VH_SE_TICK_COUNT = null; // forces initTrackerVh() to rebuild
-            SE_FAST = false;
             initTrackerVh();
             return false;
         }

@@ -163,6 +163,10 @@ done
 
 if [ "$JSON_OK" != "1" ]; then
   echo "FATAL: no baseline.json (timeout or crash)"
+  # grab the JVM fatal report BEFORE exiting — the only forensic for a
+  # GC-barrier SIGSEGV (the corrupting thread's frames live there)
+  cp "$S"/hs_err_pid*.log "$R/" 2>/dev/null || true
+  cp "$S"/hs_err_pid*.jfr "$R/" 2>/dev/null || true
   tail -n 80 "$R/server.log" || true
   kill -TERM "$JPID" 2>/dev/null || true
   exit 1
@@ -177,6 +181,12 @@ kill -9 "$JPID" 2>/dev/null || true
 
 cp "$S/baseline.json" "$R/"
 cp "$S/logs/latest.log" "$R/" 2>/dev/null || true
+# Crash forensics: JVM fatal-error reports land next to the server dir —
+# without them a SIGSEGV in a GC barrier is undebuggable from CI alone
+# (the hs_err stack is the ONLY place the corrupting thread's frames live).
+cp "$S"/hs_err_pid*.log "$R/" 2>/dev/null || true
+cp "$S"/hs_err_pid*.jfr "$R/" 2>/dev/null || true
+cp "$S"/core.* "$R/" 2>/dev/null || true || true
 if [ "${MODULE:-off}" = "on" ]; then
   grep -q "\[c-entities\] ARMED" "$R/server.log" \
     || { echo "FATAL: module did not ARM — A/B is meaningless"; grep "\[c-entities\]" "$R/server.log" | head -20; exit 1; }
