@@ -439,6 +439,7 @@ public final class CeHooks {
                 + " froz=" + frozenCalls + "/" + frozenGate + "/" + frozenWrites
                 + " conv=" + convCalls + "/" + convGate + "/" + convWrites
                 + " flag=" + flagCalls + "/" + flagGate + "/" + flagWrites
+                + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
                 + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
@@ -4288,6 +4289,45 @@ public final class CeHooks {
 
     public static void setFlagGateOn(boolean on) {
         FLAGG_ON = on;
+    }
+
+    // ---- L20b: the same-value delta gate ----
+    // Woven EARLY_RETURN_GUARD2 on Entity.setDeltaMovement(Vec3). The
+    // quiet-mob travel tail rewrites the IDENTICAL delta every tick (the
+    // (0, -g*vf, 0) fixed point) and every noGravity entity's applyGravity
+    // allocates a value-equal Vec3 — vanilla's write is a value no-op but
+    // the L12 probe mirror behind it costs ~40ns per call (worldId + the
+    // batch append: probeDelta + worldId measured 4% of the mobs leg).
+    // Skipping the whole call when the value is bit-identical is exact:
+    // every deltaMovement reader is value-based EXCEPT Entity.move's
+    // `delta != getDeltaMovement()` identity term, which is unreachable
+    // for non-temporarily-active entities (the `!isTemporarilyActive`
+    // disjunct short-circuits) — so those route vanilla below.
+    public static volatile boolean DELTA_ON = false;
+    public static final boolean DELTA_FLAG_ON =
+            !"false".equals(System.getProperty("centities.deltaGate", "true"));
+    public static long deltaCalls = 0, deltaGate = 0;
+
+    public static void setDeltaGateOn(boolean on) {
+        DELTA_ON = on;
+    }
+
+    public static boolean deltaNoOp(Entity e, net.minecraft.world.phys.Vec3 v) {
+        deltaCalls++; // counts every woven call (the arming verifier's liveness proof)
+        if (!DELTA_ON) return false;
+        // vanilla silently ignores non-finite deltas — skipping is exact
+        if (!v.isFinite()) return true;
+        try {
+            if (e.isTemporarilyActive) return false;
+            net.minecraft.world.phys.Vec3 d = e.getDeltaMovement();
+            if (d.x == v.x && d.y == v.y && d.z == v.z) {
+                deltaGate++;
+                return true;
+            }
+            return false;
+        } catch (Throwable gateFail) {
+            return false; // never lose a velocity write
+        }
     }
 
     /** Replacement body of Entity.setSharedFlag(int, boolean) — byte-exact

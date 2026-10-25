@@ -638,6 +638,15 @@ fn arm_module() {
                     cplug_sdk::log::info("[c-entities] flag gate ARMED (verified live)");
                 }
             }
+            if DELTA_WOVEN.load(Ordering::Acquire)
+                && !DELTA_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::DeltaChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setDeltaGateOn", true) {
+                    DELTA_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] delta gate ARMED (verified live)");
+                }
+            }
             if attempt < 6 || attempt % 25 == 0 {
                 let dbg: Vec<(String, i64)> =
                     snap.iter().map(|(k, v)| (format!("{:?}", k), *v)).collect();
@@ -820,6 +829,10 @@ static TT_ARMED: AtomicBool = AtomicBool::new(false);
 static FLAGG_WOVEN: AtomicBool = AtomicBool::new(false);
 static FLAGG_DECLINED: AtomicBool = AtomicBool::new(false);
 static FLAGG_ARMED: AtomicBool = AtomicBool::new(false);
+/// L20b: the Entity.setDeltaMovement same-value no-op gate weave is prepared.
+static DELTA_WOVEN: AtomicBool = AtomicBool::new(false);
+static DELTA_DECLINED: AtomicBool = AtomicBool::new(false);
+static DELTA_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -1612,6 +1625,19 @@ fn flag_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     }
 }
 
+/// L20b: the same-value delta gate — op 5 (receiver + the Vec3 argument;
+/// op 4 would load the Vec3 as the receiver — the LivingEntity.travel
+/// lesson, javap-verified).
+fn delta_spec() -> cplug_sdk::asm::EarlyReturnGuard2<'static> {
+    cplug_sdk::asm::EarlyReturnGuard2 {
+        method_name: "setDeltaMovement",
+        method_desc: "(Lnet/minecraft/world/phys/Vec3;)V",
+        check_class: HOOKS_CLASS,
+        check_name: "deltaNoOp",
+        check_desc: "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/Vec3;)Z",
+    }
+}
+
 fn precompute_goalselector(loader: jni::jobject) {
     if read_java_flag("AI_FLAG_ON") != Some(true) {
         GOAL_DECLINED.store(true, Ordering::Release);
@@ -1718,6 +1744,33 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
         FLAGG_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
             "[c-entities] flag gate disabled/refused (centities.flagGate) — vanilla writes kept",
+        );
+        gated
+    };
+    // L20b: the same-value delta gate chains onto the same Entity bytes
+    // (before the probe prefixes — the gate must run FIRST so a skipped
+    // write also skips the L12 probe mirror and the worldId tax).
+    let gated = if read_java_flag("DELTA_FLAG_ON") == Some(true) {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::insert_early_return_guard2(env, loader, &gated, &delta_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                DELTA_WOVEN.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] precomputed setDeltaMovement no-op gate");
+                b
+            }
+            _ => {
+                DELTA_DECLINED.store(true, Ordering::Release);
+                cplug_sdk::log::info(
+                    "[c-entities] setDeltaMovement gate refused — vanilla writes kept",
+                );
+                gated
+            }
+        }
+    } else {
+        DELTA_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] delta gate disabled (centities.deltaGate) — vanilla writes kept",
         );
         gated
     };
@@ -1928,6 +1981,7 @@ enum Counter {
     ConvChecks,
     TTChecks,
     FlagChecks,
+    DeltaChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -1962,6 +2016,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::ConvChecks, ("convCalls", "J")),
             (Counter::TTChecks, ("ttCalls", "J")),
             (Counter::FlagChecks, ("flagCalls", "J")),
+            (Counter::DeltaChecks, ("deltaCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
