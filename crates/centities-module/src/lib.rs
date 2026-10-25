@@ -1793,6 +1793,16 @@ fn precompute_goalselector(loader: jni::jobject) {
                 pc.insert(GOAL_SELECTOR_CLASS, b);
             }
             GOAL_WOVEN.store(true, Ordering::Release);
+            // L22: arm immediately — the GoalChecks liveness gate is DEAD
+            // now that the Mob AI floor owns the zombie serverAiStep (a
+            // classified zombie never reaches the GoalSelector bodies, so
+            // the counter cannot move). The floor's own mirrors carry the
+            // pre-arm exactness; the mob-floor refusal paths keep the L15
+            // floor live for every NON-Zombie mob species.
+            if set_java_bool("setAiFloorOn", true) {
+                AI_ARMED.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] AI floor ARMED (weave verified)");
+            }
             cplug_sdk::log::info(
                 "[c-entities] precomputed GoalSelector microkernel (tick + tickRunningGoals)",
             );
