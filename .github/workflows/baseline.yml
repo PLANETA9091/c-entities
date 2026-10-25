@@ -167,9 +167,13 @@ jobs:
           git add reports/baseline
           git diff --cached --quiet || git commit -m "baseline: results [skip ci]"
           # publish races with other pushes to main (reports commit only);
-          # rebase and retry once
-          git pull --rebase origin main || git rebase --abort
-          git push || (git pull --rebase origin main && git push)
+          # rebase and retry once. During a rebase the sides swap: "theirs"
+          # is the commit being REPLAYED (our results commit) — so -X theirs
+          # keeps the NEWEST measurements when two results commits collide
+          # on reports/baseline/* (the L18 publish lost to the L17 one this
+          # way; benchmarks are monotonic — the later run wins).
+          git pull --rebase -X theirs origin main || git rebase --abort
+          git push || (git pull --rebase -X theirs origin main && git push)
 
   # ubuntu-26 runners reclaim long JVM-heavy jobs at random ("runner
   # shutdown", exit 143) — the failure rate scales with leg DURATION, which
