@@ -3590,7 +3590,7 @@ public final class CeHooks {
                 O_SE_INTERP = it.off;
                 O_SE_INTERVAL = iv.off;
                 O_SE_RESYNC = rs.off;
-                SE_FAST = true;
+                SE_FAST = "1".equals(System.getenv("CE_TRACKER_FAST"));
             }
             return true;
         } catch (Throwable t) {
@@ -3608,7 +3608,16 @@ public final class CeHooks {
     // let the JIT fold the loads out of the per-entity loop.
     private static long O_SE_ENTITY, O_SE_TICK_COUNT, O_SE_LAST_PAX,
             O_SE_TRACKED_PLAYERS, O_SE_INTERP, O_SE_INTERVAL, O_SE_RESYNC;
-    private static volatile boolean SE_FAST = false;
+    // L19/20b fast path — RETRACTED to opt-in (L19b playbook, second
+    // application): two FLAKY G1SATBMarkQueueSet::filter SIGSEGVs
+    // (items-100k @ c2140cf, mixed-150k @ e64e66f) crashed with this path
+    // as the top Java frame, and both legs died only in SOME runs — a
+    // layout/timing-dependent corruption, not a deterministic defect. The
+    // VarHandle path below is the pre-L20b proven form (same logic, safe
+    // typed accesses, ~1-2ms slower on items-100k). CE_TRACKER_FAST=1
+    // restores the direct offsets for the bisect.
+    private static volatile boolean SE_FAST =
+            "1".equals(System.getenv("CE_TRACKER_FAST"));
 
     public static boolean trackerDispatch(ServerEntity se) {
         // L15b: volatile increment per entity per tick = 100k lock-xadds/tick
