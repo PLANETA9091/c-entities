@@ -436,6 +436,7 @@ public final class CeHooks {
                 + "/" + gsFloorStops + "/" + gsMirrorTicks + "/" + gsFloorCollide
                 + " froz=" + frozenCalls + "/" + frozenGate + "/" + frozenWrites
                 + " conv=" + convCalls + "/" + convGate + "/" + convWrites
+                + " flag=" + flagCalls + "/" + flagGate + "/" + flagWrites
                 + " tt=" + ttCalls + "/" + ttGate
                 + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
@@ -3773,6 +3774,114 @@ public final class CeHooks {
             lastErrorText = "initFrozenHandles: " + t;
             FROZEN_HANDLES_OK = false;
         }
+    }
+
+    // ===================================================================
+    // L18 — the setSharedFlag gate. Entity.setSharedFlag (javap, 26.3) is a
+    // data read + conditional write of ONE byte; SynchedEntityData.set
+    // already skips equal values, so the whole body is a no-op whenever the
+    // computed byte equals the stored byte — which is EVERY tick for the
+    // flags a quiet mob re-asserts (onFire/crouching/glowing). The gate
+    // computes the new byte first and only pays the boxed set call on a
+    // real change. The accessor is protected (unlike the public
+    // DATA_TICKS_FROZEN) — it is captured ONCE via an Unsafe static-field
+    // read at handle-init; identity is preserved (the data map keys by the
+    // accessor instance), so reads/writes are the vanilla ones.
+    // ===================================================================
+    public static volatile boolean FLAGG_ON = false;
+    public static volatile boolean FLAGG_HANDLES_OK = false;
+    public static final boolean FLAGG_FLAG_ON =
+            !"false".equals(System.getProperty("centities.flagGate", "true"));
+    public static long flagCalls = 0, flagGate = 0, flagWrites = 0;
+    private static Object FLAGS_ID; // Entity.DATA_SHARED_FLAGS_ID (captured)
+
+    public static void initFlagHandles() {
+        try {
+            if (VH_ENT_DATA == null) {
+                VH_ENT_DATA = new RefField(Entity.class, "entityData");
+            }
+            if (U != null) {
+                java.lang.reflect.Field f =
+                        Entity.class.getDeclaredField("DATA_SHARED_FLAGS_ID");
+                f.setAccessible(true);
+                FLAGS_ID = U.getObject(U.staticFieldBase(f), U.staticFieldOffset(f));
+            }
+            if (FLAGS_ID != null) {
+                FLAGG_HANDLES_OK = true;
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initFlagHandles: " + t;
+            FLAGG_HANDLES_OK = false;
+        }
+    }
+
+    public static void setFlagGateOn(boolean on) {
+        FLAGG_ON = on;
+    }
+
+    /** Replacement body of Entity.setSharedFlag(int, boolean) — byte-exact
+     *  mirror with the equal-value early-out. */
+    @SuppressWarnings("unchecked")
+    public static void setSharedFlag$(Entity e, int flag, boolean set) {
+        flagCalls++;
+        if (FLAGG_ON && FLAGG_HANDLES_OK) {
+            try {
+                net.minecraft.network.syncher.SynchedEntityData ed =
+                        (net.minecraft.network.syncher.SynchedEntityData)
+                                VH_ENT_DATA.getObj(e);
+                net.minecraft.network.syncher.EntityDataAccessor<Byte> id =
+                        (net.minecraft.network.syncher.EntityDataAccessor<Byte>) FLAGS_ID;
+                byte old = ed.get(id);
+                byte nw = set
+                        ? (byte) (old | (1 << flag))
+                        : (byte) (old & ~(1 << flag));
+                if (nw == old) {
+                    flagGate++;
+                    return;
+                }
+                ed.set(id, Byte.valueOf(nw));
+                flagWrites++;
+                return;
+            } catch (Throwable gateFail) {
+                // never swallow the write — fall through to the vanilla mirror
+            }
+        }
+        // vanilla mirror (byte-exact port of the 26.3 body). FLAGS_ID is
+        // proven at weave time (the precompute refuses the bridge when
+        // initFlagHandles failed); the lazy re-resolve covers a defensive
+        // disarm — and a total failure rethrows into the caller rather than
+        // silently dropping a flags write.
+        try {
+            net.minecraft.network.syncher.SynchedEntityData ed =
+                    (net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e);
+            @SuppressWarnings("unchecked")
+            net.minecraft.network.syncher.EntityDataAccessor<Byte> id =
+                    (net.minecraft.network.syncher.EntityDataAccessor<Byte>) flagsId();
+            byte b = ed.get(id);
+            ed.set(id, set ? Byte.valueOf((byte) (b | (1 << flag)))
+                           : Byte.valueOf((byte) (b & ~(1 << flag))));
+        } catch (Throwable mirrorFail) {
+            FLAGG_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "flagMirror: " + mirrorFail;
+            if (mirrorFail instanceof RuntimeException re) throw re;
+            throw new IllegalStateException("setSharedFlag mirror failed", mirrorFail);
+        }
+    }
+
+    /** The DATA_SHARED_FLAGS_ID accessor, re-resolved lazily if the Unsafe
+     *  capture was unavailable (never on the hot path — the capture runs at
+     *  handle-init and the weave is refused without it). */
+    private static Object flagsId() throws Exception {
+        Object f = FLAGS_ID;
+        if (f == null) {
+            java.lang.reflect.Field fd = Entity.class.getDeclaredField("DATA_SHARED_FLAGS_ID");
+            fd.setAccessible(true);
+            f = fd.get(null);
+            FLAGS_ID = f;
+        }
+        return f;
     }
 
     public static void initConvHandles() {

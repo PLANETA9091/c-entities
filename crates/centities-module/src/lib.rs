@@ -629,6 +629,15 @@ fn arm_module() {
                     cplug_sdk::log::info("[c-entities] tracker-tick gate ARMED (verified live)");
                 }
             }
+            if FLAGG_WOVEN.load(Ordering::Acquire)
+                && !FLAGG_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::FlagChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setFlagGateOn", true) {
+                    FLAGG_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] flag gate ARMED (verified live)");
+                }
+            }
             if attempt < 6 || attempt % 25 == 0 {
                 let dbg: Vec<(String, i64)> =
                     snap.iter().map(|(k, v)| (format!("{:?}", k), *v)).collect();
@@ -807,6 +816,10 @@ static CONV_ARMED: AtomicBool = AtomicBool::new(false);
 static TT_WOVEN: AtomicBool = AtomicBool::new(false);
 static TT_DECLINED: AtomicBool = AtomicBool::new(false);
 static TT_ARMED: AtomicBool = AtomicBool::new(false);
+/// L18: the Entity.setSharedFlag no-op-write gate weave is prepared.
+static FLAGG_WOVEN: AtomicBool = AtomicBool::new(false);
+static FLAGG_DECLINED: AtomicBool = AtomicBool::new(false);
+static FLAGG_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -1532,6 +1545,24 @@ fn conv_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     }
 }
 
+/// L18: the shared-flags write gate. `(int, boolean)` — the boolean arg
+/// occupies one int slot (slot 2) like every other boolean in the ASM
+/// bridge builder.
+fn flag_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "setSharedFlag",
+        method_desc: "(IZ)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "setSharedFlag$",
+        bridge_desc: "(Lnet/minecraft/world/entity/Entity;IZ)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'I' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'I' },
+        ],
+    }
+}
+
 fn precompute_goalselector(loader: jni::jobject) {
     if read_java_flag("AI_FLAG_ON") != Some(true) {
         GOAL_DECLINED.store(true, Ordering::Release);
@@ -1611,6 +1642,35 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
             "[c-entities] frozen gate disabled/refused (centities.frozenGate) — vanilla write kept",
         );
         bytes.to_vec()
+    };
+    // L18: the shared-flags gate chains onto the same Entity bytes. The
+    // flag gate is OPTIONAL like the frozen one — a refusal keeps vanilla
+    // flags writes (and the frozen gate if it already landed).
+    let gated = if read_java_flag("FLAGG_FLAG_ON") == Some(true)
+        && prove_handles("initFlagHandles", "FLAGG_HANDLES_OK") == Some(true)
+    {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::replace_body(env, loader, &gated, &flag_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                FLAGG_WOVEN.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] precomputed setSharedFlag gate");
+                b
+            }
+            _ => {
+                FLAGG_DECLINED.store(true, Ordering::Release);
+                cplug_sdk::log::info(
+                    "[c-entities] setSharedFlag replace refused — vanilla flags writes kept",
+                );
+                gated
+            }
+        }
+    } else {
+        FLAGG_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] flag gate disabled/refused (centities.flagGate) — vanilla writes kept",
+        );
+        gated
     };
     // the existing rust probe prefixes (box/impulse probes), on the gated bytes
     entity_probes(gated).ok()
@@ -1818,6 +1878,7 @@ enum Counter {
     FrozenChecks,
     ConvChecks,
     TTChecks,
+    FlagChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -1851,6 +1912,7 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::FrozenChecks, ("frozenCalls", "J")),
             (Counter::ConvChecks, ("convCalls", "J")),
             (Counter::TTChecks, ("ttCalls", "J")),
+            (Counter::FlagChecks, ("flagCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
