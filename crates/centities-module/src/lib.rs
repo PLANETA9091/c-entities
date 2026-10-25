@@ -1036,36 +1036,59 @@ fn precompute_livingentity(loader: jni::jobject) {
         check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
     };
     // L20 quiet-travel floor: the same class carries the second guard.
-    // The two prefixes chain (travel first, then push); both are OPTIONAL
-    // — a refused travel weave keeps the push guard and vice versa.
-    let travel_spec = cplug_sdk::asm::EarlyReturnGuard {
+    // Op 5 (EARLY_RETURN_GUARD2) is REQUIRED here: the op-4 helper guesses
+    // the receiver slot from the descriptor (a reference first-param reads
+    // as local 1), which is correct only for no-arg instance methods and
+    // statics — travel(Vec3) loaded the VEC3 as the receiver and the JVM
+    // rejected the class (FAILS_VERIFICATION, "Vec3 is not assignable to
+    // LivingEntity", javap-confirmed bci@1). Op 5 loads local 0 explicitly.
+    let travel_spec = cplug_sdk::asm::EarlyReturnGuard2 {
         method_name: "travel",
         method_desc: "(Lnet/minecraft/world/phys/Vec3;)V",
         check_class: HOOKS_CLASS,
         check_name: "mobTravelNative",
-        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;)Z",
+        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/phys/Vec3;)Z",
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        // The two guards are INDEPENDENT prefixes on the same class: a
-        // refusal of one keeps the other (both are optional weaves).
-        let Some(b1) =
-            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &push_spec)
-        else {
-            return cplug_sdk::asm::insert_early_return_guard(
-                env, loader, &bytes, &travel_spec,
-            );
-        };
-        let Some(b2) =
-            cplug_sdk::asm::insert_early_return_guard(env, loader, &b1, &travel_spec)
-        else {
-            return Some(b1); // the push guard alone
-        };
-        Some(b2)
+        // CE_WEAVE_MODE=push|travel|both (default both) — the bisect lever
+        // for the two-guard FAILS_VERIFICATION hunt
+        let mode = std::env::var("CE_WEAVE_MODE").unwrap_or_else(|_| "both".into());
+        match mode.as_str() {
+            "push" => cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &push_spec),
+            "travel" => {
+                cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &travel_spec)
+            }
+            _ => {
+                // The two guards are INDEPENDENT prefixes on the same class:
+                // a refusal of one keeps the other (both are optional weaves).
+                let Some(b1) = cplug_sdk::asm::insert_early_return_guard(
+                    env, loader, &bytes, &push_spec,
+                ) else {
+                    return cplug_sdk::asm::insert_early_return_guard2(
+                        env, loader, &bytes, &travel_spec,
+                    );
+                };
+                let Some(b2) = cplug_sdk::asm::insert_early_return_guard2(
+                    env, loader, &b1, &travel_spec,
+                ) else {
+                    return Some(b1); // the push guard alone
+                };
+                Some(b2)
+            }
+        }
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(LIVING_ENTITY_CLASS, b);
+                pc.insert(LIVING_ENTITY_CLASS, b.clone());
+            }
+            // CE_DUMP_CLASSES=/dir: dump the patched bytes for standalone
+            // verifier diagnosis (the two-guard FAILS_VERIFICATION hunt)
+            if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
+                let _ = std::fs::write(
+                    format!("{}/LivingEntity.patched.class", dir),
+                    &b,
+                );
             }
             cplug_sdk::log::info(
                 "[c-entities] precomputed LivingEntity push + quiet-travel guards",

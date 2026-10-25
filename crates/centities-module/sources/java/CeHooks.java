@@ -2043,7 +2043,15 @@ public final class CeHooks {
                         MODE_REV[slot] = WORLD_REV; // stale-but-boring
                         restSectKeeps++;
                     }
-                    boolean active = itemCheckActive(e);
+                    // itemCheckActive runs ONLY at merge-cadence ticks (its
+                    // result gates the scan): on the other 39 ticks the
+                    // inline arithmetic is identical for the active and
+                    // inactive vanilla bodies, and checkIfActive's side
+                    // effects are value-invisible for a resting item (the
+                    // isTemporarilyActive toggle has no readers outside the
+                    // skipped move path; MISC items take no immunity stamps)
+                    boolean cadence = (e.tickCount + 1) % 40 == 0;
+                    boolean active = cadence && itemCheckActive(e);
                     // dispatcher prologue mirror (the suppressed
                     // tickNonPassenger: setOldPosAndRot is value-identical
                     // at a fixed point, the counters are not)
@@ -2078,7 +2086,10 @@ public final class CeHooks {
                     if (e.age != -32768) {
                         e.age = e.age + 1;
                     }
-                    if (e.age >= VH_DESPAWN_RATE.getInt(e)) {
+                    int rate = O_DESPAWN_RATE >= 0
+                            ? U.getInt(e, O_DESPAWN_RATE)
+                            : VH_DESPAWN_RATE.getInt(e);
+                    if (e.age >= rate) {
                         despawnTail(e);
                     }
                     MODE_GEN[slot] = MODE_EPOCH; // keep the recency stamp alive
@@ -2407,8 +2418,12 @@ public final class CeHooks {
     // (the accessor lookup + boxed return + exception-table frames that
     // made the conv gate cost MORE than the vanilla write it replaced).
     private static long O_ED_ITEMS = -1, O_DI_VALUE = -1;
-    // L20 quiet-travel floor: protected field offsets
-    private static long O_XXA = -1, O_YYA = -1, O_ZZA = -1, O_STUCK = -1;
+    // L20 quiet-travel floor: the protected stuckSpeedMultiplier offset
+    // (the input vector rides the op-5 guard's second argument — no field
+    // offsets needed for xxa/yya/zza)
+    private static long O_STUCK = -1;
+    // L20b: the rest branch's despawnRate read (valid when >= 0)
+    private static long O_DESPAWN_RATE = -1;
 
     // ---- L20: the quiet-mob travel floor ----
     // Woven EarlyReturnGuard on LivingEntity.travel(Vec3). When the
@@ -2435,14 +2450,13 @@ public final class CeHooks {
     // visibility)
     public static long travelChecks = 0, travelQuiet = 0, travelFail = 0;
 
-    public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e) {
-        if (!ACTIVE || !MOB_TRAVEL_ON || O_XXA < 0) return false;
+    public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e,
+            net.minecraft.world.phys.Vec3 input) {
+        if (!ACTIVE || !MOB_TRAVEL_ON || O_STUCK < 0) return false;
         travelChecks++;
         try {
             if (e.level().isClientSide() || e.isRemoved()
-                    || U.getFloat(e, O_XXA) != 0.0F
-                    || U.getFloat(e, O_YYA) != 0.0F
-                    || U.getFloat(e, O_ZZA) != 0.0F
+                    || input.x != 0.0F || input.y != 0.0F || input.z != 0.0F
                     || !e.getPassengers().isEmpty()
                     || e.isFallFlying()
                     || e.isTemporarilyActive
@@ -2563,10 +2577,7 @@ public final class CeHooks {
                     Class.forName(
                             "net.minecraft.network.syncher.SynchedEntityData$DataItem")
                             .getDeclaredField("value"));
-            // L20 quiet-travel floor: the protected LivingEntity input fields
-            O_XXA = offOf(net.minecraft.world.entity.LivingEntity.class, "xxa");
-            O_YYA = offOf(net.minecraft.world.entity.LivingEntity.class, "yya");
-            O_ZZA = offOf(net.minecraft.world.entity.LivingEntity.class, "zza");
+            // L20 quiet-travel floor: the protected stuck multiplier offset
             O_STUCK = offOf(net.minecraft.world.entity.Entity.class,
                     "stuckSpeedMultiplier");
         } catch (Throwable t) {
@@ -2670,6 +2681,10 @@ public final class CeHooks {
             VH_DESPAWN_RATE = new RefField(ItemEntity.class, "despawnRate");
             VH_STUCK = new RefField(Entity.class, "stuckSpeedMultiplier");
             VH_FRIC_STATE = new RefField(ItemEntity.class, "frictionState");
+            // L20b: the rest branch reads despawnRate every rest tick —
+            // direct offset when available (plain long, published by the
+            // volatile VH_READY below)
+            O_DESPAWN_RATE = VH_DESPAWN_RATE.off;
             try {
                 VH_DESPAWN_TIME = new RefField(Entity.class, "despawnTime");
             } catch (NoSuchFieldException notPaperOrRenamed) {
@@ -3463,6 +3478,47 @@ public final class CeHooks {
         trackerChecks++;
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
+        // L20b: the direct-offset path (SE_FAST). READ-ONLY over live
+        // object fields + one putInt — no reference write barriers (the
+        // L19a SATB suspicion never applied to this path; the hs_err
+        // capture is live if anything resurfaces).
+        if (SE_FAST) {
+            try {
+                Entity e = (Entity) U.getObject(se, O_SE_ENTITY);
+                if (e.getEntityData().isDirty()) return false;      // bc 384-390
+                if (e.syncPosition || e.syncVelocity || e.needsSync) return false; // bc 312-346
+                if (e.moonrise$isHardColliding()) return false;     // bc 0-16
+                // bc 302-311: the NO_OP interpolation tracker is an empty body
+                if (U.getObject(se, O_SE_INTERP)
+                        != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                    return false;
+                }
+                // bc 34-44: passengers changed → vanilla
+                Object pax = e.getPassengers();
+                if (!pax.equals(U.getObject(se, O_SE_LAST_PAX))) return false;
+                // bc 107-116: non-empty tracking → the emit paths
+                java.util.Set<?> tracked =
+                        (java.util.Set<?>) U.getObject(se, O_SE_TRACKED_PLAYERS);
+                if (tracked == null || !tracked.isEmpty()) return false;
+                // bc 347: forceStateResync → the full resync body
+                if (U.getObject(se, O_SE_RESYNC) == Boolean.TRUE) return false;
+                // bc 364-377: updateInterval.test is PURE (n % period == 0)
+                net.minecraft.world.entity.UpdateInterval interval =
+                        (net.minecraft.world.entity.UpdateInterval)
+                                U.getObject(se, O_SE_INTERVAL);
+                int tickCount = U.getInt(se, O_SE_TICK_COUNT);
+                if (interval == null || interval.test(tickCount)) return false;
+                // ALL conditions passed: this tick emits nothing. Reproduce
+                // the unconditional effects in vanilla order:
+                e.updateDataBeforeSync();                       // bc 19-23
+                U.putInt(se, O_SE_TICK_COUNT, tickCount + 1);   // bc 1106-1113
+                trackerFast++;
+                return true;
+            } catch (Throwable gateFail) {
+                SE_FAST = false; // stale offsets: fall back to the VH path
+                return false;    // route vanilla this tick
+            }
+        }
         try {
             Entity e = (Entity) VH_SE_ENTITY.getObj(se);
             // L15b REORDER: every read below is PURE (no side effects — the
@@ -4345,6 +4401,13 @@ public final class CeHooks {
             VH_TE_SEEN = new RefField(te, "seenBy");
             VH_TE_LCU = new RefField(te, "lastChunkUpdate");
             VH_TE_LTC = new RefField(te, "lastTrackedChunk");
+            if (U != null && VH_TE_SEEN.off >= 0 && VH_TE_LCU.off >= 0
+                    && VH_TE_LTC.off >= 0) {
+                O_TE_SEEN = VH_TE_SEEN.off;
+                O_TE_LCU = VH_TE_LCU.off;
+                O_TE_LTC = VH_TE_LTC.off;
+                TT_FAST = true;
+            }
             TT_HANDLES_OK = true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -4353,11 +4416,24 @@ public final class CeHooks {
         }
     }
 
+    private static long O_TE_SEEN, O_TE_LCU, O_TE_LTC;
+    private static volatile boolean TT_FAST = false;
+
     /** moonrise$tick guard: (TrackedEntity this, NearbyPlayers$TrackedChunk chunk)Z.
      *  TRUE = the vanilla body is a provable no-op (skip it wholesale). */
     public static boolean trackerTickNoOp(Object te, Object chunk) {
         ttCalls++;
-        if (!TT_ON || !TT_HANDLES_OK) return false;
+        if (!TT_ON) return false;
+        if (TT_FAST) { // direct offsets: no megamorphic RefField dispatch
+            if (chunk != null) return false;
+            java.util.Set<?> seen = (java.util.Set<?>) U.getObject(te, O_TE_SEEN);
+            if (seen == null || !seen.isEmpty()) return false;
+            if (U.getLong(te, O_TE_LCU) != -1L) return false;
+            if (U.getObject(te, O_TE_LTC) != null) return false;
+            ttGate++;
+            return true;
+        }
+        if (!TT_HANDLES_OK) return false;
         try {
             if (chunk != null) return false;
             java.util.Set<?> seen = (java.util.Set<?>) VH_TE_SEEN.getObj(te);
