@@ -3934,9 +3934,7 @@ public final class CeHooks {
                                 VH_ENT_DATA.getObj(e);
                 net.minecraft.network.syncher.EntityDataAccessor<Byte> id =
                         (net.minecraft.network.syncher.EntityDataAccessor<Byte>) FLAGS_ID;
-                byte old = O_ED_ITEMS >= 0
-                        ? ((Byte) dataValueAt(ed, id)).byteValue()
-                        : ed.get(id);
+                byte old = ed.get(id);
                 byte nw = set
                         ? (byte) (old | (1 << flag))
                         : (byte) (old & ~(1 << flag));
@@ -4066,15 +4064,12 @@ public final class CeHooks {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
             try {
-                // L19: getTicksFrozen() = the get() chain; the DataItem fast
-                // read does it in two plain loads
-                int cur = O_ED_ITEMS >= 0
-                        ? ((Integer) dataValueAt(
-                                (net.minecraft.network.syncher.SynchedEntityData)
-                                        VH_ENT_DATA.getObj(e),
-                                Entity.DATA_TICKS_FROZEN)).intValue()
-                        : e.getTicksFrozen();
-                if (cur == i) {
+                // L19 RETRACTED: the dataValueAt fast read (two Unsafe loads
+                // through itemsById[idx]) is the prime suspect of the CI
+                // SIGSEGV (G1SATB filter on a wild oop, items-100k-mod and
+                // spread-100k-mod, both L19a runs). Reverted to the exact
+                // L18 read; the helper stays for a properly diagnosed retry.
+                if (e.getTicksFrozen() == i) {
                     frozenGate++;
                     return;
                 }
@@ -4098,12 +4093,7 @@ public final class CeHooks {
                 net.minecraft.network.syncher.EntityDataAccessor<Boolean> id =
                         (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
                                 VH_CONV_ID.getObj(tracker);
-                // L19 fast read: itemsById[accessor.id()].value — two plain
-                // loads; the get() chain cost more than the vanilla write
-                // it replaced (1.72% vs 1.26% in the b0a2095 profile).
-                Boolean cur = O_ED_ITEMS >= 0
-                        ? (Boolean) dataValueAt(m.getEntityData(), id)
-                        : m.getEntityData().get(id);
+                Boolean cur = m.getEntityData().get(id);
                 if (cur.booleanValue() == z) {
                     convGate++;
                     return;
