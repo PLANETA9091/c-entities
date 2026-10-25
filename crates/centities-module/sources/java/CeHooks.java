@@ -3185,9 +3185,24 @@ public final class CeHooks {
             int maxIndex = set.getListSize();   // the snapshot semantics
             set.createRawIterator();            // iteratorCount++ (+ empty probe)
             try {
+                // L17 collect-at-walk: the tick phase is the ONLY
+                // EntityTickList.forEach caller (javap-verified, ServerLevel.tick),
+                // so the walk can route native items straight into the flush
+                // batch — skipping the guardEntityTick frame, the
+                // tickNonPassenger frame and the accept dispatch for every
+                // dispatch-owned item. The routing decision is the UNCHANGED
+                // itemDispatch chain (mode table + fresh-flag belt + activation),
+                // and a false keeps the vanilla accept path exactly as before.
+                boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
                 for (int i = 0; i < maxIndex; i++) {
                     Object o = arr[i];
-                    if (o instanceof Entity e) consumer.accept(e);
+                    if (o instanceof Entity e) {
+                        if (collect && e instanceof ItemEntity
+                                && itemDispatch((ItemEntity) e)) {
+                            continue; // native flush computes this tick
+                        }
+                        consumer.accept(e);
+                    }
                 }
             } finally {
                 set.finishRawIterator();        // iteratorCount-- + defrag check
@@ -3211,9 +3226,16 @@ public final class CeHooks {
                     int maxIndex = set.getListSize();
                     set.createRawIterator();
                     try {
+                        boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
                         for (int i = 0; i < maxIndex; i++) {
                             Object o = arr[i];
-                            if (o instanceof Entity e) consumer.accept(e);
+                            if (o instanceof Entity e) {
+                                if (collect && e instanceof ItemEntity
+                                        && itemDispatch((ItemEntity) e)) {
+                                    continue;
+                                }
+                                consumer.accept(e);
+                            }
                         }
                     } finally {
                         set.finishRawIterator();
