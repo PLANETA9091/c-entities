@@ -597,7 +597,7 @@ public final class CeHooks {
                 // next server-thread box event refreshes the mirror).
                 if (ACTIVE && INDEXING && e instanceof net.minecraft.world.entity.LivingEntity
                         && SERVER_THREAD.get()) {
-                    int pw = worldId(e.level());
+                    int pw = widFast(e.level());
                     if (pw >= 0 && ARENA[m] == e) {
                         if (dbN >= BATCH_CAP) {
                             flush();
@@ -931,11 +931,19 @@ public final class CeHooks {
      *  BOTH paths: fast records its EMA here, mirror samples its price here
      *  — that feedback is what keeps the routing on the cheaper side. */
     private static int gateCell(net.minecraft.world.level.Level level, AABB box) {
+        // L19: the thread check moved UP from fastQuery — off-thread callers
+        // (worldgen, async plugins) took the vanilla mirror anyway (fastQuery
+        // refused them after the gate bookkeeping was already paid). This
+        // both removes that dead bookkeeping and makes the widFast plain
+        // statics below single-writer (server thread only).
+        if (!SERVER_THREAD.get()) {
+            return -1;
+        }
         if (!(level instanceof net.minecraft.server.level.ServerLevel)) {
             mNotServerLevel++;
             return -1;
         }
-        int wid = worldId(level);
+        int wid = widFast(level);
         if (wid < 0 || wid >= GWORLDS) {
             mBadWorld++;
             return -1; // no gate cell — vanilla, guaranteed parity
@@ -1031,7 +1039,7 @@ public final class CeHooks {
             mOffThread++;
             return null;
         }
-        int wid = worldId(sl);
+        int wid = widFast(sl);
         if (wid < 0) {
             mBadWorld++;
             return null;
@@ -1498,6 +1506,25 @@ public final class CeHooks {
         return w;
     }
 
+    // L19: the query paths still paid ~2% for worldId even after the L16
+    // unroll — the method is called >1M times per tick across the query,
+    // probe and push bridges, so even a few compares + the slot-array
+    // loads show up. The server thread runs ALL of them and each level's
+    // tick is a contiguous burst of same-world calls, so a one-slot
+    // identity cache converts the whole cluster into a single reference
+    // compare. Plain statics (no volatile): the server thread is the only
+    // writer during ticking; a stale read just re-enters worldId.
+    private static net.minecraft.world.level.Level WID_LAST;
+    private static int WID_LAST_ID;
+
+    static int widFast(net.minecraft.world.level.Level level) {
+        if (level == WID_LAST) return WID_LAST_ID;
+        int w = worldId(level);
+        WID_LAST = level;
+        WID_LAST_ID = w;
+        return w;
+    }
+
     /** Kill-switch arm/disarm from the native side. */
     public static void setActive(boolean on) {
         ACTIVE = on;
@@ -1821,7 +1848,7 @@ public final class CeHooks {
             if (le.getTeam() != null) return false;
             refreshPushCfg(sl);
             if (PUSH_CFG_EVENTS) return false;
-            int wid = worldId(w);
+            int wid = widFast(w);
             if (wid < 0) return false;
             boolean selfVehicle = le.isVehicle();
             // the kernel reads the mirror: drain the pending probe batches first
@@ -2233,6 +2260,37 @@ public final class CeHooks {
     private static int intAt(Object o, long off) { return U.getInt(o, off); }
     private static void putIntAt(Object o, long off, int v) { U.putInt(o, off, v); }
 
+    // L19: the DataItem fast read. SynchedEntityData.getItem (javap, 26.3)
+    // is exactly `itemsById[accessor.id()]` and get() adds only the value
+    // load — with the two field offsets captured once, a gate reads the
+    // CURRENT value in two plain loads instead of the full get() chain
+    // (the accessor lookup + boxed return + exception-table frames that
+    // made the conv gate cost MORE than the vanilla write it replaced).
+    private static long O_ED_ITEMS = -1, O_DI_VALUE = -1;
+    private static void initDataOffsets() {
+        if (O_ED_ITEMS >= 0 || U == null) return;
+        try {
+            O_ED_ITEMS = U.objectFieldOffset(
+                    net.minecraft.network.syncher.SynchedEntityData.class
+                            .getDeclaredField("itemsById"));
+            O_DI_VALUE = U.objectFieldOffset(
+                    Class.forName(
+                            "net.minecraft.network.syncher.SynchedEntityData$DataItem")
+                            .getDeclaredField("value"));
+        } catch (Throwable t) {
+            O_ED_ITEMS = -1; // gates fall back to the get() chain
+        }
+    }
+
+    /** Current value of `accessor` on `ed` — the get() fast path. Only
+     *  valid when O_ED_ITEMS >= 0 (the caller checks). */
+    private static Object dataValueAt(net.minecraft.network.syncher.SynchedEntityData ed,
+                                      Object accessor) {
+        Object[] items = (Object[]) refAt(ed, O_ED_ITEMS);
+        int idx = ((net.minecraft.network.syncher.EntityDataAccessor<?>) accessor).id();
+        return refAt(items[idx], O_DI_VALUE);
+    }
+
     private static final class RefField {
         final java.lang.reflect.Field f;
         final VarHandle vh;
@@ -2474,7 +2532,7 @@ public final class CeHooks {
         }
         try {
             itemFlushes++;
-            int wid = worldId(level);
+            int wid = widFast(level);
             boolean isNether = level.dimension() == Level.NETHER;
 
             // pass 1: resync entries re-read state POST vanilla tick
@@ -3034,6 +3092,23 @@ public final class CeHooks {
             VH_SE_INTERP = it;
             VH_SE_INTERVAL = iv;
             VH_SE_RESYNC = rs;
+            // L19: the guard reads SIX fields per entity per tick — the
+            // volatile RefField static loads + per-instance offset deref
+            // showed up as Unsafe.getObject 9.11% on items-100k. Plain
+            // static longs captured once: the JIT hoists them out of the
+            // loop and the access compiles to the getfield.
+            if (U != null
+                    && en.off >= 0 && tc.off >= 0 && lp.off >= 0 && tp.off >= 0
+                    && it.off >= 0 && iv.off >= 0 && rs.off >= 0) {
+                O_SE_ENTITY = en.off;
+                O_SE_TICK_COUNT = tc.off;
+                O_SE_LAST_PAX = lp.off;
+                O_SE_TRACKED_PLAYERS = tp.off;
+                O_SE_INTERP = it.off;
+                O_SE_INTERVAL = iv.off;
+                O_SE_RESYNC = rs.off;
+                SE_FAST = true;
+            }
             return true;
         } catch (Throwable t) {
             SE_VH_FAILED = true;
@@ -3043,6 +3118,15 @@ public final class CeHooks {
         }
     }
 
+    // L19: direct offsets for the ServerEntity guard (valid once SE_FAST).
+    // PLAIN longs — the volatile SE_FAST flag is the publication barrier
+    // (the init thread writes the offsets BEFORE the SE_FAST store; a
+    // reader that sees SE_FAST==true sees all of them), and plain statics
+    // let the JIT fold the loads out of the per-entity loop.
+    private static long O_SE_ENTITY, O_SE_TICK_COUNT, O_SE_LAST_PAX,
+            O_SE_TRACKED_PLAYERS, O_SE_INTERP, O_SE_INTERVAL, O_SE_RESYNC;
+    private static volatile boolean SE_FAST = false;
+
     public static boolean trackerDispatch(ServerEntity se) {
         // L15b: volatile increment per entity per tick = 100k lock-xadds/tick
         // on items-100k (~1-2ms) — plain like the other hot-path counters
@@ -3051,7 +3135,9 @@ public final class CeHooks {
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
         try {
-            Entity e = (Entity) VH_SE_ENTITY.getObj(se);
+            Entity e = SE_FAST
+                    ? (Entity) refAt(se, O_SE_ENTITY)
+                    : (Entity) VH_SE_ENTITY.getObj(se);
             // L15b REORDER: every read below is PURE (no side effects — the
             // two unconditional effects ride at the tail in vanilla order),
             // so the ORDER of the reads is free. The cheapest sufficient
@@ -3068,29 +3154,43 @@ public final class CeHooks {
             // bc 302-311: the snapshot only matters for real trackers; the
             // NO_OP implementation (javap'd) is an empty body — skipping its
             // trackingPosition() Vec3 allocation is exact
-            if (VH_SE_INTERP.getObj(se)
+            Object interp = SE_FAST
+                    ? refAt(se, O_SE_INTERP)
+                    : VH_SE_INTERP.getObj(se);
+            if (interp
                     != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
                 return false;
             }
             // bc 34-44: passengers changed → vanilla (writes lastPassengers,
             // emits ClientboundSetPassengersPacket)
             Object pax = e.getPassengers();
-            if (!pax.equals(VH_SE_LAST_PAX.getObj(se))) return false;
+            Object lastPax = SE_FAST
+                    ? refAt(se, O_SE_LAST_PAX)
+                    : VH_SE_LAST_PAX.getObj(se);
+            if (!pax.equals(lastPax)) return false;
             // bc 107-116: non-empty tracking → ItemFrame map tick + emit paths
-            java.util.Set<?> tracked =
-                    (java.util.Set<?>) VH_SE_TRACKED_PLAYERS.getObj(se);
+            java.util.Set<?> tracked = SE_FAST
+                    ? (java.util.Set<?>) refAt(se, O_SE_TRACKED_PLAYERS)
+                    : (java.util.Set<?>) VH_SE_TRACKED_PLAYERS.getObj(se);
             if (tracked == null || !tracked.isEmpty()) return false;
             // bc 347: forceStateResync → the full resync body
-            if (VH_SE_RESYNC.getObj(se) == Boolean.TRUE) return false;
+            Object resync = SE_FAST
+                    ? refAt(se, O_SE_RESYNC)
+                    : VH_SE_RESYNC.getObj(se);
+            if (resync == Boolean.TRUE) return false;
             // bc 364-377: updateInterval.test is PURE (n % period == 0)
-            net.minecraft.world.entity.UpdateInterval interval =
-                    (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
-            int tickCount = VH_SE_TICK_COUNT.getInt(se);
+            net.minecraft.world.entity.UpdateInterval interval = SE_FAST
+                    ? (net.minecraft.world.entity.UpdateInterval) refAt(se, O_SE_INTERVAL)
+                    : (net.minecraft.world.entity.UpdateInterval) VH_SE_INTERVAL.getObj(se);
+            int tickCount = SE_FAST
+                    ? intAt(se, O_SE_TICK_COUNT)
+                    : VH_SE_TICK_COUNT.getInt(se);
             if (interval == null || interval.test(tickCount)) return false;
             // ALL conditions passed: this tick emits nothing. Reproduce the
             // unconditional effects in vanilla order:
             e.updateDataBeforeSync();                       // bc 19-23
-            VH_SE_TICK_COUNT.setInt(se, tickCount + 1);     // bc 1106-1113
+            if (SE_FAST) putIntAt(se, O_SE_TICK_COUNT, tickCount + 1);
+            else VH_SE_TICK_COUNT.setInt(se, tickCount + 1); // bc 1106-1113
             trackerFast++;
             return true;
         } catch (Throwable t) {
@@ -3100,6 +3200,7 @@ public final class CeHooks {
             trackerErr++;
             lastError = System.nanoTime();
             VH_SE_TICK_COUNT = null; // forces initTrackerVh() to rebuild
+            SE_FAST = false;
             initTrackerVh();
             return false;
         }
@@ -3768,6 +3869,7 @@ public final class CeHooks {
     public static void initFrozenHandles() {
         try {
             VH_ENT_DATA = new RefField(Entity.class, "entityData");
+            initDataOffsets();
             FROZEN_HANDLES_OK = true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -3832,7 +3934,9 @@ public final class CeHooks {
                                 VH_ENT_DATA.getObj(e);
                 net.minecraft.network.syncher.EntityDataAccessor<Byte> id =
                         (net.minecraft.network.syncher.EntityDataAccessor<Byte>) FLAGS_ID;
-                byte old = ed.get(id);
+                byte old = O_ED_ITEMS >= 0
+                        ? ((Byte) dataValueAt(ed, id)).byteValue()
+                        : ed.get(id);
                 byte nw = set
                         ? (byte) (old | (1 << flag))
                         : (byte) (old & ~(1 << flag));
@@ -3962,7 +4066,15 @@ public final class CeHooks {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
             try {
-                if (e.getTicksFrozen() == i) {
+                // L19: getTicksFrozen() = the get() chain; the DataItem fast
+                // read does it in two plain loads
+                int cur = O_ED_ITEMS >= 0
+                        ? ((Integer) dataValueAt(
+                                (net.minecraft.network.syncher.SynchedEntityData)
+                                        VH_ENT_DATA.getObj(e),
+                                Entity.DATA_TICKS_FROZEN)).intValue()
+                        : e.getTicksFrozen();
+                if (cur == i) {
                     frozenGate++;
                     return;
                 }
@@ -3986,7 +4098,13 @@ public final class CeHooks {
                 net.minecraft.network.syncher.EntityDataAccessor<Boolean> id =
                         (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
                                 VH_CONV_ID.getObj(tracker);
-                if (m.getEntityData().get(id) == z) {
+                // L19 fast read: itemsById[accessor.id()].value — two plain
+                // loads; the get() chain cost more than the vanilla write
+                // it replaced (1.72% vs 1.26% in the b0a2095 profile).
+                Boolean cur = O_ED_ITEMS >= 0
+                        ? (Boolean) dataValueAt(m.getEntityData(), id)
+                        : m.getEntityData().get(id);
+                if (cur.booleanValue() == z) {
                     convGate++;
                     return;
                 }
