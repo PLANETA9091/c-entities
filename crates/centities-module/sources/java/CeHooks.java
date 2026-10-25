@@ -2441,8 +2441,15 @@ public final class CeHooks {
     // hull enumeration is a strict SUPERSET of the vanilla visit set
     // (touching positions included), so "superset all-air" implies the
     // vanilla visit set is all-air — the gate fails safe to vanilla.
+    // RETRACTED to opt-in (L19b playbook): the gate correlated 1:1 with the
+    // items-100k SIGSEGV in G1SATBMarkQueueSet::filter (run 40214542647,
+    // hs_err_pid4417: the corrupt pre-value in the SATB queue = a reference
+    // store over a clobbered slot somewhere upstream of the tracker gate).
+    // The mobs legs ran the SAME gate green (-73% → -77.4%), so the bug is
+    // item-path-specific; the artifact is saved for the offline
+    // root-cause. Opt in with CE_BLOCK_FX=1.
     public static final boolean BLOCK_FX_ON =
-            !"0".equals(System.getenv("CE_BLOCK_FX"));
+            "1".equals(System.getenv("CE_BLOCK_FX"));
     public static long blockFxChecks = 0, blockFxQuiet = 0, blockFxFail = 0;
     // Block class -> stepOn is the empty base implementation (probed once
     // via getMethod().getDeclaringClass() — the exact override test)
@@ -4592,33 +4599,36 @@ public final class CeHooks {
             sr.setAccessible(true);
             SHARED_RANDOM = sr.get(null);
             O_RNG_VALUE = offOf(SHARED_RANDOM.getClass(), "value");
-            // protected stroll override + goal-internal fields — MethodHandles
-            java.lang.invoke.MethodHandles.Lookup pub = java.lang.invoke.MethodHandles.publicLookup();
+            // protected stroll override + goal-internal fields —
+            // privateLookupIn: publicLookup CANNOT unreflect protected
+            // members (the first bench run armed WITHOUT the engine:
+            // "handle probe failed"), the unnamed module opens everything
+            java.lang.invoke.MethodHandles.Lookup pub = java.lang.invoke.MethodHandles.lookup();
             try {
                 Class<?> was = Class.forName(
                         "net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal");
-                java.lang.reflect.Method m = was.getDeclaredMethod("getPosition");
-                m.setAccessible(true);
-                MH_GET_POSITION = pub.unreflect(m);
+                java.lang.invoke.MethodHandles.Lookup pl = java.lang.invoke.MethodHandles
+                        .privateLookupIn(was, pub);
+                MH_GET_POSITION = pl.findVirtual(was, "getPosition",
+                        java.lang.invoke.MethodType.methodType(net.minecraft.world.phys.Vec3.class));
             } catch (Throwable notOverridden) {
-                java.lang.reflect.Method m = stroll.getDeclaredMethod("getPosition");
-                m.setAccessible(true);
-                MH_GET_POSITION = pub.unreflect(m);
+                java.lang.invoke.MethodHandles.Lookup pl = java.lang.invoke.MethodHandles
+                        .privateLookupIn(stroll, pub);
+                MH_GET_POSITION = pl.findVirtual(stroll, "getPosition",
+                        java.lang.invoke.MethodType.methodType(net.minecraft.world.phys.Vec3.class));
             }
-            MH_STROLL_WX = pub.unreflectGetter(stroll.getDeclaredField("wantedX"));
-            MH_FIND_TARGET = pub.unreflect(Class.forName(
-                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal")
-                    .getDeclaredMethod("findTarget"));
-            java.lang.reflect.Field tf = Class.forName(
-                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal")
-                    .getDeclaredField("target");
-            tf.setAccessible(true);
-            MH_NEAREST_TARGET_F = pub.unreflectGetter(tf);
-            java.lang.reflect.Field cf = Class.forName(
-                    "net.minecraft.world.entity.ai.goal.LookAtPlayerGoal")
-                    .getDeclaredField("lookAtContext");
-            cf.setAccessible(true);
-            MH_LOOKAT_CTX = pub.unreflectGetter(cf);
+            MH_STROLL_WX = java.lang.invoke.MethodHandles.privateLookupIn(stroll, pub)
+                    .unreflectGetter(stroll.getDeclaredField("wantedX"));
+            Class<?> nat = Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal");
+            java.lang.invoke.MethodHandles.Lookup pnl = java.lang.invoke.MethodHandles
+                    .privateLookupIn(nat, pub);
+            MH_FIND_TARGET = pnl.findVirtual(nat, "findTarget",
+                    java.lang.invoke.MethodType.methodType(void.class));
+            MH_NEAREST_TARGET_F = pnl.unreflectGetter(nat.getDeclaredField("target"));
+            Class<?> lalCls = Class.forName("net.minecraft.world.entity.ai.goal.LookAtPlayerGoal");
+            MH_LOOKAT_CTX = java.lang.invoke.MethodHandles.privateLookupIn(lalCls, pub)
+                    .unreflectGetter(lalCls.getDeclaredField("lookAtContext"));
             AI_HANDLES_SCRATCH_OK();
         } catch (Throwable t) {
             lastError = System.nanoTime();
