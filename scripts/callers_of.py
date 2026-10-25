@@ -7,6 +7,9 @@ frame directly ABOVE it (its caller). Top-n table with % of all samples.
 """
 import subprocess
 import sys
+import os
+
+JFR_BIN = os.environ.get("JFR_BIN", "jfr")
 from collections import Counter
 
 
@@ -14,7 +17,7 @@ def main():
     jfr, callee = sys.argv[1], sys.argv[2]
     topn = int(sys.argv[3]) if len(sys.argv) > 3 else 12
     proc = subprocess.run(
-        ["jfr", "print", "--events", "jdk.ExecutionSample", jfr],
+        [JFR_BIN, "print", "--events", "jdk.ExecutionSample", jfr],
         capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr[:400])

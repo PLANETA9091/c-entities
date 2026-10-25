@@ -10,6 +10,9 @@ guard, tracker work) and prints an aligned table. Sample = CPU time proxy.
 import subprocess
 import sys
 import re
+import os
+
+JFR_BIN = os.environ.get("JFR_BIN", "jfr")
 from collections import Counter
 
 MARKERS = {
@@ -30,7 +33,7 @@ MARKERS = {
 
 def stacks(jfr: str):
     proc = subprocess.run(
-        ["jfr", "print", "--events", "jdk.ExecutionSample", jfr],
+        [JFR_BIN, "print", "--events", "jdk.ExecutionSample", jfr],
         capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr[:400])

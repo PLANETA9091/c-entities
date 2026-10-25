@@ -4465,11 +4465,23 @@ public final class CeHooks {
     static final int MAX_GOALS = 16, GOAL_STRIDE = 6, IN_HEADER = 22, OUT_HEADER = 8;
 
     // per-mob classification context (weak identity map — no leaks, no
-    // per-mob allocation after the first tick)
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static final java.util.concurrent.ConcurrentHashMap AI_CTX =
-            (java.util.concurrent.ConcurrentHashMap)
-                    new com.google.common.collect.MapMaker().weakKeys().concurrencyLevel(1).makeMap();
+    // per-mob allocation after the first tick). MapMaker.makeMap() returns
+    // its own MapMakerInternalMap — the field must be the ConcurrentMap
+    // interface; a ConcurrentHashMap cast here KILLED the <clinit> and took
+    // every gate down with it (the 40213481958 e2e failure).
+    private static final java.util.concurrent.ConcurrentMap AI_CTX = buildAiCtxMap();
+
+    private static java.util.concurrent.ConcurrentMap buildAiCtxMap() {
+        try {
+            return new com.google.common.collect.MapMaker()
+                    .weakKeys().concurrencyLevel(1).makeMap();
+        } catch (Throwable t) {
+            // never let a classification-infra failure kill the <clinit> —
+            // the non-weak fallback only leaks one AiCtx per classified mob
+            // (bounded by the mob count) and keeps the module alive
+            return new java.util.concurrent.ConcurrentHashMap<>();
+        }
+    }
 
     private static final class AiCtx {
         final Object targetSel, goalSel; // the selector objects (Unsafe-read)

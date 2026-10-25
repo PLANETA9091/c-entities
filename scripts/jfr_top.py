@@ -8,12 +8,15 @@ jdk.ExecutionSample. Also sums jdk.GCPause durations.
 import subprocess
 import sys
 import re
+import os
+
+JFR_BIN = os.environ.get("JFR_BIN", "jfr")
 from collections import Counter
 
 
 def samples(jfr: str):
     proc = subprocess.run(
-        ["jfr", "print", "--events", "jdk.ExecutionSample", jfr],
+        [JFR_BIN, "print", "--events", "jdk.ExecutionSample", jfr],
         capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr[:500])
@@ -44,7 +47,7 @@ def samples(jfr: str):
 
 
 def gc(jfr: str):
-    proc = subprocess.run(["jfr", "print", "--events", "jdk.GCPause", jfr],
+    proc = subprocess.run([JFR_BIN, "print", "--events", "jdk.GCPause", jfr],
                           capture_output=True, text=True)
     total_ms = 0.0
     count = 0
