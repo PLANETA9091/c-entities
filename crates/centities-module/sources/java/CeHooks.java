@@ -2425,6 +2425,130 @@ public final class CeHooks {
     private static long O_STUCK = -1;
     // L20b: the rest branch's despawnRate read (valid when >= 0)
     private static long O_DESPAWN_RATE = -1;
+    // L22b: the inside-block-effect scratch lists (ArrayDeque / List)
+    private static long O_MOVEMENT_TICK = -1, O_FINAL_MOVEMENTS = -1;
+
+    // ---- L22b: the inside-block-effect no-op floor ----
+    // Woven EarlyReturnGuard on Entity.applyEffectsFromBlocks(). Vanilla
+    // walks every block position the swept hull intersects, runs
+    // getEntityInsideCollisionShape + fluid tests per non-air position and
+    // steps the effect collector — all of which is a PROVEN value no-op
+    // when every visited position is AIR (the lambda's own isAir
+    // short-circuit makes air positions do nothing), the below block's
+    // stepOn is the empty base implementation, the mob is not in rain, the
+    // fire/freezing pre-states are false and the tail's
+    // setRemainingFireTicks(-immunity) rewrite would be same-value. The
+    // hull enumeration is a strict SUPERSET of the vanilla visit set
+    // (touching positions included), so "superset all-air" implies the
+    // vanilla visit set is all-air — the gate fails safe to vanilla.
+    public static final boolean BLOCK_FX_ON =
+            !"0".equals(System.getenv("CE_BLOCK_FX"));
+    public static long blockFxChecks = 0, blockFxQuiet = 0, blockFxFail = 0;
+    // Block class -> stepOn is the empty base implementation (probed once
+    // via getMethod().getDeclaringClass() — the exact override test)
+    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>
+            STEP_ON_BORING = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static boolean stepOnIsNoOp(net.minecraft.world.level.block.Block b) {
+        return STEP_ON_BORING.computeIfAbsent(b.getClass(), k -> {
+            try {
+                return k.getMethod("stepOn",
+                        net.minecraft.world.level.Level.class,
+                        net.minecraft.core.BlockPos.class,
+                        net.minecraft.world.level.block.state.BlockState.class,
+                        net.minecraft.world.entity.Entity.class
+                ).getDeclaringClass() == net.minecraft.world.level.block.Block.class;
+            } catch (Throwable t) {
+                return Boolean.FALSE;
+            }
+        });
+    }
+
+    public static boolean mobBlockEffectsNoOp(net.minecraft.world.entity.Entity e) {
+        if (!ACTIVE || !BLOCK_FX_ON || O_MOVEMENT_TICK < 0) return false;
+        blockFxChecks++;
+        try {
+            if (e.isRemoved() || e.noPhysics || !e.isAlive()) return false;
+            net.minecraft.world.level.Level lvl = e.level();
+            if (lvl.isClientSide()) return false;
+            // recorded movements this tick (portals, teleports) → the
+            // vanilla movement list path, not our single-sweep shape
+            Object mv = U.getObject(e, O_MOVEMENT_TICK);
+            if (mv instanceof java.util.Collection<?> c && !c.isEmpty()) return false;
+            // debug subscribers observe per-position intersections
+            if (lvl instanceof net.minecraft.server.level.ServerLevel sl
+                    && sl.getServer().debugSubscribers()
+                        .hasAnySubscriberFor(net.minecraft.util.debug.DebugSubscriptions
+                            .ENTITY_BLOCK_INTERSECTIONS)) {
+                return false;
+            }
+            net.minecraft.world.phys.AABB box = e.getBoundingBox();
+            double dx = e.getX() - e.xo, dy = e.getY() - e.yo, dz = e.getZ() - e.zo;
+            // hull of the from-box and the to-box (contains the swept
+            // segment; a superset of both vanilla visit sources)
+            double hx0 = Math.min(box.minX, box.minX + dx);
+            double hx1 = Math.max(box.maxX, box.maxX + dx);
+            double hy0 = Math.min(box.minY, box.minY + dy);
+            double hy1 = Math.max(box.maxY, box.maxY + dy);
+            double hz0 = Math.min(box.minZ, box.minZ + dz);
+            double hz1 = Math.max(box.maxZ, box.maxZ + dz);
+            int x0 = net.minecraft.util.Mth.floor(hx0);
+            int x1 = net.minecraft.util.Mth.floor(hx1);
+            int y0 = net.minecraft.util.Mth.floor(hy0);
+            int y1 = net.minecraft.util.Mth.floor(hy1);
+            int z0 = net.minecraft.util.Mth.floor(hz0);
+            int z1 = net.minecraft.util.Mth.floor(hz1);
+            // 4^3 cap: hulls beyond 64 positions route vanilla (the gate
+            // must stay cheaper than the thing it replaces)
+            if ((x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 64) return false;
+            for (int bx = x0; bx <= x1; bx++) {
+                for (int by = y0; by <= y1; by++) {
+                    for (int bz = z0; bz <= z1; bz++) {
+                        if (!lvl.getBlockState(new net.minecraft.core.BlockPos(bx, by, bz)).isAir()) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            // the onGround stepOn probe — exact vanilla position
+            if (e.onGround()) {
+                net.minecraft.core.BlockPos below;
+                if (e.mainSupportingBlockPos.isPresent()
+                        && lvl.getChunkIfLoadedImmediately(e.mainSupportingBlockPos.get()) != null) {
+                    below = e.mainSupportingBlockPos.get()
+                            .atY(net.minecraft.util.Mth.floor(e.getY() - 0.2F));
+                } else {
+                    below = new net.minecraft.core.BlockPos(
+                            net.minecraft.util.Mth.floor(e.getX()),
+                            net.minecraft.util.Mth.floor(e.getY() - 0.2F),
+                            net.minecraft.util.Mth.floor(e.getZ()));
+                }
+                if (!stepOnIsNoOp(lvl.getBlockState(below).getBlock())) return false;
+            }
+            // rain / fire / freezing pre-states
+            if (e.isInRain() || e.isOnFire() || e.isFreezing()) return false;
+            // the tail's same-value rewrite must already hold
+            if (e.getRemainingFireTicks() != -e.getFireImmuneTicks()) return false;
+            // replicate the scratch-list maintenance the no-arg body does:
+            // final.clear() + add(default movement). The add is dropped —
+            // with an empty final list a later
+            // applyEffectsFromBlocksForLastMovements() iterates nothing,
+            // which is observationally identical to iterating the default
+            // movement: our gate PROVED the swept hull is all-air (zero
+            // collector effects) and the tail rewrite is same-value.
+            Object fin = U.getObject(e, O_FINAL_MOVEMENTS);
+            if (fin instanceof java.util.List<?> fl) {
+                ((java.util.List) fl).clear();
+            }
+            blockFxQuiet++;
+            return true;
+        } catch (Throwable t) {
+            blockFxFail++;
+            lastError = System.nanoTime();
+            lastErrorText = "mobBlockEffectsNoOp: " + t;
+            return false;
+        }
+    }
 
     // ---- L20: the quiet-mob travel floor ----
     // Woven EarlyReturnGuard on LivingEntity.travel(Vec3). When the
@@ -2581,6 +2705,11 @@ public final class CeHooks {
             // L20 quiet-travel floor: the protected stuck multiplier offset
             O_STUCK = offOf(net.minecraft.world.entity.Entity.class,
                     "stuckSpeedMultiplier");
+            // L22b: the inside-block-effect scratch lists
+            O_MOVEMENT_TICK = offOf(net.minecraft.world.entity.Entity.class,
+                    "movementThisTick");
+            O_FINAL_MOVEMENTS = offOf(net.minecraft.world.entity.Entity.class,
+                    "finalMovementsThisTick");
         } catch (Throwable t) {
             O_ED_ITEMS = -1; // gates fall back to the get() chain
         }
@@ -4290,6 +4419,808 @@ public final class CeHooks {
     public static void setFlagGateOn(boolean on) {
         FLAGG_ON = on;
     }
+
+    // ==================================================================
+    // L22a — the native AI floor (Mob.serverAiStep orchestration)
+    //
+    // Woven EarlyReturnGuard on Mob.serverAiStep(): the whole per-mob AI
+    // sequence — noActionTime++, sensing clear, the target/goal selector
+    // parity split, navigation, controls — is driven by the RUST engine
+    // (centities-core/src/goals.rs) through the packed-buffer protocol.
+    // The engine reproduces the vanilla GoalSelector sequences EXACTLY
+    // (insertion order, flag math, priority replacement, the shared-RNG
+    // consumption with the seed handed back and forth) and stages every
+    // decision it cannot prove as a REQUEST resolved with the real virtual
+    // call. start()/stop()/tick() of unported goal bodies always run as the
+    // real virtual calls; the engine only keeps the lock book.
+    //
+    // The RNG is Entity.SHARED_RANDOM — one ThreadUnsafeRandom LCG shared
+    // by every entity. The engine advances it natively (bit-exact with the
+    // JDK, unit-tested against Random(42) vectors) and every staged Java
+    // call continues the SAME stream via the seed handoff.
+    //
+    // Kill-switch: -Dcentities.mobAi=0, any classification failure (unknown
+    // goal class, oversized selector, triggered stroll) routes vanilla
+    // forever for that mob; any engine ST_FALLBACK runs the byte-exact
+    // serverAiStep mirror (the L15-floored GoalSelector bodies included).
+    // ==================================================================
+
+    public static final boolean MOB_AI_ON_INIT =
+            !"0".equals(System.getProperty("centities.mobAi", "true"));
+    public static volatile boolean MOB_AI_ON = false;
+    public static volatile boolean MOB_AI_HANDLES_OK = false;
+    public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
+            mobAiClassified = 0, mobAiRefused = 0;
+
+    // wire constants — MUST match centities-core/src/goals.rs
+    static final int ST_DONE = 0, ST_REQUEST = 1, ST_FALLBACK = -1;
+    static final int REQ_CC_VANILLA = 1, REQ_CANUSE_VANILLA = 2, REQ_STROLL_POS = 3,
+            REQ_LOOKAT_QUERY = 4, REQ_START_VANILLA = 5, REQ_FIND_TARGET = 6;
+    static final int GK_SPEAR_USE = 1, GK_ZOMBIE_ATTACK = 2, GK_MOVE_THROUGH_VILLAGE = 3,
+            GK_STROLL = 4, GK_LOOKAT_PLAYER = 5, GK_LOOKAROUND = 6, GK_HURT_BY = 7,
+            GK_NEAREST_TARGET = 8;
+    static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
+            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6;
+    static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
+    static final int MAX_GOALS = 16, GOAL_STRIDE = 6, IN_HEADER = 22, OUT_HEADER = 8;
+
+    // per-mob classification context (weak identity map — no leaks, no
+    // per-mob allocation after the first tick)
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static final java.util.concurrent.ConcurrentHashMap AI_CTX =
+            (java.util.concurrent.ConcurrentHashMap)
+                    new com.google.common.collect.MapMaker().weakKeys().concurrencyLevel(1).makeMap();
+
+    private static final class AiCtx {
+        final Object targetSel, goalSel; // the selector objects (Unsafe-read)
+        final net.minecraft.world.entity.ai.goal.WrappedGoal[] tGoals, gGoals;
+        final int[] tKind, gKind, tPrio, gPrio;
+        final long[] tFlags, gFlags;
+        final int[] tCfg, gCfg;
+        final float[] lookDistSq; // per target-goal lookDistance^2 (lookat kind)
+        AiCtx(Object ts, Object gs,
+              net.minecraft.world.entity.ai.goal.WrappedGoal[] t,
+              net.minecraft.world.entity.ai.goal.WrappedGoal[] g,
+              int[] tk, int[] gk, int[] tp, int[] gp, long[] tf, long[] gf,
+              int[] tc, int[] gc, float[] lds) {
+            this.targetSel = ts; this.goalSel = gs;
+            this.tGoals = t; this.gGoals = g;
+            this.tKind = tk; this.gKind = gk;
+            this.tPrio = tp; this.gPrio = gp;
+            this.tFlags = tf; this.gFlags = gf;
+            this.tCfg = tc; this.gCfg = gc;
+            this.lookDistSq = lds;
+        }
+        static final AiCtx REFUSED = new AiCtx(null, null,
+                new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
+                new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
+                new int[0], new int[0], new int[0], new int[0],
+                new long[0], new long[0], new int[0], new int[0], new float[0]);
+    }
+
+    // goal-object field offsets (resolved once per class at init)
+    private static long O_RLA_LOOKTIME = -1, O_RLA_RELX = -1, O_RLA_RELZ = -1;
+    private static long O_LAL_LOOKTIME = -1, O_LAL_LOOKAT = -1;
+    private static long O_STROLL_FORCE = -1, O_STROLL_WX = -1, O_STROLL_WY = -1, O_STROLL_WZ = -1;
+    private static long O_NAV_PATH = -1, O_NAV_TICK = -1, O_NAV_DELAYED = -1;
+    private static long O_PATH_NEXT = -1, O_PATH_NODES = -1;
+    private static long O_MC_OP = -1;
+    private static long O_LE_ZZA = -1;
+    private static long O_LC_COOL = -1, O_LC_WX = -1, O_LC_WY = -1, O_LC_WZ = -1,
+            O_LC_YMAX = -1, O_LC_XMAX = -1;
+    private static long O_JC_JUMP = -1, O_LE_JUMPING = -1;
+    private static long O_MOB_TARGET = -1, O_MOB_NOACTION = -1, O_MOB_SENSE = -1;
+    private static long O_MOB_TARGETSEL = -1, O_MOB_GOALSEL = -1;
+    private static long O_ENT_POS = -1, O_ENT_XROT = -1, O_LIV_HEALTH = -1;
+    private static long O_V3_X = -1, O_V3_Y = -1, O_V3_Z = -1;
+    private static Object SHARED_RANDOM; // Entity.SHARED_RANDOM (static field ref)
+    private static long O_RNG_VALUE = -1;
+    private static java.lang.invoke.MethodHandle MH_GET_POSITION;   // RandomStrollGoal subclass
+    private static java.lang.invoke.MethodHandle MH_STROLL_WX, MH_STROLL_WY, MH_STROLL_WZ;
+    private static java.lang.invoke.MethodHandle MH_FIND_TARGET, MH_NEAREST_TARGET_F;
+    private static java.lang.invoke.MethodHandle MH_LOOKAT_CTX;     // lookAtContext getter
+    private static Object MOVE_OP_WAIT; // MoveControl.Operation.WAIT enum ref
+
+    // scratch buffers (server-thread confined — one mob at a time)
+    private static int[] AI_IN = new int[IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE];
+    private static int[] AI_OUT = new int[OUT_HEADER + 96 * 8];
+
+    /** One-time handle/offset resolution. Called via prove_handles at
+     *  precompute time; sets MOB_AI_HANDLES_OK. */
+    public static void initMobAiHandles() {
+        try {
+            Class<?> rla = Class.forName("net.minecraft.world.entity.ai.goal.RandomLookAroundGoal");
+            O_RLA_LOOKTIME = offOf(rla, "lookTime");
+            O_RLA_RELX = offOf(rla, "relX");
+            O_RLA_RELZ = offOf(rla, "relZ");
+            Class<?> lal = Class.forName("net.minecraft.world.entity.ai.goal.LookAtPlayerGoal");
+            O_LAL_LOOKTIME = offOf(lal, "lookTime");
+            O_LAL_LOOKAT = offOf(lal, "lookAt");
+            Class<?> stroll = Class.forName("net.minecraft.world.entity.ai.goal.RandomStrollGoal");
+            O_STROLL_FORCE = offOf(stroll, "forceTrigger");
+            O_STROLL_WX = offOf(stroll, "wantedX");
+            O_STROLL_WY = offOf(stroll, "wantedY");
+            O_STROLL_WZ = offOf(stroll, "wantedZ");
+            Class<?> nav = Class.forName("net.minecraft.world.entity.ai.navigation.PathNavigation");
+            O_NAV_PATH = offOf(nav, "path");
+            O_NAV_TICK = offOf(nav, "tick");
+            O_NAV_DELAYED = offOf(nav, "hasDelayedRecomputation");
+            Class<?> path = Class.forName("net.minecraft.world.level.pathfinder.Path");
+            O_PATH_NEXT = offOf(path, "nextNodeIndex");
+            O_PATH_NODES = offOf(path, "nodes");
+            Class<?> mc = Class.forName("net.minecraft.world.entity.ai.control.MoveControl");
+            O_MC_OP = offOf(mc, "operation");
+            MOVE_OP_WAIT = java.lang.Enum.valueOf(
+                    (Class<? extends java.lang.Enum>) Class.forName(
+                            "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
+                    "WAIT");
+            Class<?> lc = Class.forName("net.minecraft.world.entity.ai.control.LookControl");
+            O_LC_COOL = offOf(lc, "lookAtCooldown");
+            O_LC_WX = offOf(lc, "wantedX");
+            O_LC_WY = offOf(lc, "wantedY");
+            O_LC_WZ = offOf(lc, "wantedZ");
+            O_LC_YMAX = offOf(lc, "yMaxRotSpeed");
+            O_LC_XMAX = offOf(lc, "xMaxRotAngle");
+            Class<?> jc = Class.forName("net.minecraft.world.entity.ai.control.JumpControl");
+            O_JC_JUMP = offOf(jc, "jump");
+            O_LE_JUMPING = offOf(net.minecraft.world.entity.LivingEntity.class, "jumping");
+            O_LE_ZZA = offOf(net.minecraft.world.entity.LivingEntity.class, "zza");
+            O_MOB_TARGET = offOf(net.minecraft.world.entity.Mob.class, "target");
+            O_MOB_NOACTION = offOf(net.minecraft.world.entity.Mob.class, "noActionTime");
+            O_MOB_TARGETSEL = offOf(net.minecraft.world.entity.Mob.class, "targetSelector");
+            O_MOB_GOALSEL = offOf(net.minecraft.world.entity.Mob.class, "goalSelector");
+            O_ENT_POS = offOf(net.minecraft.world.entity.Entity.class, "position");
+            O_ENT_XROT = offOf(net.minecraft.world.entity.Entity.class, "xRot");
+            Class<?> v3 = Class.forName("net.minecraft.world.phys.Vec3");
+            O_V3_X = offOf(v3, "x");
+            O_V3_Y = offOf(v3, "y");
+            O_V3_Z = offOf(v3, "z");
+            java.lang.reflect.Field sr = net.minecraft.world.entity.Entity.class
+                    .getDeclaredField("SHARED_RANDOM");
+            sr.setAccessible(true);
+            SHARED_RANDOM = sr.get(null);
+            O_RNG_VALUE = offOf(SHARED_RANDOM.getClass(), "value");
+            // protected stroll override + goal-internal fields — MethodHandles
+            java.lang.invoke.MethodHandles.Lookup pub = java.lang.invoke.MethodHandles.publicLookup();
+            try {
+                Class<?> was = Class.forName(
+                        "net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal");
+                java.lang.reflect.Method m = was.getDeclaredMethod("getPosition");
+                m.setAccessible(true);
+                MH_GET_POSITION = pub.unreflect(m);
+            } catch (Throwable notOverridden) {
+                java.lang.reflect.Method m = stroll.getDeclaredMethod("getPosition");
+                m.setAccessible(true);
+                MH_GET_POSITION = pub.unreflect(m);
+            }
+            MH_STROLL_WX = pub.unreflectGetter(stroll.getDeclaredField("wantedX"));
+            MH_FIND_TARGET = pub.unreflect(Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal")
+                    .getDeclaredMethod("findTarget"));
+            java.lang.reflect.Field tf = Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal")
+                    .getDeclaredField("target");
+            tf.setAccessible(true);
+            MH_NEAREST_TARGET_F = pub.unreflectGetter(tf);
+            java.lang.reflect.Field cf = Class.forName(
+                    "net.minecraft.world.entity.ai.goal.LookAtPlayerGoal")
+                    .getDeclaredField("lookAtContext");
+            cf.setAccessible(true);
+            MH_LOOKAT_CTX = pub.unreflectGetter(cf);
+            AI_HANDLES_SCRATCH_OK();
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initMobAiHandles: " + t;
+            MOB_AI_HANDLES_OK = false;
+        }
+    }
+
+    private static void AI_HANDLES_SCRATCH_OK() {
+        if (SHARED_RANDOM == null || O_RNG_VALUE < 0 || O_MC_OP < 0 || O_NAV_PATH < 0
+                || O_LC_COOL < 0 || O_JC_JUMP < 0 || O_MOB_TARGET < 0 || O_MOB_NOACTION < 0
+                || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
+                || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
+                || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null) {
+            MOB_AI_HANDLES_OK = false;
+        } else {
+            MOB_AI_HANDLES_OK = true;
+        }
+    }
+
+    /** The lookat alive/range checks use virtual isAlive() — no health
+     *  offset needed (the SynchedEntityData-backed float would need the
+     *  full accessor dance for one boolean). */
+
+    /** Kind id for a goal class, or 0 (unknown → refuse). */
+    private static int aiKindOf(String cn) {
+        switch (cn) {
+            case "net.minecraft.world.entity.ai.goal.SpearUseGoal": return GK_SPEAR_USE;
+            case "net.minecraft.world.entity.ai.goal.ZombieAttackGoal":
+            case "net.minecraft.world.entity.monster.zombie.Zombie$ZombieAttackTurtleEggGoal":
+                return GK_ZOMBIE_ATTACK;
+            case "net.minecraft.world.entity.ai.goal.MoveThroughVillageGoal":
+                return GK_MOVE_THROUGH_VILLAGE;
+            case "net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal":
+            case "net.minecraft.world.entity.ai.goal.RandomStrollGoal":
+                return GK_STROLL;
+            case "net.minecraft.world.entity.ai.goal.LookAtPlayerGoal":
+                return GK_LOOKAT_PLAYER;
+            case "net.minecraft.world.entity.ai.goal.RandomLookAroundGoal":
+                return GK_LOOKAROUND;
+            case "net.minecraft.world.entity.ai.goal.target.HurtByTargetGoal":
+                return GK_HURT_BY;
+            case "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal":
+                return GK_NEAREST_TARGET;
+            default: return 0;
+        }
+    }
+
+    private static int readIntField(Object o, Class<?> start, String name) {
+        try {
+            Class<?> k = start;
+            while (k != null) {
+                try {
+                    java.lang.reflect.Field f = k.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.getInt(o);
+                } catch (NoSuchFieldException e) {
+                    k = k.getSuperclass();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return -1;
+    }
+
+    private static float readFloatField(Object o, Class<?> start, String name) {
+        try {
+            Class<?> k = start;
+            while (k != null) {
+                try {
+                    java.lang.reflect.Field f = k.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.getFloat(o);
+                } catch (NoSuchFieldException e) {
+                    k = k.getSuperclass();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return -1.0F;
+    }
+
+    /** Classify a mob: exact Zombie class + the full known goal set in both
+     *  selectors. Returns null when the mob must stay vanilla. */
+    private static AiCtx aiClassify(net.minecraft.world.entity.Mob mob) {
+        Object k = mob;
+        Object hit = AI_CTX.get(k);
+        if (hit != null) {
+            return hit == AiCtx.REFUSED ? null : (AiCtx) hit;
+        }
+        AiCtx built = null;
+        try {
+            if (mob.getClass() != net.minecraft.world.entity.monster.zombie.Zombie.class) {
+                return refuse(k);
+            }
+            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> tSet =
+                    ((net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(
+                            mob, O_MOB_TARGETSEL)).getAvailableGoals();
+            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> gSet =
+                    ((net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(
+                            mob, O_MOB_GOALSEL)).getAvailableGoals();
+            int nt = tSet.size(), ng = gSet.size();
+            if (nt == 0 || nt > MAX_GOALS || ng == 0 || ng > MAX_GOALS) {
+                return refuse(k);
+            }
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] tg =
+                    new net.minecraft.world.entity.ai.goal.WrappedGoal[nt];
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] gg =
+                    new net.minecraft.world.entity.ai.goal.WrappedGoal[ng];
+            int[] tk = new int[nt], tp = new int[nt];
+            long[] tf = new long[nt];
+            int[] tc = new int[nt];
+            float[] lds = new float[nt];
+            int i = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal wg : tSet) {
+                tg[i] = wg;
+                tk[i] = aiKindOf(wg.getGoal().getClass().getName());
+                if (tk[i] == 0) return refuse(k);
+                tp[i] = wg.getPriority();
+                tf[i] = wg.getFlags().getBackingSet();
+                if ((tf[i] & ~(1L | 2L | 4L | 8L | 16L)) != 0) return refuse(k); // unknown flags
+                if (tk[i] == GK_NEAREST_TARGET) {
+                    tc[i] = readIntField(wg.getGoal(), wg.getGoal().getClass(), "randomInterval");
+                } else if (tk[i] == GK_HURT_BY) {
+                    tc[i] = 0;
+                } else {
+                    return refuse(k);
+                }
+                lds[i] = 0.0F;
+                i++;
+            }
+            int[] gk = new int[ng], gp = new int[ng];
+            long[] gf = new long[ng];
+            int[] gc = new int[ng];
+            i = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal wg : gSet) {
+                gg[i] = wg;
+                gk[i] = aiKindOf(wg.getGoal().getClass().getName());
+                if (gk[i] == 0) return refuse(k);
+                gp[i] = wg.getPriority();
+                gf[i] = wg.getFlags().getBackingSet();
+                if ((gf[i] & ~(1L | 2L | 4L | 8L | 16L)) != 0) return refuse(k);
+                Object goal = wg.getGoal();
+                switch (gk[i]) {
+                    case GK_STROLL:
+                        int interval = readIntField(goal, goal.getClass(), "interval");
+                        if (interval <= 0) return refuse(k);
+                        if (!readBoolField(goal, goal.getClass(), "checkNoActionTime")) {
+                            return refuse(k); // the engine assumes the check is on
+                        }
+                        // reducedTickDelay(interval) = positiveCeilDiv(interval, 2)
+                        gc[i] = (interval + 1) / 2;
+                        if (U.getByte(goal, O_STROLL_FORCE) != 0) return refuse(k);
+                        break;
+                    case GK_LOOKAT_PLAYER:
+                        float prob = readFloatField(goal, goal.getClass(), "probability");
+                        gc[i] = Float.floatToIntBits(prob);
+                        lds[i] = readFloatField(goal, goal.getClass(), "lookDistance");
+                        break;
+                    default:
+                        gc[i] = 0;
+                }
+                i++;
+            }
+            built = new AiCtx(U.getObject(mob, O_MOB_TARGETSEL),
+                    U.getObject(mob, O_MOB_GOALSEL),
+                    tg, gg, tk, gk, tp, gp, tf, gf, tc, gc, lds);
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "aiClassify: " + t;
+            return refuse(k);
+        }
+        AI_CTX.put(k, built);
+        mobAiClassified++;
+        return built;
+    }
+
+    private static AiCtx refuse(Object k) {
+        AI_CTX.put(k, AiCtx.REFUSED);
+        mobAiRefused++;
+        return null;
+    }
+
+    private static boolean readBoolField(Object o, Class<?> start, String name) {
+        try {
+            Class<?> k = start;
+            while (k != null) {
+                try {
+                    java.lang.reflect.Field f = k.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.getBoolean(o);
+                } catch (NoSuchFieldException e) {
+                    k = k.getSuperclass();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return false;
+    }
+
+    // sentinel: classification refused this mob (zero-length context)
+
+    // ---- the packed-buffer engine driver ----
+
+    private static void aiPack(net.minecraft.world.entity.Mob mob, AiCtx ctx,
+                               int cursor, int res, int lastReqOp,
+                               double rx, double ry, double rz) {
+        int[] in = AI_IN;
+        in[0] = cursor;
+        int mf = 0;
+        try {
+            if (mob.hasControllingPassenger()) mf |= 0; else mf |= 1; // MF_NO_PASSENGERS=1
+        } catch (Throwable t) {
+            mf &= ~1;
+        }
+        if (mob.getMainHandItem().isEmpty()) mf |= 2;            // MF_MAINHAND_EMPTY=2
+        if (U.getObject(mob, O_MOB_TARGET) != null) mf |= 4;     // MF_HAS_TARGET=4
+        if (mob.isUsingItem()) mf |= 8;                          // MF_USING_ITEM=8
+        in[1] = mf;
+        in[2] = mob.tickCount;
+        in[3] = mob.getId();
+        // noActionTime already incremented by the floor (vanilla order)
+        in[4] = U.getInt(mob, O_MOB_NOACTION);
+        in[5] = ctx.tGoals.length;
+        in[6] = ctx.gGoals.length;
+        long dT = disabledBacking((net.minecraft.world.entity.ai.goal.GoalSelector) ctx.targetSel);
+        long dG = disabledBacking((net.minecraft.world.entity.ai.goal.GoalSelector) ctx.goalSel);
+        in[7] = (int) dT; in[8] = (int) (dT >>> 32);
+        in[9] = (int) dG; in[10] = (int) (dG >>> 32);
+        in[11] = aiNavState(mob);
+        long seed = U.getLong(SHARED_RANDOM, O_RNG_VALUE);
+        in[12] = (int) seed; in[13] = (int) (seed >>> 32);
+        in[14] = res; in[15] = cursor != 0 ? lastReqOp : 0; // the resume dispatch op
+        in[16] = (int) Double.doubleToRawLongBits(rx);
+        in[17] = (int) (Double.doubleToRawLongBits(rx) >>> 32);
+        in[18] = (int) Double.doubleToRawLongBits(ry);
+        in[19] = (int) (Double.doubleToRawLongBits(ry) >>> 32);
+        in[20] = (int) Double.doubleToRawLongBits(rz);
+        in[21] = (int) (Double.doubleToRawLongBits(rz) >>> 32);
+        int base = IN_HEADER;
+        base = aiPackSel(in, base, ctx.tGoals, ctx.tKind, ctx.tPrio, ctx.tFlags, ctx.tCfg,
+                ctx.lookDistSq, mob);
+        aiPackSel(in, base, ctx.gGoals, ctx.gKind, ctx.gPrio, ctx.gFlags, ctx.gCfg, null, mob);
+    }
+
+    private static int aiPackSel(int[] in, int base,
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] goals, int[] kinds,
+            int[] prios, long[] flags, int[] cfgs, float[] lookDistSq,
+            net.minecraft.world.entity.Mob mob) {
+        for (int i = 0; i < goals.length; i++) {
+            int b = base + i * GOAL_STRIDE;
+            in[b] = kinds[i];
+            in[b + 1] = prios[i];
+            in[b + 2] = (int) flags[i];
+            in[b + 3] = cfgs[i];
+            in[b + 4] = goals[i].isRunning() ? 1 : 0;
+            int st = 0;
+            Object goal = goals[i].getGoal();
+            switch (kinds[i]) {
+                case GK_LOOKAROUND:
+                    st = U.getInt(goal, O_RLA_LOOKTIME);
+                    break;
+                case GK_LOOKAT_PLAYER: {
+                    st = U.getInt(goal, O_LAL_LOOKTIME) & 0x3FFFFFFF;
+                    Object lookAt = U.getObject(goal, O_LAL_LOOKAT);
+                    if (lookAt instanceof net.minecraft.world.entity.LivingEntity la
+                            && la.isAlive()) {
+                        st |= 1 << 31;
+                        double d2 = ctx_distSq(mob, la);
+                        if (lookDistSq != null && lookDistSq[i] > 0.0F
+                                && !(d2 > (double) lookDistSq[i] * lookDistSq[i])) {
+                            st |= 1 << 30;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    st = 0;
+            }
+            in[b + 5] = st;
+        }
+        return base + goals.length * GOAL_STRIDE;
+    }
+
+    private static double ctx_distSq(net.minecraft.world.entity.Mob mob,
+                                    net.minecraft.world.entity.LivingEntity other) {
+        // Entity.distanceToSqr(Entity): dx*dx + dy*dy + dz*dz in doubles —
+        // the comparison must stay double (the vanilla cc compares doubles)
+        double mx = mob.getX(), my = mob.getY(), mz = mob.getZ();
+        double ox = other.getX(), oy = other.getY(), oz = other.getZ();
+        double dx = mx - ox, dy = my - oy, dz = mz - oz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static int aiNavState(net.minecraft.world.entity.Mob mob) {
+        Object nav = mob.getNavigation();
+        Object path = U.getObject(nav, O_NAV_PATH);
+        if (path == null) return NAV_NONE;
+        int next = U.getInt(path, O_PATH_NEXT);
+        Object nodes = U.getObject(path, O_PATH_NODES);
+        int n = nodes instanceof java.util.List<?> l ? l.size() : 0;
+        return next >= n ? NAV_PATH_DONE : NAV_PATH_ACTIVE;
+    }
+
+    /** The floor body — the EarlyReturnGuard check for Mob.serverAiStep. */
+    public static boolean mobAiFloor(net.minecraft.world.entity.Mob mob) {
+        if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK) return false;
+        boolean stepped = false;
+        try {
+            AiCtx ctx = aiClassify(mob);
+            if (ctx == null) return false;
+            // vanilla order: noActionTime++ then sensing.clear()
+            U.putInt(mob, O_MOB_NOACTION, U.getInt(mob, O_MOB_NOACTION) + 1);
+            mob.getSensing().tick();
+            stepped = true;
+            mobAiTicks++;
+            int status = aiRun(mob, ctx);
+            if (status == ST_FALLBACK) {
+                mobAiFallbacks++;
+                mobAiSelectorsMirror(mob);
+                return true;
+            }
+            return true;
+        } catch (Throwable t) {
+            // a live floor failure disarms globally; when the step had
+            // already mutated goal state, finish with the exact mirror
+            // instead of re-running vanilla under a half-applied tick
+            MOB_AI_ON = false;
+            lastError = System.nanoTime();
+            lastErrorText = "mobAiFloor: " + t;
+            if (stepped) {
+                try {
+                    mobAiSelectorsMirror(mob);
+                } catch (Throwable ignore) {
+                }
+                return true;
+            }
+            return false; // nothing mutated — vanilla runs the whole step
+        }
+    }
+
+    private static int aiRun(net.minecraft.world.entity.Mob mob, AiCtx ctx) {
+        if (AI_IN.length < IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE) {
+            AI_IN = new int[IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE];
+        }
+        int cursor = 0, res = 0, lastReqOp = 0;
+        double rx = 0, ry = 0, rz = 0;
+        for (int round = 0; round < 8; round++) {
+            aiPack(mob, ctx, cursor, res, lastReqOp, rx, ry, rz);
+            int status = nativeMobAiFloor(AI_IN, AI_OUT);
+            if (status == ST_FALLBACK) return ST_FALLBACK;
+            // apply the actions IMMEDIATELY after every round — the engine
+            // emits stop/start transitions in the exact vanilla order, and
+            // later rounds' packs must observe their effects
+            long seed = ((long) AI_OUT[4] << 32) | (AI_OUT[3] & 0xFFFF_FFFFL);
+            U.putLong(SHARED_RANDOM, O_RNG_VALUE, seed);
+            aiApply(mob, ctx);
+            if (status == ST_DONE) {
+                aiTail(mob);
+                return ST_DONE;
+            }
+            // ST_REQUEST — resolve the PREDICATE only (no start/stop — the
+            // engine owns the transitions); the seed was already applied
+            // above so the predicate's RNG use continues the same stream
+            mobAiRequests++;
+            cursor = AI_OUT[6];
+            int req = AI_OUT[1];
+            lastReqOp = req;
+            int gi = AI_OUT[2];
+            res = 1;
+            rx = ry = rz = 0;
+            boolean targetSel = ((cursor >> 9) & 1) == 0;
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] arr =
+                    targetSel ? ctx.tGoals : ctx.gGoals;
+            if (gi < 0 || gi >= arr.length) return ST_FALLBACK;
+            net.minecraft.world.entity.ai.goal.WrappedGoal wg = arr[gi];
+            switch (req) {
+                case REQ_CC_VANILLA:
+                    res = wg.canContinueToUse() ? 1 : 0;
+                    break;
+                case REQ_CANUSE_VANILLA:
+                    res = wg.canUse() ? 1 : 0;
+                    break;
+                case REQ_START_VANILLA:
+                    res = 1; // the engine emits the start action
+                    break;
+                case REQ_STROLL_POS: {
+                    Object pos = null;
+                    try {
+                        pos = MH_GET_POSITION.invoke(wg.getGoal());
+                    } catch (Throwable t) {
+                        return ST_FALLBACK;
+                    }
+                    if (pos instanceof net.minecraft.world.phys.Vec3 v) {
+                        Object g = wg.getGoal();
+                        U.putDouble(g, O_STROLL_WX, v.x);
+                        U.putDouble(g, O_STROLL_WY, v.y);
+                        U.putDouble(g, O_STROLL_WZ, v.z);
+                        U.putByte(g, O_STROLL_FORCE, (byte) 0);
+                        rx = v.x; ry = v.y; rz = v.z;
+                    } else {
+                        res = 0;
+                    }
+                    break;
+                }
+                case REQ_LOOKAT_QUERY: {
+                    net.minecraft.server.level.ServerLevel lvl =
+                            (net.minecraft.server.level.ServerLevel) mob.level();
+                    Object cond = null;
+                    try {
+                        cond = MH_LOOKAT_CTX.invoke(wg.getGoal());
+                    } catch (Throwable t) {
+                        return ST_FALLBACK;
+                    }
+                    net.minecraft.world.entity.player.Player p = lvl.getNearestPlayer(
+                            (net.minecraft.world.entity.ai.targeting.TargetingConditions) cond,
+                            mob, mob.getX(), mob.getEyeY(), mob.getZ());
+                    if (p == null) res = 0;
+                    break;
+                }
+                case REQ_FIND_TARGET: {
+                    try {
+                        MH_FIND_TARGET.invoke(wg.getGoal());
+                        Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
+                        res = t != null ? 1 : 0;
+                    } catch (Throwable t2) {
+                        return ST_FALLBACK;
+                    }
+                    break;
+                }
+                default:
+                    return ST_FALLBACK;
+            }
+        }
+        return ST_FALLBACK; // round cap — the mirror finishes the tick
+    }
+
+    private static void aiApply(net.minecraft.world.entity.Mob mob, AiCtx ctx) {
+        int n = AI_OUT[5];
+        for (int a = 0; a < n; a++) {
+            int b = OUT_HEADER + a * 8;
+            int op = AI_OUT[b];
+            int p0 = AI_OUT[b + 1];
+            int p1 = AI_OUT[b + 2];
+            switch (op) {
+                case ACT_GOAL_START: {
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    wg.start();
+                    break;
+                }
+                case ACT_GOAL_TICK_V: {
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    wg.tick();
+                    break;
+                }
+                case ACT_GOAL_STOP: {
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    wg.stop();
+                    break;
+                }
+                case ACT_LOOK_TICK_AROUND: {
+                    // lookaround tick port: lookTime--, setLookAt(x+relX, eyeY, z+relZ)
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    Object g = wg.getGoal();
+                    U.putInt(g, O_RLA_LOOKTIME, p1);
+                    float relX = U.getFloat(g, O_RLA_RELX);
+                    float relZ = U.getFloat(g, O_RLA_RELZ);
+                    aiLookWrite(mob, mob.getX() + relX, mob.getEyeY(), mob.getZ() + relZ);
+                    break;
+                }
+                case ACT_LOOK_TICK_AT: {
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    Object g = wg.getGoal();
+                    U.putInt(g, O_LAL_LOOKTIME, p1);
+                    Object lookAt = U.getObject(g, O_LAL_LOOKAT);
+                    if (lookAt instanceof net.minecraft.world.entity.Entity la) {
+                        aiLookWrite(mob, la.getX(), la.getEyeY(), la.getZ());
+                    }
+                    break;
+                }
+                default:
+                    return;
+            }
+        }
+    }
+
+    private static net.minecraft.world.entity.ai.goal.WrappedGoal goalAt(AiCtx ctx, int gi) {
+        // the engine emits GLOBAL indices: 0..nt-1 = target selector,
+        // nt..nt+ng-1 = goal selector (matching the packed record order)
+        int nt = ctx.tGoals.length;
+        if (gi < 0) return null;
+        if (gi < nt) return ctx.tGoals[gi];
+        int g = gi - nt;
+        if (g < ctx.gGoals.length) return ctx.gGoals[g];
+        return null;
+    }
+
+    /** lookControl.setLookAt(x, y, z) equivalent — 6 field writes with the
+     *  virtual speed getters the vanilla body calls. */
+    private static void aiLookWrite(net.minecraft.world.entity.Mob mob,
+                                    double x, double y, double z) {
+        Object lc = mob.getLookControl();
+        U.putDouble(lc, O_LC_WX, x);
+        U.putDouble(lc, O_LC_WY, y);
+        U.putDouble(lc, O_LC_WZ, z);
+        U.putFloat(lc, O_LC_YMAX, mob.getHeadRotSpeed());
+        U.putFloat(lc, O_LC_XMAX, mob.getMaxHeadXRot());
+        U.putInt(lc, O_LC_COOL, 2);
+    }
+
+    /** The post-selector tail: navigation.tick (idle port), controls. */
+    private static void aiTail(net.minecraft.world.entity.Mob mob) {
+        // navigation.tick — vanilla: tick++; delayed recompute; if !isDone ...
+        net.minecraft.world.entity.ai.navigation.PathNavigation nav = mob.getNavigation();
+        boolean delayed = U.getByte(nav, O_NAV_DELAYED) != 0;
+        int navState = aiNavState(mob);
+        if (delayed || navState == NAV_PATH_ACTIVE) {
+            nav.tick(); // the vanilla body (path following is a later cut)
+        } else {
+            U.putInt(nav, O_NAV_TICK, U.getInt(nav, O_NAV_TICK) + 1);
+        }
+        // moveControl.tick — WAIT branch: setZza(0)
+        net.minecraft.world.entity.ai.control.MoveControl mc = mob.getMoveControl();
+        if (U.getObject(mc, O_MC_OP) == MOVE_OP_WAIT) {
+            U.putFloat(mob, O_LE_ZZA, 0.0F);
+        } else {
+            mc.tick();
+        }
+        // lookControl.tick — the cooldown branch routes vanilla (Mth.atan2)
+        net.minecraft.world.entity.ai.control.LookControl lc = mob.getLookControl();
+        if (U.getInt(lc, O_LC_COOL) > 0) {
+            lc.tick();
+        } else {
+            U.putFloat(mob, O_ENT_XROT, 0.0F);
+            float yHead = mob.yHeadRot;
+            float rotated = aiRotateTowards(yHead, mob.yBodyRot, 10.0F);
+            mob.yHeadRot = rotated;
+            if (aiNavState(mob) == NAV_PATH_ACTIVE) {
+                // !isDone → clampHeadRotationToBody
+                float clamped = aiRotateIfNecessary(mob.yHeadRot, mob.yBodyRot,
+                        mob.getMaxHeadYRot());
+                mob.yHeadRot = clamped;
+            }
+        }
+        // jumpControl.tick — setJumping(jump); jump = false
+        net.minecraft.world.entity.ai.control.JumpControl jc = mob.getJumpControl();
+        boolean jump = U.getByte(jc, O_JC_JUMP) != 0;
+        U.putByte(mob, O_LE_JUMPING, (byte) (jump ? 1 : 0));
+        U.putByte(jc, O_JC_JUMP, (byte) 0);
+    }
+
+    /** Control.rotateTowards — bit-exact f32 port. */
+    private static float aiRotateTowards(float from, float to, float maxRot) {
+        float diff = aiWrapDegrees(to - from);
+        if (diff < -maxRot) diff = -maxRot;
+        if (diff > maxRot) diff = maxRot;
+        return from + diff;
+    }
+
+    /** Mth.rotateIfNecessary. */
+    private static float aiRotateIfNecessary(float base, float target, float maxDiff) {
+        float d = aiWrapDegrees(target - base);
+        if (d < -maxDiff) d = -maxDiff;
+        if (d > maxDiff) d = maxDiff;
+        return target - d;
+    }
+
+    /** Mth.wrapDegrees(float). */
+    private static float aiWrapDegrees(float a) {
+        float n = a % 360.0F;
+        if (n >= 180.0F) n -= 360.0F;
+        if (n < -180.0F) n += 360.0F;
+        return n;
+    }
+
+    /** The native goal engine (centities-core/src/goals.rs) — returns
+     *  ST_DONE / ST_REQUEST / ST_FALLBACK and fills out. */
+    public static native int nativeMobAiFloor(int[] in, int[] out);
+
+    public static void setMobAiOn(boolean on) {
+        MOB_AI_ON = on;
+    }
+
+    /** The byte-exact serverAiStep mirror for the post-noActionTime/sensing
+     *  remainder (engine fallback + disarm path). The GoalSelector calls
+     *  ride the L15 floor (itself a byte-exact vanilla sequence). The
+     *  classified mob is exactly Zombie → customServerAiStep is the empty
+     *  base body (verified in the decompile) — skipped. */
+    private static void mobAiSelectorsMirror(net.minecraft.world.entity.Mob mob) {
+        // the selectors ride the Unsafe-read refs (the fields are protected
+        // in the 26.3 mapping — no public getters)
+        net.minecraft.world.entity.ai.goal.GoalSelector ts =
+                (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_TARGETSEL);
+        net.minecraft.world.entity.ai.goal.GoalSelector gs =
+                (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_GOALSEL);
+        int idBasedTickCount = mob.tickCount + mob.getId();
+        if (idBasedTickCount % 2 != 0 && mob.tickCount > 1) {
+            ts.tickRunningGoals(false);
+            gs.tickRunningGoals(false);
+        } else {
+            ts.tick();
+            gs.tick();
+        }
+        mob.getNavigation().tick();
+        mob.getMoveControl().tick();
+        mob.getLookControl().tick();
+        mob.getJumpControl().tick();
+    }
+
 
     // ---- L20b: the same-value delta gate ----
     // Woven EARLY_RETURN_GUARD2 on Entity.setDeltaMovement(Vec3). The

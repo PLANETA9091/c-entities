@@ -26,6 +26,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeReset", "()V"));
     s.insert(("nativeItemTick", "(II[J[I[DI[I[D[I[D[I)I"));
     s.insert(("nativeItemInvalidate", "(II[I[I[I)V"));
+    // L22a: the native goal engine
+    s.insert(("nativeMobAiFloor", "([I[I)I"));
     s
 }
 

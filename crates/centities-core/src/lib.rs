@@ -20,6 +20,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod goals;
 pub mod itemtick;
 pub mod sections;
 pub mod simd;

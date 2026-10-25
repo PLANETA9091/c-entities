@@ -33,6 +33,7 @@ const LIVING_ENTITY_CLASS: &str = "net/minecraft/world/entity/LivingEntity";
 const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
 const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTickList";
 const GOAL_SELECTOR_CLASS: &str = "net/minecraft/world/entity/ai/goal/GoalSelector";
+const MOB_CLASS: &str = "net/minecraft/world/entity/Mob";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
@@ -386,6 +387,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(SERVER_ENTITY_CLASS, |_n, b| patch_serverentity(b));
     cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
     cplug_sdk::hooks::register_bytes(GOAL_SELECTOR_CLASS, |_n, b| patch_goalselector(b));
+    cplug_sdk::hooks::register_bytes(MOB_CLASS, |_n, b| patch_mob(b));
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
 
@@ -435,6 +437,7 @@ fn arm_module() {
     precompute_entityticklist(loader);
     precompute_entity(loader);
     precompute_goalselector(loader);
+    precompute_mob(loader);
     precompute_conversion(loader);
     precompute_trackedentity(loader);
 
@@ -451,6 +454,7 @@ fn arm_module() {
         SERVER_ENTITY_CLASS,
         ENTITY_TICK_LIST_CLASS,
         GOAL_SELECTOR_CLASS,
+        MOB_CLASS,
         CONVERSION_TRACKER_CLASS,
         TRACKED_ENTITY_CLASS,
     ] {
@@ -538,6 +542,22 @@ fn arm_module() {
                         let rc = cplug_sdk::retransform_class(GOAL_SELECTOR_CLASS);
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred GoalSelector floor applied, rc={rc}"
+                        ));
+                    }
+                }
+                // L22a deferred weave: Mob loads with the first mobs too.
+                if !MOB_WOVEN.load(Ordering::Acquire)
+                    && !MOB_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(MOB_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_mob(loader as jni::jobject);
+                    if MOB_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(MOB_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred Mob AI floor applied, rc={rc}"
                         ));
                     }
                 }
@@ -832,7 +852,13 @@ static FLAGG_ARMED: AtomicBool = AtomicBool::new(false);
 /// L20b: the Entity.setDeltaMovement same-value no-op gate weave is prepared.
 static DELTA_WOVEN: AtomicBool = AtomicBool::new(false);
 static DELTA_DECLINED: AtomicBool = AtomicBool::new(false);
+static BLOCKFX_WOVEN: AtomicBool = AtomicBool::new(false);
+static BLOCKFX_DECLINED: AtomicBool = AtomicBool::new(false);
 static DELTA_ARMED: AtomicBool = AtomicBool::new(false);
+/// L22a: the Mob.serverAiStep native AI floor weave state.
+static MOB_WOVEN: AtomicBool = AtomicBool::new(false);
+static MOB_DECLINED: AtomicBool = AtomicBool::new(false);
+static MOB_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -1074,16 +1100,19 @@ fn precompute_livingentity(loader: jni::jobject) {
             _ => {
                 // The two guards are INDEPENDENT prefixes on the same class:
                 // a refusal of one keeps the other (both are optional weaves).
-                let Some(b1) = cplug_sdk::asm::insert_early_return_guard(
-                    env, loader, &bytes, &push_spec,
-                ) else {
+                let Some(b1) =
+                    cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &push_spec)
+                else {
                     return cplug_sdk::asm::insert_early_return_guard2(
-                        env, loader, &bytes, &travel_spec,
+                        env,
+                        loader,
+                        &bytes,
+                        &travel_spec,
                     );
                 };
-                let Some(b2) = cplug_sdk::asm::insert_early_return_guard2(
-                    env, loader, &b1, &travel_spec,
-                ) else {
+                let Some(b2) =
+                    cplug_sdk::asm::insert_early_return_guard2(env, loader, &b1, &travel_spec)
+                else {
                     return Some(b1); // the push guard alone
                 };
                 Some(b2)
@@ -1098,10 +1127,7 @@ fn precompute_livingentity(loader: jni::jobject) {
             // CE_DUMP_CLASSES=/dir: dump the patched bytes for standalone
             // verifier diagnosis (the two-guard FAILS_VERIFICATION hunt)
             if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
-                let _ = std::fs::write(
-                    format!("{}/LivingEntity.patched.class", dir),
-                    &b,
-                );
+                let _ = std::fs::write(format!("{}/LivingEntity.patched.class", dir), &b);
             }
             cplug_sdk::log::info(
                 "[c-entities] precomputed LivingEntity push + quiet-travel guards",
@@ -1186,6 +1212,36 @@ fn patch_goalselector(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_goalselector_inner(bytes))
         .ok()
         .flatten()
+}
+
+/// L22a: Mob byte hook — same stash/serve pattern as GoalSelector.
+fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_mob_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(MOB_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(MOB_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched Mob AI floor guard");
+            Some(b)
+        }
+        _ if !MOB_WOVEN.load(Ordering::Acquire) && !MOB_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(MOB_CLASS).or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info("[c-entities] Mob bytes stashed post-arm — verifier will decide");
+            None
+        }
+        _ => None,
+    }
 }
 
 fn patch_goalselector_inner(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -1638,6 +1694,62 @@ fn delta_spec() -> cplug_sdk::asm::EarlyReturnGuard2<'static> {
     }
 }
 
+/// L22a: the Mob.serverAiStep native AI floor weave. The guard is the
+/// read-only-safe mobAiFloor — a refusal keeps vanilla; the internal
+/// mirror/fallback paths keep exactness, so arming rides the weave + the
+/// handle proof (no separate liveness gate). The engine (Rust) and the
+/// L15 GoalSelector floor do not overlap: a floored mob never reaches the
+/// GoalSelector bodies.
+fn precompute_mob(loader: jni::jobject) {
+    if read_java_flag("MOB_AI_ON_INIT") != Some(true) {
+        MOB_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] mob AI floor disabled (centities.mobAi) — vanilla serverAiStep kept",
+        );
+        return;
+    }
+    if prove_handles("initMobAiHandles", "MOB_AI_HANDLES_OK") != Some(true) {
+        MOB_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] mob AI floor handle probe failed — vanilla serverAiStep kept",
+        );
+        return;
+    }
+    let Some(bytes) = STASH.lock().ok().and_then(|mut s| s.remove(MOB_CLASS)) else {
+        cplug_sdk::log::info(
+            "[c-entities] Mob not stashed yet — AI floor deferred to the verifier",
+        );
+        return;
+    };
+    let spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "serverAiStep",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "mobAiFloor",
+        check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(MOB_CLASS, b);
+            }
+            MOB_WOVEN.store(true, Ordering::Release);
+            if set_java_bool("setMobAiOn", true) {
+                MOB_ARMED.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] precomputed + armed the Mob AI floor");
+            }
+        }
+        _ => {
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute the Mob AI floor — vanilla kept",
+            );
+        }
+    }
+}
+
 fn precompute_goalselector(loader: jni::jobject) {
     if read_java_flag("AI_FLAG_ON") != Some(true) {
         GOAL_DECLINED.store(true, Ordering::Release);
@@ -1771,6 +1883,42 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
         DELTA_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
             "[c-entities] delta gate disabled (centities.deltaGate) — vanilla writes kept",
+        );
+        gated
+    };
+    // L22b: the inside-block-effect no-op gate chains onto the same Entity
+    // bytes (op 4 — the no-arg applyEffectsFromBlocks() body; the receiver
+    // load is the op-4 default). The gate must run before the probes: the
+    // skipped work includes the applyEffectsFromBlocks → movement list
+    // maintenance the probes would otherwise observe.
+    let gated = if read_java_flag("BLOCK_FX_ON") == Some(true) {
+        let blockfx = cplug_sdk::asm::EarlyReturnGuard {
+            method_name: "applyEffectsFromBlocks",
+            method_desc: "()V",
+            check_class: HOOKS_CLASS,
+            check_name: "mobBlockEffectsNoOp",
+            check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+        };
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &gated, &blockfx)
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                BLOCKFX_WOVEN.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] precomputed applyEffectsFromBlocks no-op gate");
+                b
+            }
+            _ => {
+                BLOCKFX_DECLINED.store(true, Ordering::Release);
+                cplug_sdk::log::info(
+                    "[c-entities] applyEffectsFromBlocks gate refused — vanilla block effects kept",
+                );
+                gated
+            }
+        }
+    } else {
+        BLOCKFX_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] block-fx gate disabled (CE_BLOCK_FX=0) — vanilla effects kept",
         );
         gated
     };
@@ -2283,6 +2431,17 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         "nativePushNcol",
         "(I)I",
         n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> i32
+    );
+    push!(
+        "nativeMobAiFloor",
+        "([I[I)I",
+        n_mob_ai_floor
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                jni::jintArray,
+                jni::jintArray,
+            ) -> i32
     );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
@@ -3236,5 +3395,56 @@ pub extern "system" fn n_reset(env: *mut jni::JNIEnv, cls: jni::jclass) {
             ((*vt).SetStaticLongField)(raw, cls, fid, next);
             NEXT_SEQ.store(next, Ordering::Release);
         }
+    }
+}
+
+// ===================================================================
+// L22a — the native goal engine entry (centities-core::goals)
+// ===================================================================
+
+/// nativeMobAiFloor(int[] in, int[] out) — copy in, run the engine, copy out.
+pub extern "system" fn n_mob_ai_floor(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    in_arr: jni::jintArray,
+    out_arr: jni::jintArray,
+) -> i32 {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let n_in = ((*vt).GetArrayLength)(raw, in_arr);
+        let n_out = ((*vt).GetArrayLength)(raw, out_arr);
+        if n_in < 1 || n_out < 1 {
+            return centities_core::goals::ST_FALLBACK;
+        }
+        // thread-local scratch (server-thread confined; avoids a copy into a
+        // fresh allocation per mob)
+        thread_local! {
+            static IN_BUF: std::cell::RefCell<Vec<i32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static OUT_BUF: std::cell::RefCell<Vec<i32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        IN_BUF.with(|c| {
+            OUT_BUF.with(|oc| {
+                let mut ib = c.borrow_mut();
+                let mut ob = oc.borrow_mut();
+                ib.resize(n_in as usize, 0);
+                ob.resize(n_out as usize, 0);
+                ((*vt).GetIntArrayRegion)(raw, in_arr, 0, n_in, ib.as_mut_ptr());
+                if e.exception_check() {
+                    e.exception_clear();
+                    return centities_core::goals::ST_FALLBACK;
+                }
+                let st = centities_core::goals::ai_floor(&ib, &mut ob);
+                ((*vt).SetIntArrayRegion)(raw, out_arr, 0, n_out, ob.as_ptr());
+                if e.exception_check() {
+                    e.exception_clear();
+                    return centities_core::goals::ST_FALLBACK;
+                }
+                st
+            })
+        })
     }
 }
