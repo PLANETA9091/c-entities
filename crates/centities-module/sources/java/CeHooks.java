@@ -428,6 +428,7 @@ public final class CeHooks {
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
+                + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
@@ -2406,6 +2407,152 @@ public final class CeHooks {
     // (the accessor lookup + boxed return + exception-table frames that
     // made the conv gate cost MORE than the vanilla write it replaced).
     private static long O_ED_ITEMS = -1, O_DI_VALUE = -1;
+    // L20 quiet-travel floor: protected field offsets
+    private static long O_XXA = -1, O_YYA = -1, O_ZZA = -1, O_STUCK = -1;
+
+    // ---- L20: the quiet-mob travel floor ----
+    // Woven EarlyReturnGuard on LivingEntity.travel(Vec3). When the
+    // predicate below holds, the ENTIRE vanilla travel slice is provably a
+    // VALUE no-op for this tick: moveRelative adds Vec3.ZERO (the input
+    // length short-circuit), handleOnClimbable is skipped (not climbable),
+    // the collide clips the swept move to exactly (0,0,0) (full-block
+    // ground at box.minY, no hard entity colliders, inside the border),
+    // the restitution zeroes the bounce (|delta.y| <= effectiveGravity),
+    // and the drag/gravity tail recomputes the identical delta. Every
+    // field vanilla writes equals the pre-tick value, so skipping the
+    // slice is value-exact. The proof is STATELESS: every input is re-read
+    // per tick, so any block/attribute/flag change fails the predicate and
+    // routes vanilla (self-healing, no mode tables, no flush, no Rust).
+    //
+    // The delta check is also the omni/discardFriction discriminator: a
+    // mob whose verticalFriction differs (omnidirectionalAirMover, or
+    // shouldDiscardFriction) has a DIFFERENT fixed-point delta, so the
+    // exact-equality test fails and those mobs route vanilla.
+    public static final boolean MOB_TRAVEL_ON =
+            !"0".equals(System.getenv("CE_MOB_TRAVEL"));
+    // plain longs (the L15b lesson: a volatile add per entity per tick was
+    // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
+    // visibility)
+    public static long travelChecks = 0, travelQuiet = 0, travelFail = 0;
+
+    public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e) {
+        if (!ACTIVE || !MOB_TRAVEL_ON || O_XXA < 0) return false;
+        travelChecks++;
+        try {
+            if (e.level().isClientSide() || e.isRemoved()
+                    || U.getFloat(e, O_XXA) != 0.0F
+                    || U.getFloat(e, O_YYA) != 0.0F
+                    || U.getFloat(e, O_ZZA) != 0.0F
+                    || !e.getPassengers().isEmpty()
+                    || e.isFallFlying()
+                    || e.isTemporarilyActive
+                    || !e.getActiveEffects().isEmpty()) {
+                return false;
+            }
+            net.minecraft.world.phys.Vec3 d = e.getDeltaMovement();
+            if (d.x == 0.0 && d.y == 0.0 && d.z == 0.0) {
+                // SHAPE A: the zero-delta fixed point (noGravity mobs).
+                // The authoritative flag block sets onGround=false and the
+                // three collision flags false every tick; the pre-state
+                // must already equal that. checkFallDamage leaves fall
+                // untouched (any value is fixed) but the climbable clamp
+                // would reset it AND write lastClimbablePos -> excluded.
+                if (e.getGravity() != 0.0
+                        || e.onGround()
+                        || e.mainSupportingBlockPos.isPresent()
+                        || e.horizontalCollision
+                        || e.verticalCollision
+                        || e.verticalCollisionBelow
+                        || e.minorHorizontalCollision
+                        || e.fallDistance != 0.0
+                        || e.onClimbable()) {
+                    return false;
+                }
+                travelQuiet++;
+                return true;
+            }
+            // SHAPE B: the standing fixed point (0, -g * vf, 0)
+            if (d.x != 0.0 || d.z != 0.0 || !e.onGround()
+                    || e.fallDistance != 0.0
+                    || e.horizontalCollision
+                    || !e.verticalCollision
+                    || !e.verticalCollisionBelow
+                    || e.minorHorizontalCollision
+                    || !e.mainSupportingBlockPos.isPresent()
+                    || e.onClimbable()
+                    || e.wasInPowderSnow) {
+                return false;
+            }
+            double y = e.getY();
+            if (y != Math.floor(y)) return false; // the clip must be exact
+            // the swept slab must REACH the ground layer for the collide to
+            // clip it (the gather's EPS7 margin): |d.y| > 1e-7 else the move
+            // passes unclipped and the mob would sink
+            if (d.y >= -1.0e-7) return false;
+            double g = e.getGravity();
+            if (g <= 0.0) return false;
+            float dragMod =
+                    (float) e.getAttributeValue(
+                            net.minecraft.world.entity.ai.attributes.Attributes.AIR_DRAG_MODIFIER);
+            float vf = 1.0F - (1.0F - 0.98F) * dragMod; // computeModifiedFriction
+            if (vf < 0.0F) vf = 0.0F;
+            if (vf > 1.0F) vf = 1.0F;
+            if (d.y != -g * (double) vf) return false;
+            Object stuck = U.getObject(e, O_STUCK);
+            if (stuck instanceof net.minecraft.world.phys.Vec3 sv
+                    && sv.x * sv.x + sv.y * sv.y + sv.z * sv.z > 1.0e-7) {
+                return false;
+            }
+            // travel's own router: the fluid branch must not be taken
+            net.minecraft.world.level.material.FluidState fs =
+                    e.level().getFluidState(e.blockPosition());
+            if (e.isInLiquid() && e.isAffectedByFluids() && !e.canStandOnFluid(fs)) {
+                return false;
+            }
+            // every footprint column at the ground layer must be a FULL
+            // block: the swept down-move then clips to exactly zero. The
+            // column range mirrors the gather's EPS7 intersect margins
+            // (touching columns never gather).
+            net.minecraft.world.phys.AABB box = e.getBoundingBox();
+            int gy = (int) y - 1;
+            int x0 = net.minecraft.util.Mth.floor(box.minX + 1.0e-7);
+            int x1 = net.minecraft.util.Mth.floor(box.maxX - 1.0e-7);
+            int z0 = net.minecraft.util.Mth.floor(box.minZ + 1.0e-7);
+            int z1 = net.minecraft.util.Mth.floor(box.maxZ - 1.0e-7);
+            net.minecraft.world.level.Level lvl = e.level();
+            for (int bx = x0; bx <= x1; bx++) {
+                for (int bz = z0; bz <= z1; bz++) {
+                    net.minecraft.core.BlockPos bp =
+                            new net.minecraft.core.BlockPos(bx, gy, bz);
+                    if (!lvl.getBlockState(bp).isCollisionShapeFullBlock(lvl, bp)) {
+                        return false;
+                    }
+                }
+            }
+            // no hard entity colliders in the swept slab (the same query
+            // the vanilla collide runs), strictly inside the border
+            net.minecraft.world.phys.AABB swept = new net.minecraft.world.phys.AABB(
+                    box.minX, box.minY + d.y, box.minZ, box.maxX, box.minY, box.maxZ);
+            java.util.List<net.minecraft.world.phys.AABB> hard =
+                    new java.util.ArrayList<>(2);
+            ca.spottedleaf.moonrise.patches.collisions.CollisionUtil
+                    .getEntityHardCollisions(lvl, e, swept, hard, 0, null);
+            if (!hard.isEmpty()) return false;
+            net.minecraft.world.level.border.WorldBorder wb = lvl.getWorldBorder();
+            if (box.minX <= wb.getMinX() || box.maxX >= wb.getMaxX()
+                    || box.minZ <= wb.getMinZ() || box.maxZ >= wb.getMaxZ()) {
+                return false;
+            }
+            travelQuiet++;
+            return true;
+        } catch (Throwable t) {
+            travelFail++;
+            lastError = System.nanoTime();
+            lastErrorText = "mobTravelNative: " + t;
+            return false;
+        }
+    }
+
     private static void initDataOffsets() {
         if (O_ED_ITEMS >= 0 || U == null) return;
         try {
@@ -2416,6 +2563,12 @@ public final class CeHooks {
                     Class.forName(
                             "net.minecraft.network.syncher.SynchedEntityData$DataItem")
                             .getDeclaredField("value"));
+            // L20 quiet-travel floor: the protected LivingEntity input fields
+            O_XXA = offOf(net.minecraft.world.entity.LivingEntity.class, "xxa");
+            O_YYA = offOf(net.minecraft.world.entity.LivingEntity.class, "yya");
+            O_ZZA = offOf(net.minecraft.world.entity.LivingEntity.class, "zza");
+            O_STUCK = offOf(net.minecraft.world.entity.Entity.class,
+                    "stuckSpeedMultiplier");
         } catch (Throwable t) {
             O_ED_ITEMS = -1; // gates fall back to the get() chain
         }

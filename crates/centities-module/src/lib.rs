@@ -1028,27 +1028,53 @@ fn precompute_livingentity(loader: jni::jobject) {
     // that throw in their tick; the first CI run lost every zombie to
     // exactly this). Passing the receiver as the base Entity type is the
     // itemDispatch pattern (widening is verifier-clean).
-    let spec = cplug_sdk::asm::EarlyReturnGuard {
+    let push_spec = cplug_sdk::asm::EarlyReturnGuard {
         method_name: "pushEntities",
         method_desc: "()V",
         check_class: HOOKS_CLASS,
         check_name: "pushDispatch",
         check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
     };
+    // L20 quiet-travel floor: the same class carries the second guard.
+    // The two prefixes chain (travel first, then push); both are OPTIONAL
+    // — a refused travel weave keeps the push guard and vice versa.
+    let travel_spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "travel",
+        method_desc: "(Lnet/minecraft/world/phys/Vec3;)V",
+        check_class: HOOKS_CLASS,
+        check_name: "mobTravelNative",
+        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;)Z",
+    };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+        // The two guards are INDEPENDENT prefixes on the same class: a
+        // refusal of one keeps the other (both are optional weaves).
+        let Some(b1) =
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &push_spec)
+        else {
+            return cplug_sdk::asm::insert_early_return_guard(
+                env, loader, &bytes, &travel_spec,
+            );
+        };
+        let Some(b2) =
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &b1, &travel_spec)
+        else {
+            return Some(b1); // the push guard alone
+        };
+        Some(b2)
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
                 pc.insert(LIVING_ENTITY_CLASS, b);
             }
-            cplug_sdk::log::info("[c-entities] precomputed LivingEntity push dispatch guard");
+            cplug_sdk::log::info(
+                "[c-entities] precomputed LivingEntity push + quiet-travel guards",
+            );
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
             cplug_sdk::log::info(
-                "[c-entities] FAILED to precompute LivingEntity push guard — vanilla pushes kept",
+                "[c-entities] FAILED to precompute LivingEntity guards — vanilla kept",
             );
         }
     }
