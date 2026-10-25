@@ -401,6 +401,14 @@ const B_LAND: i32 = 1 << 9;
 const B_VANILLA_NEXT: i32 = 1 << 11;
 const B_NATIVE_OK: i32 = 1 << 12;
 const B_ABORTED: i32 = 1 << 13;
+/// L16: post-tick delta is bit-identical to the pre-tick delta. Vanilla
+/// still allocates a fresh Vec3 and rewrites the field every tick — the
+/// FIELD VALUE is the same, so skipping the Java writeback is value-exact.
+/// A resting item reaches the (0,0,0) fixed point after landing: gravity
+/// (-0.04) is applied, move() collides and zeroes the collided axis, and
+/// 0.0 * friction == 0.0 exactly — so the mask holds every tick after the
+/// item settles and the flush drops the setDeltaMovement call entirely.
+const B_DELTA_SAME: i32 = 1 << 14;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -823,6 +831,9 @@ unsafe fn n_item_tick_impl(
                                                 let id = id_c[j];
                                                 let f = f_c[j] & 0x3F;
                                                 let st = &mut st_c[j];
+                                                // L16: pre-tick delta snapshot for
+                                                // the DELTA_SAME mask below
+                                                let (pdx, pdy, pdz) = (st.dx, st.dy, st.dz);
                                                 let outcome = if (f & F_INACTIVE) != 0 {
                                                     tick_item_inactive(st)
                                                 } else {
@@ -861,6 +872,9 @@ unsafe fn n_item_tick_impl(
                                                 if outcome.has(TickOutcome::MOVED) { ob |= B_MOVED; }
                                                 if outcome.has(TickOutcome::ON_GROUND) { ob |= B_ON_GROUND; }
                                                 if outcome.has(TickOutcome::HAS_IMPULSE) { ob |= B_IMPULSE; }
+                                                if st.dx == pdx && st.dy == pdy && st.dz == pdz {
+                                                    ob |= B_DELTA_SAME;
+                                                }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
                                                 if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
                                                 if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }

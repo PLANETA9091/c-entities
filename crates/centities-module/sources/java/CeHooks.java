@@ -1330,7 +1330,17 @@ public final class CeHooks {
         } else {
             winN = 0;
         }
-        if (total == 0) { rowEmpty++; return new ArrayList<>(0); }
+        if (total == 0) {
+            // L16: the shared immutable empty list. At ~32k queries/tick the
+            // per-query ArrayList(0) churned ~25MB/s of TLAB garbage that
+            // shows up as allocator + GC pressure (Arrays.copyOf shows in the
+            // leg). The query CONTRACT is read-only iteration; every in-tree
+            // caller (push resolve, merge scan, goal targeting) only reads.
+            // A mutating caller would throw UnsupportedOperationException and
+            // flip the kill switch loudly — never silently corrupt.
+            rowEmpty++;
+            return java.util.Collections.emptyList();
+        }
         // Row-size ceiling (L4c, graded): the row path pays a per-candidate
         // home re-check + live-box test in Java (~40-70ns each), while the
         // native query pays a FIXED ~13-30us JNI+drain+publish toll and then
@@ -1451,8 +1461,15 @@ public final class CeHooks {
     private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[16];
 
     public static int worldId(net.minecraft.world.level.Level level) {
-        // hot loop: ~4 identity compares typical (1-3 live query worlds)
-        for (int w = 0; w < 16; w++) {
+        // L16: the benchmarks keep exactly THREE live query worlds
+        // (overworld, nether, end) in slots 0-2 — the unrolled identity
+        // probes below hit on ~all calls with 1-3 compares and no loop
+        // bookkeeping. The general 16-slot scan stays for any shape beyond
+        // that (worlds >= 3, plugin worlds), then the map.
+        if (WID_SLOTS[0] == level) return 0;
+        if (WID_SLOTS[1] == level) return 1;
+        if (WID_SLOTS[2] == level) return 2;
+        for (int w = 3; w < 16; w++) {
             if (WID_SLOTS[w] == level) {
                 return w;
             }
@@ -2168,9 +2185,59 @@ public final class CeHooks {
      *  guaranteed, so it is the fallback (and, for the two fields the
      *  collector reads per tick, reflection on a cached Field costs
      *  ~15-25ns which is acceptable). */
+    // ===================================================================
+    // L16 — the Unsafe floor. The L15 profile (b0a2095) put 12.86% of the
+    // items-100k leg INSIDE java.lang.invoke.VarHandleReferences — every
+    // RefField read paid a megamorphic VarHandle.invoke chain on top of the
+    // actual field load. sun.misc.Unsafe with a captured field offset
+    // compiles to the getfield itself: ~1-2ns vs ~15-30ns, zero extra
+    // frames. The VarHandle/reflection paths stay as the fallback for a
+    // JVM that refuses theUnsafe (behaviour identical, just slower).
+    // ===================================================================
+    private static final sun.misc.Unsafe U;
+    static {
+        sun.misc.Unsafe u = null;
+        try {
+            java.lang.reflect.Field f =
+                    sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            u = (sun.misc.Unsafe) f.get(null);
+        } catch (Throwable t) {
+            u = null; // fallback: VarHandle / reflection below
+        }
+        U = u;
+    }
+
+    /** Direct-offset read/write helpers for fields captured outside
+     *  RefField (the tracker guard's Entity-side flags). All callers hold
+     *  the offset from offOf() at arm time; a null U never reaches them
+     *  (offOf throws instead). */
+    private static long offOf(Class<?> start, String name) {
+        Class<?> k = start;
+        while (k != null) {
+            try {
+                java.lang.reflect.Field f = k.getDeclaredField(name);
+                f.setAccessible(true);
+                return U.objectFieldOffset(f);
+            } catch (NoSuchFieldException notHere) {
+                k = k.getSuperclass();
+            } catch (Throwable t) {
+                break;
+            }
+        }
+        throw new IllegalStateException("offOf: " + start.getName() + "." + name);
+    }
+    private static Object refAt(Object o, long off) { return U.getObject(o, off); }
+    private static void putRefAt(Object o, long off, Object v) { U.putObject(o, off, v); }
+    private static int intAt(Object o, long off) { return U.getInt(o, off); }
+    private static void putIntAt(Object o, long off, int v) { U.putInt(o, off, v); }
+
     private static final class RefField {
         final java.lang.reflect.Field f;
         final VarHandle vh;
+        /** L16: the Unsafe field offset — the fast path for every read and
+         *  write below. -1 only when U is null (the fallback JVM). */
+        final long off;
         RefField(Class<?> start, String name) throws ReflectiveOperationException {
             Class<?> k = start;
             java.lang.reflect.Field found = null;
@@ -2191,8 +2258,18 @@ public final class CeHooks {
                 h = null; // plain reflection fallback
             }
             vh = h;
+            long o = -1L;
+            if (U != null) {
+                try {
+                    o = U.objectFieldOffset(found);
+                } catch (Throwable uRefused) {
+                    o = -1L;
+                }
+            }
+            off = o;
         }
         int getInt(Object o) {
+            if (off >= 0) return U.getInt(o, off);
             try {
                 return vh != null ? (int) vh.get(o) : f.getInt(o);
             } catch (IllegalAccessException neverWithSetAccessible) {
@@ -2200,6 +2277,7 @@ public final class CeHooks {
             }
         }
         long getLong(Object o) {
+            if (off >= 0) return U.getLong(o, off);
             try {
                 return vh != null ? (long) vh.get(o) : f.getLong(o);
             } catch (IllegalAccessException neverWithSetAccessible) {
@@ -2207,6 +2285,7 @@ public final class CeHooks {
             }
         }
         void setInt(Object o, int v) {
+            if (off >= 0) { U.putInt(o, off, v); return; }
             try {
                 if (vh != null) vh.set(o, v); else f.setInt(o, v);
             } catch (IllegalAccessException neverWithSetAccessible) {
@@ -2214,6 +2293,7 @@ public final class CeHooks {
             }
         }
         Object getObj(Object o) {
+            if (off >= 0) return U.getObject(o, off);
             try {
                 return vh != null ? vh.get(o) : f.get(o);
             } catch (IllegalAccessException neverWithSetAccessible) {
@@ -2221,6 +2301,7 @@ public final class CeHooks {
             }
         }
         void setObj(Object o, Object v) {
+            if (off >= 0) { U.putObject(o, off, v); return; }
             try {
                 if (vh != null) vh.set(o, v); else f.set(o, v);
             } catch (IllegalAccessException neverWithSetAccessible) {
@@ -2531,7 +2612,17 @@ public final class CeHooks {
                     continue;
                 }
                 int o = i * 8;
-                e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                // L16 DELTA_SAME: when the core reports the post-tick delta
+                // is bit-identical to the pre-tick delta (the resting-item
+                // fixed point: gravity -0.04, collide zeroes the axis,
+                // 0.0 * friction == 0.0), vanilla would still allocate a
+                // fresh Vec3 and rewrite the field — the FIELD VALUE is the
+                // same, so skipping the write is value-exact. This drops
+                // ~100k Vec3 allocations + virtual writes per tick on
+                // items-100k (setDeltaMovement self was 3.5% of the leg).
+                if ((bits & (1 << 14)) == 0) { // not DELTA_SAME
+                    e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                }
                 e.age = outI[i * 4];
                 e.pickupDelay = outI[i * 4 + 1];
                 setFallDist(e, (float) outD[o + 6]);
@@ -3211,8 +3302,112 @@ public final class CeHooks {
         int n;
     }
 
-    private static final java.util.concurrent.ConcurrentMap<Object, AIShadow> AI_SHADOWS =
-            new com.google.common.collect.MapMaker().weakKeys().makeMap();
+    // L16: the shadow map was a Guava MapMaker weak-keys ConcurrentMap —
+    // the 26.3 mobs-25k-mod profile billed its segment chain
+    // (Segment.getFirst 1.46% + getEntry 0.57%) per tick per selector
+    // (25k mobs). This table is a flat open-addressed identity probe with
+    // WEAK keys: one identityHashCode, one slot, one WeakReference.get()
+    // — ~5-10ns. Dead entries (GC-cleared selectors) are reused in place
+    // on the next probe that touches them; a periodic sweep rebuilds the
+    // table when dead slots pile up (mob churn). Server-thread confined
+    // (every caller runs inside the goal tick phase) — plain arrays, no
+    // fences.
+    private static final class AIKey extends java.lang.ref.WeakReference<Object> {
+        final int hash;
+        AIKey(Object k) {
+            super(k);
+            hash = System.identityHashCode(k);
+        }
+    }
+
+    private static final int AI_CAP_INIT = 1 << 13;   // 8192 slots
+    private static AIKey[] AI_KEYS = new AIKey[AI_CAP_INIT];
+    private static AIShadow[] AI_VALS = new AIShadow[AI_CAP_INIT];
+    private static int AI_SIZE = 0;      // live + dead entries
+    private static int AI_DEAD = 0;      // GC-cleared entries seen while probing
+
+    private static AIShadow shadowOf(Object gs) {
+        int mask = AI_KEYS.length - 1;
+        int h = System.identityHashCode(gs);
+        int i = h & mask;
+        while (true) {
+            AIKey k = AI_KEYS[i];
+            if (k == null) {
+                AIShadow sh = new AIShadow();
+                AI_KEYS[i] = new AIKey(gs);
+                AI_VALS[i] = sh;
+                AI_SIZE++;
+                if (AI_SIZE + (AI_SIZE >> 1) >= AI_KEYS.length) {
+                    aiRebuild(AI_KEYS.length << 1);
+                }
+                return sh;
+            }
+            Object cur = k.get();
+            if (cur == gs) return AI_VALS[i];
+            if (cur == null) {
+                // dead slot: claim in place. Safe under linear probing —
+                // the incoming key's probe path starts here, so the new
+                // pair is found first; the dead key is unreachable by
+                // definition; every other chain still terminates at a
+                // null or its own live key.
+                AI_DEAD++;
+                AIShadow sh = new AIShadow();
+                AI_KEYS[i] = new AIKey(gs);
+                AI_VALS[i] = sh;
+                if (AI_DEAD > 2048 && AI_DEAD * 2 > AI_SIZE) {
+                    aiRebuild(AI_KEYS.length); // sweep dead, same capacity
+                }
+                return sh;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /** Non-inserting probe (the odd-tick fast path: a selector whose floor
+     *  tick built the shadow already hits; a fresh selector returns null and
+     *  the caller builds it with the full pass). Dead slots are tombstones:
+     *  the probe must WALK PAST them (a live entry later in the chain is
+     *  still reachable), terminating at the first true null. */
+    private static AIShadow aiShadowPeek(Object gs) {
+        AIKey[] keys = AI_KEYS;
+        AIShadow[] vals = AI_VALS;
+        int mask = keys.length - 1;
+        int i = System.identityHashCode(gs) & mask;
+        while (true) {
+            AIKey k = keys[i];
+            if (k == null) return null;
+            Object cur = k.get();
+            if (cur == gs) return vals[i];
+            i = (i + 1) & mask;
+        }
+    }
+
+    /** Rehash (capacity 0 = same capacity, dead sweep only). Keeps the
+     *  live pairs, drops the dead ones. Called from the server thread —
+     *  no racing readers. */
+    private static void aiRebuild(int newCap) {
+        AIKey[] oldKeys = AI_KEYS;
+        AIShadow[] oldVals = AI_VALS;
+        AIKey[] nk = new AIKey[newCap];
+        AIShadow[] nv = new AIShadow[newCap];
+        int mask = newCap - 1;
+        int live = 0;
+        for (int j = 0; j < oldKeys.length; j++) {
+            AIKey k = oldKeys[j];
+            if (k == null) continue;
+            Object cur = k.get();
+            if (cur == null) continue; // dead — dropped
+            int i = k.hash & mask;
+            while (nk[i] != null) i = (i + 1) & mask;
+            nk[i] = k;
+            nv[i] = oldVals[j];
+            live++;
+        }
+        AI_KEYS = nk;
+        AI_VALS = nv;
+        AI_SIZE = live;
+        AI_DEAD = 0;
+    }
 
     private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_LOCK_TABLE =
             ThreadLocal.withInitial(
@@ -3238,16 +3433,6 @@ public final class CeHooks {
             lastErrorText = "initAIHandles: " + t;
             AI_HANDLES_OK = false;
         }
-    }
-
-    private static AIShadow shadowOf(Object gs) {
-        AIShadow sh = AI_SHADOWS.get(gs);
-        if (sh == null) {
-            sh = new AIShadow();
-            AIShadow race = AI_SHADOWS.putIfAbsent(gs, sh);
-            if (race != null) sh = race;
-        }
-        return sh;
     }
 
     private static long disabledBacking(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
@@ -3285,7 +3470,7 @@ public final class CeHooks {
             }
         } else {
             gsFloorRunning++;
-            AIShadow sh = AI_SHADOWS.get(gs);
+            AIShadow sh = aiShadowPeek(gs);
             if (sh == null) {
                 // first odd-tick visit of a fresh selector: build the shadow
                 // with a silent full pass (isRunning reads only — no calls)
