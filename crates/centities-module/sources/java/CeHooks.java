@@ -2441,14 +2441,15 @@ public final class CeHooks {
     // hull enumeration is a strict SUPERSET of the vanilla visit set
     // (touching positions included), so "superset all-air" implies the
     // vanilla visit set is all-air — the gate fails safe to vanilla.
-    // RETRACTED to opt-in (L19b playbook): the gate correlated 1:1 with the
-    // items-100k SIGSEGV in G1SATBMarkQueueSet::filter (run 40214542647,
-    // hs_err_pid4417: the corrupt pre-value in the SATB queue = a reference
-    // store over a clobbered slot somewhere upstream of the tracker gate).
-    // The mobs legs ran the SAME gate green (-73% → -77.4%), so the bug is
-    // item-path-specific; the artifact is saved for the offline
-    // root-cause. Opt in with CE_BLOCK_FX=1.
+    // Scope: MOBS ONLY by default. The c2140cf bench proved the gate green
+    // and ~23ms fast on mobs-25k, while the items-100k leg died in the G1
+    // SATB filter (hs_err_pid4417) — ItemEntity.tick calls
+    // applyEffectsFromBlocksForLastMovements() + applyEffectsFromBlocks()
+    // BACK TO BACK, an interaction the mobs never exercise. CE_BLOCK_FX=1
+    // re-enables the item path for the bisect; the default protects it.
     public static final boolean BLOCK_FX_ON =
+            !"0".equals(System.getenv("CE_BLOCK_FX"));
+    public static final boolean BLOCK_FX_ITEMS =
             "1".equals(System.getenv("CE_BLOCK_FX"));
     public static long blockFxChecks = 0, blockFxQuiet = 0, blockFxFail = 0;
     // Block class -> stepOn is the empty base implementation (probed once
@@ -2473,6 +2474,7 @@ public final class CeHooks {
 
     public static boolean mobBlockEffectsNoOp(net.minecraft.world.entity.Entity e) {
         if (!ACTIVE || !BLOCK_FX_ON || O_MOVEMENT_TICK < 0) return false;
+        if (!BLOCK_FX_ITEMS && !(e instanceof net.minecraft.world.entity.Mob)) return false;
         blockFxChecks++;
         try {
             if (e.isRemoved() || e.noPhysics || !e.isAlive()) return false;
@@ -4452,8 +4454,14 @@ public final class CeHooks {
     // serverAiStep mirror (the L15-floored GoalSelector bodies included).
     // ==================================================================
 
+    // MEASURED NET LOSS on the 26.3 bench (e774d00: mobs-25k 193.2 vs
+    // 129.5 without it): the staged-request protocol pays a pack+JNI round
+    // per staged predicate, and the bench's TARGETED zombies stage a
+    // canContinueToUse + canUse EVERY even tick — the rounds cost more than
+    // the virtual calls they replace. Opt in with -Dcentities.mobAi=1
+    // until the pre-resolved-predicate redesign lands (doc 30).
     public static final boolean MOB_AI_ON_INIT =
-            !"0".equals(System.getProperty("centities.mobAi", "true"));
+            "1".equals(System.getProperty("centities.mobAi", "0"));
     public static volatile boolean MOB_AI_ON = false;
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
