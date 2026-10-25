@@ -409,6 +409,13 @@ const B_ABORTED: i32 = 1 << 13;
 /// 0.0 * friction == 0.0 exactly — so the mask holds every tick after the
 /// item settles and the flush drops the setDeltaMovement call entirely.
 const B_DELTA_SAME: i32 = 1 << 14;
+/// REST candidate: the tick was a VALUE fixed point (pos/delta/ground/fall
+/// identical, no events, no vanilla_next) — the dispatch guard may run the
+/// counter arithmetic (tickCount/totalEntityAge/age/pickupDelay/despawn)
+/// inline and keep the item out of the flush cycle entirely. Wakes
+/// (probes, section changes, the 256-tick belt) clear the rest mode; the
+/// next full native tick re-proves it.
+const B_REST_CAND: i32 = 1 << 15;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -832,8 +839,13 @@ unsafe fn n_item_tick_impl(
                                                 let f = f_c[j] & 0x3F;
                                                 let st = &mut st_c[j];
                                                 // L16: pre-tick delta snapshot for
-                                                // the DELTA_SAME mask below
+                                                // the DELTA_SAME mask below; the
+                                                // rest of the state snapshots feed
+                                                // the REST_CAND fixed-point test
                                                 let (pdx, pdy, pdz) = (st.dx, st.dy, st.dz);
+                                                let (px, py, pz) = (st.x, st.y, st.z);
+                                                let pground = st.on_ground;
+                                                let pfall = st.fall_dist;
                                                 let outcome = if (f & F_INACTIVE) != 0 {
                                                     tick_item_inactive(st)
                                                 } else {
@@ -889,6 +901,36 @@ unsafe fn n_item_tick_impl(
                                                     ob |= B_VANILLA_NEXT;
                                                 } else {
                                                     ob |= B_NATIVE_OK;
+                                                    // REST candidate: a value fixed point
+                                                    // with no events. The %4 zero-delta
+                                                    // move gate writes setPos with
+                                                    // IDENTICAL values (MOVED set, no
+                                                    // state change) — the pos compare
+                                                    // below is the exact test, so MOVED
+                                                    // is deliberately not in the mask.
+                                                    let quiet = outcome.0
+                                                        & (TickOutcome::HAS_IMPULSE
+                                                            | TickOutcome::H_COLL
+                                                            | TickOutcome::V_COLL
+                                                            | TickOutcome::MERGE
+                                                            | TickOutcome::MERGE2
+                                                            | TickOutcome::DESPAWN
+                                                            | TickOutcome::VOID
+                                                            | TickOutcome::ABORTED
+                                                            | TickOutcome::LAND)
+                                                        == 0;
+                                                    if quiet
+                                                        && st.x == px
+                                                        && st.y == py
+                                                        && st.z == pz
+                                                        && st.dx == pdx
+                                                        && st.dy == pdy
+                                                        && st.dz == pdz
+                                                        && st.on_ground == pground
+                                                        && st.fall_dist == pfall
+                                                    {
+                                                        ob |= B_REST_CAND;
+                                                    }
                                                 }
                                                 oi_c[j * 4 + 2] = ob;
                                                 oi_c[j * 4 + 3] = st.tick_count;

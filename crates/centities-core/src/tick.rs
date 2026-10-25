@@ -450,6 +450,12 @@ pub fn tick_item(
     }
 
     // ===== commit phase (all checks passed) =====
+    // ItemEntity.tick: the pickupDelay decrement sits right after
+    // super.tick() in vanilla — an independent scalar on the pre-tick
+    // value, so the hoisted read-only phase above cannot skew it.
+    if st.pickup_delay > 0 && st.pickup_delay != 32767 {
+        st.pickup_delay -= 1;
+    }
     st.xo = st.x;
     st.yo = st.y;
     st.zo = st.z;

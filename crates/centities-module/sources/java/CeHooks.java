@@ -427,6 +427,7 @@ public final class CeHooks {
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
+                + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
@@ -1692,6 +1693,13 @@ public final class CeHooks {
     private static final int IB_CAP = 1 << 17;
     private static final long[] IB_IDS = new long[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
+    // L21: the entity ref captured AT COLLECT — the flush applies through
+    // this (one array read) instead of arenaRef(id) (an ARENA read + the
+    // megamorphic cand.getId() staleness call: measured 15.6% of the
+    // items-100k-mod leg). The batch is per-tick state, so no id-match
+    // staleness check is needed: a mid-tick removal is caught by
+    // isRemoved() (a plain field read).
+    private static final Entity[] IB_REF = new Entity[IB_CAP];
     // L8.2 COMPACT BATCH: only collector-data entries (resync /
     // force-vanilla — the rare population) carry the 14-double state stride;
     // they are side-packed contiguously into IB_CD. The 1-based slot number
@@ -2000,6 +2008,83 @@ public final class CeHooks {
         try {
             if (e.level().isClientSide()) return false;
             int slot = e.getId() & MAMASK;
+            if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
+                if (REST_ID[slot] != e.getId()) {
+                    // slot turnover: entity ids are monotonic per run, so a
+                    // mismatched stamp belongs to a dead predecessor
+                    MODE_VAL[slot] = 0;
+                } else {
+                    // cheap gates (the same set the native path runs): any
+                    // hit leaves rest — vanilla computes the tick exactly
+                    // and the resync re-arms the mode (the L6 protocol)
+                    if (e.isRemoved() || e.noPhysics
+                            || e.portalProcess != null || e.isOnPortalCooldown()
+                            || stackEmptyDispatch(e)
+                            || !e.getPassengers().isEmpty()
+                            || ARENA[e.getId() & AMASK] != e) {
+                        MODE_VAL[slot] = 0;
+                        restExits++;
+                        dispPass++;
+                        return false;
+                    }
+                    if (MODE_REV[slot] != WORLD_REV) {
+                        dispGate++;
+                        // the global revision moved: exit only when THIS
+                        // item's environment was touched (a block change
+                        // anywhere must not herd the whole rest set)
+                        if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
+                                || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
+                            MODE_VAL[slot] = 0;
+                            restExits++;
+                            dispPass++;
+                            return false;
+                        }
+                        MODE_REV[slot] = WORLD_REV; // stale-but-boring
+                        restSectKeeps++;
+                    }
+                    boolean active = itemCheckActive(e);
+                    // dispatcher prologue mirror (the suppressed
+                    // tickNonPassenger: setOldPosAndRot is value-identical
+                    // at a fixed point, the counters are not)
+                    e.tickCount = e.tickCount + 1;
+                    e.totalEntityAge = e.totalEntityAge + 1;
+                    // vanilla tick() order: pickupDelay--, merge cadence
+                    // (active ticks only), age++, despawn. The merge scan
+                    // runs INLINE (the exact L3 path) — a merge's own state
+                    // changes are exact vanilla writes, so rest continues;
+                    // an absorbed item keeps running the tail exactly like
+                    // the vanilla body does.
+                    boolean pdDec = false;
+                    if (e.pickupDelay > 0 && e.pickupDelay != 32767) {
+                        e.pickupDelay = e.pickupDelay - 1;
+                        pdDec = true;
+                    }
+                    if (active && e.tickCount % 40 == 0) {
+                        if (!mergeScanNative(e)) {
+                            // index unsure: UNDO the mirror and let the
+                            // vanilla body compute the whole tick (counters
+                            // included) exactly — the resync re-arms rest
+                            MODE_VAL[slot] = 0;
+                            e.tickCount = e.tickCount - 1;
+                            e.totalEntityAge = e.totalEntityAge - 1;
+                            if (pdDec) {
+                                e.pickupDelay = e.pickupDelay + 1;
+                            }
+                            dispPass++;
+                            return false;
+                        }
+                    }
+                    if (e.age != -32768) {
+                        e.age = e.age + 1;
+                    }
+                    if (e.age >= VH_DESPAWN_RATE.getInt(e)) {
+                        despawnTail(e);
+                    }
+                    MODE_GEN[slot] = MODE_EPOCH; // keep the recency stamp alive
+                    dispRest++;
+                    return true;
+                }
+            }
             if (MODE_GEN[slot] != MODE_EPOCH || MODE_VAL[slot] == 0) {
                 dispPass++;
                 return false;
@@ -2102,6 +2187,7 @@ public final class CeHooks {
         ibN = i + 1;
         IB_IDS[i] = e.getId();
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
+        IB_REF[i] = e;
         IB_I[i * 4] = 0;
         IB_I[i * 4 + 1] = 0;
         IB_I[i * 4 + 2] = e.pickupDelay;
@@ -2156,6 +2242,59 @@ public final class CeHooks {
     private static final int[] MODE_GEN = new int[1 << 22];
     private static volatile int MODE_EPOCH = 1;
     private static final int MAMASK = (1 << 22) - 1;
+
+    // ---- L21 native rest ----
+    // MODE_VAL == 2 means: the item's last native tick was a VALUE fixed
+    // point (pos/delta/ground/fall identical, no events) — the dispatch
+    // guard runs the exact counter arithmetic inline (tickCount,
+    // totalEntityAge, pickupDelay, age, despawn, merge cadence) and the
+    // item skips the whole collect -> flush -> apply cycle. REST_ID holds
+    // the FULL entity id the stamp was proven for: entity ids are
+    // monotonic per run, so a slot-colliding successor can never inherit
+    // the fixed-point proof (the ARENA ref is kept as defense in depth).
+    private static final long[] REST_ID = new long[1 << 22];
+    // Per-section revision stamps: the flush drain stamps every invalidated
+    // section with the post-bump WORLD_REV. A rest item whose environment
+    // sections were not touched by the current revision keeps resting even
+    // though the GLOBAL revision moved (a block change anywhere must not
+    // herd every rest item through a vanilla tick).
+    private static final int[] SECT_REV = new int[1 << 18];
+    private static final int SECT_MASK = (1 << 18) - 1;
+    public static volatile long dispRest = 0, restExits = 0, restSectKeeps = 0;
+
+    private static int sectKeySlot(int sx, int sy, int sz) {
+        return (int) ((((sx & 0x3FF) << 20) | ((sy & 0x3FF) << 10) | (sz & 0x3FF)) & SECT_MASK);
+    }
+
+    /** True when any section of the item's tick environment was touched by
+     *  the CURRENT world revision. The envelope covers every block read the
+     *  native tick makes: the box span (0.25 x 0.25 x 0.25), the swept box
+     *  (gravity reaches 0.04 below), the friction/supporting block (one
+     *  block below), and find_supporting_block's \u00b11 block scan margin.
+     *  Only reached on a MODE_REV mismatch (a global block-change bump). */
+    private static boolean restSectionTouched(ItemEntity e) {
+        int rev = WORLD_REV;
+        if (rev == 0) {
+            return false;
+        }
+        double x = e.getX(), y = e.getY(), z = e.getZ();
+        int bx0 = ((int) Math.floor(x - 0.125)) - 1;
+        int bx1 = ((int) Math.floor(x + 0.125)) + 1;
+        int by0 = ((int) Math.floor(y - 1.0)) - 1;
+        int by1 = ((int) Math.floor(y + 0.25)) + 1;
+        int bz0 = ((int) Math.floor(z - 0.125)) - 1;
+        int bz1 = ((int) Math.floor(z + 0.125)) + 1;
+        for (int sy = by0 >> 4; sy <= by1 >> 4; sy++) {
+            for (int sx = bx0 >> 4; sx <= bx1 >> 4; sx++) {
+                for (int sz = bz0 >> 4; sz <= bz1 >> 4; sz++) {
+                    if (SECT_REV[sectKeySlot(sx, sy, sz)] == rev) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
 
     // ---- L8.4 empty-stack dispatch cache ----
     // The tick guard must keep vanilla's FIRST-instruction parity:
@@ -2483,6 +2622,7 @@ public final class CeHooks {
         int id = e.getId();
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
+        IB_REF[i] = e;
         // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
         int ci = ibCDN;
         int o = ci * 14;
@@ -2539,8 +2679,8 @@ public final class CeHooks {
             for (int i = 0; i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
-                    Entity ref = arenaRef(IB_IDS[i]);
-                    if (!(ref instanceof ItemEntity)) continue;
+                    Entity ref = IB_REF[i];
+                    if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
                     ItemEntity e = (ItemEntity) ref;
                     int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
                     IB_CD[o] = e.getX();
@@ -2604,9 +2744,16 @@ public final class CeHooks {
             // new blocks; the vanilla_next routing self-heals this tick)
             if (sdN > 0 && sdWid >= 0) {
                 nativeItemInvalidate(sdWid, sdN, SD_X, SD_Y, SD_Z);
+                int nSd = sdN;
                 sdN = 0;
                 sdWid = -1;
                 WORLD_REV = revBefore + 1;
+                // L21 rest: stamp the touched sections with the post-bump
+                // revision — the rest branch exits only items whose tick
+                // environment (box span + the below block) was touched
+                for (int si = 0; si < nSd; si++) {
+                    SECT_REV[sectKeySlot(SD_X[si], SD_Y[si], SD_Z[si])] = WORLD_REV;
+                }
             }
 
             // pass 2: apply, in batch order (== vanilla entity tick order).
@@ -2621,13 +2768,34 @@ public final class CeHooks {
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
                 MODE_GEN[mSlot] = epoch;
-                MODE_REV[mSlot] = revBefore;
                 if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
+                    MODE_REV[mSlot] = revBefore;
                     MODE_VAL[mSlot] = 0;
                     itemVanillaNext++;
                 } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
-                    MODE_VAL[mSlot] = 1;
+                    // L21 REST: a value-fixed-point tick — the dispatch guard
+                    // takes over the counter arithmetic and the item leaves
+                    // the flush cycle until something wakes it (probe delta/
+                    // box, section change, merge cadence, the 256-tick belt,
+                    // despawn). MODE_REV is stamped with the POST-drain
+                    // revision so a stale-but-boring world revision does not
+                    // herd every rest item vanilla.
+                    Entity r0 = IB_REF[i];
+                    // the tick above ran on the PRE-drain section cache: an
+                    // environment section invalidated by THIS drain must
+                    // not enter rest (the proof sat on stale blocks)
+                    if ((bits & (1 << 15)) != 0
+                            && r0 instanceof ItemEntity ie0
+                            && !restSectionTouched(ie0)) {
+                        MODE_VAL[mSlot] = 2;
+                        REST_ID[mSlot] = IB_IDS[i];
+                        MODE_REV[mSlot] = WORLD_REV;
+                    } else {
+                        MODE_VAL[mSlot] = 1;
+                        MODE_REV[mSlot] = revBefore;
+                    }
                 } else {
+                    MODE_REV[mSlot] = revBefore;
                     MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
                                          // want_native next flush
                 }
@@ -2637,8 +2805,8 @@ public final class CeHooks {
                     if ((bits & (1 << 13)) != 0) itemAbort++;
                     continue;
                 }
-                Entity ref = arenaRef(IB_IDS[i]);
-                if (!(ref instanceof ItemEntity)) continue;
+                Entity ref = IB_REF[i];
+                if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
                 ItemEntity e = (ItemEntity) ref;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
@@ -2648,7 +2816,10 @@ public final class CeHooks {
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
                     e.age = outI[i * 4];
-                    e.pickupDelay = outI[i * 4 + 1];
+                    int pd = outI[i * 4 + 1];
+                    if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
+                        e.pickupDelay = pd;
+                    }
                     if ((bits & (1 << 7)) != 0) {
                         int rate = VH_DESPAWN_RATE.getInt(e);
                         // IF_NATIVE entries carry no batch despawnRate — the
@@ -2657,15 +2828,7 @@ public final class CeHooks {
                         boolean rateOk = (f & IF_NATIVE) != 0
                                 || rate == IB_I[i * 4 + 3];
                         if (rateOk && e.age >= rate) {
-                            itemDespawn++;
-                            Object ev = MH_DESPAWN_EV.invoke(e);
-                            Boolean cancelled = (Boolean) ev.getClass()
-                                    .getMethod("isCancelled").invoke(ev);
-                            if (cancelled) {
-                                e.age = 0;
-                            } else {
-                                MH_DISCARD.invoke(e, CAUSE_DESPAWN);
-                            }
+                            despawnTail(e);
                         }
                     }
                     continue;
@@ -2683,8 +2846,14 @@ public final class CeHooks {
                     e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
                 }
                 e.age = outI[i * 4];
-                e.pickupDelay = outI[i * 4 + 1];
-                setFallDist(e, (float) outD[o + 6]);
+                int pd = outI[i * 4 + 1];
+                if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
+                    e.pickupDelay = pd;
+                }
+                float fd = (float) outD[o + 6];
+                if (fd != e.fallDistance) { // same-value skip (resting items)
+                    setFallDist(e, fd);
+                }
                 boolean wantGround = (bits & (1 << 1)) != 0;
                 if (wantGround != e.onGround()) {
                     e.onGround = wantGround;
@@ -2707,15 +2876,7 @@ public final class CeHooks {
                     boolean rateOk = (f & IF_NATIVE) != 0
                             || rate == IB_I[i * 4 + 3];
                     if (rateOk && e.age >= rate) {
-                        itemDespawn++;
-                        Object ev = MH_DESPAWN_EV.invoke(e);
-                        Boolean cancelled = (Boolean) ev.getClass()
-                                .getMethod("isCancelled").invoke(ev);
-                        if (cancelled) {
-                            e.age = 0;
-                        } else {
-                            MH_DISCARD.invoke(e, CAUSE_DESPAWN);
-                        }
+                        despawnTail(e);
                     }
                 }
                 if ((bits & (1 << 8)) != 0) { // VOID: vanilla discard
@@ -2749,6 +2910,21 @@ public final class CeHooks {
     private static Entity arenaRef(long id) {
         Entity cand = ARENA[(int) (id & 0xFFFF_FFFFL) & AMASK];
         return (cand != null && cand.getId() == id) ? cand : null;
+    }
+
+    /** The exact vanilla despawn tail (ItemEntity.tick/inactiveTick):
+     *  callItemDespawnEvent -> cancelled ? age = 0 : discard(Cause.DESPAWN).
+     *  Shared by the flush apply and the rest branch's inline arithmetic. */
+    private static void despawnTail(ItemEntity e) throws Throwable {
+        itemDespawn++;
+        Object ev = MH_DESPAWN_EV.invoke(e);
+        Boolean cancelled = (Boolean) ev.getClass()
+                .getMethod("isCancelled").invoke(ev);
+        if (cancelled) {
+            e.age = 0;
+        } else {
+            MH_DISCARD.invoke(e, CAUSE_DESPAWN);
+        }
     }
 
     // ---- Bukkit surface via reflection (the compile classpath carries the
