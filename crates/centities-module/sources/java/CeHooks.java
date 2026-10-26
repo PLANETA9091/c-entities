@@ -2585,7 +2585,34 @@ public final class CeHooks {
     // plain longs (the L15b lesson: a volatile add per entity per tick was
     // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
     // visibility)
-    public static long travelChecks = 0, travelQuiet = 0, travelFail = 0;
+    public static long travelChecks = 0, travelQuiet = 0, travelWalk = 0, travelFail = 0;
+    // L24b: the two protected members the SHAPE C writeback needs —
+    // resolved once with setAccessible (unreflect honors the flag), the
+    // virtual dispatch stays exact through the MethodHandle
+    private static volatile MethodHandle MH_BACK_OFF_EDGE, MH_BOUNCINESS;
+    private static volatile boolean TRAVEL_MH_READY = false;
+
+    private static synchronized boolean initTravelMh() {
+        if (TRAVEL_MH_READY) return true;
+        try {
+            java.lang.reflect.Method bo = net.minecraft.world.entity.Entity.class
+                    .getDeclaredMethod("maybeBackOffFromEdge",
+                            net.minecraft.world.phys.Vec3.class,
+                            net.minecraft.world.entity.MoverType.class);
+            bo.setAccessible(true);
+            MH_BACK_OFF_EDGE = MethodHandles.lookup().unreflect(bo);
+            java.lang.reflect.Method bn = net.minecraft.world.entity.LivingEntity.class
+                    .getDeclaredMethod("getEntityBounciness");
+            bn.setAccessible(true);
+            MH_BOUNCINESS = MethodHandles.lookup().unreflect(bn);
+            TRAVEL_MH_READY = MH_BACK_OFF_EDGE != null && MH_BOUNCINESS != null;
+            return TRAVEL_MH_READY;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initTravelMh: " + t;
+            return false;
+        }
+    }
 
     public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e,
             net.minecraft.world.phys.Vec3 input) {
@@ -2620,6 +2647,206 @@ public final class CeHooks {
                     return false;
                 }
                 travelQuiet++;
+                return true;
+            }
+            // SHAPE C — the moving grounded walk on proven-open ground (the
+            // L24b port; the delta math is the bit-exact mirror of the
+            // javap'd 26.3 travelInAir chain and is pinned by
+            // centities-core/src/mobtravel.rs). Covers the dominant moving
+            // shape: a grounded untracked mob walking across open ground.
+            // Vanilla pays: 4 attribute reads, the friction block read, the
+            // moveRelative, the full collide (block shapes + hard colliders
+            // + step-up) and the flag bookkeeping. We compute the delta
+            // natively and skip the collide by PROVING the swept hull is
+            // air and the ground layer is full zero-bounce blocks under the
+            // union footprint.
+            if (d.x != 0.0 || d.z != 0.0) {
+                // NOTE on the 0.2 powder-snow/climb branch (bc 41-91 of
+                // handleRelativeFriction): it fires only when
+                // (horizontalCollision || jumping) && (onClimbable ||
+                // (wasInPowderSnow && canWalkOnPowderSnow)). The routing
+                // proves horizontalCollision false (the hull is open),
+                // requires wasInPowderSnow false, and the hull proof makes
+                // onClimbable provably false — so the branch cannot fire
+                // regardless of `jumping`, and the protected jump field
+                // needs no read. isImmobile is likewise input-side only:
+                // aiStep zeroes the input before travel sees it, so the
+                // captured input already reflects it.
+                if (input.y != 0.0F || d.y >= -1.0e-7
+                        || e.wasInPowderSnow
+                        || e.horizontalCollision || e.minorHorizontalCollision
+                        || e.onClimbable() || e.isPassenger()
+                        || e.getVehicle() != null
+                        || e.isInWater() || e.isInLava()) {
+                    return false;
+                }
+                net.minecraft.world.level.Level lvl = e.level();
+                // the steady-walker vertical fixed point: the previous
+                // tail wrote delta.y = -gravity * computeModifiedFriction(
+                // 0.98, drag) — the same shape SHAPE B pins
+                double y = e.getY();
+                if (y != Math.floor(y)) return false; // the ground-clip exactness
+                double g = e.getGravity(); // = getEffectiveGravity() (virtual)
+                if (g <= 0.0) return false;
+                float dragMod = (float) e.getAttributeValue(
+                        net.minecraft.world.entity.ai.attributes.Attributes.AIR_DRAG_MODIFIER);
+                float vf = 1.0F - (1.0F - 0.98F) * dragMod; // computeModifiedFriction
+                if (vf < 0.0F) vf = 0.0F;
+                if (vf > 1.0F) vf = 1.0F;
+                if (d.y != -g * (double) vf) return false;
+                Object stuckC = U.getObject(e, O_STUCK);
+                if (stuckC instanceof net.minecraft.world.phys.Vec3 svC
+                        && svC.x * svC.x + svC.y * svC.y + svC.z * svC.z > 1.0e-7) {
+                    return false;
+                }
+                // the untracked contract: with no recipients the move()'s
+                // sound/gameEvent tails are unobservable (sound range 16 <<
+                // mob tracking range), which is what makes the skip exact
+                Object trkC = e.moonrise$getTrackedEntity();
+                if (trkC != null && VH_SE_TRACKED_PLAYERS != null) {
+                    Object tpC = VH_SE_TRACKED_PLAYERS.getObj(trkC);
+                    if (!(tpC instanceof java.util.Set<?> tsC) || !tsC.isEmpty()) {
+                        return false;
+                    }
+                }
+                // the delta math (bit-exact; mobtravel.rs pins the floats)
+                float fmC = (float) e.getAttributeValue(
+                        net.minecraft.world.entity.ai.attributes.Attributes.FRICTION_MODIFIER);
+                float speedC = (float) e.getAttributeValue(
+                        net.minecraft.world.entity.ai.attributes.Attributes.MOVEMENT_SPEED);
+                float bfC = lvl.getBlockState(
+                        e.getBlockPosBelowThatAffectsMyMovement()).getBlock().getFriction();
+                float frictC = 1.0F - (1.0F - bfC) * fmC; // computeModifiedFriction
+                if (frictC < 0.0F) frictC = 0.0F;
+                if (frictC > 1.0F) frictC = 1.0F;
+                float fisC = frictC > 0.6F
+                        ? speedC * (0.21600002F / (frictC * frictC * frictC))
+                        : speedC;
+                double lsC = (double) input.x * (double) input.x
+                        + (double) input.y * (double) input.y
+                        + (double) input.z * (double) input.z;
+                double dmX = d.x, dmY = d.y, dmZ = d.z;
+                if (lsC >= 1.0e-7) {
+                    double nx, ny, nz;
+                    if (lsC > 1.0) {
+                        double len = Math.sqrt(lsC);
+                        nx = (double) input.x / len;
+                        ny = (double) input.y / len;
+                        nz = (double) input.z / len;
+                    } else {
+                        nx = (double) input.x;
+                        ny = (double) input.y;
+                        nz = (double) input.z;
+                    }
+                    nx *= (double) fisC;
+                    ny *= (double) fisC;
+                    nz *= (double) fisC;
+                    float yrC = e.getYRot() * 0.017453292F;
+                    float sinC = net.minecraft.util.Mth.sin((double) yrC);
+                    float cosC = net.minecraft.util.Mth.cos((double) yrC);
+                    dmX += nx * (double) cosC - nz * (double) sinC;
+                    dmY += ny;
+                    dmZ += nz * (double) cosC + nx * (double) sinC;
+                }
+                // maybeBackOffFromEdge must be the identity (non-sneaking
+                // mobs) — compare by reference like the no-op returns
+                if (!initTravelMh()) return false;
+                net.minecraft.world.phys.Vec3 wantedC =
+                        new net.minecraft.world.phys.Vec3(dmX, dmY, dmZ);
+                if (MH_BACK_OFF_EDGE.invoke(e, wantedC,
+                        net.minecraft.world.entity.MoverType.SELF) != wantedC) {
+                    return false;
+                }
+                // --- the hull proof ---
+                net.minecraft.world.phys.AABB boxC = e.getBoundingBox();
+                double hy0C = boxC.minY + dmY; // dmY < 0: the swept bottom
+                double hx0C = Math.min(boxC.minX, boxC.minX + dmX);
+                double hx1C = Math.max(boxC.maxX, boxC.maxX + dmX);
+                double hz0C = Math.min(boxC.minZ, boxC.minZ + dmZ);
+                double hz1C = Math.max(boxC.maxZ, boxC.maxZ + dmZ);
+                int gyC = (int) y - 1;
+                if (net.minecraft.util.Mth.floor(hy0C) != gyC) return false;
+                // the body layers (a SUPERSET of the collide's strict set:
+                // the ±1e-7 outer margin can only route vanilla more often)
+                int ax0 = net.minecraft.util.Mth.floor(hx0C - 1.0e-7);
+                int ax1 = net.minecraft.util.Mth.floor(hx1C + 1.0e-7);
+                int az0 = net.minecraft.util.Mth.floor(hz0C - 1.0e-7);
+                int az1 = net.minecraft.util.Mth.floor(hz1C + 1.0e-7);
+                int ay0 = gyC + 1;
+                int ay1 = net.minecraft.util.Mth.floor(boxC.maxY - 1.0e-7);
+                if ((ax1 - ax0 + 1) * (long) (az1 - az0 + 1)
+                        * (ay1 - ay0 + 1) > 4096L) {
+                    return false;
+                }
+                if (((double) MH_BOUNCINESS.invoke(e)) != 0.0) return false;
+                for (int bx = ax0; bx <= ax1; bx++) {
+                    for (int bz = az0; bz <= az1; bz++) {
+                        for (int by = ay0; by <= ay1; by++) {
+                            if (!lvl.getBlockState(
+                                    new net.minecraft.core.BlockPos(bx, by, bz)).isAir()) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                // the ground layer: full zero-bounce blocks under the
+                // UNION footprint (the touch margins mirror the gather)
+                int gx0 = net.minecraft.util.Mth.floor(hx0C + 1.0e-7);
+                int gx1 = net.minecraft.util.Mth.floor(hx1C - 1.0e-7);
+                int gz0 = net.minecraft.util.Mth.floor(hz0C + 1.0e-7);
+                int gz1 = net.minecraft.util.Mth.floor(hz1C - 1.0e-7);
+                for (int bx = gx0; bx <= gx1; bx++) {
+                    for (int bz = gz0; bz <= gz1; bz++) {
+                        net.minecraft.core.BlockPos bpC =
+                                new net.minecraft.core.BlockPos(bx, gyC, bz);
+                        net.minecraft.world.level.block.state.BlockState stC =
+                                lvl.getBlockState(bpC);
+                        if (!stC.isCollisionShapeFullBlock(lvl, bpC)
+                                || stC.getBlock().getBounceRestitution() != 0.0F) {
+                            return false;
+                        }
+                    }
+                }
+                net.minecraft.world.phys.AABB sweptC = new net.minecraft.world.phys.AABB(
+                        hx0C, hy0C, hz0C, hx1C, boxC.maxY, hz1C);
+                java.util.List<net.minecraft.world.phys.AABB> hardC =
+                        new java.util.ArrayList<>(2);
+                ca.spottedleaf.moonrise.patches.collisions.CollisionUtil
+                        .getEntityHardCollisions(lvl, e, sweptC, hardC, 0, null);
+                if (!hardC.isEmpty()) return false;
+                net.minecraft.world.level.border.WorldBorder wbC = lvl.getWorldBorder();
+                if (boxC.minX + dmX <= wbC.getMinX() || boxC.maxX + dmX >= wbC.getMaxX()
+                        || boxC.minZ + dmZ <= wbC.getMinZ() || boxC.maxZ + dmZ >= wbC.getMaxZ()) {
+                    return false;
+                }
+                // --- the writeback (the exact vanilla order) ---
+                // move(): setPos(position + clipped); recordMovement;
+                // horizontalCollision=false (proven equal); vertical
+                // Collision=true / below=true (same-value writes — the
+                // pre-state is required); setOnGroundWithMovement — the
+                // REAL Level supporting-block rescan (exact by
+                // construction); checkFallDamage(0.0, true, ..) is a
+                // proven no-op (fallDistance==0, moved dy==0.0). The
+                // restitution zeroed dmY. The travel tail applies the drag
+                // to the post-restitution delta. addMovementThisTick is
+                // NOT reproduced: for mobs the deque is consumed only by
+                // applyEffectsFromBlocks, which the block-fx gate no-ops
+                // on the SAME all-air hull — the record is unobservable,
+                // and skipping it keeps that gate armed.
+                e.setPos(e.getX() + dmX, y, e.getZ() + dmZ);
+                net.minecraft.world.phys.Vec3 clippedC =
+                        new net.minecraft.world.phys.Vec3(dmX, 0.0, dmZ);
+                e.recordMovement(net.minecraft.world.entity.MoverType.SELF, clippedC);
+                e.setOnGroundWithMovement(true, false, clippedC);
+                float hdC = 1.0F - (1.0F - 0.91F) * dragMod; // the horizontal drag
+                if (hdC < 0.0F) hdC = 0.0F;
+                if (hdC > 1.0F) hdC = 1.0F;
+                float hC = frictC * hdC;
+                e.setDeltaMovement(new net.minecraft.world.phys.Vec3(
+                        dmX * (double) hC,
+                        (0.0 - g) * (double) vf,
+                        dmZ * (double) hC));
+                travelWalk++;
                 return true;
             }
             // SHAPE B: the standing fixed point (0, -g * vf, 0)
