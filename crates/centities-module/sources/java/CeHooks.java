@@ -1472,7 +1472,33 @@ public final class CeHooks {
     // slot is claimed only when null (winner writes its own id there).
     private static final net.minecraft.world.level.Level[] WID_SLOTS = new net.minecraft.world.level.Level[16];
 
+    // L27: the single-slot memo. worldId is called >1M times/tick (query,
+    // probe and push bridges, one to three times per entity per tick); the
+    // L16 unroll costs 1-3 static-array loads + compares. One immutable
+    // (level, id) pair published atomically through a volatile field is ONE
+    // load + one identity compare on the hot path — and no torn-pair hazard:
+    // the L19 idea of two plain statics (last level, last id) can interleave
+    // a server-thread write with a worldgen-worker write into a mismatched
+    // pair (level of one world, id of another — a cross-world index leak).
+    // A single volatile reference publish is atomic; writers race benignly
+    // (any published pair is self-consistent, and the fall-through path
+    // still resolves and publishes the correct one). The dead L19 widFast
+    // (zero callers — the hot paths all call worldId directly) is removed
+    // with its torn-pair pair.
+    private record WidMemo(net.minecraft.world.level.Level level, int id) {
+    }
+
+    private static volatile WidMemo WID_LAST;
+
     public static int worldId(net.minecraft.world.level.Level level) {
+        WidMemo m = WID_LAST;
+        if (m != null && m.level == level) return m.id();
+        int w = resolveWorldId(level);
+        WID_LAST = new WidMemo(level, w);
+        return w;
+    }
+
+    private static int resolveWorldId(net.minecraft.world.level.Level level) {
         // L16: the benchmarks keep exactly THREE live query worlds
         // (overworld, nether, end) in slots 0-2 — the unrolled identity
         // probes below hit on ~all calls with 1-3 compares and no loop
@@ -1506,25 +1532,6 @@ public final class CeHooks {
                 return w;
             }
         }
-        return w;
-    }
-
-    // L19: the query paths still paid ~2% for worldId even after the L16
-    // unroll — the method is called >1M times per tick across the query,
-    // probe and push bridges, so even a few compares + the slot-array
-    // loads show up. The server thread runs ALL of them and each level's
-    // tick is a contiguous burst of same-world calls, so a one-slot
-    // identity cache converts the whole cluster into a single reference
-    // compare. Plain statics (no volatile): the server thread is the only
-    // writer during ticking; a stale read just re-enters worldId.
-    private static net.minecraft.world.level.Level WID_LAST;
-    private static int WID_LAST_ID;
-
-    static int widFast(net.minecraft.world.level.Level level) {
-        if (level == WID_LAST) return WID_LAST_ID;
-        int w = worldId(level);
-        WID_LAST = level;
-        WID_LAST_ID = w;
         return w;
     }
 
@@ -2614,6 +2621,102 @@ public final class CeHooks {
         }
     }
 
+    // L27: the per-mob AttributeInstance cache. AttributeMap builds its
+    // instances once in the constructor and never replaces them, so caching
+    // the instance references is the same read as AttributeMap.getValue
+    // (which is attributes.get(holder) -> instance.getValue()) without the
+    // HashMap.get per call (the 2.18% AttributeMap.getInstance bucket in
+    // the mixed-150k profile; the SHAPE C path pays it 3x per covered mob
+    // per tick). Slots: [0]=AIR_DRAG_MODIFIER, [1]=FRICTION_MODIFIER,
+    // [2]=MOVEMENT_SPEED. A null slot means the supplier lacks the
+    // attribute — vanilla's getAttributeValue base-default path routes for
+    // those. Weak-keyed identity table (the AIKey pattern): an entry dies
+    // with its mob, dead slots are claimed in place, server-thread confined
+    // (mobTravelNative runs inside the tick phase).
+    private static final int AT_CAP_INIT = 1 << 13;   // 8192 slots
+    private static AIKey[] AT_KEYS = new AIKey[AT_CAP_INIT];
+    private static net.minecraft.world.entity.ai.attributes.AttributeInstance[][] AT_VALS =
+            new net.minecraft.world.entity.ai.attributes.AttributeInstance[AT_CAP_INIT][];
+    private static int AT_SIZE = 0, AT_DEAD = 0;
+
+    private static net.minecraft.world.entity.ai.attributes.AttributeInstance[] attrCache(
+            net.minecraft.world.entity.LivingEntity e) {
+        AIKey[] keys = AT_KEYS;
+        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] vals = AT_VALS;
+        int mask = keys.length - 1;
+        int i = System.identityHashCode(e) & mask;
+        while (true) {
+            AIKey k = keys[i];
+            if (k == null) {
+                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
+                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
+                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.AIR_DRAG_MODIFIER),
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.FRICTION_MODIFIER),
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.MOVEMENT_SPEED),
+                        };
+                keys[i] = new AIKey(e);
+                vals[i] = v;
+                AT_SIZE++;
+                if (AT_SIZE + (AT_SIZE >> 1) >= keys.length) {
+                    attrRebuild(keys.length << 1);
+                }
+                return v;
+            }
+            Object cur = k.get();
+            if (cur == e) return vals[i];
+            if (cur == null) {
+                // dead slot: claim in place (same linear-probe law as the
+                // AI table — the incoming key's probe path starts here)
+                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
+                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
+                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.AIR_DRAG_MODIFIER),
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.FRICTION_MODIFIER),
+                                am.getInstance(net.minecraft.world.entity.ai.attributes
+                                        .Attributes.MOVEMENT_SPEED),
+                        };
+                AT_DEAD++;
+                keys[i] = new AIKey(e);
+                vals[i] = v;
+                if (AT_DEAD > 2048 && AT_DEAD * 2 > AT_SIZE) {
+                    attrRebuild(keys.length); // sweep dead, same capacity
+                }
+                return v;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    private static void attrRebuild(int newCap) {
+        AIKey[] oldKeys = AT_KEYS;
+        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] oldVals = AT_VALS;
+        AIKey[] nk = new AIKey[newCap];
+        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] nv =
+                new net.minecraft.world.entity.ai.attributes.AttributeInstance[newCap][];
+        int mask = newCap - 1;
+        int live = 0;
+        for (int j = 0; j < oldKeys.length; j++) {
+            AIKey k = oldKeys[j];
+            if (k == null) continue;
+            if (k.get() == null) continue; // dead — dropped
+            int i = k.hash & mask;
+            while (nk[i] != null) i = (i + 1) & mask;
+            nk[i] = k;
+            nv[i] = oldVals[j];
+            live++;
+        }
+        AT_KEYS = nk;
+        AT_VALS = nv;
+        AT_SIZE = live;
+        AT_DEAD = 0;
+    }
+
     public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e,
             net.minecraft.world.phys.Vec3 input) {
         if (!ACTIVE || !MOB_TRAVEL_ON || O_STUCK < 0) return false;
@@ -2688,8 +2791,20 @@ public final class CeHooks {
                 if (y != Math.floor(y)) return false; // the ground-clip exactness
                 double g = e.getGravity(); // = getEffectiveGravity() (virtual)
                 if (g <= 0.0) return false;
-                float dragMod = (float) e.getAttributeValue(
-                        net.minecraft.world.entity.ai.attributes.Attributes.AIR_DRAG_MODIFIER);
+                // L27: the three instances come from the per-mob cache —
+                // getAttributeValue paid a HashMap.get per call (the map is
+                // per-entity and the instances are built once in the
+                // AttributeMap ctor and never replaced), so caching the
+                // instance and calling getValue() directly is the same read
+                // without the lookup. A null instance (an attribute absent
+                // from the supplier — vanilla returns the base default) is
+                // cached too and routes getAttributeValue.
+                net.minecraft.world.entity.ai.attributes.AttributeInstance[] attrs =
+                        attrCache(e);
+                float dragMod = attrs[0] != null
+                        ? (float) attrs[0].getValue()
+                        : (float) e.getAttributeValue(
+                                net.minecraft.world.entity.ai.attributes.Attributes.AIR_DRAG_MODIFIER);
                 float vf = 1.0F - (1.0F - 0.98F) * dragMod; // computeModifiedFriction
                 if (vf < 0.0F) vf = 0.0F;
                 if (vf > 1.0F) vf = 1.0F;
@@ -2716,10 +2831,14 @@ public final class CeHooks {
                     return false;
                 }
                 // the delta math (bit-exact; mobtravel.rs pins the floats)
-                float fmC = (float) e.getAttributeValue(
-                        net.minecraft.world.entity.ai.attributes.Attributes.FRICTION_MODIFIER);
-                float speedC = (float) e.getAttributeValue(
-                        net.minecraft.world.entity.ai.attributes.Attributes.MOVEMENT_SPEED);
+                float fmC = attrs[1] != null
+                        ? (float) attrs[1].getValue()
+                        : (float) e.getAttributeValue(
+                                net.minecraft.world.entity.ai.attributes.Attributes.FRICTION_MODIFIER);
+                float speedC = attrs[2] != null
+                        ? (float) attrs[2].getValue()
+                        : (float) e.getAttributeValue(
+                                net.minecraft.world.entity.ai.attributes.Attributes.MOVEMENT_SPEED);
                 float bfC = lvl.getBlockState(
                         e.getBlockPosBelowThatAffectsMyMovement()).getBlock().getFriction();
                 float frictC = 1.0F - (1.0F - bfC) * fmC; // computeModifiedFriction
@@ -2938,6 +3057,23 @@ public final class CeHooks {
     }
 
     private static void initDataOffsets() {
+        // L27 FIX (e2e 9474477): the O_ACC_ID resolution must NOT live behind
+        // the O_ED_ITEMS early-return — initDataOffsets first ran at the L15
+        // frozen-gate init, before O_ACC_ID existed, so every later call
+        // returned on the guard and the accessor-id offset stayed -1. That
+        // made entityDataValue() return null on EVERY call and all three
+        // same-value gates routed vanilla (the frozen gate served zero
+        // no-ops; the assert caught it). Resolve idempotently BEFORE the
+        // guard.
+        if (O_ACC_ID < 0 && U != null) {
+            try {
+                O_ACC_ID = U.objectFieldOffset(
+                        net.minecraft.network.syncher.EntityDataAccessor.class
+                                .getDeclaredField("id"));
+            } catch (Throwable t) {
+                O_ACC_ID = -1; // the typed gates fall back to the get() chain
+            }
+        }
         if (O_ED_ITEMS >= 0 || U == null) return;
         try {
             O_ED_ITEMS = U.objectFieldOffset(
@@ -2947,11 +3083,6 @@ public final class CeHooks {
                     Class.forName(
                             "net.minecraft.network.syncher.SynchedEntityData$DataItem")
                             .getDeclaredField("value"));
-            // L25: the accessor id record component — one int read replaces
-            // the virtual id() call in the direct-read gates.
-            O_ACC_ID = U.objectFieldOffset(
-                    net.minecraft.network.syncher.EntityDataAccessor.class
-                            .getDeclaredField("id"));
             // L20 quiet-travel floor: the protected stuck multiplier offset
             O_STUCK = offOf(net.minecraft.world.entity.Entity.class,
                     "stuckSpeedMultiplier");
@@ -4498,14 +4629,19 @@ public final class CeHooks {
 
     @SuppressWarnings({"rawtypes"})
     private static Object firstOf(java.util.Set s) {
-        return (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
-                ? o.first() : null;
+        // fastutil's first()/last() THROW NoSuchElementException on an empty
+        // set (Brain-mobs tick an empty goalSelector every tick — the e2e
+        // run died exactly there on the first floor tick).
+        return s.isEmpty() ? null
+                : (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
+                        ? o.first() : null;
     }
 
     @SuppressWarnings({"rawtypes"})
     private static Object lastOf(java.util.Set s) {
-        return (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
-                ? o.last() : null;
+        return s.isEmpty() ? null
+                : (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
+                        ? o.last() : null;
     }
 
     /** Replacement body of GoalSelector.tick() — the vanilla algorithm with
