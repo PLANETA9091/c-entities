@@ -2701,13 +2701,19 @@ public final class CeHooks {
                 }
                 // the untracked contract: with no recipients the move()'s
                 // sound/gameEvent tails are unobservable (sound range 16 <<
-                // mob tracking range), which is what makes the skip exact
+                // mob tracking range), which is what makes the skip exact.
+                // moonrise$getTrackedEntity returns the ChunkMap$TrackedEntity
+                // (NOT the ServerEntity!) — the recipients are ITS seenBy set
+                // (the TrackedEntity IS the ServerEntity$Synchronizer), and
+                // moonrise$hasPlayers() is the exact public query. The first
+                // e2e crash (hs_err 4006) was a raw ServerEntity-offset read
+                // against a TrackedEntity instance — the same wild-oop bug
+                // class that killed the SE_FAST path; typed access only now.
                 Object trkC = e.moonrise$getTrackedEntity();
-                if (trkC != null && VH_SE_TRACKED_PLAYERS != null) {
-                    Object tpC = VH_SE_TRACKED_PLAYERS.getObj(trkC);
-                    if (!(tpC instanceof java.util.Set<?> tsC) || !tsC.isEmpty()) {
-                        return false;
-                    }
+                if (trkC != null
+                        && ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) trkC)
+                                .moonrise$hasPlayers()) {
+                    return false;
                 }
                 // the delta math (bit-exact; mobtravel.rs pins the floats)
                 float fmC = (float) e.getAttributeValue(
