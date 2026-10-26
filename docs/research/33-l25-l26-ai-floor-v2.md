@@ -130,3 +130,34 @@ mobs-25k: -4..-7% (scheduler 2-2.5%, sensing 2.2%, gates 1.5-2%).
 mixed-150k: -3..-5% (gates + tracker reads + sensing + scheduler share).
 items-100k/spread-100k: smaller (the floors are mob-centric; the flag-read
 floor covers items too). Watch the next ab-paired run.
+
+## The bench verdict (mobs-25k-mod server log, baseline run 40340133235 @ a8ea95c)
+
+The hooks@ counter line settles every open question (note the field order:
+gs = floorTicks/floorRunning/starts/stops/mirrorTicks/collide):
+
+- `gs=20576466/15475570/157274/149098/0/0` — the v2 floor served ALL 20.5M
+  goal ticks; the mirror NEVER ran (gsMirrorTicks=0); zero collide disarms.
+  The flat scheduler is the production path.
+- `froz=15499933/15419343/0` and `conv=15470315/15389990/0` — both gates
+  catch 99.5% of all calls; zero vanilla writes leaked.
+- `flag=31024920/30860581/0` — the shared-flag gate catches 99.5%.
+- `row=3377801/0/0/0/112/0/712/0/0/0/0/0/w350810046` — the row path served
+  3.38M single-cell queries with 350.8M window skips; rowMulti=0 (multi-cell
+  boxes never reach the row path — the next lever).
+- `fast=3378625 mirror=12121308` — 78% of Level.getEntities calls (the big
+  targeting scans) routed to the vanilla mirror by the per-bucket EMA — the
+  mirror family (AABB.intersects 4.42% + ChunkEntitySlices + Entity.getId
+  2.49%) is the largest remaining bucket in the leg.
+
+Two reporting artifacts to keep in mind when reading hotspots.md:
+
+1. The hotspot script's CeHooks frame names can mislead after an edit shift
+   (the a8ea95c profile printed "gsMirrorTick line 4679" for what is the v2
+   goalSelectorTick cleanup pass — the counters above are the ground truth).
+2. The e2e assert family (grep on the server log) stays the exactness gate;
+   the counters are the perf truth.
+
+L28a adds the missing retransform after the Sensing precompute (the bench
+loaded Sensing pre-arm; "precomputed" alone never went live — vanilla
+Sensing.tick frames at 1.51% in the same profile).
