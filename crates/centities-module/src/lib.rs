@@ -35,6 +35,7 @@ const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTic
 const GOAL_SELECTOR_CLASS: &str = "net/minecraft/world/entity/ai/goal/GoalSelector";
 const MOB_CLASS: &str = "net/minecraft/world/entity/Mob";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
+const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
@@ -390,6 +391,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(MOB_CLASS, |_n, b| patch_mob(b));
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
+    cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -439,6 +441,7 @@ fn arm_module() {
     precompute_goalselector(loader);
     precompute_mob(loader);
     precompute_conversion(loader);
+    precompute_sensing(loader);
     precompute_trackedentity(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
@@ -591,6 +594,22 @@ fn arm_module() {
                         ));
                     }
                 }
+                // L26 deferred weave: Sensing loads with the first mobs.
+                if !SENSING_WOVEN.load(Ordering::Acquire)
+                    && !SENSING_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(SENSING_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_sensing(loader as jni::jobject);
+                    if SENSING_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(SENSING_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred Sensing floor applied, rc={rc}"
+                        ));
+                    }
+                }
                 if !TT_WOVEN.load(Ordering::Acquire)
                     && !TT_DECLINED.load(Ordering::Acquire)
                     && STASH
@@ -665,6 +684,24 @@ fn arm_module() {
                 if set_java_bool("setDeltaGateOn", true) {
                     DELTA_ARMED.store(true, Ordering::Release);
                     cplug_sdk::log::info("[c-entities] delta gate ARMED (verified live)");
+                }
+            }
+            if SENSING_WOVEN.load(Ordering::Acquire)
+                && !SENSING_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::SenseChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setSenseOn", true) {
+                    SENSING_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] sensing floor ARMED (verified live)");
+                }
+            }
+            if FLAGR_WOVEN.load(Ordering::Acquire)
+                && !FLAGR_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::FlagRChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setFlagROn", true) {
+                    FLAGR_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] flag-read floor ARMED (verified live)");
                 }
             }
             if attempt < 6 || attempt % 25 == 0 {
@@ -859,6 +896,14 @@ static DELTA_ARMED: AtomicBool = AtomicBool::new(false);
 static MOB_WOVEN: AtomicBool = AtomicBool::new(false);
 static MOB_DECLINED: AtomicBool = AtomicBool::new(false);
 static MOB_ARMED: AtomicBool = AtomicBool::new(false);
+/// L26: the Sensing.tick O(1)-clear floor weave state.
+static SENSING_WOVEN: AtomicBool = AtomicBool::new(false);
+static SENSING_DECLINED: AtomicBool = AtomicBool::new(false);
+static SENSING_ARMED: AtomicBool = AtomicBool::new(false);
+/// L26: the Entity.getSharedFlag direct-read floor weave state.
+static FLAGR_WOVEN: AtomicBool = AtomicBool::new(false);
+static FLAGR_DECLINED: AtomicBool = AtomicBool::new(false);
+static FLAGR_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     let stash = STASH
@@ -1309,6 +1354,40 @@ fn patch_conversion_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// L26: Sensing byte hook — same stash/serve pattern as GoalSelector.
+fn patch_sensing(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_sensing_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_sensing_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(SENSING_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(SENSING_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched Sensing O(1)-clear floor");
+            Some(b)
+        }
+        _ if !SENSING_WOVEN.load(Ordering::Acquire)
+            && !SENSING_DECLINED.load(Ordering::Acquire) =>
+        {
+            let mut st = STASH.lock().ok()?;
+            st.entry(SENSING_CLASS).or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] Sensing bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 fn patch_entityticklist_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
@@ -1663,6 +1742,36 @@ fn conv_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     }
 }
 
+/// L26: the Sensing.tick floor — the body becomes `CeHooks.sensingTick$`;
+/// the first call per Sensing swaps the seen/unseen fields to GenIntSet
+/// (O(1) generation-stamped clear), every call then clears in O(1).
+fn sensing_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "tick",
+        method_desc: "()V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "sensingTick$",
+        bridge_desc: "(Lnet/minecraft/world/entity/ai/sensing/Sensing;)V",
+        args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+    }
+}
+
+/// L26: the Entity.getSharedFlag direct-read floor — the body becomes
+/// `CeHooks.getSharedFlag$`; the mirror is the byte-exact vanilla chain.
+fn flagr_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getSharedFlag",
+        method_desc: "(I)Z",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getSharedFlag$",
+        bridge_desc: "(Lnet/minecraft/world/entity/Entity;I)Z",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'I' },
+        ],
+    }
+}
+
 /// L18: the shared-flags write gate. `(int, boolean)` — the boolean arg
 /// occupies one int slot (slot 2) like every other boolean in the ASM
 /// bridge builder.
@@ -1932,6 +2041,34 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
         );
         gated
     };
+    // L26: the getSharedFlag direct-read floor chains onto the same Entity
+    // bytes (after the block-fx gate — a different method, order is free).
+    let gated = if read_java_flag("FLAGR_FLAG_ON") == Some(true)
+        && prove_handles("initFlagRHandles", "FLAGR_HANDLES_OK") == Some(true)
+    {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::replace_body(env, loader, &gated, &flagr_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                FLAGR_WOVEN.store(true, Ordering::Release);
+                cplug_sdk::log::info("[c-entities] precomputed getSharedFlag direct floor");
+                b
+            }
+            _ => {
+                FLAGR_DECLINED.store(true, Ordering::Release);
+                cplug_sdk::log::info(
+                    "[c-entities] getSharedFlag replace refused — vanilla flag reads kept",
+                );
+                gated
+            }
+        }
+    } else {
+        FLAGR_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] flag-read floor disabled/refused (centities.flagRead) — vanilla kept",
+        );
+        gated
+    };
     // the existing rust probe prefixes (box/impulse probes), on the gated bytes
     entity_probes(gated).ok()
 }
@@ -2002,6 +2139,49 @@ fn precompute_conversion(loader: jni::jobject) {
         _ => {
             cplug_sdk::log::info(
                 "[c-entities] FAILED to precompute ConversionTracker gate — vanilla kept",
+            );
+        }
+    }
+}
+
+/// L26: the Sensing.tick floor precompute. Same shape as the conv gate:
+/// honor the kill switch, prove the handles, weave, stash the patched bytes
+/// for the post-arm class load.
+fn precompute_sensing(loader: jni::jobject) {
+    if read_java_flag("SENSE_FLAG_ON") != Some(true) {
+        SENSING_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] sensing floor disabled (centities.sensing) — vanilla tick kept",
+        );
+        return;
+    }
+    if prove_handles("initSenseHandles", "SENSE_HANDLES_OK") != Some(true) {
+        SENSING_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] sensing floor handle probe failed — vanilla Sensing.tick kept",
+        );
+        return;
+    }
+    let Some(bytes) = STASH.lock().ok().and_then(|mut s| s.remove(SENSING_CLASS)) else {
+        cplug_sdk::log::info(
+            "[c-entities] Sensing not loaded yet — floor deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &sensing_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(SENSING_CLASS, b);
+            }
+            SENSING_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed Sensing O(1)-clear floor");
+        }
+        _ => {
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute Sensing floor — vanilla kept",
             );
         }
     }
@@ -2140,6 +2320,8 @@ enum Counter {
     TTChecks,
     FlagChecks,
     DeltaChecks,
+    SenseChecks,
+    FlagRChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -2175,6 +2357,8 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::TTChecks, ("ttCalls", "J")),
             (Counter::FlagChecks, ("flagCalls", "J")),
             (Counter::DeltaChecks, ("deltaCalls", "J")),
+            (Counter::SenseChecks, ("senseCalls", "J")),
+            (Counter::FlagRChecks, ("flagrCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);

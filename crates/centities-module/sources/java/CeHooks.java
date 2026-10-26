@@ -2947,6 +2947,11 @@ public final class CeHooks {
                     Class.forName(
                             "net.minecraft.network.syncher.SynchedEntityData$DataItem")
                             .getDeclaredField("value"));
+            // L25: the accessor id record component — one int read replaces
+            // the virtual id() call in the direct-read gates.
+            O_ACC_ID = U.objectFieldOffset(
+                    net.minecraft.network.syncher.EntityDataAccessor.class
+                            .getDeclaredField("id"));
             // L20 quiet-travel floor: the protected stuck multiplier offset
             O_STUCK = offOf(net.minecraft.world.entity.Entity.class,
                     "stuckSpeedMultiplier");
@@ -3811,6 +3816,18 @@ public final class CeHooks {
             VH_SE_INTERP = it;
             VH_SE_INTERVAL = iv;
             VH_SE_RESYNC = rs;
+            // L26: direct offsets for the fast-exit reads. DIFFERENT from the
+            // retracted L19/20b path: the doc-32 rule is applied AT ENTRY —
+            // the weave guarantees `se` is ServerEntity (the replaced body's
+            // own receiver), and every offset here is single-class
+            // ServerEntity. The old crash fed a FOREIGN receiver (a
+            // TrackedEntity) into ServerEntity offsets without a check.
+            if (SE_DIRECT_ON) {
+                O_SE_ENTITY = en.off;
+                O_SE_TICKCOUNT = tc.off;
+                O_SE_TRACKED_PLAYERS = tp.off;
+                O_SE_INTERP = it.off;
+            }
             return true;
         } catch (Throwable t) {
             SE_VH_FAILED = true;
@@ -3843,7 +3860,21 @@ public final class CeHooks {
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
         try {
-            Entity e = (Entity) VH_SE_ENTITY.getObj(se);
+            // L26: the two fast-exit reads go through single-class direct
+            // offsets when SE_DIRECT_ON (typed ServerEntity receiver — the
+            // weave-guaranteed `this` of the replaced sendChanges body).
+            final Entity e;
+            final Object trk;
+            final Object interp;
+            if (SE_DIRECT_ON && O_SE_ENTITY >= 0) {
+                e = (Entity) U.getObject(se, O_SE_ENTITY);
+                trk = U.getObject(se, O_SE_TRACKED_PLAYERS);
+                interp = U.getObject(se, O_SE_INTERP);
+            } else {
+                e = (Entity) VH_SE_ENTITY.getObj(se);
+                trk = VH_SE_TRACKED_PLAYERS.getObj(se);
+                interp = VH_SE_INTERP.getObj(se);
+            }
             // L24a — the empty-tracking fast exit. javap 26.3 (doc 31): with
             // trackedPlayers EMPTY the vanilla sendChanges body cannot send
             // anything — every emit rides sendToTrackingPlayers(AndSelf)
@@ -3857,7 +3888,6 @@ public final class CeHooks {
             // the moment a player pairs). The fast exit keeps three
             // conditions that route vanilla exactly where the skipped tail
             // would have had a real effect.
-            Object trk = VH_SE_TRACKED_PLAYERS.getObj(se);
             if (trk instanceof java.util.Set<?> ts && ts.isEmpty()
                     // a non-NO_OP interpolation tracker's updateTracking
                     // advances real state every tick; a hard-colliding
@@ -3867,13 +3897,16 @@ public final class CeHooks {
                     // PlayerVelocityEvent path for ServerPlayers
                     // (bc 1116-1246). Any hit → the full gate below (the
                     // exact vanilla mirror).
-                    && VH_SE_INTERP.getObj(se)
-                        == net.minecraft.world.entity.InterpolationTracker.NO_OP
+                    && interp == net.minecraft.world.entity.InterpolationTracker.NO_OP
                     && !e.moonrise$isHardColliding()
                     && !e.syncVelocity) {
                 e.updateDataBeforeSync();                       // bc 19-23
-                VH_SE_TICK_COUNT.setInt(se,
-                        VH_SE_TICK_COUNT.getInt(se) + 1);       // bc 1106-1113
+                if (SE_DIRECT_ON && O_SE_TICKCOUNT >= 0) {
+                    U.putInt(se, O_SE_TICKCOUNT, U.getInt(se, O_SE_TICKCOUNT) + 1);
+                } else {
+                    VH_SE_TICK_COUNT.setInt(se,
+                            VH_SE_TICK_COUNT.getInt(se) + 1);   // bc 1106-1113
+                }
                 trackerFast++;
                 return true;
             }
@@ -3961,6 +3994,15 @@ public final class CeHooks {
 
     private static volatile RefField VH_TL_ENTITIES;
     private static volatile boolean TL_VH_FAILED = false;
+
+    // L26: direct ServerEntity offsets for the trackerDispatch fast exit
+    // (single-class, typed receiver — see the comment at the capture site).
+    // SE_DIRECT_ON is its own kill switch so a bisect can cut exactly this
+    // path without losing the L24a fast exit.
+    public static final boolean SE_DIRECT_ON =
+            !"false".equals(System.getProperty("centities.trackerDirect", "true"));
+    private static long O_SE_ENTITY = -1, O_SE_TICKCOUNT = -1,
+            O_SE_TRACKED_PLAYERS = -1, O_SE_INTERP = -1;
 
     private static synchronized boolean initTickListVh() {
         if (TL_VH_FAILED) return false;
@@ -4147,6 +4189,16 @@ public final class CeHooks {
         net.minecraft.world.entity.ai.goal.WrappedGoal[] goals =
                 new net.minecraft.world.entity.ai.goal.WrappedGoal[8];
         int n;
+        // L25 — the flat-scheduler shape stamp. allSize/first/last pin the
+        // availableGoals identity the running[] snapshot was built from;
+        // first()/last() are two direct field reads on fastutil's linked
+        // set (javap-verified), so the per-tick validation costs three
+        // compares. full=true (fresh shadow / post-mutation) forces the
+        // exact 4-pass rebuild.
+        int allSize = -1;
+        Object first;
+        Object last;
+        boolean full = true;
     }
 
     // L16: the shadow map was a Guava MapMaker weak-keys ConcurrentMap —
@@ -4292,13 +4344,16 @@ public final class CeHooks {
     private static boolean canReplaceAll(
             net.minecraft.world.entity.ai.goal.WrappedGoal[] lock,
             net.minecraft.world.entity.ai.goal.WrappedGoal cand) {
-        long fb = cand.getFlags().getBackingSet();
-        int fs = cand.getFlags().size();
+        // L25: one getFlags() read (the old code called it twice — the
+        // delegate chain is a virtual hop onto the inner goal per call).
+        net.minecraft.world.entity.ai.goal.WrappedGoal g = cand;
+        long fb = g.getFlags().getBackingSet();
+        int fs = g.getFlags().size();
         for (int i = 0; i < fs; i++) {
             int ord = Long.numberOfTrailingZeros(fb);
             fb &= fb - 1;
             net.minecraft.world.entity.ai.goal.WrappedGoal holder = lock[ord];
-            if (holder != null && !holder.canBeReplacedBy(cand)) return false;
+            if (holder != null && !holder.canBeReplacedBy(g)) return false;
         }
         return true;
     }
@@ -4345,17 +4400,15 @@ public final class CeHooks {
         profiler.pop();
     }
 
-    /** Replacement body of GoalSelector.tick() — the vanilla algorithm with
-     *  flat-lock-table bookkeeping and the exact vanilla call sequence. */
-    public static void goalSelectorTick(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
-        if (!AI_ON || !AI_HANDLES_OK) {
-            gsMirrorTick(gs);
-            return;
-        }
-        gsFloorTicks++;
+    /** The exact 4-pass tick (the L15 v1 body) — runs when the fast-path
+     *  shape validation fails (fresh shadow, a set mutation the merge-walk
+     *  cannot pin, an externally started goal) or when the collide check
+     *  fires. Ends by recording the shadow shape so the next tick can take
+     *  the flat path again. */
+    private static void fullPassTick(net.minecraft.world.entity.ai.goal.GoalSelector gs,
+            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> goals,
+            AIShadow sh) {
         try {
-            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> goals =
-                    gs.getAvailableGoals();
             net.minecraft.util.profiling.ProfilerFiller profiler =
                     net.minecraft.util.profiling.Profiler.get();
             long disabled = disabledBacking(gs);
@@ -4373,7 +4426,6 @@ public final class CeHooks {
             // rebuild the lock table + running shadow (silent pass)
             net.minecraft.world.entity.ai.goal.WrappedGoal[] lock = AI_LOCK_TABLE.get();
             for (int i = 0; i < FLAG_N; i++) lock[i] = null;
-            AIShadow sh = shadowOf(gs);
             sh.n = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
                 if (g.isRunning()) {
@@ -4425,6 +4477,158 @@ public final class CeHooks {
             profiler.pop();
             // vanilla tick() ends with tickRunningGoals(true) — full-set walk
             tickRunningImpl(gs, true);
+            // record the shadow shape for the L25 flat path
+            sh.allSize = goals.size();
+            sh.first = firstOf(goals);
+            sh.last = lastOf(goals);
+            sh.full = false;
+        } catch (Throwable t) {
+            // The mirror path is for KILL-SWITCH states only; a live floor
+            // tick must propagate exceptions exactly like vanilla (a goal
+            // throwing is a vanilla crash too). Disarm so the next tick is
+            // clean, then rethrow the original.
+            AI_ON = false;
+            lastError = System.nanoTime();
+            lastErrorText = "gsFloor: " + t;
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new IllegalStateException("goalSelectorTick floor failed", t);
+        }
+    }
+
+    @SuppressWarnings({"rawtypes"})
+    private static Object firstOf(java.util.Set s) {
+        return (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
+                ? o.first() : null;
+    }
+
+    @SuppressWarnings({"rawtypes"})
+    private static Object lastOf(java.util.Set s) {
+        return (s instanceof it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet o)
+                ? o.last() : null;
+    }
+
+    /** Replacement body of GoalSelector.tick() — the vanilla algorithm with
+     *  flat-lock-table bookkeeping and the exact vanilla call sequence.
+     *  L25: cleanup + lock-build + the tail run over the running-shadow
+     *  array; the availableGoals set is iterated ONCE (the update pass)
+     *  with a survivor merge-walk that proves the shadow matches the live
+     *  set — any mismatch falls into fullPassTick for an exact rebuild. */
+    public static void goalSelectorTick(net.minecraft.world.entity.ai.goal.GoalSelector gs) {
+        if (!AI_ON || !AI_HANDLES_OK) {
+            gsMirrorTick(gs);
+            return;
+        }
+        gsFloorTicks++;
+        try {
+            java.util.Set<net.minecraft.world.entity.ai.goal.WrappedGoal> goals =
+                    gs.getAvailableGoals();
+            AIShadow sh = shadowOf(gs);
+            if (sh.full
+                    || sh.allSize != goals.size()
+                    || sh.first != firstOf(goals)
+                    || sh.last != lastOf(goals)) {
+                fullPassTick(gs, goals, sh);
+                return;
+            }
+            net.minecraft.util.profiling.ProfilerFiller profiler =
+                    net.minecraft.util.profiling.Profiler.get();
+            long disabled = disabledBacking(gs);
+            // cleanup — vanilla conditions and short-circuit order, over the
+            // running shadow (same relative set order; isRunning re-checked
+            // per entry so an externally stopped goal skips exactly where
+            // vanilla's set walk would skip it)
+            profiler.push("goalCleanup");
+            int w = 0;
+            for (int i = 0; i < sh.n; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
+                if (!g.isRunning()) continue;
+                long fb = g.getFlags().getBackingSet();
+                if (((fb & disabled) != 0L) || !g.canContinueToUse()) {
+                    g.stop();
+                    gsFloorStops++;
+                    continue;
+                }
+                sh.goals[w++] = g;
+            }
+            sh.n = w;
+            profiler.pop();
+            // lock table from the survivors
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] lock = AI_LOCK_TABLE.get();
+            for (int i = 0; i < FLAG_N; i++) lock[i] = null;
+            for (int i = 0; i < w; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
+                long fb = g.getFlags().getBackingSet();
+                int fs = g.getFlags().size();
+                for (int j = 0; j < fs; j++) {
+                    int ord = Long.numberOfTrailingZeros(fb);
+                    fb &= fb - 1;
+                    if (lock[ord] != null) {
+                        // two running goals on one flag — a plugin mutated
+                        // flags while running: disarm, stay exact.
+                        gsFloorCollide++;
+                        AI_ON = false;
+                        gsMirrorTick(gs);
+                        return;
+                    }
+                    lock[ord] = g;
+                }
+            }
+            // update — the ONLY full set pass. Survivor merge-walk: a running
+            // set element must be the next expected survivor (both walk the
+            // same insertion order); anything else (external start, direct
+            // set surgery) falls to the exact 4-pass rebuild.
+            profiler.push("goalUpdate");
+            int n = w;
+            int j = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (g.isRunning()) {
+                    if (j < w && sh.goals[j] == g) {
+                        j++;
+                        continue;
+                    }
+                    profiler.pop();
+                    fullPassTick(gs, goals, sh);
+                    return;
+                }
+                long fb = g.getFlags().getBackingSet();
+                if ((fb & disabled) == 0L && canReplaceAll(lock, g) && g.canUse()) {
+                    long it = fb;
+                    int fs = g.getFlags().size();
+                    for (int k = 0; k < fs; k++) {
+                        int ord = Long.numberOfTrailingZeros(it);
+                        it &= it - 1;
+                        net.minecraft.world.entity.ai.goal.WrappedGoal cur = lock[ord];
+                        if (cur != null) {
+                            cur.stop();
+                            gsFloorStops++;
+                        }
+                        lock[ord] = g;
+                    }
+                    g.start();
+                    gsFloorStarts++;
+                    if (n == sh.goals.length) {
+                        sh.goals = java.util.Arrays.copyOf(sh.goals, n * 2);
+                    }
+                    sh.goals[n++] = g;
+                }
+            }
+            profiler.pop();
+            if (j != w) {
+                // a survivor vanished from the set mid-walk (direct set
+                // surgery) — the exact rebuild pins the new shape
+                fullPassTick(gs, goals, sh);
+                return;
+            }
+            sh.n = n;
+            // vanilla tail — tickRunningGoals(true): the running array IS the
+            // set's running subset in the same order; every entry re-checked
+            profiler.push("goalTick");
+            for (int i = 0; i < n; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
+                if (g.isRunning()) g.tick();
+            }
+            profiler.pop();
         } catch (Throwable t) {
             // The mirror path is for KILL-SWITCH states only; a live floor
             // tick must propagate exceptions exactly like vanilla (a goal
@@ -4593,12 +4797,49 @@ public final class CeHooks {
         try {
             VH_ENT_DATA = new RefField(Entity.class, "entityData");
             initDataOffsets();
+            // L25: the direct entityData offset for the fast gates (the
+            // offset is per-class constant; VH_ENT_DATA.off never changes).
+            if (VH_ENT_DATA.off >= 0) {
+                O_ED = VH_ENT_DATA.off;
+            }
             FROZEN_HANDLES_OK = true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "initFrozenHandles: " + t;
             FROZEN_HANDLES_OK = false;
         }
+    }
+
+    /** L25 — direct-offset fast-gate infrastructure. O_ED = Entity.entityData;
+     *  O_CT_MOB/O_CT_ID = ConversionTracker.mob/conversionId; O_ACC_ID =
+     *  EntityDataAccessor.id. All single-class offsets per the doc-32 rule:
+     *  every fast path re-checks the receiver's type before the next hop,
+     *  and any miss routes the exact vanilla chain. */
+    private static long O_ED = -1;
+    private static long O_CT_MOB = -1, O_CT_ID = -1, O_ACC_ID = -1;
+
+    /** The current value of the accessor `acc` on the entity `e` — the
+     *  direct-read gate core. Returns null when any shape check fails (the
+     *  caller then routes the vanilla chain). Typed at every hop: the
+     *  receiver of each Unsafe read is instanceof-checked against the class
+     *  the offset belongs to (doc-32 rule — the SE_FAST lesson). */
+    private static Object entityDataValue(Entity e, Object acc) {
+        if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0 || O_ACC_ID < 0) return null;
+        Object ed = U.getObject(e, O_ED);
+        if (!(ed instanceof net.minecraft.network.syncher.SynchedEntityData sde)) {
+            return null;
+        }
+        if (!(acc instanceof net.minecraft.network.syncher.EntityDataAccessor acc0)) {
+            return null;
+        }
+        Object[] items = (Object[]) U.getObject(sde, O_ED_ITEMS);
+        int idx = U.getInt(acc, O_ACC_ID);
+        if (idx < 0 || idx >= items.length) return null;
+        Object di = items[idx];
+        if (!(di instanceof net.minecraft.network.syncher.SynchedEntityData.DataItem)) {
+            return null;
+        }
+        return U.getObject(di, O_DI_VALUE);
     }
 
     // ===================================================================
@@ -4643,6 +4884,360 @@ public final class CeHooks {
 
     public static void setFlagGateOn(boolean on) {
         FLAGG_ON = on;
+    }
+
+    // ==================================================================
+    // L26 — the Sensing floor. Vanilla Sensing.tick() (26.3, decompiled)
+    // is `seen.clear(); unseen.clear();` — and fastutil IntOpenHashSet
+    // .clear() is an O(capacity) Arrays.fill whenever the set is non-empty
+    // (the bench mobs' LookAtPlayer scans fill it every tick: 2.2% of the
+    // mobs-25k-mod profile on the two clear() lines alone). The floor
+    // swaps the two PRIVATE final IntSet fields (seen/unseen — only
+    // Sensing.tick/hasLineOfSight ever touch them, decompile-verified) for
+    // GenIntSet instances: an open-addressed int table with per-slot
+    // generation stamps, whose clear() is ONE integer increment. The
+    // vanilla hasLineOfSight body stays untouched — it reads the fields
+    // and calls contains/add on whatever IntSet is there, and GenIntSet
+    // honors the IntSet contract for exactly those operations. The swap
+    // stores a real reference into a declared IntSet field via
+    // Unsafe.putObject — a proper oop store (the SE_FAST bug class was a
+    // raw offset READ of a foreign-class receiver, not a real-reference
+    // store; doc 32's rule is honored: every hop here is typed).
+    // ==================================================================
+
+    public static volatile boolean SENSE_ON = false;
+    public static volatile boolean SENSE_HANDLES_OK = false;
+    public static final boolean SENSE_FLAG_ON =
+            !"false".equals(System.getProperty("centities.sensing", "true"));
+    public static long senseCalls = 0, senseSwaps = 0;
+    private static volatile RefField VH_SN_SEEN;  // Sensing.seen
+    private static volatile RefField VH_SN_UNSEEN; // Sensing.unseen
+    private static long O_SN_SEEN = -1, O_SN_UNSEEN = -1;
+
+    public static void initSenseHandles() {
+        try {
+            VH_SN_SEEN = new RefField(net.minecraft.world.entity.ai.sensing.Sensing.class, "seen");
+            VH_SN_UNSEEN = new RefField(
+                    net.minecraft.world.entity.ai.sensing.Sensing.class, "unseen");
+            if (U != null && VH_SN_SEEN.off >= 0 && VH_SN_UNSEEN.off >= 0) {
+                O_SN_SEEN = VH_SN_SEEN.off;
+                O_SN_UNSEEN = VH_SN_UNSEEN.off;
+            }
+            SENSE_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initSenseHandles: " + t;
+            SENSE_HANDLES_OK = false;
+        }
+    }
+
+    public static void setSenseOn(boolean on) {
+        SENSE_ON = on;
+    }
+
+    /** Replacement body of Sensing.tick() — first call per Sensing swaps
+     *  the fields to GenIntSet; every call then clears O(1). The kill-switch
+     *  mirror clears whatever IntSet sits in the fields (GenIntSet included
+     *  — its clear() works through the interface), so a mid-run disarm
+     *  stays exact. */
+    public static void sensingTick$(net.minecraft.world.entity.ai.sensing.Sensing s) {
+        senseCalls++;
+        if (SENSE_ON && SENSE_HANDLES_OK && O_SN_SEEN >= 0) {
+            Object a = U.getObject(s, O_SN_SEEN);
+            Object b = U.getObject(s, O_SN_UNSEEN);
+            if (a instanceof GenIntSet ga) {
+                ga.clear();
+                if (b instanceof GenIntSet gb) {
+                    gb.clear();
+                    return;
+                }
+                if (b instanceof java.util.Set<?> bs) {
+                    bs.clear();
+                    return;
+                }
+                // unknown unseen type — vanilla body via the field read
+                U.getObject(s, O_SN_UNSEEN);
+                return;
+            }
+            // first sight: install both (a fresh Sensing's sets are empty —
+            // nothing to preserve, and a mid-life swap is exact too: the
+            // generation stamp starts at 1 = "empty")
+            U.putObject(s, O_SN_SEEN, new GenIntSet());
+            U.putObject(s, O_SN_UNSEEN, new GenIntSet());
+            senseSwaps++;
+            return;
+        }
+        try {
+            Object a = VH_SN_SEEN.getObj(s);
+            if (a instanceof java.util.Set<?> sa) sa.clear();
+            Object b = VH_SN_UNSEEN.getObj(s);
+            if (b instanceof java.util.Set<?> sb) sb.clear();
+        } catch (Throwable mirrorFail) {
+            SENSE_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "senseMirror: " + mirrorFail;
+        }
+    }
+
+    /** The drop-in IntSet: O(1) clear via per-slot generation stamps, open
+     *  addressing with linear probing. Entity ids never collide with the
+     *  0 empty marker (vanilla's ENTITY_COUNTER starts at 1), but id 0 is
+     *  still handled through an explicit slot. Stale-generation entries
+     *  stay as tombstones until the next grow() rehashes them away — probe
+     *  chains always terminate (capacity is grown at 75% occupancy of
+     *  non-empty slots). Vanilla only ever calls clear/contains/add on
+     *  these sets (Sensing decompile); the remaining IntSet surface is
+     *  implemented faithfully anyway. */
+    public static final class GenIntSet extends it.unimi.dsi.fastutil.ints.AbstractIntSet {
+        private int[] keys = new int[16];
+        private int[] gens = new int[16];
+        private int mask = 15;
+        private int gen = 1;
+        private int used = 0;      // non-empty slots (incl. stale tombstones)
+        private int live = 0;      // current-generation entries
+        private int threshold = 12;
+        private boolean hasZero;
+        private int zeroGen;
+
+        private static int mix(int k) {
+            k *= 0x9E3779B9;
+            return k ^ (k >>> 16);
+        }
+
+        @Override
+        public void clear() {
+            if (gen == Integer.MAX_VALUE) {
+                java.util.Arrays.fill(keys, 0);
+                gen = 1;
+            } else {
+                gen++;
+            }
+            used = 0;
+            live = 0;
+            hasZero = false;
+        }
+
+        @Override
+        public boolean contains(int k) {
+            if (k == 0) return hasZero && zeroGen == gen;
+            int i = mix(k) & mask;
+            while (true) {
+                int kk = keys[i];
+                if (kk == 0) return false;
+                if (kk == k && gens[i] == gen) return true;
+                i = (i + 1) & mask;
+            }
+        }
+
+        @Override
+        public boolean add(int k) {
+            if (k == 0) {
+                if (hasZero && zeroGen == gen) return false;
+                if (!hasZero) used++;
+                hasZero = true;
+                zeroGen = gen;
+                live++;
+                if (used > threshold) grow();
+                return true;
+            }
+            int i = mix(k) & mask;
+            while (true) {
+                int kk = keys[i];
+                if (kk == 0) {
+                    keys[i] = k;
+                    gens[i] = gen;
+                    used++;
+                    live++;
+                    if (used > threshold) grow();
+                    return true;
+                }
+                if (kk == k) {
+                    if (gens[i] == gen) return false;
+                    gens[i] = gen;   // reactivate a stale tombstone
+                    live++;
+                    return true;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+
+        @Override
+        public boolean remove(int k) {
+            if (k == 0) {
+                if (hasZero && zeroGen == gen) {
+                    hasZero = false;
+                    live--;
+                    return true;
+                }
+                return false;
+            }
+            int i = mix(k) & mask;
+            while (true) {
+                int kk = keys[i];
+                if (kk == 0) return false;
+                if (kk == k) {
+                    if (gens[i] == gen) {
+                        gens[i] = 0;  // tombstone: invisible, probe-safe
+                        live--;
+                        return true;
+                    }
+                    return false;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+
+        @Override
+        public int size() {
+            return live;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return live == 0;
+        }
+
+        private void grow() {
+            int[] ok = keys;
+            int[] og = gens;
+            int nc = keys.length << 1;
+            keys = new int[nc];
+            gens = new int[nc];
+            mask = nc - 1;
+            threshold = nc - (nc >> 2);
+            int u = 0;
+            int l = 0;
+            for (int i = 0; i < ok.length; i++) {
+                if (ok[i] != 0 && og[i] == gen) {
+                    int j = mix(ok[i]) & mask;
+                    while (keys[j] != 0) j = (j + 1) & mask;
+                    keys[j] = ok[i];
+                    gens[j] = gen;
+                    u++;
+                    l++;
+                }
+            }
+            if (hasZero && zeroGen == gen) {
+                l++;
+            }
+            used = u;
+            live = l;
+        }
+
+        @Override
+        public it.unimi.dsi.fastutil.ints.IntIterator iterator() {
+            int[] k = keys;
+            int[] g = gens;
+            int cur = gen;
+            return new it.unimi.dsi.fastutil.ints.IntIterator() {
+                private int i = 0;
+                private int next = -1;
+                private boolean has = false;
+
+                private void advance() {
+                    while (!has && i < k.length) {
+                        if (k[i] != 0 && g[i] == cur) {
+                            next = k[i];
+                            has = true;
+                        }
+                        i++;
+                    }
+                }
+
+                @Override
+                public boolean hasNext() {
+                    advance();
+                    return has;
+                }
+
+                @Override
+                public int nextInt() {
+                    advance();
+                    if (!has) throw new java.util.NoSuchElementException();
+                    has = false;
+                    return next;
+                }
+            };
+        }
+    }
+
+    // ==================================================================
+    // L26 — the getSharedFlag floor. Entity.getSharedFlag(int) (javap,
+    // 26.3) is entityData.get(DATA_SHARED_FLAGS_ID) -> Byte -> (1<<flag)&b
+    // — the full boxed get chain (getItem + DataItem.getValue + cast +
+    // unbox) for a read that happens ~10-30x per mob per tick across
+    // isOnFire/isCrouching/isSprinting/isGlowing/... The floor replaces the
+    // body with the same read off the DataItem directly (typed at every
+    // hop, single-class offsets per the doc-32 rule). The mirror is the
+    // byte-exact vanilla chain.
+    // ==================================================================
+
+    public static volatile boolean FLAGR_ON = false;
+    public static volatile boolean FLAGR_HANDLES_OK = false;
+    public static final boolean FLAGR_FLAG_ON =
+            !"false".equals(System.getProperty("centities.flagRead", "true"));
+    public static long flagrCalls = 0, flagrHits = 0;
+    private static int FLAGR_ACC_ID = -1;
+
+    public static void initFlagRHandles() {
+        try {
+            if (FLAGS_ID == null) {
+                initFlagHandles();
+            }
+            if (!FLAGG_HANDLES_OK || FLAGS_ID == null || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
+                FLAGR_HANDLES_OK = false;
+                return;
+            }
+            FLAGR_ACC_ID = ((net.minecraft.network.syncher.EntityDataAccessor<?>) FLAGS_ID).id();
+            if (VH_ENT_DATA == null) {
+                VH_ENT_DATA = new RefField(Entity.class, "entityData");
+            }
+            if (O_ED < 0 && VH_ENT_DATA.off >= 0) {
+                O_ED = VH_ENT_DATA.off;
+            }
+            if (O_ACC_ID < 0) {
+                initDataOffsets();
+            }
+            FLAGR_HANDLES_OK = FLAGR_ACC_ID >= 0 && O_ED >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initFlagRHandles: " + t;
+            FLAGR_HANDLES_OK = false;
+        }
+    }
+
+    public static void setFlagROn(boolean on) {
+        FLAGR_ON = on;
+    }
+
+    /** Replacement body of Entity.getSharedFlag(int) — the direct DataItem
+     *  read; any shape-check miss routes the byte-exact vanilla chain. */
+    public static boolean getSharedFlag$(Entity e, int flag) {
+        flagrCalls++;
+        if (FLAGR_ON && FLAGR_HANDLES_OK) {
+            Object cur = entityDataValue(e, FLAGS_ID);
+            if (cur instanceof Byte b0) {
+                flagrHits++;
+                return ((1 << flag) & b0.byteValue()) != 0;
+            }
+        }
+        // vanilla mirror — byte-exact port of the 26.3 body
+        try {
+            net.minecraft.network.syncher.SynchedEntityData ed =
+                    (net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e);
+            @SuppressWarnings("unchecked")
+            net.minecraft.network.syncher.EntityDataAccessor<Byte> id =
+                    (net.minecraft.network.syncher.EntityDataAccessor<Byte>) flagsId();
+            Byte b = ed.get(id);
+            return ((1 << flag) & b.byteValue()) != 0;
+        } catch (Throwable mirrorFail) {
+            FLAGR_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "flagRMirror: " + mirrorFail;
+            if (mirrorFail instanceof RuntimeException re) throw re;
+            if (mirrorFail instanceof Error err) throw err;
+            throw new IllegalStateException("getSharedFlag mirror failed", mirrorFail);
+        }
     }
 
     // ==================================================================
@@ -5513,6 +6108,27 @@ public final class CeHooks {
     public static void setSharedFlag$(Entity e, int flag, boolean set) {
         flagCalls++;
         if (FLAGG_ON && FLAGG_HANDLES_OK) {
+            // L25: the direct-read gate — the byte comes off the DataItem
+            // directly (one typed Unsafe walk), replacing the boxed get
+            // chain. The computed-byte equality decision is the one
+            // vanilla's SynchedEntityData.set would make (ObjectUtils
+            // .notEqual on the boxed byte).
+            try {
+                Object cur = entityDataValue(e, FLAGS_ID);
+                if (cur instanceof Byte b0) {
+                    int old = b0.byteValue();
+                    int nw = set
+                            ? (old | (1 << flag))
+                            : (old & ~(1 << flag));
+                    if ((byte) nw == old) {
+                        flagGate++;
+                        return;
+                    }
+                    flagWrites++;
+                }
+            } catch (Throwable gateFail) {
+                // never swallow the write — fall through
+            }
             try {
                 net.minecraft.network.syncher.SynchedEntityData ed =
                         (net.minecraft.network.syncher.SynchedEntityData)
@@ -5576,6 +6192,21 @@ public final class CeHooks {
             VH_CONV_MOB = new RefField(net.minecraft.world.entity.ConversionTracker.class, "mob");
             VH_CONV_ID = new RefField(
                     net.minecraft.world.entity.ConversionTracker.class, "conversionId");
+            // L25: direct offsets for the fast gate (single-class on
+            // ConversionTracker — the weave guarantees the receiver).
+            if (U != null) {
+                O_CT_MOB = U.objectFieldOffset(
+                        net.minecraft.world.entity.ConversionTracker.class
+                                .getDeclaredField("mob"));
+                O_CT_ID = U.objectFieldOffset(
+                        net.minecraft.world.entity.ConversionTracker.class
+                                .getDeclaredField("conversionId"));
+            }
+            if (VH_ENT_DATA == null) {
+                VH_ENT_DATA = new RefField(Entity.class, "entityData");
+                initDataOffsets();
+                if (VH_ENT_DATA.off >= 0) O_ED = VH_ENT_DATA.off;
+            }
             CONV_HANDLES_OK = true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -5668,13 +6299,15 @@ public final class CeHooks {
     public static void setTicksFrozen$(Entity e, int i) {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
+            // L25: the direct-read gate — one typed Unsafe walk instead of
+            // the getTicksFrozen() boxed chain (which cost as much as the
+            // write it guarded — the get chain IS the set chain minus the
+            // assign). The value read is the same field vanilla's
+            // DATA_TICKS_FROZEN DataItem holds, so the equality decision is
+            // the one vanilla's SynchedEntityData.set would make.
             try {
-                // L19 RETRACTED: the dataValueAt fast read (two Unsafe loads
-                // through itemsById[idx]) is the prime suspect of the CI
-                // SIGSEGV (G1SATB filter on a wild oop, items-100k-mod and
-                // spread-100k-mod, both L19a runs). Reverted to the exact
-                // L18 read; the helper stays for a properly diagnosed retry.
-                if (e.getTicksFrozen() == i) {
+                Object cur = entityDataValue(e, Entity.DATA_TICKS_FROZEN);
+                if (cur instanceof Integer iv && iv.intValue() == i) {
                     frozenGate++;
                     return;
                 }
@@ -5692,16 +6325,21 @@ public final class CeHooks {
     public static void setConverting$(Object tracker, boolean z) {
         convCalls++;
         if (CONV_ON && CONV_HANDLES_OK) {
+            // L25: the direct-read gate. The receiver is ConversionTracker
+            // (weave-guaranteed), so O_CT_MOB/O_CT_ID are the exact
+            // single-class offsets (doc-32 rule); the mob/entityData hops
+            // are typed-checked, and the value read is the same DataItem
+            // field vanilla's set() compares — the skip decision is the
+            // one vanilla would make.
             try {
-                net.minecraft.world.entity.Mob m =
-                        (net.minecraft.world.entity.Mob) VH_CONV_MOB.getObj(tracker);
-                net.minecraft.network.syncher.EntityDataAccessor<Boolean> id =
-                        (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
-                                VH_CONV_ID.getObj(tracker);
-                Boolean cur = m.getEntityData().get(id);
-                if (cur.booleanValue() == z) {
-                    convGate++;
-                    return;
+                Object m = U.getObject(tracker, O_CT_MOB);
+                if (m instanceof net.minecraft.world.entity.Mob mb) {
+                    Object acc = U.getObject(tracker, O_CT_ID);
+                    Object cur = entityDataValue(mb, acc);
+                    if (cur instanceof Boolean bv && bv.booleanValue() == z) {
+                        convGate++;
+                        return;
+                    }
                 }
             } catch (Throwable gateFail) {
                 // fall through to the vanilla write
