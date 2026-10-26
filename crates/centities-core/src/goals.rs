@@ -40,6 +40,14 @@ pub const REQ_STROLL_POS: i32 = 3; // getPosition() chain → resume res(0/1)
 pub const REQ_LOOKAT_QUERY: i32 = 4; // getNearestPlayer chain → resume res(0/1)
 pub const REQ_START_VANILLA: i32 = 5; // goal.start() → resume res(=1)
 pub const REQ_FIND_TARGET: i32 = 6; // findTarget() chain → resume res(0/1)
+/// native pre-filtered LoS scan: the engine ran the exact non-LoS half of
+/// TargetingConditions.test over the packed player snapshot and staged the
+/// candidates (snapshot order — the vanilla level.players() iteration
+/// order) in out[9..]. Java raycasts EVERY candidate through the Sensing
+/// cache (vanilla getNearestPlayer has no early exit) and resumes with
+/// res = bit i set when snapshot candidate i passed. ≥31 players parks
+/// vanilla instead (MF_MANY_PLAYERS).
+pub const REQ_LOS_SCAN: i32 = 7;
 
 // goal kinds (the classified zombie set)
 pub const GK_UNKNOWN: i32 = 0;
@@ -67,6 +75,42 @@ pub const MF_USING_ITEM: i32 = 1 << 3;
 pub const MF_LAST_HURT_BY: i32 = 1 << 4; // mob.getLastHurtByMob() != null
 pub const MF_BRIGHT_OUTSIDE: i32 = 1 << 5; // !hasFixedTime && skyDarken < 4 (level-global per tick)
 pub const MF_NEAR_VILLAGE: i32 = 1 << 6; // level.isCloseToVillage(mob.blockPosition(), 6) — packed only when the night gate lets canUse proceed
+pub const MF_PEACEFUL: i32 = 1 << 7; // level difficulty == PEACEFUL (level-global)
+pub const MF_TEAMS_PRESENT: i32 = 1 << 8; // any scoreboard team activity — native target scans disabled
+pub const MF_MANY_PLAYERS: i32 = 1 << 9; // > 30 players — the LoS-scan mask does not fit res
+
+// per-player snapshot record (PSTRIDE i32), appended after the goal
+// records; the order = level.players() order (the vanilla scan order)
+pub const PSTRIDE: usize = 12;
+pub const PX_LO: usize = 0; // f64 x (feet)
+pub const PY_LO: usize = 2; // f64 y (feet)
+pub const PZ_LO: usize = 4; // f64 z (feet)
+pub const PEYE_LO: usize = 6; // f64 eyeY
+pub const PVIS_LO: usize = 8; // f64 getVisibilityPercent(level, zombie-type targeter)
+pub const PFLAGS: usize = 10; // PF_* bit set
+pub const PID: usize = 11; // entity id (the Java LoS resolver maps id -> Player)
+
+// player snapshot flags (PFLAGS)
+pub const PF_ALIVE: i32 = 1;
+pub const PF_SPECTATOR: i32 = 1 << 1;
+pub const PF_INVULNERABLE: i32 = 1 << 2;
+pub const PF_INVISIBLE: i32 = 1 << 3;
+pub const PF_DISCRETE: i32 = 1 << 4; // isDiscrete (sneaking) — visPct input, packed for parity
+pub const PF_RIDING: i32 = 1 << 5; // isPassenger (notRiding selector)
+pub const PF_MOBVIS_ZOMBIE: i32 = 1 << 6; // MOB_VISIBILITY gear component targets zombies — visPct already includes it
+
+// TargetingConditions.test line 2: !target.canBeSeenByAnyone() —
+// canBeSeenByAnyone() = !isSpectator() && isAlive()
+#[inline]
+fn pf_can_be_seen_by_anyone(fl: i32) -> bool {
+    fl & (PF_SPECTATOR | PF_ALIVE) == PF_ALIVE
+}
+
+// canBeSeenAsEnemy() = !isInvulnerable() && canBeSeenByAnyone()
+#[inline]
+fn pf_can_be_seen_as_enemy(fl: i32) -> bool {
+    fl & PF_INVULNERABLE == 0 && pf_can_be_seen_by_anyone(fl)
+}
 
 // selector order — vanilla runs targetSelector FIRST in both branches
 pub const SEL_TARGET: usize = 0;
@@ -77,13 +121,15 @@ pub const NAV_NONE: i32 = 0;
 pub const NAV_PATH_DONE: i32 = 1;
 pub const NAV_PATH_ACTIVE: i32 = 2;
 
-// per-goal record: 6 i32 — [kind, priority, flagsMask, cfg, running, state]
-pub const GOAL_STRIDE: usize = 6;
+// per-goal record: 8 i32 — [kind, priority, flagsMask, cfg, running, state, cfg2, cfg3]
+pub const GOAL_STRIDE: usize = 8;
 // cfg word per kind:
 //   GK_STROLL         low16 = reducedTickDelay(interval) (60 for 120)
-//   GK_LOOKAT_PLAYER  = probability f32 bits (0.02F)
-//   GK_NEAREST_TARGET low16 = randomInterval (10)
+//   GK_LOOKAT_PLAYER  = probability f32 bits (0.02F); SIGN bit = Player-typed
+//   GK_NEAREST_TARGET low16 = randomInterval (10); SIGN bit = Player-typed
 //   GK_MOVE_THROUGH_VILLAGE bit0 = onlyAtNight
+// cfg2 word per kind:
+//   GK_LOOKAT_PLAYER  = lookDistance f32 bits (the context range)
 // state word per kind:
 //   GK_LOOKAROUND     = lookTime
 //   GK_LOOKAT_PLAYER  bit30 = lookAt alive, bit29 = within range, low16 = lookTime
@@ -107,8 +153,19 @@ pub const GOAL_STRIDE: usize = 6;
 //   [22] mob.lastHurtByMobTimestamp (low i32 — HurtByTargetGoal gate)
 //   [23] level.getGameTime() low i32 (MeleeAttackGoal 20-tick throttle;
 //        u32-wrapping compares — exact modulo 2^32, see can_use)
-//   [24..]  goal records: target selector first, then goal selector
-const IN_HEADER: usize = 24;
+//   [24] player snapshot count P (0 = no native scans)
+//   [25] mob.getFollowDistance() f32 bits (NearestAttackable range)
+//   [26..28] mob.getX() f64, [28..30] getY(), [30..32] getZ(),
+//   [32..34] getEyeY()
+//   [34..]  goal records: target selector first, then goal selector;
+//   then P * PSTRIDE player snapshot records (level.players() order)
+const IN_HEADER: usize = 34;
+const IN_PCOUNT: usize = 24;
+const IN_FOLLOW: usize = 25;
+const IN_MOBX: usize = 26;
+const IN_MOBY: usize = 28;
+const IN_MOBZ: usize = 30;
+const IN_EYEY: usize = 32;
 const IN_SEED_LO: usize = 12;
 const IN_SEED_HI: usize = 13;
 const IN_RES: usize = 14;
@@ -155,6 +212,7 @@ pub const ACT_LOOK_TICK_AT: i32 = 6; // lookat tick port: lookTime-- (p1 = new),
 pub const ACT_NAV_IDLE: i32 = 7; // navigation.tick idle port done natively (executor does tick++ etc.)
 pub const ACT_MOVE_ZZA0: i32 = 8; // moveControl WAIT: setZza(0)
 pub const ACT_LOOK_COOL_VANILLA: i32 = 9; // lookControl.tick routes vanilla (cooldown > 0)
+pub const ACT_REF_SET_PLAYER: i32 = 10; // goal.lookAt/target = players[p1] (p0 = global goalIdx)
 pub const ACT_NOOP: i32 = 0;
 
 // phases within one selector tick
@@ -337,6 +395,14 @@ impl<'a> Ctx<'a> {
         self.inb[self.off(sel, i) + 3]
     }
     #[inline]
+    fn cfg2(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 6]
+    }
+    #[inline]
+    fn cfg3(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 7]
+    }
+    #[inline]
     fn is_running(&self, sel: usize, i: usize) -> bool {
         self.inb[self.off(sel, i) + 4] != 0
     }
@@ -347,6 +413,162 @@ impl<'a> Ctx<'a> {
     #[inline]
     fn flag(&self, bit: i32) -> bool {
         self.inb[1] & bit != 0
+    }
+    // ---- player snapshot accessors (v3 native scans) ----
+    #[inline]
+    fn pcount(&self) -> usize {
+        self.inb[IN_PCOUNT] as usize
+    }
+    #[inline]
+    fn player_base(&self) -> usize {
+        self.base + (self.counts[0] + self.counts[1]) * GOAL_STRIDE
+    }
+    #[inline]
+    fn pcoords(&self, i: usize) -> (f64, f64, f64) {
+        let b = self.player_base() + i * PSTRIDE;
+        (
+            f64::from_bits(
+                ((self.inb[b + PX_LO + 1] as u64) << 32)
+                    | (self.inb[b + PX_LO] as u64 & 0xFFFF_FFFF),
+            ),
+            f64::from_bits(
+                ((self.inb[b + PY_LO + 1] as u64) << 32)
+                    | (self.inb[b + PY_LO] as u64 & 0xFFFF_FFFF),
+            ),
+            f64::from_bits(
+                ((self.inb[b + PZ_LO + 1] as u64) << 32)
+                    | (self.inb[b + PZ_LO] as u64 & 0xFFFF_FFFF),
+            ),
+        )
+    }
+    #[inline]
+    fn pflags(&self, i: usize) -> i32 {
+        self.inb[self.player_base() + i * PSTRIDE + PFLAGS]
+    }
+    #[inline]
+    fn pvis(&self, i: usize) -> f64 {
+        let b = self.player_base() + i * PSTRIDE + PVIS_LO;
+        f64::from_bits(((self.inb[b + 1] as u64) << 32) | (self.inb[b] as u64 & 0xFFFF_FFFF))
+    }
+    #[inline]
+    fn mob_pos(&self) -> (f64, f64, f64, f64) {
+        (
+            f64::from_bits(
+                ((self.inb[IN_MOBX + 1] as u64) << 32) | (self.inb[IN_MOBX] as u64 & 0xFFFF_FFFF),
+            ),
+            f64::from_bits(
+                ((self.inb[IN_MOBY + 1] as u64) << 32) | (self.inb[IN_MOBY] as u64 & 0xFFFF_FFFF),
+            ),
+            f64::from_bits(
+                ((self.inb[IN_MOBZ + 1] as u64) << 32) | (self.inb[IN_MOBZ] as u64 & 0xFFFF_FFFF),
+            ),
+            f64::from_bits(
+                ((self.inb[IN_EYEY + 1] as u64) << 32) | (self.inb[IN_EYEY] as u64 & 0xFFFF_FFFF),
+            ),
+        )
+    }
+
+    /// The native non-LoS half of TargetingConditions.test over the packed
+    /// snapshot, in the vanilla level.players() order. combat = isCombat
+    /// (canAttack/isAlliedTo checks); not_riding = the notRiding selector;
+    /// range = the conditions range (lookDistance or followDistance).
+    /// Returns the candidate list (snapshot indices) that passed everything
+    /// except the Sensing LoS — the caller stages REQ_LOS_SCAN with them
+    /// (or Cu::No when there are none: vanilla would return null).
+    fn scan_players(&self, combat: bool, not_riding: bool, range: f64) -> Vec<usize> {
+        let (mx, my, mz, _eyey) = self.mob_pos();
+        let peaceful = self.flag(MF_PEACEFUL);
+        let mut cands = Vec::new();
+        for i in 0..self.pcount() {
+            let fl = self.pflags(i);
+            // test() line 2: !canBeSeenByAnyone -> false
+            if !pf_can_be_seen_by_anyone(fl) {
+                continue;
+            }
+            // selector: notRiding for the Player lookat context
+            if not_riding && fl & PF_RIDING != 0 {
+                continue;
+            }
+            // targeter != null path, isCombat half:
+            //   !targeter.canAttack(target) || targeter.isAlliedTo(target) -> false
+            // canAttack(LivingEntity) = !(Player && PEACEFUL) && target.canBeSeenAsEnemy()
+            if combat {
+                if peaceful || !pf_can_be_seen_as_enemy(fl) {
+                    continue;
+                }
+                // isAlliedTo: no scoreboard teams on either side (the
+                // MF_TEAMS_PRESENT gate routes team-enabled worlds to the
+                // vanilla park) -> false, no skip
+            }
+            // range half: modifier = testInvisible ? getVisibilityPercent : 1.0
+            //   (testInvisible defaults true on both contexts)
+            let modifier = self.pvis(i);
+            let vd = (range * modifier).max(2.0);
+            let (px, py, pz) = self.pcoords(i);
+            let dx = mx - px;
+            let dy = my - py;
+            let dz = mz - pz;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 > vd * vd {
+                continue;
+            }
+            cands.push(i);
+        }
+        cands
+    }
+
+    /// The getNearestPlayer best-selection: nearest passing candidate by
+    /// e.distanceToSqr(mobX, mobEyeY, mobZ). mask bit i = candidate i's
+    /// Sensing LoS passed (Java resolved every candidate — no early exit
+    /// in vanilla).
+    fn best_from_mask(
+        &self,
+        mask: u32,
+        combat: bool,
+        not_riding: bool,
+        range: f64,
+    ) -> Option<usize> {
+        if mask == 0 {
+            return None;
+        }
+        let (mx, _my, mz, eyey) = self.mob_pos();
+        let peaceful = self.flag(MF_PEACEFUL);
+        let mut best: Option<usize> = None;
+        let mut best_d2 = f64::INFINITY;
+        for i in 0..self.pcount() {
+            if mask & (1u32 << i) == 0 {
+                continue;
+            }
+            let fl = self.pflags(i);
+            if !pf_can_be_seen_by_anyone(fl) {
+                continue;
+            }
+            if not_riding && fl & PF_RIDING != 0 {
+                continue;
+            }
+            if combat && (peaceful || !pf_can_be_seen_as_enemy(fl)) {
+                continue;
+            }
+            let modifier = self.pvis(i);
+            let vd = (range * modifier).max(2.0);
+            let (px, py, pz) = self.pcoords(i);
+            let dx = mx - px;
+            let dy = _my - py;
+            let dz = mz - pz;
+            if dx * dx + dy * dy + dz * dz > vd * vd {
+                continue;
+            }
+            // best-selection distance: player.distanceToSqr(mx, eyeY, mz)
+            let ddx = px - mx;
+            let ddy = py - eyey;
+            let ddz = pz - mz;
+            let d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = Some(i);
+            }
+        }
+        best
     }
     fn seed(&self) -> i64 {
         ((self.inb[IN_SEED_HI] as i64) << 32) | (self.inb[IN_SEED_LO] as i64 as u64) as i64
@@ -371,7 +593,15 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
     }
     let nt = in_buf[5] as usize;
     let ng = in_buf[6] as usize;
-    if nt > MAX_GOALS || ng > MAX_GOALS || in_buf.len() < IN_HEADER + (nt + ng) * GOAL_STRIDE {
+    let p = if in_buf.len() > IN_PCOUNT {
+        in_buf[IN_PCOUNT].max(0) as usize
+    } else {
+        0
+    };
+    if nt > MAX_GOALS
+        || ng > MAX_GOALS
+        || in_buf.len() < IN_HEADER + (nt + ng) * GOAL_STRIDE + p * PSTRIDE
+    {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_GOAL_OVERFLOW;
         return ST_FALLBACK;
@@ -440,6 +670,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
             }
         }
         let res = in_buf[IN_RES] != 0;
+        let res_mask = in_buf[IN_RES];
         match in_buf[IN_RES_OP] {
             REQ_CC_VANILLA => {
                 if !res && stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
@@ -453,6 +684,35 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // job, emitted as actions the floor applies IMMEDIATELY
                 if res && lock_only(&mut ctx, &mut out, sel, gi).is_err() {
                     return fallback(&mut out, FB_STATE_MISMATCH);
+                }
+            }
+            REQ_LOS_SCAN => {
+                // res_mask = the passing bitmask over the staged candidates.
+                // The best selection (nearest by player.distanceToSqr(mx,
+                // eyeY, mz)) runs here; a winner gets its reference written
+                // (goal.lookAt / goal.target) BEFORE the lock transition —
+                // the vanilla start() bodies read those fields.
+                if res_mask != 0 {
+                    let kind = ctx.kind(sel, gi);
+                    let combat = kind == GK_NEAREST_TARGET;
+                    let not_riding = kind == GK_LOOKAT_PLAYER;
+                    let range = if combat {
+                        f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
+                    } else {
+                        f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
+                    };
+                    if let Some(winner) =
+                        ctx.best_from_mask(res_mask as u32, combat, not_riding, range)
+                    {
+                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), winner as i32, 0, 0);
+                        if lock_only(&mut ctx, &mut out, sel, gi).is_err() {
+                            return fallback(&mut out, FB_STATE_MISMATCH);
+                        }
+                    } else if combat {
+                        // every candidate failed the Sensing LoS — vanilla's
+                        // findTarget wrote null into the goal's target field
+                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                    }
                 }
             }
             _ => {}
@@ -582,6 +842,18 @@ fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -
     ST_REQUEST
 }
 
+/// REQ_LOS_SCAN park: the native non-LoS filter passed `cands` (snapshot
+/// indices, vanilla list order) — Java raycasts each through the Sensing
+/// cache and resumes with res = a bitmask over the same indices.
+fn park_los(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, cands: &[usize]) -> i32 {
+    let st = park(ctx, out, sel, phase, gi, REQ_LOS_SCAN);
+    out.buf[OUT_ACT] = cands.len() as i32;
+    for (i, c) in cands.iter().enumerate() {
+        out.buf[OUT_ACT + 1 + i] = *c as i32;
+    }
+    st
+}
+
 fn needs_cc_vanilla(kind: i32) -> bool {
     matches!(
         kind,
@@ -683,6 +955,30 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             if ri > 0 && ctx.lcg.next_int_bound(ri) != 0 {
                 return Ok(Cu::No);
             }
+            // Player-typed target (cfg SIGN bit — bit1 collided with the
+            // randomInterval value 10 = 0b1010!): findTarget() =
+            // getNearestPlayer over the snapshot — the non-LoS half of
+            // TargetingConditions.test is exact natively (combat
+            // conditions, no selector on the Player-typed goal, range =
+            // followDistance); the Sensing LoS raycasts stay Java
+            // (REQ_LOS_SCAN). Team-enabled and >30-player worlds park.
+            if ctx.cfg3(sel, gi) & 1 != 0
+                && !ctx.flag(MF_TEAMS_PRESENT)
+                && !ctx.flag(MF_MANY_PLAYERS)
+                && ctx.pcount() > 0
+            {
+                let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
+                let cands = ctx.scan_players(true, false, range);
+                if cands.is_empty() {
+                    // vanilla: this.target = getNearestPlayer(...) -> null —
+                    // NearestAttackableTargetGoal has no stop() clear for the
+                    // field, so the null write is observable
+                    out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                    return Ok(Cu::No);
+                }
+                park_los(ctx, out, sel, phase, gi, &cands);
+                return Ok(Cu::Staged);
+            }
             // findTarget() — a level query, staged (the gate pull already
             // happened; the seed handoff keeps the stream exact)
             park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
@@ -708,10 +1004,23 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             Ok(Cu::Staged)
         }
         GK_LOOKAT_PLAYER => {
-            // nextFloat() >= probability → false; the query stages
+            // nextFloat() >= probability → false
             let prob = f32::from_bits(ctx.cfg(sel, gi) as u32);
             if ctx.lcg.next_f32() >= prob {
                 return Ok(Cu::No);
+            }
+            // Player-typed lookat (cfg SIGN bit — bit1 collided with the
+            // 0.02F probability bits): getNearestPlayer over the snapshot —
+            // non-combat conditions (canBeSeenByAnyone + the notRiding
+            // selector + range = lookDistance), LoS staged.
+            if ctx.cfg3(sel, gi) & 1 != 0 && !ctx.flag(MF_MANY_PLAYERS) && ctx.pcount() > 0 {
+                let range = f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32));
+                let cands = ctx.scan_players(false, true, range);
+                if cands.is_empty() {
+                    return Ok(Cu::No); // getNearestPlayer -> null
+                }
+                park_los(ctx, out, sel, phase, gi, &cands);
+                return Ok(Cu::Staged);
             }
             park(ctx, out, sel, phase, gi, REQ_LOOKAT_QUERY);
             Ok(Cu::Staged)
@@ -820,7 +1129,7 @@ mod tests {
     const MF_NO_PASSENGERS: i32 = 1;
     const MF_MAINHAND_EMPTY: i32 = 2;
 
-    fn rec(kind: i32, prio: i32, flags: i64, cfg: i32, running: bool, state: i32) -> [i32; 6] {
+    fn rec(kind: i32, prio: i32, flags: i64, cfg: i32, running: bool, state: i32) -> [i32; 8] {
         [
             kind,
             prio,
@@ -828,7 +1137,114 @@ mod tests {
             cfg,
             if running { 1 } else { 0 },
             state,
+            0, // cfg2
+            0, // cfg3 (unit tests stay vanilla-parked; the scan tests set bit0)
         ]
+    }
+
+    /// one player 5 blocks away on flat ground; header carries the mob at
+    /// the origin with followRange 35
+    fn snapshot_one_player(px: f64, py: f64, pz: f64) -> Vec<i32> {
+        let mut b = build_in(777, 100, 2, 42);
+        b[IN_PCOUNT] = 1;
+        b[IN_FOLLOW] = 35.0f32.to_bits() as i32;
+        let (mx, my, mz, ey) = (0.0f64, 0.0, 0.0, 1.62);
+        for (slot, v) in [(IN_MOBX, mx), (IN_MOBY, my), (IN_MOBZ, mz), (IN_EYEY, ey)] {
+            let bits = v.to_bits();
+            b[slot] = bits as i32;
+            b[slot + 1] = (bits >> 32) as i32;
+        }
+        // the lookat context range (cfg2) = lookDistance 8.0 — build_in
+        // leaves cfg2 zeroed, which the scan reads as a 2-block range
+        b[IN_HEADER + 9 * GOAL_STRIDE + 6] = 8.0f32.to_bits() as i32;
+        let pb = IN_HEADER + 11 * GOAL_STRIDE;
+        b.resize(pb + PSTRIDE, 0);
+        let bits = |v: f64| -> (i32, i32) { (v.to_bits() as i32, (v.to_bits() >> 32) as i32) };
+        let (xl, xh) = bits(px);
+        let (yl, yh) = bits(py);
+        let (zl, zh) = bits(pz);
+        let (vl, vh) = bits(1.0); // visible
+        let (el, eh) = bits(py + 1.62);
+        b[pb..pb + PSTRIDE]
+            .copy_from_slice(&[xl, xh, yl, yh, zl, zh, el, eh, vl, vh, PF_ALIVE, 42]);
+        b
+    }
+
+    #[test]
+    fn lookat_player_scan_stages_los_and_starts() {
+        // the lookat canUse: nextFloat (2% gate) must PASS for the scan to
+        // run — drive the RNG deterministically by scanning seeds
+        let mut seed = 1u64;
+        let mut inb = loop {
+            let mut b = snapshot_one_player(3.0, 0.0, 4.0); // d2 = 25 < 64
+            b[12] = seed as i32;
+            b[13] = (seed >> 32) as i32;
+            // even tick
+            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let st = ai_floor(&b, &mut out);
+            if st == ST_REQUEST && out[1] == REQ_LOS_SCAN && out[2] == 5 {
+                // the LOOKAT goal's scan (gi=5); candidate 0 staged
+                assert_eq!(out[8], 1);
+                assert_eq!(out[9], 0);
+                break b;
+            }
+            assert!(st == ST_DONE || st == ST_REQUEST, "status {st}");
+            seed += 1;
+            assert!(seed < 100000, "no scan seed found");
+        };
+        // Java resolves the Sensing LoS: player 0 passed — emulate aiRun's
+        // resume (cursor + op + mask) on a fresh re-run of the same seed
+        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out2 = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let st = ai_floor(&inb, &mut out2);
+        assert_eq!(st, ST_REQUEST);
+        assert_eq!(out2[1], REQ_LOS_SCAN);
+        inb[0] = out2[6];
+        inb[IN_RES_OP] = REQ_LOS_SCAN;
+        inb[IN_RES] = 1; // bit 0 set: candidate 0 passed LoS
+        let seed2 = ((out2[4] as u64) << 32) | (out2[3] as u64 & 0xFFFF_FFFF);
+        inb[12] = seed2 as i32;
+        inb[13] = (seed2 >> 32) as i32;
+        let st2 = ai_floor(&inb, &mut out);
+        // the winner write + lock transition apply in THIS round; the walk
+        // then finishes the remaining goals (no further parks on this seed)
+        assert!(st2 == ST_DONE || st2 == ST_REQUEST, "st2={st2}");
+        let mut saw_ref = false;
+        let mut saw_start = false;
+        let n = out[5] as usize;
+        for a in 0..n {
+            let b = OUT_HEADER + a * OUT_ACT;
+            if out[b] == ACT_REF_SET_PLAYER && out[b + 1] == 9 {
+                saw_ref = true; // the lookat goal = global idx 9 (4 target goals 0..3, then 7 goal goals)
+            }
+            if out[b] == ACT_GOAL_START {
+                saw_start = true;
+            }
+        }
+        assert!(saw_ref, "lookat field write missing");
+        assert!(saw_start, "lock start missing");
+    }
+
+    #[test]
+    fn nearest_target_scan_stages_los() {
+        // a player within followRange stages the LoS scan for the Player
+        // NearestAttackableTargetGoal (global idx 1); the villager/golem/
+        // turtle goals (no snapshot types) park vanilla REQ_FIND_TARGET —
+        // the FIRST park is the Player goal (target selector order)
+        let mut seed = 1u64;
+        loop {
+            let mut b = snapshot_one_player(10.0, 0.0, 0.0); // d2 = 100 < 1225
+            b[12] = seed as i32;
+            b[13] = (seed >> 32) as i32;
+            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let st = ai_floor(&b, &mut out);
+            if st == ST_REQUEST && out[1] == REQ_LOS_SCAN {
+                assert_eq!(out[2], 1, "global goal idx of the Player nearest goal");
+                return;
+            }
+            seed += 1;
+            assert!(seed < 100000, "no nearest-scan seed found");
+        }
     }
 
     /// idle zombie: target selector = hurtby + 3 nearest; goal selector =
@@ -851,15 +1267,16 @@ mod tests {
         b[13] = (seed >> 32) as i32;
         let fl_target = FL_TARGET;
         let fl_ml = FL_MOVE | FL_LOOK;
+        b[IN_PCOUNT] = 0; // no snapshot in the unit tests -> vanilla parks
         let mut off = IN_HEADER;
         for r in [
             rec(GK_HURT_BY, 1, fl_target, 0, false, 0),
-            rec(GK_NEAREST_TARGET, 2, fl_target, 10, false, 0),
+            rec(GK_NEAREST_TARGET, 2, fl_target, 10, false, 0), // cfg3 set below
             rec(GK_NEAREST_TARGET, 3, fl_target, 10, false, 0),
             rec(GK_NEAREST_TARGET, 5, fl_target, 10, false, 0),
         ] {
-            b[off..off + 6].copy_from_slice(&r);
-            off += 6;
+            b[off..off + GOAL_STRIDE].copy_from_slice(&r);
+            off += GOAL_STRIDE;
         }
         for r in [
             rec(GK_SPEAR_USE, 2, fl_ml, 0, false, 0),
@@ -877,9 +1294,13 @@ mod tests {
             ),
             rec(GK_LOOKAROUND, 8, fl_ml, 0, false, 0),
         ] {
-            b[off..off + 6].copy_from_slice(&r);
-            off += 6;
+            b[off..off + GOAL_STRIDE].copy_from_slice(&r);
+            off += GOAL_STRIDE;
         }
+        // mark the Player-typed goals (cfg3 bit0): global idx 1 = the
+        // Player NearestAttackableTargetGoal, idx 9 = the Player lookat
+        b[IN_HEADER + 1 * GOAL_STRIDE + 7] = 1;
+        b[IN_HEADER + 9 * GOAL_STRIDE + 7] = 1;
         b
     }
 

@@ -5483,11 +5483,19 @@ public final class CeHooks {
             GK_NEAREST_TARGET = 8;
     static final int MF_NO_PASSENGERS = 1, MF_MAINHAND_EMPTY = 2, MF_HAS_TARGET = 4,
             MF_USING_ITEM = 8, MF_LAST_HURT_BY = 16, MF_BRIGHT_OUTSIDE = 32,
-            MF_NEAR_VILLAGE = 64;
+            MF_NEAR_VILLAGE = 64, MF_PEACEFUL = 128, MF_TEAMS_PRESENT = 256,
+            MF_MANY_PLAYERS = 512;
     static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
-            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6;
+            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10;
+    static final int REQ_LOS_SCAN = 7;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
-    static final int MAX_GOALS = 16, GOAL_STRIDE = 6, IN_HEADER = 24, OUT_HEADER = 8;
+    static final int MAX_GOALS = 16, GOAL_STRIDE = 8, IN_HEADER = 34, OUT_HEADER = 8;
+    static final int IN_PCOUNT = 24, IN_FOLLOW = 25, IN_MOBX = 26, IN_MOBY = 28,
+            IN_MOBZ = 30, IN_EYEY = 32;
+    static final int PSTRIDE = 12, PX_LO = 0, PY_LO = 2, PZ_LO = 4, PEYE_LO = 6,
+            PVIS_LO = 8, PFLAGS = 10, PID = 11;
+    static final int AIPF_ALIVE = 1, AIPF_SPECTATOR = 2, AIPF_INVULNERABLE = 4,
+            AIPF_INVISIBLE = 8, AIPF_DISCRETE = 16, AIPF_RIDING = 32;
 
     // per-mob classification context (weak identity map — no leaks, no
     // per-mob allocation after the first tick). MapMaker.makeMap() returns
@@ -5513,8 +5521,8 @@ public final class CeHooks {
         final net.minecraft.world.entity.ai.goal.WrappedGoal[] tGoals, gGoals;
         final int[] tKind, gKind, tPrio, gPrio;
         final long[] tFlags, gFlags;
-        final int[] tCfg, gCfg;
-        final float[] lookDistSq; // per target-goal lookDistance^2 (lookat kind)
+        final int[] tCfg, tCfg3, gCfg, gCfg2, gCfg3; // cfg2: lookat range f32 bits; cfg3: flags
+        final float[] lookDistSq; // per target-goal lookDistance (lookat kind)
         // MoveThroughVillage lazy-flag inputs: the village proximity read
         // (a POI-section probe) runs only when the mob HAS the goal AND the
         // night gate lets canUse proceed — otherwise it would burn the
@@ -5524,14 +5532,15 @@ public final class CeHooks {
               net.minecraft.world.entity.ai.goal.WrappedGoal[] t,
               net.minecraft.world.entity.ai.goal.WrappedGoal[] g,
               int[] tk, int[] gk, int[] tp, int[] gp, long[] tf, long[] gf,
-              int[] tc, int[] gc, float[] lds,
+              int[] tc, int[] tc3, int[] gc, int[] gc2, int[] gc3, float[] lds,
               boolean hasMtv, boolean mtvOnlyNight, boolean fixedTime) {
             this.targetSel = ts; this.goalSel = gs;
             this.tGoals = t; this.gGoals = g;
             this.tKind = tk; this.gKind = gk;
             this.tPrio = tp; this.gPrio = gp;
             this.tFlags = tf; this.gFlags = gf;
-            this.tCfg = tc; this.gCfg = gc;
+            this.tCfg = tc; this.tCfg3 = tc3;
+            this.gCfg = gc; this.gCfg2 = gc2; this.gCfg3 = gc3;
             this.lookDistSq = lds;
             this.hasMtv = hasMtv; this.mtvOnlyNight = mtvOnlyNight;
             this.fixedTime = fixedTime;
@@ -5540,8 +5549,8 @@ public final class CeHooks {
                 new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
                 new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
                 new int[0], new int[0], new int[0], new int[0],
-                new long[0], new long[0], new int[0], new int[0], new float[0],
-                false, false, false);
+                new long[0], new long[0], new int[0], new int[0], new int[0],
+                new int[0], new int[0], new float[0], false, false, false);
     }
 
     // goal-object field offsets (resolved once per class at init)
@@ -5554,6 +5563,7 @@ public final class CeHooks {
     private static long O_AL_SIZE = -1;        // java.util.ArrayList.size (int)
     private static long O_MOB_LASTHURTBY = -1, O_MOB_LASTHURTBY_TS = -1;
     private static long O_LVL_SKYDARKEN = -1;
+    private static long O_NAT_TARGET = -1; // NearestAttackableTargetGoal.target
     private static long O_STROLL_FORCE = -1, O_STROLL_WX = -1, O_STROLL_WY = -1, O_STROLL_WZ = -1;
     private static long O_NAV_PATH = -1, O_NAV_TICK = -1, O_NAV_DELAYED = -1;
     private static long O_PATH_NEXT = -1, O_PATH_NODES = -1;
@@ -5615,6 +5625,11 @@ public final class CeHooks {
             O_MOB_LASTHURTBY = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMob");
             O_MOB_LASTHURTBY_TS = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMobTimestamp");
             O_LVL_SKYDARKEN = offOf(net.minecraft.world.level.Level.class, "skyDarken");
+            // v3 native scans: the goal reference fields the ACT_REF_SET_PLAYER
+            // executor writes (vanilla getNearestPlayer/findTarget assign them)
+            O_NAT_TARGET = offOf(Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal"),
+                    "target");
             MOVE_OP_WAIT = java.lang.Enum.valueOf(
                     (Class<? extends java.lang.Enum>) Class.forName(
                             "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
@@ -5688,7 +5703,7 @@ public final class CeHooks {
                 || O_LC_COOL < 0 || O_JC_JUMP < 0 || O_MOB_TARGET < 0 || O_MOB_NOACTION < 0
                 || O_ZA_LASTCANUSE < 0 || O_HB_TIMESTAMP < 0 || O_MTV_VISITED < 0
                 || O_MTV_ONLYNIGHT < 0 || O_AL_SIZE < 0 || O_MOB_LASTHURTBY < 0
-                || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0
+                || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0 || O_NAT_TARGET < 0
                 || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
                 || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
                 || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null) {
@@ -5760,6 +5775,23 @@ public final class CeHooks {
         return -1.0F;
     }
 
+    private static Object readObjectField(Object o, Class<?> start, String name) {
+        try {
+            Class<?> k = start;
+            while (k != null) {
+                try {
+                    java.lang.reflect.Field f = k.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.get(o);
+                } catch (NoSuchFieldException e) {
+                    k = k.getSuperclass();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return null;
+    }
+
     /** Classify a mob: exact Zombie class + the full known goal set in both
      *  selectors. Returns null when the mob must stay vanilla. */
     private static AiCtx aiClassify(net.minecraft.world.entity.Mob mob) {
@@ -5790,6 +5822,7 @@ public final class CeHooks {
             int[] tk = new int[nt], tp = new int[nt];
             long[] tf = new long[nt];
             int[] tc = new int[nt];
+            int[] tc3 = new int[nt];
             float[] lds = new float[nt];
             int i = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal wg : tSet) {
@@ -5801,6 +5834,12 @@ public final class CeHooks {
                 if ((tf[i] & ~(1L | 2L | 4L | 8L | 16L)) != 0) return refuse(k); // unknown flags
                 if (tk[i] == GK_NEAREST_TARGET) {
                     tc[i] = readIntField(wg.getGoal(), wg.getGoal().getClass(), "randomInterval");
+                    // cfg bit1 = targetType == Player (native snapshot scan)
+                    // cfg3 bit0 = Player-typed (native snapshot scan gate);
+                    // cfg stays the pure randomInterval (bit1 collided with 10!)
+                    tc3[i] = readObjectField(wg.getGoal(), wg.getGoal().getClass(),
+                            "targetType") == net.minecraft.world.entity.player.Player.class
+                            ? 1 : 0;
                 } else if (tk[i] == GK_HURT_BY) {
                     tc[i] = 0;
                 } else {
@@ -5812,6 +5851,8 @@ public final class CeHooks {
             int[] gk = new int[ng], gp = new int[ng];
             long[] gf = new long[ng];
             int[] gc = new int[ng];
+            int[] gc2 = new int[ng];
+            int[] gc3 = new int[ng];
             boolean hasMtv = false, mtvOnlyNight = false;
             i = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal wg : gSet) {
@@ -5837,6 +5878,11 @@ public final class CeHooks {
                         float prob = readFloatField(goal, goal.getClass(), "probability");
                         gc[i] = Float.floatToIntBits(prob);
                         lds[i] = readFloatField(goal, goal.getClass(), "lookDistance");
+                        if (readObjectField(goal, goal.getClass(), "lookAtType")
+                                == net.minecraft.world.entity.player.Player.class) {
+                            gc2[i] = Float.floatToIntBits(lds[i]); // cfg2 = the context range
+                            gc3[i] = 1; // cfg3 bit0 = Player-typed scan
+                        }
                         break;
                     case GK_MOVE_THROUGH_VILLAGE:
                         hasMtv = true;
@@ -5851,7 +5897,7 @@ public final class CeHooks {
             boolean fixedTime = mob.level().dimensionType().hasFixedTime();
             built = new AiCtx(U.getObject(mob, O_MOB_TARGETSEL),
                     U.getObject(mob, O_MOB_GOALSEL),
-                    tg, gg, tk, gk, tp, gp, tf, gf, tc, gc, lds,
+                    tg, gg, tk, gk, tp, gp, tf, gf, tc, tc3, gc, gc2, gc3, lds,
                     hasMtv, mtvOnlyNight, fixedTime);
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -5950,15 +5996,72 @@ public final class CeHooks {
             }
             in[1] = mf; // publish the late flags
         }
+        // v3 native scan inputs: level-global flags + the mob anchor + the
+        // player snapshot (level.players() order, LIVE coords per pack)
+        java.util.List<?> players = lvl.players();
+        int p = players.size();
+        mf |= MF_PEACEFUL;
+        if (lvl.getDifficulty() != net.minecraft.world.Difficulty.PEACEFUL) mf &= ~MF_PEACEFUL;
+        if (aiTeamsPresent(lvl)) mf |= MF_TEAMS_PRESENT;
+        if (p > 30) mf |= MF_MANY_PLAYERS;
+        in[1] = mf;
+        in[IN_PCOUNT] = p;
+        // TargetGoal.getFollowDistance() = getAttributeValue(FOLLOW_RANGE)
+        in[IN_FOLLOW] = Float.floatToIntBits((float) mob.getAttributeValue(
+                net.minecraft.world.entity.ai.attributes.Attributes.FOLLOW_RANGE));
+        long bx = Double.doubleToRawLongBits(mob.getX());
+        in[IN_MOBX] = (int) bx; in[IN_MOBX + 1] = (int) (bx >>> 32);
+        long by = Double.doubleToRawLongBits(mob.getY());
+        in[IN_MOBY] = (int) by; in[IN_MOBY + 1] = (int) (by >>> 32);
+        long bz = Double.doubleToRawLongBits(mob.getZ());
+        in[IN_MOBZ] = (int) bz; in[IN_MOBZ + 1] = (int) (bz >>> 32);
+        long beye = Double.doubleToRawLongBits(mob.getEyeY());
+        in[IN_EYEY] = (int) beye; in[IN_EYEY + 1] = (int) (beye >>> 32);
+        if (p > 0) {
+            aiRefreshPlayers(lvl, players, p);
+            int need = IN_HEADER + (ctx.tGoals.length + ctx.gGoals.length) * GOAL_STRIDE
+                    + p * PSTRIDE;
+            if (AI_IN.length < need) {
+                AI_IN = new int[Math.max(need, 2 * AI_IN.length)];
+            }
+            int[] in2 = AI_IN;
+            int pb = IN_HEADER + (ctx.tGoals.length + ctx.gGoals.length) * GOAL_STRIDE;
+            for (int i = 0; i < p; i++) {
+                net.minecraft.world.entity.player.Player pl =
+                        (net.minecraft.world.entity.player.Player) players.get(i);
+                int b = pb + i * PSTRIDE;
+                long lx = Double.doubleToRawLongBits(pl.getX());
+                in2[b + PX_LO] = (int) lx; in2[b + PX_LO + 1] = (int) (lx >>> 32);
+                long ly = Double.doubleToRawLongBits(pl.getY());
+                in2[b + PY_LO] = (int) ly; in2[b + PY_LO + 1] = (int) (ly >>> 32);
+                long lz = Double.doubleToRawLongBits(pl.getZ());
+                in2[b + PZ_LO] = (int) lz; in2[b + PZ_LO + 1] = (int) (lz >>> 32);
+                long ley = Double.doubleToRawLongBits(pl.getEyeY());
+                in2[b + PEYE_LO] = (int) ley; in2[b + PEYE_LO + 1] = (int) (ley >>> 32);
+                long lvis = Double.doubleToRawLongBits(aiVisPct(pl, lvl, mob));
+                in2[b + PVIS_LO] = (int) lvis; in2[b + PVIS_LO + 1] = (int) (lvis >>> 32);
+                int fl = 0;
+                if (pl.isAlive()) fl |= AIPF_ALIVE;
+                if (pl.isSpectator()) fl |= AIPF_SPECTATOR;
+                if (pl.isInvulnerable()) fl |= AIPF_INVULNERABLE;
+                if (pl.isInvisible()) fl |= AIPF_INVISIBLE;
+                if (pl.isDiscrete()) fl |= AIPF_DISCRETE;
+                if (pl.isPassenger()) fl |= AIPF_RIDING;
+                in2[b + PFLAGS] = fl;
+                in2[b + PID] = pl.getId();
+            }
+        }
         int base = IN_HEADER;
         base = aiPackSel(in, base, ctx.tGoals, ctx.tKind, ctx.tPrio, ctx.tFlags, ctx.tCfg,
-                ctx.lookDistSq, mob);
-        aiPackSel(in, base, ctx.gGoals, ctx.gKind, ctx.gPrio, ctx.gFlags, ctx.gCfg, null, mob);
+                null, ctx.tCfg3, ctx.lookDistSq, mob);
+        aiPackSel(in, base, ctx.gGoals, ctx.gKind, ctx.gPrio, ctx.gFlags, ctx.gCfg,
+                ctx.gCfg2, ctx.gCfg3, ctx.lookDistSq, mob);
     }
 
     private static int aiPackSel(int[] in, int base,
             net.minecraft.world.entity.ai.goal.WrappedGoal[] goals, int[] kinds,
-            int[] prios, long[] flags, int[] cfgs, float[] lookDistSq,
+            int[] prios, long[] flags, int[] cfgs, int[] cfg2s, int[] cfg3s,
+            float[] lookDistSq,
             net.minecraft.world.entity.Mob mob) {
         for (int i = 0; i < goals.length; i++) {
             int b = base + i * GOAL_STRIDE;
@@ -6005,6 +6108,8 @@ public final class CeHooks {
                     st = 0;
             }
             in[b + 5] = st;
+            in[b + 6] = cfg2s != null ? cfg2s[i] : 0;
+            in[b + 7] = cfg3s != null ? cfg3s[i] : 0;
         }
         return base + goals.length * GOAL_STRIDE;
     }
@@ -6027,6 +6132,73 @@ public final class CeHooks {
         Object nodes = U.getObject(path, O_PATH_NODES);
         int n = nodes instanceof java.util.List<?> l ? l.size() : 0;
         return next >= n ? NAV_PATH_DONE : NAV_PATH_ACTIVE;
+    }
+
+    // ---- v3 native-scan Java side ----
+    // The player snapshot array mirrors the packed order (level.players());
+    // rebuilt once per (level, gameTime). Identities are stable within a
+    // tick (joins/leaves process between ticks); COORDS are re-read per
+    // pack (a player can move mid-tick — vanilla reads them live too).
+    private static net.minecraft.world.entity.player.Player[] AI_PLAYERS =
+            new net.minecraft.world.entity.player.Player[8];
+    private static int AI_PLAYERS_N = 0;
+    private static long AI_PLAYERS_TICK = -1;
+    private static Object AI_PLAYERS_LEVEL = null;
+
+    private static void aiRefreshPlayers(net.minecraft.server.level.ServerLevel lvl,
+            java.util.List<?> players, int p) {
+        long t = lvl.getGameTime();
+        if (AI_PLAYERS_LEVEL == lvl && AI_PLAYERS_TICK == t && AI_PLAYERS_N == p) return;
+        if (AI_PLAYERS.length < p) {
+            AI_PLAYERS = new net.minecraft.world.entity.player.Player[Math.max(p, 8)];
+        }
+        for (int i = 0; i < p; i++) {
+            AI_PLAYERS[i] = (net.minecraft.world.entity.player.Player) players.get(i);
+        }
+        AI_PLAYERS_N = p;
+        AI_PLAYERS_TICK = t;
+        AI_PLAYERS_LEVEL = lvl;
+    }
+
+    private static boolean AI_TEAMS_PRESENT = false;
+    private static long AI_TEAMS_TICK = -1;
+
+    /** Any scoreboard team activity disables the native target scans (the
+     *  isAlliedTo half is not snapshot-computable); memoized per tick. */
+    private static boolean aiTeamsPresent(net.minecraft.server.level.ServerLevel lvl) {
+        long t = lvl.getGameTime();
+        if (AI_TEAMS_TICK == t) return AI_TEAMS_PRESENT;
+        boolean any = false;
+        try {
+            for (Object team : lvl.getScoreboard().getPlayerTeams()) {
+                any = true;
+                break;
+            }
+        } catch (Throwable ignore) {
+            any = true; // cannot prove absence — stay vanilla
+        }
+        AI_TEAMS_PRESENT = any;
+        AI_TEAMS_TICK = t;
+        return any;
+    }
+
+    // getVisibilityPercent memo — the gear/stealth inputs change only
+    // between ticks (packets process before the level tick), the targeter
+    // half is type-based (the classified zombie) — valid per (player, tick)
+    private static Object VIS_MEMO_PLAYER = null;
+    private static long VIS_MEMO_TICK = -1;
+    private static double VIS_MEMO_VAL = 1.0;
+
+    private static double aiVisPct(net.minecraft.world.entity.player.Player pl,
+            net.minecraft.server.level.ServerLevel lvl,
+            net.minecraft.world.entity.Mob targeter) {
+        long t = lvl.getGameTime();
+        if (VIS_MEMO_PLAYER == pl && VIS_MEMO_TICK == t) return VIS_MEMO_VAL;
+        double v = pl.getVisibilityPercent(lvl, targeter);
+        VIS_MEMO_PLAYER = pl;
+        VIS_MEMO_TICK = t;
+        VIS_MEMO_VAL = v;
+        return v;
     }
 
     /** The floor body — the EarlyReturnGuard check for Mob.serverAiStep. */
@@ -6099,8 +6271,10 @@ public final class CeHooks {
     }
 
     private static int aiRun(net.minecraft.world.entity.Mob mob, AiCtx ctx) {
-        if (AI_IN.length < IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE) {
-            AI_IN = new int[IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE];
+        int want = IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE
+                + (AI_PLAYERS_N + 1) * PSTRIDE;
+        if (AI_IN.length < want) {
+            AI_IN = new int[Math.max(want, 2 * AI_IN.length)];
         }
         int cursor = 0, res = 0, lastReqOp = 0;
         double rx = 0, ry = 0, rz = 0;
@@ -6221,6 +6395,25 @@ public final class CeHooks {
                     }
                     break;
                 }
+                case REQ_LOS_SCAN: {
+                    // the engine staged the non-LoS-passing candidates
+                    // (snapshot indices, vanilla list order); raycast EVERY
+                    // one through the Sensing cache (vanilla getNearestPlayer
+                    // has no early exit) and resume with a bitmask over the
+                    // SNAPSHOT indices
+                    int cands = AI_OUT[8];
+                    int mask = 0;
+                    net.minecraft.world.entity.ai.sensing.Sensing sensing = mob.getSensing();
+                    for (int c = 0; c < cands; c++) {
+                        int pi = AI_OUT[9 + c];
+                        if (pi < 0 || pi >= AI_PLAYERS_N) continue;
+                        if (sensing.hasLineOfSight(AI_PLAYERS[pi])) {
+                            mask |= (1 << pi);
+                        }
+                    }
+                    res = mask;
+                    break;
+                }
                 default:
                     mobAiFallbackWhy = FB_JAVA_UNKNOWN_REQ;
                     mobAiFallbackRound = round;
@@ -6295,6 +6488,22 @@ public final class CeHooks {
                     actLookTickAround(mob, wg, p1);
                     break;
                 }
+                case ACT_REF_SET_PLAYER: {
+                    // vanilla getNearestPlayer/findTarget assigns the goal's
+                    // lookAt/target field; p1 < 0 writes null (the field is
+                    // observable through start() and stale across stops for
+                    // NearestAttackableTargetGoal which has no stop() clear)
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    Object pl = (p1 >= 0 && p1 < AI_PLAYERS_N) ? AI_PLAYERS[p1] : null;
+                    Object g = wg.getGoal();
+                    if (kindAt(ctx, p0) == GK_LOOKAT_PLAYER) {
+                        U.putObject(g, O_LAL_LOOKAT, pl);
+                    } else if (kindAt(ctx, p0) == GK_NEAREST_TARGET) {
+                        U.putObject(g, O_NAT_TARGET, pl);
+                    }
+                    break;
+                }
                 case ACT_LOOK_TICK_AT: {
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
                     if (wg == null) return;
@@ -6310,6 +6519,10 @@ public final class CeHooks {
                     return;
             }
         }
+    }
+
+    private static int kindAt(AiCtx ctx, int gi) {
+        return gi < ctx.tKind.length ? ctx.tKind[gi] : ctx.gKind[gi - ctx.tKind.length];
     }
 
     private static net.minecraft.world.entity.ai.goal.WrappedGoal goalAt(AiCtx ctx, int gi) {
