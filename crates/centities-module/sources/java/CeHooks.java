@@ -444,6 +444,7 @@ public final class CeHooks {
                 + " tt=" + ttCalls + "/" + ttGate
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
+                + " oddJ=" + mobAiOddJava
                 + " mobwhy=" + mobAiFallbackWhy + "/" + mobAiFallbackRound + "/"
                 + mobAiFallbackReq + " " + mobAiFallbackMob + " refused=" + mobAiRefusedClass
                 + " wclash=" + mWorldSlotClash
@@ -5457,7 +5458,7 @@ public final class CeHooks {
     public static volatile boolean MOB_AI_ON = false;
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
-            mobAiClassified = 0, mobAiRefused = 0;
+            mobAiClassified = 0, mobAiRefused = 0, mobAiOddJava = 0;
     /** Diagnostics: reason (FB_*) + round + request op of the FIRST fallback
      *  this boot; the one-shot log line makes a classified-mob fallback
      *  diagnosable from the CI log alone (behavior itself stays exact — the
@@ -6040,6 +6041,28 @@ public final class CeHooks {
             mob.getSensing().tick();
             stepped = true;
             mobAiTicks++;
+            // L22c — the odd branch of serverAiStep runs tickRunningGoals(false)
+            // on both selectors, i.e. it ticks ONLY goals whose inner goal
+            // overrides requiresUpdateEveryTick(): exactly {GK_ZOMBIE_ATTACK
+            // (MeleeAttackGoal), GK_LOOKAROUND} for the classified set — the
+            // target-selector kinds do not override it (javap-verified).
+            // When no Melee goal is RUNNING the whole branch is a lookaround
+            // walk: lookTime-- + setLookAt, no RNG, no engine round-trip —
+            // run it in pure Java and skip the JNI entirely (half the ticks
+            // of a peaceful zombie).
+            boolean odd = ((mob.tickCount + mob.getId()) & 1) != 0 && mob.tickCount > 1;
+            if (odd && !aiMeleeRunning(ctx)) {
+                for (int i = 0; i < ctx.gGoals.length; i++) {
+                    if (ctx.gKind[i] == GK_LOOKAROUND && ctx.gGoals[i].isRunning()) {
+                        Object g = ctx.gGoals[i].getGoal();
+                        actLookTickAround(mob, ctx.gGoals[i],
+                                U.getInt(g, O_RLA_LOOKTIME) - 1);
+                    }
+                }
+                aiTail(mob);
+                mobAiOddJava++;
+                return true;
+            }
             int status = aiRun(mob, ctx);
             if (status == ST_FALLBACK) {
                 mobAiFallbacks++;
@@ -6063,6 +6086,16 @@ public final class CeHooks {
             }
             return false; // nothing mutated — vanilla runs the whole step
         }
+    }
+
+    /** True when a Melee-attack goal (the only every-tick kind besides
+     *  RandomLookAroundGoal) is RUNNING — the odd-tick Java shortcut is
+     *  exact only when it is not. */
+    private static boolean aiMeleeRunning(AiCtx ctx) {
+        for (int i = 0; i < ctx.gGoals.length; i++) {
+            if (ctx.gKind[i] == GK_ZOMBIE_ATTACK && ctx.gGoals[i].isRunning()) return true;
+        }
+        return false;
     }
 
     private static int aiRun(net.minecraft.world.entity.Mob mob, AiCtx ctx) {
@@ -6215,6 +6248,20 @@ public final class CeHooks {
                 + " mob=" + mobAiFallbackMob);
     }
 
+    /** RandomLookAroundGoal.tick() byte-exact port — lookTime-- then
+     *  setLookAt(x+relX, eyeY, z+relZ). relX/relZ are DOUBLE fields in the
+     *  26.3 mappings (decompile-verified); the old getFloat read half the
+     *  bytes and silently drifted the look direction. Shared by the action
+     *  executor and the odd-tick Java walk. */
+    private static void actLookTickAround(net.minecraft.world.entity.Mob mob,
+            net.minecraft.world.entity.ai.goal.WrappedGoal wg, int newLookTime) {
+        Object g = wg.getGoal();
+        U.putInt(g, O_RLA_LOOKTIME, newLookTime);
+        double relX = U.getDouble(g, O_RLA_RELX);
+        double relZ = U.getDouble(g, O_RLA_RELZ);
+        aiLookWrite(mob, mob.getX() + relX, mob.getEyeY(), mob.getZ() + relZ);
+    }
+
     private static void aiApply(net.minecraft.world.entity.Mob mob, AiCtx ctx) {
         int n = AI_OUT[5];
         for (int a = 0; a < n; a++) {
@@ -6245,11 +6292,7 @@ public final class CeHooks {
                     // lookaround tick port: lookTime--, setLookAt(x+relX, eyeY, z+relZ)
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
                     if (wg == null) return;
-                    Object g = wg.getGoal();
-                    U.putInt(g, O_RLA_LOOKTIME, p1);
-                    float relX = U.getFloat(g, O_RLA_RELX);
-                    float relZ = U.getFloat(g, O_RLA_RELZ);
-                    aiLookWrite(mob, mob.getX() + relX, mob.getEyeY(), mob.getZ() + relZ);
+                    actLookTickAround(mob, wg, p1);
                     break;
                 }
                 case ACT_LOOK_TICK_AT: {
