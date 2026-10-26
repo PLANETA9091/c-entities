@@ -6,31 +6,31 @@ Server: `26.3-224-eb9098a (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25061 -> 25061) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25067 -> 25067) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 373.906 / 421.480 / 467.087 / 509.862 |
-| MSPT mean, ms | 380.859 |
+| MSPT p50 / p90 / p99 / max, ms | 372.572 / 412.259 / 454.272 / 511.106 |
+| MSPT mean, ms | 378.282 |
 | TPS estimate (1000/p50) | 2.7 |
-| heap used / max, MB | 1145.9 / 4096.0 |
+| heap used / max, MB | 1272.2 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 24.64% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 5.58% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 3 | 4.62% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
-| 4 | 3.56% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 5 | 1.88% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
-| 6 | 1.62% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 7 | 1.43% | `java.util.ImmutableCollections$ListItr.next() line: 397` |
-| 8 | 1.27% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 9 | 1.20% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
-| 10 | 1.12% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 11 | 1.01% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
-| 12 | 0.93% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3728` |
-| 13 | 0.88% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 14 | 0.86% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
-| 15 | 0.83% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3908` |
+| 1 | 23.30% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 5.24% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 3 | 5.21% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 4 | 2.37% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 5 | 2.02% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
+| 6 | 1.73% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 7 | 1.33% | `java.util.ImmutableCollections$ListItr.next() line: 397` |
+| 8 | 1.15% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 9 | 1.14% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
+| 10 | 1.08% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
+| 11 | 0.89% | `java.util.EnumMap.get(Object) line: 248` |
+| 12 | 0.81% | `java.util.HashMap.getNode(Object) line: 586` |
+| 13 | 0.78% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 14 | 0.78% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
+| 15 | 0.78% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
 
