@@ -2178,6 +2178,18 @@ fn precompute_sensing(loader: jni::jobject) {
             }
             SENSING_WOVEN.store(true, Ordering::Release);
             cplug_sdk::log::info("[c-entities] precomputed Sensing O(1)-clear floor");
+            // L28: the stash existed = the class ALREADY LOADED (its boot
+            // load served vanilla bytes — the ClassFileLoadHook ran before
+            // the bridge was ready). Unlike the post-arm classes (served
+            // patched at load), this instance needs a RETRANSFORM or the
+            // floor never goes live — the mobs-25k bench profile showed
+            // vanilla Sensing.tick() frames with the weave "precomputed".
+            // retransform is idempotent; for a not-yet-loaded class it is a
+            // harmless no-op (the hook serves the patched bytes at load).
+            let rc = cplug_sdk::retransform_class(SENSING_CLASS);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] retransform Sensing after precompute: rc={rc}"
+            ));
         }
         _ => {
             cplug_sdk::log::info(
