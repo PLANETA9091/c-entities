@@ -5148,7 +5148,12 @@ public final class CeHooks {
             } else {
                 gen++;
             }
-            used = 0;
+            // CRITICAL: `used` must NOT be reset here — the keys array keeps
+            // the stale ids (probe-visible tombstones), so the non-empty
+            // slot count is unchanged. Zeroing it would let `add` exceed the
+            // capacity before the next grow and the probe loop would never
+            // find an empty slot (a hang). The stale entries stay invisible
+            // to contains() (gen mismatch) and are rehashed away on growth.
             live = 0;
             hasZero = false;
         }
