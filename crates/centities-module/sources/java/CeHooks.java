@@ -442,6 +442,8 @@ public final class CeHooks {
                 + " flag=" + flagCalls + "/" + flagGate + "/" + flagWrites
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
+                + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
+                + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
                 + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;

@@ -105,12 +105,19 @@ XMX="${XMX:-8G}"
 # System.getenv; the merge knob is a system property in CeHooks — map it.
 export CE_ITEM_TICK="${CE_ITEM_TICK:-1}"
 if [ "${CE_MERGE:-1}" = "0" ]; then MERGE_PROP="-Dcentities.mergeFast=false"; else MERGE_PROP=""; fi
-echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1}"
-# ExitOnOutOfMemoryError: a JVM OOM must fail FAST (FATAL with logs) instead
-# of GC-thrashing the VM into a kernel-OOM runner death.
+# L22a native mob AI floor (Rust goal engine): ON by default for every
+# MODULE=on leg (baseline -mod runs + ab-paired on-legs). CE_MOB_AI=0 rolls
+# back to vanilla serverAiStep; with MODULE=off the property is inert
+# (no CeHooks class exists to read it).
+MOBAI_PROP=""
+if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-1}" = "1" ]; then
+  MOBAI_PROP="-Dcentities.mobAi=1"
+fi
+echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1} mobAi=${MOBAI_PROP:+on}"
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
   ${MERGE_PROP} \
+  ${MOBAI_PROP} \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
