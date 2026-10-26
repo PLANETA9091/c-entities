@@ -116,10 +116,28 @@ const IN_RES_X: usize = 16;
 //       before any staged virtual call)
 //   [5] action count
 //   [6] resume cursor (Java writes it into in[0] on resume)
+//   [7] fallback reason (FB_* — 0 when no fallback; diagnostics only)
 //   [8...] actions, 8 i32 each: [op, p0, p1, p2, p3, d0lo, d0hi, pad]
 const OUT_HEADER: usize = 8;
 const OUT_ACT: usize = 8;
 const MAX_ACTS: usize = 96;
+
+/// fallback reason codes (out[7]) — the Java floor logs the first one so a
+/// classified-mob fallback is diagnosable from the CI log alone.
+pub const FB_OK: i32 = 0;
+pub const FB_BUF_TOO_SMALL: i32 = 1;
+pub const FB_GOAL_OVERFLOW: i32 = 2;
+pub const FB_LOCK_COLLIDE: i32 = 3;
+pub const FB_UNKNOWN_KIND: i32 = 4;
+pub const FB_BAD_CURSOR: i32 = 5;
+pub const FB_UNKNOWN_REQ: i32 = 6;
+pub const FB_ACTS_OVERFLOW: i32 = 7;
+pub const FB_STATE_MISMATCH: i32 = 8;
+/// Java-side reasons (aiRun) — round cap / bad goal index / unknown op
+pub const FB_JAVA_ROUND_CAP: i32 = 101;
+pub const FB_JAVA_BAD_GI: i32 = 102;
+pub const FB_JAVA_UNKNOWN_REQ: i32 = 103;
+pub const FB_JAVA_PREDICATE: i32 = 104;
 
 // action opcodes (applied by the executor after the FINAL round)
 pub const ACT_GOAL_START: i32 = 1; // goal.start() virtual (p0 = global goalIdx)
@@ -341,12 +359,14 @@ enum Cu {
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_BUF_TOO_SMALL;
         return ST_FALLBACK;
     }
     let nt = in_buf[5] as usize;
     let ng = in_buf[6] as usize;
     if nt > MAX_GOALS || ng > MAX_GOALS || in_buf.len() < IN_HEADER + (nt + ng) * GOAL_STRIDE {
         out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_GOAL_OVERFLOW;
         return ST_FALLBACK;
     }
 
@@ -405,7 +425,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 while fl != 0 {
                     let bit = fl.trailing_zeros() as usize;
                     if bit >= MAX_GOALS || ctx.lock[sel][bit] != -1 {
-                        return fallback(&mut out);
+                        return fallback(&mut out, FB_LOCK_COLLIDE);
                     }
                     ctx.lock[sel][bit] = i as i32;
                     fl &= fl - 1;
@@ -416,7 +436,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         match in_buf[IN_RES_OP] {
             REQ_CC_VANILLA => {
                 if !res && stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
-                    return fallback(&mut out);
+                    return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
             REQ_CANUSE_VANILLA | REQ_STROLL_POS | REQ_LOOKAT_QUERY | REQ_FIND_TARGET
@@ -425,7 +445,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // transition (displaced stops, then start) is the engine's
                 // job, emitted as actions the floor applies IMMEDIATELY
                 if res && lock_only(&mut ctx, &mut out, sel, gi).is_err() {
-                    return fallback(&mut out);
+                    return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
             _ => {}
@@ -441,13 +461,13 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     if ctx.running[sel][gi] {
                         if ctx.flags(sel, gi) & ctx.disabled[sel] != 0 {
                             if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
-                                return fallback(&mut out);
+                                return fallback(&mut out, FB_STATE_MISMATCH);
                             }
                         } else if needs_cc_vanilla(ctx.kind(sel, gi)) {
                             return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
                         } else if !cc_ported(&ctx, sel, gi) {
                             if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
-                                return fallback(&mut out);
+                                return fallback(&mut out, FB_STATE_MISMATCH);
                             }
                         }
                     }
@@ -468,7 +488,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                             if bit >= MAX_GOALS || ctx.lock[sel][bit] != -1 {
                                 // two running goals on one flag — impossible
                                 // under vanilla semantics; fall back
-                                return fallback(&mut out);
+                                return fallback(&mut out, FB_LOCK_COLLIDE);
                             }
                             ctx.lock[sel][bit] = i as i32;
                             fl &= fl - 1;
@@ -488,7 +508,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                                 Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
                                     return out.buf[0]; // parked
                                 }
-                                Err(()) => return fallback(&mut out),
+                                Err(()) => return fallback(&mut out, FB_UNKNOWN_KIND),
                             }
                         }
                     }
@@ -519,7 +539,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 }
                 return done(&mut ctx, &mut out);
             }
-            _ => return fallback(&mut out),
+            _ => return fallback(&mut out, FB_BAD_CURSOR),
         }
     }
 }
@@ -537,9 +557,10 @@ fn done(ctx: &mut Ctx, out: &mut Out) -> i32 {
     ST_DONE
 }
 
-fn fallback(out: &mut Out) -> i32 {
+fn fallback(out: &mut Out, reason: i32) -> i32 {
     out.buf[0] = ST_FALLBACK;
     out.buf[5] = 0;
+    out.buf[7] = reason;
     ST_FALLBACK
 }
 

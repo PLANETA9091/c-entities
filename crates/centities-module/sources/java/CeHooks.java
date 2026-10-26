@@ -444,6 +444,8 @@ public final class CeHooks {
                 + " tt=" + ttCalls + "/" + ttGate
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
+                + " mobwhy=" + mobAiFallbackWhy + "/" + mobAiFallbackRound + "/"
+                + mobAiFallbackReq + " " + mobAiFallbackMob + " refused=" + mobAiRefusedClass
                 + " wclash=" + mWorldSlotClash
                 + " indexing=" + INDEXING
                 + " active=" + ACTIVE + " lastErr=" + lastErrorText;
@@ -5456,9 +5458,23 @@ public final class CeHooks {
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
             mobAiClassified = 0, mobAiRefused = 0;
+    /** Diagnostics: reason (FB_*) + round + request op of the FIRST fallback
+     *  this boot; the one-shot log line makes a classified-mob fallback
+     *  diagnosable from the CI log alone (behavior itself stays exact — the
+     *  mirror finishes that tick). */
+    public static volatile int mobAiFallbackWhy = 0, mobAiFallbackRound = -1,
+            mobAiFallbackReq = 0;
+    public static volatile String mobAiFallbackMob = "-", mobAiRefusedClass = "-";
+    private static volatile boolean mobAiFallbackLogged = false;
+    private static volatile boolean mobAiRefusedLogged = false;
 
     // wire constants — MUST match centities-core/src/goals.rs
     static final int ST_DONE = 0, ST_REQUEST = 1, ST_FALLBACK = -1;
+    static final int FB_BUF_TOO_SMALL = 1, FB_GOAL_OVERFLOW = 2,
+            FB_LOCK_COLLIDE = 3, FB_UNKNOWN_KIND = 4, FB_BAD_CURSOR = 5,
+            FB_UNKNOWN_REQ = 6, FB_ACTS_OVERFLOW = 7, FB_STATE_MISMATCH = 8,
+            FB_JAVA_ROUND_CAP = 101, FB_JAVA_BAD_GI = 102,
+            FB_JAVA_UNKNOWN_REQ = 103, FB_JAVA_PREDICATE = 104;
     static final int REQ_CC_VANILLA = 1, REQ_CANUSE_VANILLA = 2, REQ_STROLL_POS = 3,
             REQ_LOOKAT_QUERY = 4, REQ_START_VANILLA = 5, REQ_FIND_TARGET = 6;
     static final int GK_SPEAR_USE = 1, GK_ZOMBIE_ATTACK = 2, GK_MOVE_THROUGH_VILLAGE = 3,
@@ -5807,6 +5823,11 @@ public final class CeHooks {
     private static AiCtx refuse(Object k) {
         AI_CTX.put(k, AiCtx.REFUSED);
         mobAiRefused++;
+        if (!mobAiRefusedLogged && k instanceof net.minecraft.world.entity.Mob m) {
+            mobAiRefusedLogged = true;
+            mobAiRefusedClass = m.getClass().getName();
+            System.out.println("[c-entities] mob AI first refused class: " + mobAiRefusedClass);
+        }
         return null;
     }
 
@@ -5974,10 +5995,22 @@ public final class CeHooks {
         }
         int cursor = 0, res = 0, lastReqOp = 0;
         double rx = 0, ry = 0, rz = 0;
-        for (int round = 0; round < 8; round++) {
+        // 32 rounds: the cap is a run-away guard, not a semantic limit — a
+        // legal tick can need one round per staged request (lookat scan,
+        // findTarget, stroll pos, starts, ccs). 8 was demonstrably too low
+        // (e2e: a burst tick fell back, the mirror covered it, but the
+        // engine engagement was lost for that tick).
+        for (int round = 0; round < 32; round++) {
             aiPack(mob, ctx, cursor, res, lastReqOp, rx, ry, rz);
             int status = nativeMobAiFloor(AI_IN, AI_OUT);
-            if (status == ST_FALLBACK) return ST_FALLBACK;
+            if (status == ST_FALLBACK) {
+                mobAiFallbackWhy = AI_OUT.length > 7 ? AI_OUT[7] : 0;
+                mobAiFallbackRound = round;
+                mobAiFallbackReq = lastReqOp;
+                mobAiFallbackMob = mob.getClass().getName();
+                logFirstFallback();
+                return ST_FALLBACK;
+            }
             // apply the actions IMMEDIATELY after every round — the engine
             // emits stop/start transitions in the exact vanilla order, and
             // later rounds' packs must observe their effects
@@ -6001,7 +6034,14 @@ public final class CeHooks {
             boolean targetSel = ((cursor >> 9) & 1) == 0;
             net.minecraft.world.entity.ai.goal.WrappedGoal[] arr =
                     targetSel ? ctx.tGoals : ctx.gGoals;
-            if (gi < 0 || gi >= arr.length) return ST_FALLBACK;
+            if (gi < 0 || gi >= arr.length) {
+                mobAiFallbackWhy = FB_JAVA_BAD_GI;
+                mobAiFallbackRound = round;
+                mobAiFallbackReq = lastReqOp;
+                mobAiFallbackMob = mob.getClass().getName();
+                logFirstFallback();
+                return ST_FALLBACK;
+            }
             net.minecraft.world.entity.ai.goal.WrappedGoal wg = arr[gi];
             switch (req) {
                 case REQ_CC_VANILLA:
@@ -6018,6 +6058,11 @@ public final class CeHooks {
                     try {
                         pos = MH_GET_POSITION.invoke(wg.getGoal());
                     } catch (Throwable t) {
+                        mobAiFallbackWhy = FB_JAVA_PREDICATE;
+                        mobAiFallbackRound = round;
+                        mobAiFallbackReq = lastReqOp;
+                        mobAiFallbackMob = mob.getClass().getName();
+                        logFirstFallback();
                         return ST_FALLBACK;
                     }
                     if (pos instanceof net.minecraft.world.phys.Vec3 v) {
@@ -6039,6 +6084,11 @@ public final class CeHooks {
                     try {
                         cond = MH_LOOKAT_CTX.invoke(wg.getGoal());
                     } catch (Throwable t) {
+                        mobAiFallbackWhy = FB_JAVA_PREDICATE;
+                        mobAiFallbackRound = round;
+                        mobAiFallbackReq = lastReqOp;
+                        mobAiFallbackMob = mob.getClass().getName();
+                        logFirstFallback();
                         return ST_FALLBACK;
                     }
                     net.minecraft.world.entity.player.Player p = lvl.getNearestPlayer(
@@ -6053,15 +6103,40 @@ public final class CeHooks {
                         Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
                         res = t != null ? 1 : 0;
                     } catch (Throwable t2) {
+                        mobAiFallbackWhy = FB_JAVA_PREDICATE;
+                        mobAiFallbackRound = round;
+                        mobAiFallbackReq = lastReqOp;
+                        mobAiFallbackMob = mob.getClass().getName();
+                        logFirstFallback();
                         return ST_FALLBACK;
                     }
                     break;
                 }
                 default:
+                    mobAiFallbackWhy = FB_JAVA_UNKNOWN_REQ;
+                    mobAiFallbackRound = round;
+                    mobAiFallbackReq = lastReqOp;
+                    mobAiFallbackMob = mob.getClass().getName();
+                    logFirstFallback();
                     return ST_FALLBACK;
             }
         }
+        mobAiFallbackWhy = FB_JAVA_ROUND_CAP;
+        mobAiFallbackRound = 32;
+        mobAiFallbackReq = lastReqOp;
+        mobAiFallbackMob = mob.getClass().getName();
+        logFirstFallback();
         return ST_FALLBACK; // round cap — the mirror finishes the tick
+    }
+
+    /** One-shot diagnostics: the first fallback of this boot names its
+     *  reason/round/request/mob class on the server log. */
+    private static void logFirstFallback() {
+        if (mobAiFallbackLogged) return;
+        mobAiFallbackLogged = true;
+        System.out.println("[c-entities] mob AI first fallback: why=" + mobAiFallbackWhy
+                + " round=" + mobAiFallbackRound + " req=" + mobAiFallbackReq
+                + " mob=" + mobAiFallbackMob);
     }
 
     private static void aiApply(net.minecraft.world.entity.Mob mob, AiCtx ctx) {

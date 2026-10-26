@@ -2188,9 +2188,7 @@ fn precompute_sensing(loader: jni::jobject) {
             // a post-arm load is served directly by the hook.
         }
         _ => {
-            cplug_sdk::log::info(
-                "[c-entities] FAILED to precompute Sensing floor — vanilla kept",
-            );
+            cplug_sdk::log::info("[c-entities] FAILED to precompute Sensing floor — vanilla kept");
         }
     }
 }

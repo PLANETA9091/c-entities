@@ -101,11 +101,7 @@ pub fn get_input_vector(
     } else {
         (x, y, z)
     };
-    let (nx, ny, nz) = (
-        nx * speed as f64,
-        ny * speed as f64,
-        nz * speed as f64,
-    );
+    let (nx, ny, nz) = (nx * speed as f64, ny * speed as f64, nz * speed as f64);
     let yaw_rad = yaw * 0.017453292f32; // f32 multiply, then f2d
     let sin = mth.sin(yaw_rad as f64);
     let cos = mth.cos(yaw_rad as f64);
@@ -217,7 +213,14 @@ pub fn travel_in_air_open_ground(
     };
     // 2. moveRelative: delta += getInputVector(input, speed(friction), yaw)
     let fis = get_friction_influenced_speed(on_ground, friction, speed, flying_speed);
-    let (ix, iy, iz) = get_input_vector(mth, input.0 as f64, input.1 as f64, input.2 as f64, fis, yaw);
+    let (ix, iy, iz) = get_input_vector(
+        mth,
+        input.0 as f64,
+        input.1 as f64,
+        input.2 as f64,
+        fis,
+        yaw,
+    );
     let dm = (delta.0 + ix, delta.1 + iy, delta.2 + iz);
     // 3-4. the ground-clip restitution: the horizontal passes clip nothing,
     // the vertical clip zeroes the y component (bounce == 0)
@@ -279,7 +282,10 @@ mod tests {
     #[test]
     fn input_vector_zero_input_is_zero() {
         let mth = Mth::new();
-        assert_eq!(get_input_vector(&mth, 0.0, 0.0, 0.0, 0.1, 0.0), (0.0, 0.0, 0.0));
+        assert_eq!(
+            get_input_vector(&mth, 0.0, 0.0, 0.0, 0.1, 0.0),
+            (0.0, 0.0, 0.0)
+        );
         // below the 1e-7 threshold
         assert_eq!(
             get_input_vector(&mth, 1e-5, 0.0, 0.0, 0.1, 0.0),
@@ -386,45 +392,55 @@ mod tests {
         // The vectors below were produced by the Java oracle dump; each row
         // asserts the exact f64 bits the JVM computed through the same
         // bytecode semantics.
-        let cases: Vec<((f64, f64, f64), (f32, f32, f32), f32, f32, f32, f32, f32, f32, f64, bool)> =
-            vec![
-                (
-                    (0.1, -0.08, 0.0),
-                    (0.0, 0.0, 1.0),
-                    0.0,
-                    0.23,
-                    0.02,
-                    0.6,
-                    0.0,
-                    0.0,
-                    0.08,
-                    true,
-                ),
-                (
-                    (-0.013, -0.08, 0.216),
-                    (0.0, 0.0, 1.0),
-                    45.5,
-                    0.23,
-                    0.02,
-                    0.6,
-                    0.0,
-                    0.0,
-                    0.08,
-                    true,
-                ),
-                (
-                    (0.04, -0.0784, -0.11),
-                    (0.3, 0.0, -0.7),
-                    213.75,
-                    0.3,
-                    0.02,
-                    0.98,
-                    0.0,
-                    0.0,
-                    0.08,
-                    true,
-                ),
-            ];
+        let cases: Vec<(
+            (f64, f64, f64),
+            (f32, f32, f32),
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f64,
+            bool,
+        )> = vec![
+            (
+                (0.1, -0.08, 0.0),
+                (0.0, 0.0, 1.0),
+                0.0,
+                0.23,
+                0.02,
+                0.6,
+                0.0,
+                0.0,
+                0.08,
+                true,
+            ),
+            (
+                (-0.013, -0.08, 0.216),
+                (0.0, 0.0, 1.0),
+                45.5,
+                0.23,
+                0.02,
+                0.6,
+                0.0,
+                0.0,
+                0.08,
+                true,
+            ),
+            (
+                (0.04, -0.0784, -0.11),
+                (0.3, 0.0, -0.7),
+                213.75,
+                0.3,
+                0.02,
+                0.98,
+                0.0,
+                0.0,
+                0.08,
+                true,
+            ),
+        ];
         for (delta, input, yaw, speed, flying, bf, fm, adm, grav, og) in cases {
             let out = travel_in_air_open_ground(
                 &mth, delta, input, yaw, speed, flying, bf, fm, adm, grav, og, false,
