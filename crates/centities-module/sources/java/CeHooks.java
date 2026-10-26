@@ -4906,14 +4906,16 @@ public final class CeHooks {
 
     public static volatile boolean FROZEN_ON = false;
     public static volatile boolean FROZEN_HANDLES_OK = false;
-    public static long frozenGate = 0, frozenWrites = 0;
     public static volatile boolean CONV_ON = false;
     public static volatile boolean CONV_HANDLES_OK = false;
-    public static long convGate = 0, convWrites = 0;
     // liveness counters: bumped on EVERY bridge entry (the verifier proves
     // the weave by watching these BEFORE the gates are armed — frozenGate/
     // convGate move only after arming). PLAIN longs, same reasoning as gsFloorTicks.
+    // frozenDirect/convDirect = the L25 direct-read layer's catches (the
+    // proven get-chain layer counts into the same frozenGate/convGate).
     public static long frozenCalls = 0, convCalls = 0;
+    public static long frozenGate = 0, frozenWrites = 0, frozenDirect = 0;
+    public static long convGate = 0, convWrites = 0, convDirect = 0;
     // system-property kill switches, folded to static finals at class init.
     // NOTE the idiom: Boolean.getBoolean(name) returns FALSE when the
     // property is ABSENT — the first CI e2e armed with the floor disabled
