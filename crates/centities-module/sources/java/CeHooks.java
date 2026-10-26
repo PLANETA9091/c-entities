@@ -4963,7 +4963,7 @@ public final class CeHooks {
      *  receiver of each Unsafe read is instanceof-checked against the class
      *  the offset belongs to (doc-32 rule — the SE_FAST lesson). */
     private static Object entityDataValue(Entity e, Object acc) {
-        if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0 || O_ACC_ID < 0) {
+        if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
             // L28c one-shot: the FIRST null explanation (the ab legs could
             // not tell WHICH hop fails — every gate counter is shared by
             // both layers and the profile only shows the chain's cost).
@@ -4979,8 +4979,18 @@ public final class CeHooks {
             if (!(ed instanceof net.minecraft.network.syncher.SynchedEntityData sde)) {
                 return edvProbe("ed=" + ed);
             }
+            if (!(acc instanceof net.minecraft.network.syncher.EntityDataAccessor acc0)) {
+                return edvProbe("acc=" + acc);
+            }
             Object[] items = (Object[]) U.getObject(sde, O_ED_ITEMS);
-            int idx = U.getInt(acc, O_ACC_ID);
+            // L28d (the edv probe's verdict, reproduced locally on JDK 25:
+            // "UnsupportedOperationException: can't get field offset on a
+            // record class") — sun.misc.Unsafe REFUSES record fields, so the
+            // O_ACC_ID offset can never resolve and the direct layer silently
+            // dead-fell into the chain layer everywhere. The accessor is a
+            // RECORD: its public id() accessor is the exact read, JIT-inlined,
+            // no Unsafe needed.
+            int idx = acc0.id();
             if (idx < 0 || idx >= items.length) {
                 return edvProbe("idx=" + idx + " len=" + items.length);
             }
