@@ -5622,8 +5622,13 @@ public final class CeHooks {
             O_MTV_VISITED = offOf(mtv, "visited");
             O_MTV_ONLYNIGHT = offOf(mtv, "onlyAtNight");
             O_AL_SIZE = offOf(java.util.ArrayList.class, "size");
-            O_MOB_LASTHURTBY = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMob");
-            O_MOB_LASTHURTBY_TS = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMobTimestamp");
+            // 26.3: lastHurtByMob/lastHurtByMobTimestamp live on
+            // LivingEntity (the former is an EntityReference — a non-null
+            // reference is a SAFE SUPERSET for the HurtBy gate: the vanilla
+            // canUse park re-resolves it, so a dangling reference only
+            // costs a staged round, never a wrong decision)
+            O_MOB_LASTHURTBY = offOf(net.minecraft.world.entity.LivingEntity.class, "lastHurtByMob");
+            O_MOB_LASTHURTBY_TS = offOf(net.minecraft.world.entity.LivingEntity.class, "lastHurtByMobTimestamp");
             O_LVL_SKYDARKEN = offOf(net.minecraft.world.level.Level.class, "skyDarken");
             // v3 native scans: the goal reference fields the ACT_REF_SET_PLAYER
             // executor writes (vanilla getNearestPlayer/findTarget assign them)
