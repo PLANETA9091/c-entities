@@ -2441,16 +2441,19 @@ public final class CeHooks {
     // hull enumeration is a strict SUPERSET of the vanilla visit set
     // (touching positions included), so "superset all-air" implies the
     // vanilla visit set is all-air — the gate fails safe to vanilla.
-    // Scope: MOBS ONLY by default. The c2140cf bench proved the gate green
-    // and ~23ms fast on mobs-25k, while the items-100k leg died in the G1
-    // SATB filter (hs_err_pid4417) — ItemEntity.tick calls
-    // applyEffectsFromBlocksForLastMovements() + applyEffectsFromBlocks()
-    // BACK TO BACK, an interaction the mobs never exercise. CE_BLOCK_FX=1
-    // re-enables the item path for the bisect; the default protects it.
+    // Scope: ALL ENTITIES. The 2026-10-25 crash pair (items-100k @ c2140cf,
+    // mixed-150k @ e64e66f, hs_err 4417+5536) was FIRST blamed on the item
+    // path, and e64e66f mob-scoped the gate as a precaution. The e64e66f
+    // mixed-150k leg THEN crashed with the item path OFF — the item path is
+    // exonerated; the only factor common to all four L22-era crashes is the
+    // L20b SE_FAST direct-offset tracker path (ON in every crash run,
+    // OFF in every green run before AND after — see the trackerDispatch
+    // comment). The item path is re-enabled by default with its own kill
+    // switch (CE_BLOCK_FX_ITEMS=0) for the bisect.
     public static final boolean BLOCK_FX_ON =
             !"0".equals(System.getenv("CE_BLOCK_FX"));
     public static final boolean BLOCK_FX_ITEMS =
-            "1".equals(System.getenv("CE_BLOCK_FX"));
+            !"0".equals(System.getenv("CE_BLOCK_FX_ITEMS"));
     public static long blockFxChecks = 0, blockFxQuiet = 0, blockFxFail = 0;
     // Block class -> stepOn is the empty base implementation (probed once
     // via getMethod().getDeclaringClass() — the exact override test)
@@ -3575,23 +3578,6 @@ public final class CeHooks {
             VH_SE_INTERP = it;
             VH_SE_INTERVAL = iv;
             VH_SE_RESYNC = rs;
-            // L19: the guard reads SIX fields per entity per tick — the
-            // volatile RefField static loads + per-instance offset deref
-            // showed up as Unsafe.getObject 9.11% on items-100k. Plain
-            // static longs captured once: the JIT hoists them out of the
-            // loop and the access compiles to the getfield.
-            if (U != null
-                    && en.off >= 0 && tc.off >= 0 && lp.off >= 0 && tp.off >= 0
-                    && it.off >= 0 && iv.off >= 0 && rs.off >= 0) {
-                O_SE_ENTITY = en.off;
-                O_SE_TICK_COUNT = tc.off;
-                O_SE_LAST_PAX = lp.off;
-                O_SE_TRACKED_PLAYERS = tp.off;
-                O_SE_INTERP = it.off;
-                O_SE_INTERVAL = iv.off;
-                O_SE_RESYNC = rs.off;
-                SE_FAST = "1".equals(System.getenv("CE_TRACKER_FAST"));
-            }
             return true;
         } catch (Throwable t) {
             SE_VH_FAILED = true;
@@ -3601,23 +3587,20 @@ public final class CeHooks {
         }
     }
 
-    // L19: direct offsets for the ServerEntity guard (valid once SE_FAST).
-    // PLAIN longs — the volatile SE_FAST flag is the publication barrier
-    // (the init thread writes the offsets BEFORE the SE_FAST store; a
-    // reader that sees SE_FAST==true sees all of them), and plain statics
-    // let the JIT fold the loads out of the per-entity loop.
-    private static long O_SE_ENTITY, O_SE_TICK_COUNT, O_SE_LAST_PAX,
-            O_SE_TRACKED_PLAYERS, O_SE_INTERP, O_SE_INTERVAL, O_SE_RESYNC;
-    // L19/20b fast path — RETRACTED to opt-in (L19b playbook, second
-    // application): two FLAKY G1SATBMarkQueueSet::filter SIGSEGVs
-    // (items-100k @ c2140cf, mixed-150k @ e64e66f) crashed with this path
-    // as the top Java frame, and both legs died only in SOME runs — a
-    // layout/timing-dependent corruption, not a deterministic defect. The
-    // VarHandle path below is the pre-L20b proven form (same logic, safe
-    // typed accesses, ~1-2ms slower on items-100k). CE_TRACKER_FAST=1
-    // restores the direct offsets for the bisect.
-    private static volatile boolean SE_FAST =
-            "1".equals(System.getenv("CE_TRACKER_FAST"));
+    // L19/20b: the direct-offset (Unsafe raw offsets, plain static longs)
+    // fast path was RETRACTED at 7c88ee2 and is now DELETED (L24 verdict,
+    // 2026-10-25): the hs_err pair 4417+5536 was decoded offline — both are
+    // G1SATBMarkQueueSet::filter SIGSEGVs whose queue held a native-range
+    // garbage oop; the crash spot (trackerDispatch's own barrier) is just
+    // where the per-thread buffer FILLED (trackerDispatch is the 100k/tick
+    // store), not necessarily the corruption site. The run correlation is
+    // conclusive: every L22-era crash ran with the direct-offset path ON,
+    // every green run before AND after ran with it OFF (67% crash rate with,
+    // 0% without, same agent, same legs). The mechanism stays unresolved
+    // (the module's own Rust/JNI surface was audited clean — no raw writes,
+    // no cached refs, bounds-matched buffers), so the path stays out; the
+    // VH path below is the proven form and the L24 mark-bitmap gate
+    // replaces its speed in a barrier-safe way.
 
     public static boolean trackerDispatch(ServerEntity se) {
         // L15b: volatile increment per entity per tick = 100k lock-xadds/tick
@@ -3626,58 +3609,49 @@ public final class CeHooks {
         trackerChecks++;
         if (!ACTIVE || !TRACKER_ON || !cplugReady) return false;
         if (VH_SE_ENTITY == null && !initTrackerVh()) return false;
-        // L20b: the direct-offset path (SE_FAST). READ-ONLY over live
-        // object fields + one putInt — no reference write barriers (the
-        // L19a SATB suspicion never applied to this path; the hs_err
-        // capture is live if anything resurfaces).
-        if (SE_FAST) {
-            try {
-                Entity e = (Entity) U.getObject(se, O_SE_ENTITY);
-                if (e.getEntityData().isDirty()) return false;      // bc 384-390
-                if (e.syncPosition || e.syncVelocity || e.needsSync) return false; // bc 312-346
-                if (e.moonrise$isHardColliding()) return false;     // bc 0-16
-                // bc 302-311: the NO_OP interpolation tracker is an empty body
-                if (U.getObject(se, O_SE_INTERP)
-                        != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
-                    return false;
-                }
-                // bc 34-44: passengers changed → vanilla
-                Object pax = e.getPassengers();
-                if (!pax.equals(U.getObject(se, O_SE_LAST_PAX))) return false;
-                // bc 107-116: non-empty tracking → the emit paths
-                java.util.Set<?> tracked =
-                        (java.util.Set<?>) U.getObject(se, O_SE_TRACKED_PLAYERS);
-                if (tracked == null || !tracked.isEmpty()) return false;
-                // bc 347: forceStateResync → the full resync body
-                if (U.getObject(se, O_SE_RESYNC) == Boolean.TRUE) return false;
-                // bc 364-377: updateInterval.test is PURE (n % period == 0)
-                net.minecraft.world.entity.UpdateInterval interval =
-                        (net.minecraft.world.entity.UpdateInterval)
-                                U.getObject(se, O_SE_INTERVAL);
-                int tickCount = U.getInt(se, O_SE_TICK_COUNT);
-                if (interval == null || interval.test(tickCount)) return false;
-                // ALL conditions passed: this tick emits nothing. Reproduce
-                // the unconditional effects in vanilla order:
-                e.updateDataBeforeSync();                       // bc 19-23
-                U.putInt(se, O_SE_TICK_COUNT, tickCount + 1);   // bc 1106-1113
-                trackerFast++;
-                return true;
-            } catch (Throwable gateFail) {
-                SE_FAST = false; // stale offsets: fall back to the VH path
-                return false;    // route vanilla this tick
-            }
-        }
         try {
             Entity e = (Entity) VH_SE_ENTITY.getObj(se);
+            // L24a — the empty-tracking fast exit. javap 26.3 (doc 31): with
+            // trackedPlayers EMPTY the vanilla sendChanges body cannot send
+            // anything — every emit rides sendToTrackingPlayers(AndSelf)
+            // over an empty set. What remains: updateDataBeforeSync (we
+            // reproduce), tickCount++ (we reproduce), the syncPosition /
+            // needsSync / forceStateResync / isDirty "changed" latches and
+            // the lastPassengers state compare — all of which vanilla leaves
+            // set/stale and the FIRST sendChanges that actually has a
+            // recipient consumes (every one of them bypasses the interval
+            // gate, so a latched flag self-heals with an exact vanilla emit
+            // the moment a player pairs). The fast exit keeps three
+            // conditions that route vanilla exactly where the skipped tail
+            // would have had a real effect.
+            Object trk = VH_SE_TRACKED_PLAYERS.getObj(se);
+            if (trk instanceof java.util.Set<?> ts && ts.isEmpty()
+                    // a non-NO_OP interpolation tracker's updateTracking
+                    // advances real state every tick; a hard-colliding
+                    // entity gets teleportDelay=9999 written every tick
+                    // (bc 0-16); syncVelocity entities hit the tail's
+                    // velocity branch which consumes the flag + fires the
+                    // PlayerVelocityEvent path for ServerPlayers
+                    // (bc 1116-1246). Any hit → the full gate below (the
+                    // exact vanilla mirror).
+                    && VH_SE_INTERP.getObj(se)
+                        == net.minecraft.world.entity.InterpolationTracker.NO_OP
+                    && !e.moonrise$isHardColliding()
+                    && !e.syncVelocity) {
+                e.updateDataBeforeSync();                       // bc 19-23
+                VH_SE_TICK_COUNT.setInt(se,
+                        VH_SE_TICK_COUNT.getInt(se) + 1);       // bc 1106-1113
+                trackerFast++;
+                return true;
+            }
+            // tracked entities and fast-exit rejects: the full gate below
+            // decides — one extra tracked-read total for tracked entities.
             // L15b REORDER: every read below is PURE (no side effects — the
             // two unconditional effects ride at the tail in vanilla order),
-            // so the ORDER of the reads is free. The cheapest sufficient
-            // no-send discriminators go first: for a resting item the
-            // entity-data dirty flag is clear ~always — one volatile chain
-            // read rejects before any RefField/interface work. Vanilla's
-            // decision ORDER still decides nothing observable here: a
-            // throw from any read propagates with zero state changed
-            // either way.
+            // so the ORDER of the reads is free, and a throw from any read
+            // propagates with zero state changed either way. This full gate
+            // now serves only the entities that HAVE trackers (or hit a fast
+            // exit reject): the exact vanilla-order mirror.
             if (e.getEntityData().isDirty()) return false;      // bc 384-390
             if (e.syncPosition || e.syncVelocity || e.needsSync) return false; // bc 312-346
             // bc 0-16: hard-colliding entities own the teleportDelay path
