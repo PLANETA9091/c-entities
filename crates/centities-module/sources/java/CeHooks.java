@@ -5560,7 +5560,6 @@ public final class CeHooks {
     private static long O_HB_TIMESTAMP = -1;   // HurtByTargetGoal.timestamp (int)
     private static long O_MTV_VISITED = -1;    // MoveThroughVillageGoal.visited (ArrayList)
     private static long O_MTV_ONLYNIGHT = -1;  // MoveThroughVillageGoal.onlyAtNight (boolean)
-    private static long O_AL_SIZE = -1;        // java.util.ArrayList.size (int)
     private static long O_MOB_LASTHURTBY = -1, O_MOB_LASTHURTBY_TS = -1;
     private static long O_LVL_SKYDARKEN = -1;
     private static long O_NAT_TARGET = -1; // NearestAttackableTargetGoal.target
@@ -5621,7 +5620,10 @@ public final class CeHooks {
             Class<?> mtv = Class.forName("net.minecraft.world.entity.ai.goal.MoveThroughVillageGoal");
             O_MTV_VISITED = offOf(mtv, "visited");
             O_MTV_ONLYNIGHT = offOf(mtv, "onlyAtNight");
-            O_AL_SIZE = offOf(java.util.ArrayList.class, "size");
+            // NOTE: no offOf on JDK classes (java.util.ArrayList.size) —
+            // java.base is not open to the unnamed module, objectFieldOffset
+            // throws InaccessibleObjectException; the visited size reads via
+            // the virtual List.size() (monomorphic ArrayList) instead
             // 26.3: lastHurtByMob/lastHurtByMobTimestamp live on
             // LivingEntity (the former is an EntityReference — a non-null
             // reference is a SAFE SUPERSET for the HurtBy gate: the vanilla
@@ -5707,7 +5709,7 @@ public final class CeHooks {
         if (SHARED_RANDOM == null || O_RNG_VALUE < 0 || O_MC_OP < 0 || O_NAV_PATH < 0
                 || O_LC_COOL < 0 || O_JC_JUMP < 0 || O_MOB_TARGET < 0 || O_MOB_NOACTION < 0
                 || O_ZA_LASTCANUSE < 0 || O_HB_TIMESTAMP < 0 || O_MTV_VISITED < 0
-                || O_MTV_ONLYNIGHT < 0 || O_AL_SIZE < 0 || O_MOB_LASTHURTBY < 0
+                || O_MTV_ONLYNIGHT < 0 || O_MOB_LASTHURTBY < 0
                 || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0 || O_NAT_TARGET < 0
                 || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
                 || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
@@ -6089,10 +6091,10 @@ public final class CeHooks {
                     break;
                 case GK_MOVE_THROUGH_VILLAGE: {
                     Object visited = U.getObject(goal, O_MTV_VISITED);
-                    // ArrayList fast path; an exotic List impl parks
-                    // (state > 15 routes vanilla — always exact)
-                    st = (visited instanceof java.util.ArrayList al)
-                            ? U.getInt(al, O_AL_SIZE) : 999;
+                    // the virtual List.size() (monomorphic ArrayList — the
+                    // goal constructs Lists.newArrayList()); a null/exotic
+                    // shape parks (state > 15 routes vanilla — always exact)
+                    st = visited instanceof java.util.List<?> l ? l.size() : 999;
                     break;
                 }
                 case GK_LOOKAT_PLAYER: {
