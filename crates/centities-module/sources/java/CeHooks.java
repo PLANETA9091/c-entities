@@ -6443,14 +6443,24 @@ public final class CeHooks {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
             // L25: the direct-read gate — one typed Unsafe walk instead of
-            // the getTicksFrozen() boxed chain (which cost as much as the
-            // write it guarded — the get chain IS the set chain minus the
-            // assign). The value read is the same field vanilla's
-            // DATA_TICKS_FROZEN DataItem holds, so the equality decision is
-            // the one vanilla's SynchedEntityData.set would make.
+            // the getTicksFrozen() boxed chain. LAYERED after the e2e
+            // forensics (a77b3ea: the direct walk served zero catches while
+            // the flags shim, which kept BOTH layers, caught 9104 through
+            // its proven chain layer): the direct read is a pure bonus on
+            // top of the proven L18 gate, never its replacement.
+            // frozenDirect attributes which layer actually wins.
             try {
                 Object cur = entityDataValue(e, Entity.DATA_TICKS_FROZEN);
                 if (cur instanceof Integer iv && iv.intValue() == i) {
+                    frozenDirect++;
+                    frozenGate++;
+                    return;
+                }
+            } catch (Throwable directFail) {
+                // fall through to the proven get-chain gate
+            }
+            try {
+                if (e.getTicksFrozen() == i) {
                     frozenGate++;
                     return;
                 }
@@ -6480,9 +6490,24 @@ public final class CeHooks {
                     Object acc = U.getObject(tracker, O_CT_ID);
                     Object cur = entityDataValue(mb, acc);
                     if (cur instanceof Boolean bv && bv.booleanValue() == z) {
+                        convDirect++;
                         convGate++;
                         return;
                     }
+                }
+            } catch (Throwable directFail) {
+                // fall through to the proven get-chain gate
+            }
+            try {
+                net.minecraft.world.entity.Mob m2 =
+                        (net.minecraft.world.entity.Mob) VH_CONV_MOB.getObj(tracker);
+                net.minecraft.network.syncher.EntityDataAccessor<Boolean> id2 =
+                        (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
+                                VH_CONV_ID.getObj(tracker);
+                Boolean cur2 = m2.getEntityData().get(id2);
+                if (cur2.booleanValue() == z) {
+                    convGate++;
+                    return;
                 }
             } catch (Throwable gateFail) {
                 // fall through to the vanilla write
