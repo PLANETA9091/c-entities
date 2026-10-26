@@ -437,6 +437,7 @@ public final class CeHooks {
                 + " gs=" + gsFloorTicks + "/" + gsFloorRunning + "/" + gsFloorStarts
                 + "/" + gsFloorStops + "/" + gsMirrorTicks + "/" + gsFloorCollide
                 + " froz=" + frozenCalls + "/" + frozenGate + "/" + frozenWrites
+                + " fd=" + frozenDirect + " cd=" + convDirect
                 + " conv=" + convCalls + "/" + convGate + "/" + convWrites
                 + " flag=" + flagCalls + "/" + flagGate + "/" + flagWrites
                 + " delta=" + deltaCalls + "/" + deltaGate
@@ -4962,22 +4963,45 @@ public final class CeHooks {
      *  receiver of each Unsafe read is instanceof-checked against the class
      *  the offset belongs to (doc-32 rule — the SE_FAST lesson). */
     private static Object entityDataValue(Entity e, Object acc) {
-        if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0 || O_ACC_ID < 0) return null;
-        Object ed = U.getObject(e, O_ED);
-        if (!(ed instanceof net.minecraft.network.syncher.SynchedEntityData sde)) {
+        if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0 || O_ACC_ID < 0) {
+            // L28c one-shot: the FIRST null explanation (the ab legs could
+            // not tell WHICH hop fails — every gate counter is shared by
+            // both layers and the profile only shows the chain's cost).
+            if (!mEdvProbed) {
+                mEdvProbed = true;
+                lastErrorText = "edv: off ED=" + O_ED + " ITEMS=" + O_ED_ITEMS
+                        + " DIV=" + O_DI_VALUE + " ACC=" + O_ACC_ID;
+            }
             return null;
         }
-        if (!(acc instanceof net.minecraft.network.syncher.EntityDataAccessor acc0)) {
-            return null;
+        try {
+            Object ed = U.getObject(e, O_ED);
+            if (!(ed instanceof net.minecraft.network.syncher.SynchedEntityData sde)) {
+                return edvProbe("ed=" + ed);
+            }
+            Object[] items = (Object[]) U.getObject(sde, O_ED_ITEMS);
+            int idx = U.getInt(acc, O_ACC_ID);
+            if (idx < 0 || idx >= items.length) {
+                return edvProbe("idx=" + idx + " len=" + items.length);
+            }
+            Object di = items[idx];
+            if (!(di instanceof net.minecraft.network.syncher.SynchedEntityData.DataItem)) {
+                return edvProbe("di=" + di);
+            }
+            return U.getObject(di, O_DI_VALUE);
+        } catch (Throwable t) {
+            return edvProbe("throw " + t);
         }
-        Object[] items = (Object[]) U.getObject(sde, O_ED_ITEMS);
-        int idx = U.getInt(acc, O_ACC_ID);
-        if (idx < 0 || idx >= items.length) return null;
-        Object di = items[idx];
-        if (!(di instanceof net.minecraft.network.syncher.SynchedEntityData.DataItem)) {
-            return null;
+    }
+
+    private static volatile boolean mEdvProbed = false;
+
+    private static Object edvProbe(String what) {
+        if (!mEdvProbed) {
+            mEdvProbed = true;
+            lastErrorText = "edv: " + what;
         }
-        return U.getObject(di, O_DI_VALUE);
+        return null;
     }
 
     // ===================================================================
