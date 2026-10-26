@@ -64,6 +64,9 @@ pub const MF_NO_PASSENGERS: i32 = 1; // !hasControllingPassenger()
 pub const MF_MAINHAND_EMPTY: i32 = 1 << 1;
 pub const MF_HAS_TARGET: i32 = 1 << 2;
 pub const MF_USING_ITEM: i32 = 1 << 3;
+pub const MF_LAST_HURT_BY: i32 = 1 << 4; // mob.getLastHurtByMob() != null
+pub const MF_BRIGHT_OUTSIDE: i32 = 1 << 5; // !hasFixedTime && skyDarken < 4 (level-global per tick)
+pub const MF_NEAR_VILLAGE: i32 = 1 << 6; // level.isCloseToVillage(mob.blockPosition(), 6) — packed only when the night gate lets canUse proceed
 
 // selector order — vanilla runs targetSelector FIRST in both branches
 pub const SEL_TARGET: usize = 0;
@@ -80,6 +83,7 @@ pub const GOAL_STRIDE: usize = 6;
 //   GK_STROLL         low16 = reducedTickDelay(interval) (60 for 120)
 //   GK_LOOKAT_PLAYER  = probability f32 bits (0.02F)
 //   GK_NEAREST_TARGET low16 = randomInterval (10)
+//   GK_MOVE_THROUGH_VILLAGE bit0 = onlyAtNight
 // state word per kind:
 //   GK_LOOKAROUND     = lookTime
 //   GK_LOOKAT_PLAYER  bit30 = lookAt alive, bit29 = within range, low16 = lookTime
@@ -100,8 +104,11 @@ pub const GOAL_STRIDE: usize = 6;
 //   [14] request result (0/1), [15] request opcode (the resume dispatch —
 //        the packer echoes out[1] here; slot 1 stays the mob flags)
 //   [16..22] request result coords x/y/z as f64 bit pairs
-//   [22..]  goal records: target selector first, then goal selector
-const IN_HEADER: usize = 22;
+//   [22] mob.lastHurtByMobTimestamp (low i32 — HurtByTargetGoal gate)
+//   [23] level.getGameTime() low i32 (MeleeAttackGoal 20-tick throttle;
+//        u32-wrapping compares — exact modulo 2^32, see can_use)
+//   [24..]  goal records: target selector first, then goal selector
+const IN_HEADER: usize = 24;
 const IN_SEED_LO: usize = 12;
 const IN_SEED_HI: usize = 13;
 const IN_RES: usize = 14;
@@ -616,7 +623,57 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
                 Ok(Cu::Staged)
             }
         }
-        GK_ZOMBIE_ATTACK | GK_MOVE_THROUGH_VILLAGE | GK_HURT_BY => {
+        GK_ZOMBIE_ATTACK => {
+            // MeleeAttackGoal.canUse: the 20-tick throttle (level game time
+            // vs the goal's lastCanUseCheck — u32-wrapping compares are
+            // exact modulo 2^32) and the target-null check are provable
+            // natively; the alive+pathfinding tail (only reachable with a
+            // live target) stays staged. Vanilla consumes no RNG here.
+            let time = ctx.inb[23] as u32;
+            let last = ctx.state(sel, gi) as u32;
+            if time.wrapping_sub(last) < 20 {
+                return Ok(Cu::No);
+            }
+            if !ctx.flag(MF_HAS_TARGET) {
+                return Ok(Cu::No);
+            }
+            park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+            Ok(Cu::Staged)
+        }
+        GK_HURT_BY => {
+            // HurtByTargetGoal.canUse: the gate is
+            // timestamp != this.timestamp && lastHurtByMob != null — both
+            // halves native (goal timestamp via the state word, mob
+            // timestamp via in[22]); the anger/ignore-class/canAttack tail
+            // (only reachable when the gate opens) stays staged.
+            let mobTs = ctx.inb[22];
+            if mobTs == ctx.state(sel, gi) || !ctx.flag(MF_LAST_HURT_BY) {
+                return Ok(Cu::No);
+            }
+            park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+            Ok(Cu::Staged)
+        }
+        GK_MOVE_THROUGH_VILLAGE => {
+            // MoveThroughVillageGoal.canUse: updateVisited() is a no-op
+            // while visited.size() <= 15 (the list only grows after a
+            // village path completes) — so with a small visited list the
+            // night gate (level-global brightness flag) and the village
+            // proximity gate (packed per mob) are provable natively.
+            // A grown visited list parks (vanilla mutates it); the
+            // pathfinding tail stages. No RNG consumed before those.
+            if ctx.state(sel, gi) > 15 {
+                park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                return Ok(Cu::Staged);
+            }
+            let only_at_night = ctx.cfg(sel, gi) & 1 != 0;
+            // vanilla: if (this.onlyAtNight && this.mob.level().isBrightOutside()) return false;
+            // — a night-only goal refuses to run while it is BRIGHT outside.
+            if only_at_night && ctx.flag(MF_BRIGHT_OUTSIDE) {
+                return Ok(Cu::No);
+            }
+            if !ctx.flag(MF_NEAR_VILLAGE) {
+                return Ok(Cu::No);
+            }
             park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
             Ok(Cu::Staged)
         }

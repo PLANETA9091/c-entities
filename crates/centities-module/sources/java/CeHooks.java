@@ -5480,10 +5480,13 @@ public final class CeHooks {
     static final int GK_SPEAR_USE = 1, GK_ZOMBIE_ATTACK = 2, GK_MOVE_THROUGH_VILLAGE = 3,
             GK_STROLL = 4, GK_LOOKAT_PLAYER = 5, GK_LOOKAROUND = 6, GK_HURT_BY = 7,
             GK_NEAREST_TARGET = 8;
+    static final int MF_NO_PASSENGERS = 1, MF_MAINHAND_EMPTY = 2, MF_HAS_TARGET = 4,
+            MF_USING_ITEM = 8, MF_LAST_HURT_BY = 16, MF_BRIGHT_OUTSIDE = 32,
+            MF_NEAR_VILLAGE = 64;
     static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
             ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
-    static final int MAX_GOALS = 16, GOAL_STRIDE = 6, IN_HEADER = 22, OUT_HEADER = 8;
+    static final int MAX_GOALS = 16, GOAL_STRIDE = 6, IN_HEADER = 24, OUT_HEADER = 8;
 
     // per-mob classification context (weak identity map — no leaks, no
     // per-mob allocation after the first tick). MapMaker.makeMap() returns
@@ -5511,11 +5514,17 @@ public final class CeHooks {
         final long[] tFlags, gFlags;
         final int[] tCfg, gCfg;
         final float[] lookDistSq; // per target-goal lookDistance^2 (lookat kind)
+        // MoveThroughVillage lazy-flag inputs: the village proximity read
+        // (a POI-section probe) runs only when the mob HAS the goal AND the
+        // night gate lets canUse proceed — otherwise it would burn the
+        // vanilla canUse cost on every pack.
+        final boolean hasMtv, mtvOnlyNight, fixedTime;
         AiCtx(Object ts, Object gs,
               net.minecraft.world.entity.ai.goal.WrappedGoal[] t,
               net.minecraft.world.entity.ai.goal.WrappedGoal[] g,
               int[] tk, int[] gk, int[] tp, int[] gp, long[] tf, long[] gf,
-              int[] tc, int[] gc, float[] lds) {
+              int[] tc, int[] gc, float[] lds,
+              boolean hasMtv, boolean mtvOnlyNight, boolean fixedTime) {
             this.targetSel = ts; this.goalSel = gs;
             this.tGoals = t; this.gGoals = g;
             this.tKind = tk; this.gKind = gk;
@@ -5523,17 +5532,27 @@ public final class CeHooks {
             this.tFlags = tf; this.gFlags = gf;
             this.tCfg = tc; this.gCfg = gc;
             this.lookDistSq = lds;
+            this.hasMtv = hasMtv; this.mtvOnlyNight = mtvOnlyNight;
+            this.fixedTime = fixedTime;
         }
         static final AiCtx REFUSED = new AiCtx(null, null,
                 new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
                 new net.minecraft.world.entity.ai.goal.WrappedGoal[0],
                 new int[0], new int[0], new int[0], new int[0],
-                new long[0], new long[0], new int[0], new int[0], new float[0]);
+                new long[0], new long[0], new int[0], new int[0], new float[0],
+                false, false, false);
     }
 
     // goal-object field offsets (resolved once per class at init)
     private static long O_RLA_LOOKTIME = -1, O_RLA_RELX = -1, O_RLA_RELZ = -1;
     private static long O_LAL_LOOKTIME = -1, O_LAL_LOOKAT = -1;
+    private static long O_ZA_LASTCANUSE = -1;  // MeleeAttackGoal.lastCanUseCheck (long)
+    private static long O_HB_TIMESTAMP = -1;   // HurtByTargetGoal.timestamp (int)
+    private static long O_MTV_VISITED = -1;    // MoveThroughVillageGoal.visited (ArrayList)
+    private static long O_MTV_ONLYNIGHT = -1;  // MoveThroughVillageGoal.onlyAtNight (boolean)
+    private static long O_AL_SIZE = -1;        // java.util.ArrayList.size (int)
+    private static long O_MOB_LASTHURTBY = -1, O_MOB_LASTHURTBY_TS = -1;
+    private static long O_LVL_SKYDARKEN = -1;
     private static long O_STROLL_FORCE = -1, O_STROLL_WX = -1, O_STROLL_WY = -1, O_STROLL_WZ = -1;
     private static long O_NAV_PATH = -1, O_NAV_TICK = -1, O_NAV_DELAYED = -1;
     private static long O_PATH_NEXT = -1, O_PATH_NODES = -1;
@@ -5583,6 +5602,18 @@ public final class CeHooks {
             O_PATH_NODES = offOf(path, "nodes");
             Class<?> mc = Class.forName("net.minecraft.world.entity.ai.control.MoveControl");
             O_MC_OP = offOf(mc, "operation");
+            // L22b — canUse gate inputs for the three unconditional parks
+            Class<?> za = Class.forName("net.minecraft.world.entity.ai.goal.MeleeAttackGoal");
+            O_ZA_LASTCANUSE = offOf(za, "lastCanUseCheck");
+            Class<?> hb = Class.forName("net.minecraft.world.entity.ai.goal.target.HurtByTargetGoal");
+            O_HB_TIMESTAMP = offOf(hb, "timestamp");
+            Class<?> mtv = Class.forName("net.minecraft.world.entity.ai.goal.MoveThroughVillageGoal");
+            O_MTV_VISITED = offOf(mtv, "visited");
+            O_MTV_ONLYNIGHT = offOf(mtv, "onlyAtNight");
+            O_AL_SIZE = offOf(java.util.ArrayList.class, "size");
+            O_MOB_LASTHURTBY = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMob");
+            O_MOB_LASTHURTBY_TS = offOf(net.minecraft.world.entity.Mob.class, "lastHurtByMobTimestamp");
+            O_LVL_SKYDARKEN = offOf(net.minecraft.world.level.Level.class, "skyDarken");
             MOVE_OP_WAIT = java.lang.Enum.valueOf(
                     (Class<? extends java.lang.Enum>) Class.forName(
                             "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
@@ -5654,6 +5685,9 @@ public final class CeHooks {
     private static void AI_HANDLES_SCRATCH_OK() {
         if (SHARED_RANDOM == null || O_RNG_VALUE < 0 || O_MC_OP < 0 || O_NAV_PATH < 0
                 || O_LC_COOL < 0 || O_JC_JUMP < 0 || O_MOB_TARGET < 0 || O_MOB_NOACTION < 0
+                || O_ZA_LASTCANUSE < 0 || O_HB_TIMESTAMP < 0 || O_MTV_VISITED < 0
+                || O_MTV_ONLYNIGHT < 0 || O_AL_SIZE < 0 || O_MOB_LASTHURTBY < 0
+                || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0
                 || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
                 || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
                 || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null) {
@@ -5777,6 +5811,7 @@ public final class CeHooks {
             int[] gk = new int[ng], gp = new int[ng];
             long[] gf = new long[ng];
             int[] gc = new int[ng];
+            boolean hasMtv = false, mtvOnlyNight = false;
             i = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal wg : gSet) {
                 gg[i] = wg;
@@ -5802,14 +5837,21 @@ public final class CeHooks {
                         gc[i] = Float.floatToIntBits(prob);
                         lds[i] = readFloatField(goal, goal.getClass(), "lookDistance");
                         break;
+                    case GK_MOVE_THROUGH_VILLAGE:
+                        hasMtv = true;
+                        mtvOnlyNight = U.getByte(goal, O_MTV_ONLYNIGHT) != 0;
+                        gc[i] = mtvOnlyNight ? 1 : 0;
+                        break;
                     default:
                         gc[i] = 0;
                 }
                 i++;
             }
+            boolean fixedTime = mob.level().dimensionType().hasFixedTime();
             built = new AiCtx(U.getObject(mob, O_MOB_TARGETSEL),
                     U.getObject(mob, O_MOB_GOALSEL),
-                    tg, gg, tk, gk, tp, gp, tf, gf, tc, gc, lds);
+                    tg, gg, tk, gk, tp, gp, tf, gf, tc, gc, lds,
+                    hasMtv, mtvOnlyNight, fixedTime);
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "aiClassify: " + t;
@@ -5866,6 +5908,7 @@ public final class CeHooks {
         if (mob.getMainHandItem().isEmpty()) mf |= 2;            // MF_MAINHAND_EMPTY=2
         if (U.getObject(mob, O_MOB_TARGET) != null) mf |= 4;     // MF_HAS_TARGET=4
         if (mob.isUsingItem()) mf |= 8;                          // MF_USING_ITEM=8
+        if (U.getObject(mob, O_MOB_LASTHURTBY) != null) mf |= 16; // MF_LAST_HURT_BY=16
         in[1] = mf;
         in[2] = mob.tickCount;
         in[3] = mob.getId();
@@ -5887,6 +5930,25 @@ public final class CeHooks {
         in[19] = (int) (Double.doubleToRawLongBits(ry) >>> 32);
         in[20] = (int) Double.doubleToRawLongBits(rz);
         in[21] = (int) (Double.doubleToRawLongBits(rz) >>> 32);
+        // L22b — HurtBy gate timestamp + the level game time (MeleeAttack
+        // 20-tick throttle; u32-wrapping compares in the engine)
+        in[22] = U.getInt(mob, O_MOB_LASTHURTBY_TS);
+        net.minecraft.server.level.ServerLevel lvl =
+                (net.minecraft.server.level.ServerLevel) mob.level();
+        in[23] = (int) lvl.getGameTime();
+        // MoveThroughVillage lazy flags: the POI proximity probe runs only
+        // when the mob HAS the goal AND the night gate lets canUse proceed.
+        // vanilla: if (onlyAtNight && level.isBrightOutside()) return false;
+        // isBrightOutside() = !hasFixedTime() && skyDarken < 4.
+        if (ctx.hasMtv) {
+            boolean bright = !ctx.fixedTime && U.getInt(lvl, O_LVL_SKYDARKEN) < 4;
+            if (bright) mf |= MF_BRIGHT_OUTSIDE;
+            if (!(ctx.mtvOnlyNight && bright)
+                    && lvl.isCloseToVillage(mob.blockPosition(), 6)) {
+                mf |= MF_NEAR_VILLAGE;
+            }
+            in[1] = mf; // publish the late flags
+        }
         int base = IN_HEADER;
         base = aiPackSel(in, base, ctx.tGoals, ctx.tKind, ctx.tPrio, ctx.tFlags, ctx.tCfg,
                 ctx.lookDistSq, mob);
@@ -5910,6 +5972,20 @@ public final class CeHooks {
                 case GK_LOOKAROUND:
                     st = U.getInt(goal, O_RLA_LOOKTIME);
                     break;
+                case GK_ZOMBIE_ATTACK:
+                    st = (int) U.getLong(goal, O_ZA_LASTCANUSE); // low 32 — u32-wrapping throttle
+                    break;
+                case GK_HURT_BY:
+                    st = U.getInt(goal, O_HB_TIMESTAMP);
+                    break;
+                case GK_MOVE_THROUGH_VILLAGE: {
+                    Object visited = U.getObject(goal, O_MTV_VISITED);
+                    // ArrayList fast path; an exotic List impl parks
+                    // (state > 15 routes vanilla — always exact)
+                    st = (visited instanceof java.util.ArrayList al)
+                            ? U.getInt(al, O_AL_SIZE) : 999;
+                    break;
+                }
                 case GK_LOOKAT_PLAYER: {
                     st = U.getInt(goal, O_LAL_LOOKTIME) & 0x3FFFFFFF;
                     Object lookAt = U.getObject(goal, O_LAL_LOOKAT);
