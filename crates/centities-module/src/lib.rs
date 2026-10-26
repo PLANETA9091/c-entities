@@ -460,6 +460,7 @@ fn arm_module() {
         MOB_CLASS,
         CONVERSION_TRACKER_CLASS,
         TRACKED_ENTITY_CLASS,
+        SENSING_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -2178,18 +2179,13 @@ fn precompute_sensing(loader: jni::jobject) {
             }
             SENSING_WOVEN.store(true, Ordering::Release);
             cplug_sdk::log::info("[c-entities] precomputed Sensing O(1)-clear floor");
-            // L28: the stash existed = the class ALREADY LOADED (its boot
-            // load served vanilla bytes — the ClassFileLoadHook ran before
-            // the bridge was ready). Unlike the post-arm classes (served
-            // patched at load), this instance needs a RETRANSFORM or the
-            // floor never goes live — the mobs-25k bench profile showed
-            // vanilla Sensing.tick() frames with the weave "precomputed".
-            // retransform is idempotent; for a not-yet-loaded class it is a
-            // harmless no-op (the hook serves the patched bytes at load).
-            let rc = cplug_sdk::retransform_class(SENSING_CLASS);
-            cplug_sdk::log::info(&format!(
-                "[c-entities] retransform Sensing after precompute: rc={rc}"
-            ));
+            // NOTE: no retransform here — the precomputes run BEFORE
+            // BRIDGE_READY, and the hook's reentrancy check would re-stash
+            // and serve the ORIGINAL bytes (the L28a attempt logged rc=0 but
+            // was a verified no-op: SenseChecks stayed 0). The boot-loaded
+            // class is retransformed by the arm sequence BELOW (SENSING_CLASS
+            // joined the list), where the hook serves the precomputed bytes;
+            // a post-arm load is served directly by the hook.
         }
         _ => {
             cplug_sdk::log::info(
