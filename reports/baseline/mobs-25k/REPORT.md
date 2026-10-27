@@ -6,31 +6,31 @@ Server: `26.3-227-7f9c797 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25066 -> 25066) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25069 -> 25069) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 265.533 / 304.541 / 337.670 / 428.085 |
-| MSPT mean, ms | 273.941 |
-| TPS estimate (1000/p50) | 3.8 |
-| heap used / max, MB | 923.6 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 505.337 / 561.646 / 618.679 / 643.126 |
+| MSPT mean, ms | 515.260 |
+| TPS estimate (1000/p50) | 2.0 |
+| heap used / max, MB | 1274.1 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 16.32% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 5.32% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 3 | 4.91% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 4 | 2.50% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 5 | 2.14% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
-| 6 | 2.04% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 7 | 1.82% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 8 | 1.73% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
-| 9 | 1.54% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 10 | 1.40% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
-| 11 | 1.38% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
-| 12 | 1.29% | `java.util.EnumMap.get(Object) line: 248` |
-| 13 | 1.26% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 14 | 1.26% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
-| 15 | 1.25% | `java.util.function.Predicate.lambda$and$0(Predicate, Object) line: 69` |
+| 1 | 35.36% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 3.96% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 3 | 3.93% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 4 | 2.00% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
+| 5 | 1.43% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 6 | 1.09% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
+| 7 | 1.01% | `java.util.ImmutableCollections$ListItr.next() line: 397` |
+| 8 | 0.95% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 9 | 0.92% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 10 | 0.87% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
+| 11 | 0.78% | `java.util.HashMap.getNode(Object) line: 586` |
+| 12 | 0.69% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 13 | 0.66% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
+| 14 | 0.66% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3908` |
+| 15 | 0.62% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getVolatile(VarHandle, Object) line: 99` |
 
