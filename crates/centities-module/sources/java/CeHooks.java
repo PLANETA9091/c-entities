@@ -92,6 +92,15 @@ public final class CeHooks {
     public static final long[][] ROWS = new long[1 << 23][]; // [wid:3][cx:10][cz:10]
     public static volatile long PUBLISH_SEQ = 0; // native stamps rows + this
     public static volatile int OVERSIZE_POP = 0; // native oversize population
+    // L37c ORDER CHECK: run the vanilla mirror next to the fast path and
+    // compare the result lists ELEMENT-BY-ELEMENT — logs ORDER-MISMATCH
+    // (ids, sections, seqs of the first differing position) and a running
+    // counter into the hooks@ line. Diagnostic only; costs a full vanilla
+    // scan per checked query.
+    public static final boolean ORDER_CHECK =
+            "true".equals(System.getProperty("centities.orderCheck", "false"));
+    public static long orderChecks = 0, orderMismatches = 0;
+
     public static final boolean ROW_PATH_ON =
             !"false".equals(System.getProperty("centities.rowPath", "true"));
     private static final int ROW_CAP = 510;      // must match the native ROW_CAP
@@ -1473,6 +1482,46 @@ public final class CeHooks {
         // other order-sensitive consumer need the exact (chunkZ, chunkX,
         // sectionY, insertionSeq) sequence.
         ordSortVanilla(out);
+        if (ORDER_CHECK) {
+            orderChecks++;
+            List<Entity> van = mirror(level, source, box, predicate);
+            boolean same = van.size() == out.size();
+            if (same) {
+                for (int i = 0; i < out.size(); i++) {
+                    if (van.get(i) != out.get(i)) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (!same) {
+                orderMismatches++;
+                if (orderMismatches <= 12) {
+                    StringBuilder sb = new StringBuilder(320);
+                    sb.append("ORDER-MISMATCH n_van=").append(van.size())
+                            .append(" n_fast=").append(out.size());
+                    int lim = Math.min(van.size(), out.size());
+                    for (int i = 0; i < lim; i++) {
+                        Entity a = van.get(i), b = out.get(i);
+                        if (a != b) {
+                            sb.append(" first@").append(i)
+                                    .append(" van_id=").append(a.getId())
+                                    .append(" sec=(").append(a.moonrise$getSectionZ())
+                                    .append(',').append(a.moonrise$getSectionX())
+                                    .append(',').append(a.moonrise$getSectionY())
+                                    .append(") fast_id=").append(b.getId())
+                                    .append(" sec=(").append(b.moonrise$getSectionZ())
+                                    .append(',').append(b.moonrise$getSectionX())
+                                    .append(',').append(b.moonrise$getSectionY())
+                                    .append(") van_seq=").append(ORD_SEQ[a.getId() & AMASK])
+                                    .append(" fast_seq=").append(ORD_SEQ[b.getId() & AMASK]);
+                            break;
+                        }
+                    }
+                    System.err.println("[c-entities] " + sb);
+                }
+            }
+        }
         return out;
     }
 
