@@ -6,31 +6,31 @@ Server: `26.3-226-4f49049 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 150000 (items 105073 / stands 30072 / zombies 14855) (merge shrink: 100589 -> 100589) |
+| entities spawned | 150000 (items 105073 / stands 30072 / zombies 14855) (merge shrink: 100579 -> 100579) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 286.793 / 380.540 / 535.164 / 596.383 |
-| MSPT mean, ms | 305.841 |
-| TPS estimate (1000/p50) | 3.5 |
-| heap used / max, MB | 1576.0 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 255.598 / 345.656 / 463.656 / 570.743 |
+| MSPT mean, ms | 271.517 |
+| TPS estimate (1000/p50) | 3.9 |
+| heap used / max, MB | 1998.8 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 3.46% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 2 | 3.23% | `dev.planeta9091.centities.CeHooks.setTicksFrozen$(Entity, int) line: 7603` |
-| 3 | 2.83% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 7462` |
-| 4 | 2.46% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 5 | 2.37% | `java.util.ImmutableCollections$ListItr.next() line: 397` |
-| 6 | 1.95% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 4522` |
-| 7 | 1.84% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 8 | 1.68% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 9 | 1.61% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
-| 10 | 1.56% | `dev.planeta9091.centities.CeHooks.ttlFastPath(Entity, Object, Object) line: 7409` |
-| 11 | 1.45% | `net.minecraft.world.entity.Entity.getId() line: 651` |
-| 12 | 1.34% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getInstance(Holder) line: 46` |
-| 13 | 1.22% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate) line: 1715` |
-| 14 | 1.19% | `dev.planeta9091.centities.CeHooks.trackerDispatch(ServerEntity) line: 4377` |
-| 15 | 1.15% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 1 | 4.62% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 2 | 3.26% | `dev.planeta9091.centities.CeHooks.setTicksFrozen$(Entity, int) line: 7603` |
+| 3 | 3.03% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 7462` |
+| 4 | 2.65% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 5 | 2.54% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 6 | 2.41% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 7 | 2.06% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 4522` |
+| 8 | 2.03% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getInstance(Holder) line: 46` |
+| 9 | 2.02% | `dev.planeta9091.centities.CeHooks.trackerDispatch(ServerEntity) line: 4377` |
+| 10 | 1.89% | `net.minecraft.world.entity.Entity.getId() line: 651` |
+| 11 | 1.80% | `dev.planeta9091.centities.CeHooks.ttlFastPath(Entity, Object, Object) line: 7409` |
+| 12 | 1.33% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
+| 13 | 1.33% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate) line: 1715` |
+| 14 | 1.30% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
+| 15 | 1.08% | `net.minecraft.world.entity.LivingEntity.refreshDirtyAttributes() line: 1334` |
 
