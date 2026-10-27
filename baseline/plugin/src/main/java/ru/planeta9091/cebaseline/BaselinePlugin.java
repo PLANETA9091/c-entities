@@ -118,6 +118,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         tileArea = intEnv("TILE_AREA", 260);
         parity = "1".equals(env("PARITY", "0"));
         paritySeed = longEnv("PARITY_SEED", 4242L);
+        traceId = (int) longEnv("PARITY_TRACE_ID", -1L);
 
         // Neutralize non-entity noise.
         for (World w : Bukkit.getWorlds()) {
@@ -392,6 +393,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 }
             }
         }
+        if (parity && traceId >= 0) {
+            traceStep();
+        }
         switch (phase) {
             case "WARMUP" -> {
                 if (tickNo >= measureEndTick - measureTicks) {
@@ -663,4 +667,70 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // activatedTick (parity mode only — perf irrelevant there).
     private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
     private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED;
+
+    // ------------------------------------------------------------------
+    // PARITY_TRACE_ID: per-tick EXACT trace of ONE entity (both legs write
+    // parity-trace.jsonl; a line diff names the diverging TICK and FIELD —
+    // the snapshot triple only shows the ACCUMULATED state).
+    // ------------------------------------------------------------------
+    private int traceId;
+    private org.bukkit.entity.Entity traced;
+    private java.io.Writer traceOut;
+
+    private void traceStep() {
+        try {
+            if (traceOut == null) {
+                traceOut = new java.io.OutputStreamWriter(
+                        new java.io.FileOutputStream(
+                                new File(Bukkit.getWorldContainer(), "parity-trace.jsonl"),
+                                true),
+                        StandardCharsets.UTF_8);
+            }
+            if (traced == null) {
+                for (org.bukkit.entity.Entity en : Bukkit.getWorlds().get(0).getEntities()) {
+                    if (en.getEntityId() == traceId) {
+                        traced = en;
+                        break;
+                    }
+                }
+                if (traced == null) {
+                    traceOut.write("t=" + tickNo + " pending\n");
+                    traceOut.flush();
+                    return;
+                }
+            }
+            if (!traced.isValid()) {
+                traceOut.write("t=" + tickNo + " REMOVED\n");
+                traceOut.flush();
+                return;
+            }
+            Location l = traced.getLocation();
+            org.bukkit.util.Vector v = traced.getVelocity();
+            StringBuilder sb = new StringBuilder(160);
+            sb.append("t=").append(tickNo)
+                    .append(" type=").append(traced.getType().name());
+            if (PARITY_GET_HANDLE != null) {
+                try {
+                    Object h = PARITY_GET_HANDLE.invoke(traced);
+                    sb.append(" tc=").append(PARITY_TICK_COUNT.getInt(h))
+                            .append(" at=").append(PARITY_ACTIVATED.getLong(h));
+                } catch (Throwable quiet) {
+                    // diagnostics only
+                }
+            }
+            sb.append(" x=").append(hex(l.getX()))
+                    .append(" y=").append(hex(l.getY()))
+                    .append(" z=").append(hex(l.getZ()))
+                    .append(" yaw=").append(hexf(l.getYaw()))
+                    .append(" vx=").append(hex(v.getX()))
+                    .append(" vy=").append(hex(v.getY()))
+                    .append(" vz=").append(hex(v.getZ()))
+                    .append(" onG=").append(traced.isOnGround() ? 1 : 0)
+                    .append('\n');
+            traceOut.write(sb.toString());
+            traceOut.flush();
+        } catch (Throwable t) {
+            getLogger().warning("trace step failed: " + t);
+        }
+    }
 }

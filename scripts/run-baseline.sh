@@ -232,6 +232,9 @@ cp "$S/logs/latest.log" "$R/" 2>/dev/null || true
 # Parity snapshots: copy every parity-*.json the run produced (the A/B
 # gate compares them across the off/on legs).
 cp "$S"/parity-*.json "$R/" 2>/dev/null || true
+# Parity per-tick trace (PARITY_TRACE_ID): the line diff across the legs
+# names the diverging TICK and FIELD directly.
+cp "$S"/parity-trace*.jsonl "$R/" 2>/dev/null || true
 # Crash forensics: JVM fatal-error reports land next to the server dir —
 # without them a SIGSEGV in a GC barrier is undebuggable from CI alone
 # (the hs_err stack is the ONLY place the corrupting thread's frames live).

@@ -38,6 +38,18 @@ on:
       merge:
         description: 'CE_MERGE (1=shipped, 0=vanilla merge in ON leg)'
         default: '1'
+      push:
+        description: 'CE_PUSH (1=shipped, 0=vanilla pushes via -Dcentities.pushNative=false)'
+        default: '1'
+      ai_floor:
+        description: 'CE_AI_FLOOR (1=shipped, 0=vanilla GoalSelector via -Dcentities.aiFloor=false)'
+        default: '1'
+      trace_id:
+        description: 'PARITY_TRACE_ID: per-tick trace of this entity id in BOTH legs (−1 = off)'
+        default: '-1'
+      extra_jvm:
+        description: 'extra JVM flags appended to EXTRA_JVM (e.g. -Dcentities.x=y)'
+        default: ''
   push:
     branches: [main]
     paths:
@@ -77,7 +89,16 @@ jobs:
         # -XX:hashCode is experimental on JDK 25: the unlock flag must
         # PRECEDE it (run-baseline.sh appends EXTRA_JVM after the other
         # options, so both travel in one string, unlock first).
-        run: echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5" >> "$GITHUB_ENV"
+        run: |
+          BISECT_JVM=""
+          if [ "$([ "${{ inputs.push }}" = "0" ] && echo 0 || echo 1)" = "0" ]; then
+            BISECT_JVM="$BISECT_JVM -Dcentities.pushNative=false"
+          fi
+          if [ "$([ "${{ inputs.ai_floor }}" = "0" ] && echo 0 || echo 1)" = "0" ]; then
+            BISECT_JVM="$BISECT_JVM -Dcentities.aiFloor=false"
+          fi
+          EJ="${{ inputs.extra_jvm || '' }}"
+          echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5$BISECT_JVM $EJ" >> "$GITHUB_ENV"
 
       - name: Paired parity runs (off/on per scenario)
         run: |
@@ -88,13 +109,14 @@ jobs:
           IT="$([ "${{ inputs.item_tick }}" = "0" ] && echo 0 || echo 1)"
           MA="$([ "${{ inputs.mob_ai }}" = "0" ] && echo 0 || echo 1)"
           MG="$([ "${{ inputs.merge }}" = "0" ] && echo 0 || echo 1)"
-          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG"
+          TR="${{ inputs.trace_id }}"
+          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
             RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
             TILE_HOPPERS=0 TILE_FURNACES=0 \
             FILL_TICKS="$FILL_TICKS" WARMUP_TICKS="$WARMUP_TICKS" MEASURE_TICKS="$MEASURE_TICKS" \
-            PARITY=1 PARITY_SEED="$PARITY_SEED" \
+            PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" \
             MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
             CE_ITEM_TICK="$IT" CE_MOB_AI="$MA" CE_MERGE="$MG" \
             bash scripts/run-baseline.sh
