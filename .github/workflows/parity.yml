@@ -20,7 +20,24 @@ name: parity
 # "mobs do exactly what Paper's mobs do" proof.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      # Diagnostic bisect knobs (defaults = the SHIPPED config; the push
+      # parity always runs the shipped config):
+      #   item_tick=0: items run the vanilla tick body in the ON leg
+      #   mob_ai=0:    mobs run the vanilla serverAiStep in the ON leg
+      #   merge=0:     the merge fast path routes vanilla
+      # A leg pair that PASSES with a knob off localizes the divergence to
+      # that subsystem; the shipped-config gate stays the honest A/B.
+      item_tick:
+        description: 'CE_ITEM_TICK (1=shipped, 0=vanilla item tick in ON leg)'
+        default: '1'
+      mob_ai:
+        description: 'CE_MOB_AI (1=shipped, 0=vanilla AI in ON leg)'
+        default: '1'
+      merge:
+        description: 'CE_MERGE (1=shipped, 0=vanilla merge in ON leg)'
+        default: '1'
   push:
     branches: [main]
     paths:
@@ -65,6 +82,10 @@ jobs:
       - name: Paired parity runs (off/on per scenario)
         run: |
           set -euo pipefail
+          IT="${{ inputs.item_tick || '1' }}"
+          MA="${{ inputs.mob_ai || '1' }}"
+          MG="${{ inputs.merge || '1' }}"
+          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
             RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
@@ -72,6 +93,7 @@ jobs:
             FILL_TICKS="$FILL_TICKS" WARMUP_TICKS="$WARMUP_TICKS" MEASURE_TICKS="$MEASURE_TICKS" \
             PARITY=1 PARITY_SEED="$PARITY_SEED" \
             MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
+            CE_ITEM_TICK="$IT" CE_MOB_AI="$MA" CE_MERGE="$MG" \
             bash scripts/run-baseline.sh
           }
           # Scenario set: every entity family the perf benches use, at a

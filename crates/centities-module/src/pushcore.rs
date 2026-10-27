@@ -89,6 +89,13 @@ pub struct PushCore {
     /// and the maxEntityCollisions cap depend on it.
     pub sy: Vec<i32>,
     pub seq: Vec<i32>,
+    /// L37b: the entity's home-cell key (world+cell of the box center) at
+    /// the last upsert — structural invalidation: when an entity's order
+    /// key (sy/seq) or home cell CHANGES, the affected cells' cached sorts
+    /// are stale and must be cleared (vanilla re-appends on every section
+    /// change — the per-tick sort cache would otherwise serve the old
+    /// order to later pushes in that cell).
+    pub home_key: Vec<u64>,
     /// pending kernel delta additions (see the MERGE STATE note)
     pub kadd_dx: Vec<f64>,
     pub kadd_dz: Vec<f64>,
@@ -119,6 +126,7 @@ impl PushCore {
             ncol: vec![0; PS_CAP],
             sy: vec![0; PS_CAP],
             seq: vec![0; PS_CAP],
+            home_key: vec![0; PS_CAP],
             kadd_dx: vec![0.0; PS_CAP],
             kadd_dz: vec![0.0; PS_CAP],
             sorted_at: HashMap::new(),
@@ -142,6 +150,7 @@ impl PushCore {
     pub fn upsert(
         &mut self,
         id: i64,
+        wid: u16,
         b: &centities_core::Aabb,
         px: f64,
         pz: f64,
@@ -155,6 +164,7 @@ impl PushCore {
     ) -> Option<i64> {
         let s = (id as usize) & PS_MASK;
         let mut evicted = None;
+        let mut structural = false;
         if self.key[s] != id {
             if self.key[s] != 0 {
                 // slot collision (id & MASK): the previous owner loses its
@@ -168,6 +178,19 @@ impl PushCore {
             self.ncol[s] = 0; // a fresh id starts the counter at zero
             self.kadd_dx[s] = 0.0;
             self.kadd_dz[s] = 0.0;
+            structural = true; // a fresh member changes the cell list
+        } else {
+            // the ORDER key changes only when the seq/section-Y changes or
+            // the position crosses a CHUNK border (cz/cx in the key) — a
+            // move within the chunk keeps both the vanilla list position
+            // and the key, so the cached sort stays valid (per-move
+            // invalidation would kill the once-per-tick amortization)
+            let ocx = ((self.px[s].floor() as i64) >> 4) as i32;
+            let ocz = ((self.pz[s].floor() as i64) >> 4) as i32;
+            let ncx = ((px.floor() as i64) >> 4) as i32;
+            let ncz = ((pz.floor() as i64) >> 4) as i32;
+            structural = self.seq[s] != seq || self.sy[s] != sy
+                || ocx != ncx || ocz != ncz;
         }
         let o = s * 6;
         self.box6[o] = b.x0;
@@ -187,6 +210,26 @@ impl PushCore {
         self.vid[s] = vid;
         self.sy[s] = sy;
         self.seq[s] = seq;
+        // L37b structural invalidation: clear the cached sorts of BOTH the
+        // old and the new home cell (position cell too — the center-based
+        // home can sit one cell from the position near a border).
+        if structural {
+            let old_home = self.home_key[s];
+            if old_home != 0 {
+                self.sorted_at.remove(&old_home);
+            }
+            let ccx = (((b.x0 + b.x1) * 0.5).floor() as i32) >> centities_core::CELL_SHIFT;
+            let ccz = (((b.z0 + b.z1) * 0.5).floor() as i32) >> centities_core::CELL_SHIFT;
+            let new_home = centities_core::cell_key_pub(wid, ccx, ccz);
+            self.sorted_at.remove(&new_home);
+            let pcx = (((px.floor() as i32)) >> centities_core::CELL_SHIFT) as i64;
+            let pcz = (((pz.floor() as i32)) >> centities_core::CELL_SHIFT) as i64;
+            let pos_key = centities_core::cell_key_pub(wid, pcx as i32, pcz as i32);
+            if pos_key != new_home {
+                self.sorted_at.remove(&pos_key);
+            }
+            self.home_key[s] = new_home;
+        }
         evicted
     }
 
@@ -204,6 +247,13 @@ impl PushCore {
     pub fn remove(&mut self, id: i64) {
         let s = (id as usize) & PS_MASK;
         if self.key[s] == id {
+            // L37b: a removal reshuffles the cell's list (vanilla arraycopy-
+            // shifts) — the cached per-cell sort is stale
+            let hk = self.home_key[s];
+            if hk != 0 {
+                self.sorted_at.remove(&hk);
+            }
+            self.home_key[s] = 0;
             self.key[s] = 0;
             self.flags[s] = 0;
             self.ncol[s] = 0;
@@ -510,7 +560,7 @@ mod tests {
 
     fn core_with(id: i64, x: f64, z: f64) -> PushCore {
         let mut pc = PushCore::new();
-        pc.upsert(id, &zbox(x, z), x, z, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(id, 0, &zbox(x, z), x, z, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         pc
     }
 
@@ -531,7 +581,7 @@ mod tests {
         let sq = 0.5f64 / 0.5f64.sqrt();
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -562,7 +612,7 @@ mod tests {
     fn same_position_eps_return_keeps_counters() {
         let mut pidx = idx_with(2, 0.0, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(2, 0, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -585,7 +635,7 @@ mod tests {
         for k in 2..7i64 {
             let x = 0.05 * (k - 1) as f64; // 0.05..0.25 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -610,7 +660,7 @@ mod tests {
         for k in 2..32i64 {
             let x = 0.01 * (k - 1) as f64; // 0.01..0.29 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -629,6 +679,7 @@ mod tests {
         let mut pc = core_with(1, 0.0, 0.0);
         pc.upsert(
             2,
+            0,
             &zbox(0.5, 0.0),
             0.5,
             0.0,
@@ -655,7 +706,7 @@ mod tests {
     fn removed_candidate_never_pushed() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -680,7 +731,7 @@ mod tests {
             // order authority
             let seq = (14 - k) as i32;
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, seq);
+            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, seq);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -703,7 +754,7 @@ mod tests {
     fn java_delta_event_preserves_pending_kernel_push() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -733,7 +784,7 @@ mod tests {
     fn density_gate_routes_sparse_worlds() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         // gate_min=96 with 2 rows -> decline, NO state changes
@@ -761,6 +812,7 @@ mod tests {
         pc.dy[s1] = -0.0784;
         pc.upsert(
             2,
+            0,
             &zbox(0.5, 0.0),
             0.5,
             0.0,

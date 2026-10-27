@@ -3822,6 +3822,7 @@ pub extern "system" fn n_flush(
                     if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
                         let evicted = st.push.upsert(
                             id as i64,
+                            wid,
                             &b,
                             pxz_buf[i * 2],
                             pxz_buf[i * 2 + 1],
