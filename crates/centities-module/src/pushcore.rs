@@ -510,7 +510,7 @@ mod tests {
 
     fn core_with(id: i64, x: f64, z: f64) -> PushCore {
         let mut pc = PushCore::new();
-        pc.upsert(id, &zbox(x, z), x, z, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(id, &zbox(x, z), x, z, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         pc
     }
 
@@ -531,7 +531,7 @@ mod tests {
         let sq = 0.5f64 / 0.5f64.sqrt();
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -562,7 +562,7 @@ mod tests {
     fn same_position_eps_return_keeps_counters() {
         let mut pidx = idx_with(2, 0.0, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(2, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -585,7 +585,7 @@ mod tests {
         for k in 2..7i64 {
             let x = 0.05 * (k - 1) as f64; // 0.05..0.25 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -610,7 +610,7 @@ mod tests {
         for k in 2..32i64 {
             let x = 0.01 * (k - 1) as f64; // 0.01..0.29 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -637,6 +637,8 @@ mod tests {
             0.0,
             PF_PUSHABLE | PF_PASSENGER,
             1,
+            0,
+            0,
         );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -653,7 +655,7 @@ mod tests {
     fn removed_candidate_never_pushed() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -664,17 +666,21 @@ mod tests {
         assert_eq!(out.ncol, 0);
     }
 
-    /// Cells are served in ID order after the sort: with maxEC=2 and ten
-    /// candidates inserted in DESCENDING id order, the cap still picks the
-    /// two lowest ids.
+    /// Cells are served in the VANILLA scan order: (chunkZ, chunkX,
+    /// sectionY, insertion seq). With maxEC=2 and ten same-spot candidates
+    /// whose seqs run DESCENDING against their ids, the cap keeps the two
+    /// LOWEST SEQs (the vanilla first-candidates), not the lowest ids.
     #[test]
-    fn candidates_served_in_id_order() {
+    fn candidates_served_in_vanilla_order() {
         let mut pidx = centities_core::EntityIndex::new();
         let mut pc = core_with(1, 0.0, 0.0);
         for k in (2..12i64).rev() {
             let x = 0.02 * (k - 1) as f64; // 0.02..0.18 — all intersect
+            // seq REVERSE of id: vanilla re-appends make seq, not id, the
+            // order authority
+            let seq = (14 - k) as i32;
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+            pc.upsert(k, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, seq);
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
@@ -684,7 +690,8 @@ mod tests {
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
             let s = pc.slot_of(k).unwrap();
-            let want = if k <= 3 { 1 } else { 0 };
+            // lowest seqs = ids 11, 10 (seq 3, 4)
+            let want = if k >= 10 { 1 } else { 0 };
             assert_eq!(pc.ncol[s], want, "id {k}");
         }
     }
@@ -696,7 +703,7 @@ mod tests {
     fn java_delta_event_preserves_pending_kernel_push() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         push_tick(
@@ -726,7 +733,7 @@ mod tests {
     fn density_gate_routes_sparse_worlds() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0);
+        pc.upsert(2, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         // gate_min=96 with 2 rows -> decline, NO state changes
@@ -761,6 +768,8 @@ mod tests {
             -0.08,
             0.0,
             PF_PUSHABLE,
+            0,
+            0,
             0,
         );
         let mut out = PushOut::default();
