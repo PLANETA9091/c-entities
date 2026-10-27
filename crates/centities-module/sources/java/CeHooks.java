@@ -1251,12 +1251,14 @@ public final class CeHooks {
     }
 
     // Multi-cell scratch (server-thread only, reused — no per-query alloc).
-    private static final long[][] MQ_ROWS = new long[4][];
-    private static final int[] MQ_CELL = new int[4];
+    // L32: widened 4 -> 16 — the staging rectangle is up to 4x4 cells
+    // (span <= 3 per axis); the scan below is already rectangle-general.
+    private static final long[][] MQ_ROWS = new long[16][];
+    private static final int[] MQ_CELL = new int[16];
     // L4c windowed rows: the UNWRAPPED cell x-origin of each covered row
     // (world blocks) — the reference frame for the packed candidate windows.
-    private static final long[] MQ_CELL_X0 = new long[4];
-    private static final long[] MQ_CELL_Z0 = new long[4];
+    private static final long[] MQ_CELL_X0 = new long[16];
+    private static final long[] MQ_CELL_Z0 = new long[16];
     // Pending row-neutral ids homed in a covered cell: their packed windows
     // are stale until the next publish, so the window test must not skip them.
     // Sized to PENDING_CAP: every pending row-neutral id of a covered cell
@@ -1271,14 +1273,36 @@ public final class CeHooks {
         int cx1 = cellFloor(box.maxX);
         int cz0 = cellFloor(box.minZ);
         int cz1 = cellFloor(box.maxZ);
-        if (cx1 - cx0 > 1 || cz1 - cz0 > 1) { rowMulti++; return null; }
+        // L32: the window is 4x4 (span <= 3). Wider boxes (the really wide
+        // targeting scans) still refuse into the native/mirror paths.
+        if (cx1 - cx0 > 3 || cz1 - cz0 > 3) { rowMulti++; return null; }
         int nr = 0;
         int total = 0;
+        // L32 freshness proof for the null-skip below: the publisher only
+        // republishes DIRTY cells (in place, same slot), so a null slot is a
+        // cell never occupied in the current index epoch — an EMPTY cell.
+        // An emptied cell is republished with count 0 (the move-out marks
+        // both homes dirty), never cleared. A slot collision (cells beyond
+        // the ±1024 direct range) cannot fake a null — and cannot fake a
+        // hit either: the row key embeds the full ±2M-cell coords and the
+        // key mismatch refuses. The one residual doubt — the index not yet
+        // built for this world — is covered by requiring at least one
+        // covered row to carry the current PUBLISH_SEQ before any null is
+        // trusted: a live publish stamps every dirty cell it writes, so a
+        // zero-fresh window means the index says nothing about it (early
+        // boot, regrowth, foreign world) and the query refuses.
+        boolean freshSeen = false;
         for (int cx = cx0; cx <= cx1; cx++) {
             for (int cz = cz0; cz <= cz1; cz++) {
                 int packed = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 long[] row = ROWS[packed];
-                if (row == null) { rowNoRow++; return null; }
+                if (row == null) {
+                    // L32: never-occupied cell — skipped, not refused (see
+                    // the freshness proof above; the refusal decision needs
+                    // the full window scanned first).
+                    rowNoRow++;
+                    continue;
+                }
                 long key = ((long) (wid & 0xFFFF) << 44)
                         | (((long) ((cx + (1 << 20)) & 0x3FFFFF)) << 22)
                         | (long) ((cz + (1 << 20)) & 0x3FFFFF);
@@ -1294,6 +1318,7 @@ public final class CeHooks {
                 }
                 long hdr = row[1];
                 if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
+                freshSeen = true;
                 int n = (int) (hdr & 0x7FF);
                 if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
                 MQ_ROWS[nr] = row;
@@ -1303,6 +1328,12 @@ public final class CeHooks {
                 nr++;
                 total += n;
             }
+        }
+        if (!freshSeen) {
+            // L32: every covered cell is either null or stale-fresh — the
+            // index proves nothing about this window; the native/mirror
+            // paths decide (the pre-L32 behavior for any non-empty window).
+            return null;
         }
         // Pending (unflushed) probe batch: an upsert whose NEW home cell is
         // ANY covered cell means some row predates the entity — answering
@@ -7144,7 +7175,12 @@ public final class CeHooks {
                 }
                 ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
                         .moonrise$tick((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk);
-                if (!((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                // vanilla bc 71-94: sendChanges iff hasPlayers() OR the
+                // entity's chunk is entity-ticking — NO negation (the first
+                // weave shipped with an inverted !hasPlayers(); players
+                // tracking an entity in a non-entity-ticking chunk would
+                // have missed every update).
+                if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
                         .moonrise$hasPlayers()
                         || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                                 .moonrise$getChunkStatus()

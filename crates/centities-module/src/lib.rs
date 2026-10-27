@@ -1191,6 +1191,11 @@ fn precompute_livingentity(loader: jni::jobject) {
     };
     // L33: the tickEffects empty-map early-out — a THIRD independent guard
     // on the same class, chained after whatever the mode selection kept.
+    // tickEffects()V is a NO-ARG instance method — op-4 (receiver-only,
+    // the descriptor's reference first-param reads as local 0) is the
+    // correct op; op-5 (guard2) refuses it ("bad first param") because it
+    // demands a real first argument (the same lesson as the travel note
+    // below, mirrored).
     let eff_ok = read_java_flag("EFF_FLAG_ON") == Some(true)
         && prove_handles("initEffHandles", "EFF_HANDLES_OK") == Some(true);
     if !eff_ok {
@@ -1199,7 +1204,7 @@ fn precompute_livingentity(loader: jni::jobject) {
             "[c-entities] tickEffects gate declined (flag/handles) — vanilla kept",
         );
     }
-    let eff_spec = cplug_sdk::asm::EarlyReturnGuard2 {
+    let eff_spec = cplug_sdk::asm::EarlyReturnGuard {
         method_name: "tickEffects",
         method_desc: "()V",
         check_class: HOOKS_CLASS,
@@ -1242,7 +1247,7 @@ fn precompute_livingentity(loader: jni::jobject) {
             return base;
         }
         match base {
-            Some(b) => match cplug_sdk::asm::insert_early_return_guard2(
+            Some(b) => match cplug_sdk::asm::insert_early_return_guard(
                 env,
                 loader,
                 &b,
@@ -1257,7 +1262,7 @@ fn precompute_livingentity(loader: jni::jobject) {
             None => {
                 // no base guard survived; the eff guard alone is still worth
                 // applying — vanilla keeps the other two bodies.
-                match cplug_sdk::asm::insert_early_return_guard2(
+                match cplug_sdk::asm::insert_early_return_guard(
                     env,
                     loader,
                     &bytes,

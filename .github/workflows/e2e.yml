@@ -175,11 +175,19 @@ jobs:
           echo "$LAST_HOOKS" | grep -Eq "push=[1-9]" || fail "push guard never executed (linkage or weave dead)"
           # L14: every entity's sendChanges passes the tracker gate; in a
           # playerless soak trackedPlayers is empty for every entity, so the
-          # provable-no-op path MUST serve traffic (fast>0). err>0 alone is
+          # provable-no-op path MUST serve traffic. err>0 alone is
           # tolerable (self-healing stale RefField) but checks==0 means the
           # weave never linked — the doc-24 silent-discard failure shape.
+          # L30 NOTE: the tracker-loop floor serves the no-tracking case at
+          # the LOOP level (ttl=fuse>0) and those entities never reach
+          # sendChanges — so the no-op proof is EITHER the sendChanges fast
+          # exit (tracker=checks/fast>0) OR the fused loop path
+          # (ttl=calls/fuse>0). tracker=checks>0 alone still proves linkage.
           echo "$LAST_HOOKS" | grep -Eq "tracker=[1-9]"          || fail "tracker gate never executed (linkage or weave dead)"
-          echo "$LAST_HOOKS" | grep -Eq "tracker=[0-9]+/[1-9]"   || fail "tracker gate never served a provable no-op"
+          TRACKER_NOOP=0
+          echo "$LAST_HOOKS" | grep -Eq "tracker=[0-9]+/[1-9]" && TRACKER_NOOP=1
+          echo "$LAST_HOOKS" | grep -Eq "ttl=[0-9]+/[1-9]"       && TRACKER_NOOP=1
+          [ "$TRACKER_NOOP" = "1" ] || fail "neither the sendChanges fast exit nor the L30 fused loop served a provable no-op"
           # L13: the tick phase walks through the raw-array mirror every tick.
           echo "$LAST_HOOKS" | grep -Eq "ticklist=[1-9]"         || fail "tick-list raw walk never executed"
           # L15: the goal bridge executed (mirror while disarmed / floor after)
