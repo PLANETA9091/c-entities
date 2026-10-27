@@ -36,7 +36,11 @@ pub const ITEM_GRAVITY: f64 = 0.04;
 /// f64-promoted float, NOT the f64 0.98.
 pub const FRICTION_F32_AS_F64: f64 = 0.98f32 as f64;
 /// Air/ground drag applied to Y every friction step (double literal 0.98).
-pub const Y_DRAG: f64 = 0.98;
+/// Vanilla Y drag = `getAirDrag()` — a FLOAT 0.98F widened to double
+/// (0.9800000190734863). The f64 literal 0.98 is a DIFFERENT number and
+/// shifts the item's vy by 1 ULP per tick (the parity trace caught it:
+/// items-T389 id 2, t=142, first ULP divergence of vy mid-air).
+pub const Y_DRAG: f64 = 0.98f32 as f64;
 /// Move gate float threshold: `horizontalDistanceSqr() > 1.0E-5F`.
 pub const GATE_HORZ_SQR: f64 = 1.0e-5f32 as f64;
 /// ItemEntity dimensions: width 0.25F, height 0.25F (EntityType.ITEM).
