@@ -2962,7 +2962,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeFlush",
-        "(I[J[D[I[D[D[II[J[D)V",
+        "(I[J[D[I[D[D[I[I[II[J[D)V",
         n_flush
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -2973,6 +2973,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 jni::jintArray,
                 jni::jdoubleArray,
                 jni::jdoubleArray,
+                jni::jintArray,
+                jni::jintArray,
                 jni::jintArray,
                 i32,
                 jni::jlongArray,
@@ -3190,10 +3192,36 @@ fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(1, b'L')],
     ) {
-        Ok(b) => {
-            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info("[c-entities] patched EntityLookup add/remove probes");
-            Some(b)
+        Ok(b2) => {
+            // L37: the moveEntity re-append probe. REQUIRED for the arm —
+            // without it the ORD_SEQ stamps go stale on every section-
+            // crossing move and the vanilla-order sort (merge partners,
+            // maxEntityCollisions cap) silently diverges. A refused patch
+            // keeps the whole module vanilla (exact, just slower).
+            match patch::insert_static_call_at_start(
+                b2,
+                "moveEntity",
+                "(Lnet/minecraft/world/entity/Entity;)Lca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices;",
+                HOOKS_CLASS,
+                "probeMoveSection",
+                "(Lnet/minecraft/world/entity/Entity;)V",
+                &[(1, b'L')],
+            ) {
+                Ok(b3) => {
+                    PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(
+                        "[c-entities] patched EntityLookup add/remove/move probes",
+                    );
+                    Some(b3)
+                }
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] moveEntity probe refused: {e}"
+                    ));
+                    None
+                }
+            }
         }
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -3731,6 +3759,8 @@ pub extern "system" fn n_flush(
     pxz: jni::jdoubleArray,
     dv: jni::jdoubleArray,
     vid: jni::jintArray,
+    sy: jni::jintArray,
+    seq: jni::jintArray,
     dbn: i32,
     db_ids: jni::jlongArray,
     db_dv: jni::jdoubleArray,
@@ -3746,6 +3776,8 @@ pub extern "system" fn n_flush(
         let mut pxz_buf: Vec<f64> = vec![0.0; n.max(0) as usize * 2];
         let mut dv_buf: Vec<f64> = vec![0.0; n.max(0) as usize * 3];
         let mut vid_buf: Vec<i32> = vec![0; n.max(0) as usize];
+        let mut sy_buf: Vec<i32> = vec![0; n.max(0) as usize];
+        let mut seq_buf: Vec<i32> = vec![0; n.max(0) as usize];
         if n > 0 {
             e.get_long_array_region(ids, 0, n, &mut id_buf);
             jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
@@ -3753,6 +3785,8 @@ pub extern "system" fn n_flush(
             jni_get_double_array_region(&e, pxz, 0, n * 2, &mut pxz_buf);
             jni_get_double_array_region(&e, dv, 0, n * 3, &mut dv_buf);
             e.get_int_array_region(vid, 0, n, &mut vid_buf);
+            e.get_int_array_region(sy, 0, n, &mut sy_buf);
+            e.get_int_array_region(seq, 0, n, &mut seq_buf);
         }
         let mut db_buf: Vec<i64> = vec![0; dbn.max(0) as usize];
         let mut dbdv_buf: Vec<f64> = vec![0.0; dbn.max(0) as usize * 3];
@@ -3796,6 +3830,8 @@ pub extern "system" fn n_flush(
                             dv_buf[i * 3 + 2],
                             pf_buf[i] as u8,
                             vid_buf[i] as i64,
+                            sy_buf[i],
+                            seq_buf[i],
                         );
                         if let Some(old) = evicted {
                             // arena slot collision: the previous owner lost

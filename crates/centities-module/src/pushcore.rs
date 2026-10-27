@@ -19,10 +19,12 @@
 //!   `numCollisions` reset + `maxEntityCollisions` cap, `Entity.push` force
 //!   math (absMax metric, 0.009999999776482582 threshold, 0.05f quantum),
 //!   mutual delta writes, `needsSync`.
-//! * candidates are served in **entity-id order** — vanilla's per-section
-//!   candidate order is section-insertion order, which for the farm
-//!   populations equals id order; the core's `sort_cell_by_id` keeps each
-//!   cell sorted at most once per tick.
+//! * candidates are served in the EXACT vanilla EntityLookup.getEntities
+//!   scan order — (chunkZ, chunkX, sectionY, section-insertion seq), the
+//!   seq mirrors Java's ORD_SEQ stamps (addEntity / moveEntity re-append);
+//!   the kernel's per-cell `sort_cell_by_keys` keeps each cell sorted at
+//!   most once per tick and the cell walk is chunkZ-major, so the merged
+//!   stream is bit-identical to vanilla's for the cap and force math.
 //!
 //! State mirrors (the arena): exact f64 box6 (probeBox), exact x/z, delta
 //! xyz (probeDelta + kernel writes), flag bits, `numCollisions`. Java reads
@@ -80,6 +82,13 @@ pub struct PushCore {
     /// numCollisions mirror (the ONLY reader/writer outside is the vanilla
     /// pushEntities body — javap-verified — so the mirror is authoritative)
     pub ncol: Vec<i32>,
+    /// L37 vanilla-order key halves: the clamped section Y and the global
+    /// insertion seq (Java bumps at addEntity / moveEntity re-append). With
+    /// px/pz (chunkZ/X at sort time) the kernel sorts cell candidates into
+    /// the exact EntityLookup.getEntities scan order — merge partner choice
+    /// and the maxEntityCollisions cap depend on it.
+    pub sy: Vec<i32>,
+    pub seq: Vec<i32>,
     /// pending kernel delta additions (see the MERGE STATE note)
     pub kadd_dx: Vec<f64>,
     pub kadd_dz: Vec<f64>,
@@ -108,6 +117,8 @@ impl PushCore {
             flags: vec![0; PS_CAP],
             vid: vec![0; PS_CAP],
             ncol: vec![0; PS_CAP],
+            sy: vec![0; PS_CAP],
+            seq: vec![0; PS_CAP],
             kadd_dx: vec![0.0; PS_CAP],
             kadd_dz: vec![0.0; PS_CAP],
             sorted_at: HashMap::new(),
@@ -139,6 +150,8 @@ impl PushCore {
         dz: f64,
         flags: u8,
         vid: i64,
+        sy: i32,
+        seq: i32,
     ) -> Option<i64> {
         let s = (id as usize) & PS_MASK;
         let mut evicted = None;
@@ -172,6 +185,8 @@ impl PushCore {
         self.dy[s] = dy;
         self.flags[s] = flags;
         self.vid[s] = vid;
+        self.sy[s] = sy;
+        self.seq[s] = seq;
         evicted
     }
 
@@ -269,8 +284,8 @@ pub fn push_tick(
     let gz0 = ((sz0 - ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
     let gz1 = ((sz1 + ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
     let mut rows = 0usize;
-    for cx in gx0..=gx1 {
-        for cz in gz0..=gz1 {
+    for cz in gz0..=gz1 {
+        for cx in gx0..=gx1 {
             rows += pidx.cell_population(world, cx, cz);
         }
     }
@@ -286,8 +301,14 @@ pub fn push_tick(
         0
     };
 
-    // Candidate scan over the pushable-only index, cell by cell, each
-    // cell served in id order (sorted at most once per (cell, tick)).
+    // Candidate scan over the pushable-only index. L37: cells are visited
+    // CZ-MAJOR (vanilla iterates regions Z outer/X inner, chunks Z outer/
+    // X inner — chunkZ-major), and each cell's entries are sorted at most
+    // once per (cell, tick) by the EXACT vanilla scan key (chunkZ, chunkX,
+    // sectionY, insertion seq — mirrors of the Java ORD_SEQ stamps). The
+    // merged stream is therefore bit-identical to vanilla's
+    // EntityLookup.getEntities order: the maxEntityCollisions cap and the
+    // f64 force accumulation see the same neighbors in the same sequence.
     // `query_cell` is a provable superset (f32 prefilter + margin); the
     // exact f64 intersect below restores the vanilla set.
     let mut cell_hits: Vec<i64> = Vec::new();
@@ -306,11 +327,26 @@ pub fn push_tick(
     let mut base_dy = pc.dy[self_slot];
     let mut base_dz = pc.dz[self_slot];
 
-    for cx in cx0..=cx1 {
-        for cz in cz0..=cz1 {
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
             let key = centities_core::cell_key_pub(world, cx, cz);
             if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
-                pidx.sort_cell_by_id(world, cx, cz);
+                pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
+                    Some(s) => {
+                        // px/pz are POSITIONS: >> 4 first (chunk coords,
+                        // ±2M), then the 22-bit bias — the same key shape
+                        // as CeHooks.ordKey (which reads the already-chunk-
+                        // sized moonrise section fields directly).
+                        let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                        let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                        let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
+                        let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
+                        ((czk << 22) | cxk, (syk << 40) | seq)
+                    }
+                    // unknown slot (index-only id): never a kernel candidate
+                    // (the pushable filter needs the mirror); park it last.
+                    None => (i64::MAX, i64::MAX),
+                });
                 pc.sorted_at.insert(key, tick);
             }
             cell_hits.clear();

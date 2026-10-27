@@ -94,6 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           FAIL=0
+          mkdir -p bench/parity-dumps
           for SC in mobs items mixed spread; do
             OFF=bench/parity-$SC-off/results
             ON=bench/parity-$SC-on/results
@@ -101,13 +102,22 @@ jobs:
             # share the fixed fill window, so the tick tags must agree 1:1
             TAGS=$(ls "$OFF"/parity-*.json 2>/dev/null | sed -n 's/.*\/parity-\(.*\)\.json/\1/p' | sort -u)
             for TAG in $TAGS; do
-              if ! python3 scripts/parity-compare.py "$OFF/parity-$TAG.json" "$ON/parity-$TAG.json"; then
+              if ! python3 scripts/parity-compare.py "$OFF/parity-$TAG.json" "$ON/parity-$TAG.json" \
+                  --dump "bench/parity-dumps/$SC-$TAG.json"; then
                 FAIL=1
               fi
             done
           done
           echo "PARITY-A-B-GATE: $([ "$FAIL" = 0 ] && echo PASS || echo FAIL)"
           exit "$FAIL"
+
+      - name: Upload parity divergence dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-dumps
+          path: bench/parity-dumps/
+          retention-days: 30
 
       - name: Upload parity results
         if: always()

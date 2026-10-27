@@ -575,6 +575,22 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private void writeParitySnapshot(String tag, int offset) {
         if (!snapDone.add((long) tag.hashCode())) return;
         try {
+            // L37 diagnostics: the activation/tick bookkeeping is the most
+            // order-sensitive state two legs can share — divergences in
+            // tickCount/activatedTick pinpoint WHERE the streams split
+            // (activation windows, dispatcher phase) long before positions
+            // drift visibly. Parity mode only; perf is irrelevant here.
+            if (PARITY_GET_HANDLE == null) {
+                synchronized (BaselinePlugin.class) {
+                    if (PARITY_GET_HANDLE == null) {
+                        PARITY_GET_HANDLE = org.bukkit.entity.Entity.class
+                                .getMethod("getHandle");
+                        Class<?> nms = PARITY_GET_HANDLE.getReturnType();
+                        PARITY_TICK_COUNT = nms.getField("tickCount");
+                        PARITY_ACTIVATED = nms.getField("activatedTick");
+                    }
+                }
+            }
             List<org.bukkit.entity.Entity> ents = new ArrayList<>(Bukkit.getWorlds().get(0).getEntities());
             ents.sort(Comparator.comparingInt(org.bukkit.entity.Entity::getEntityId));
             StringBuilder sb = new StringBuilder(ents.size() * 160 + 128);
@@ -600,6 +616,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         .append(",\"onG\":").append(en.isOnGround() ? 1 : 0)
                         .append(",\"fire\":").append(en.getFireTicks())
                         .append(",\"alive\":").append(en.isValid() ? 1 : 0);
+                try {
+                    Object h = PARITY_GET_HANDLE.invoke(en);
+                    sb.append(",\"tc\":").append(PARITY_TICK_COUNT.getInt(h))
+                            .append(",\"at\":").append(PARITY_ACTIVATED.getLong(h));
+                } catch (Throwable quiet) {
+                    // L37 diagnostics only — never break the snapshot
+                }
                 if (en instanceof org.bukkit.entity.LivingEntity le) {
                     sb.append(",\"hp\":").append(hex(le.getHealth()))
                             .append(",\"hurtT\":").append(le.getNoActionTicks());
@@ -631,4 +654,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static String hexf(float f) {
         return "\"" + Float.toHexString(f) + "\"";
     }
+
+    // L37 parity diagnostics: lazily-bound NMS accessors for tickCount /
+    // activatedTick (parity mode only — perf irrelevant there).
+    private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
+    private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED;
 }

@@ -663,6 +663,7 @@ public final class CeHooks {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
                 ARENA[e.getId() & AMASK] = e;
+                ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
                 batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
@@ -757,6 +758,12 @@ public final class CeHooks {
     private static final double[] B_PXZ = new double[BATCH_CAP * 2];
     private static final double[] B_DV = new double[BATCH_CAP * 3];
     private static final int[] B_VID = new int[BATCH_CAP];
+    // L37 vanilla-order keys: the clamped section Y + the insertion seq per
+    // entry — the push kernel sorts cell candidates by (chunkZ, chunkX,
+    // sectionY, seq) exactly like vanilla's EntityLookup scan (chunkZ/X come
+    // from the mirrored px/pz at sort time).
+    private static final int[] B_SY = new int[BATCH_CAP];
+    private static final int[] B_SEQ = new int[BATCH_CAP];
     // L12 delta-only batch (probeDelta events without a box change)
     private static final long[] DB_IDS = new long[BATCH_CAP];
     private static final double[] DB_DV = new double[BATCH_CAP * 3];
@@ -784,6 +791,8 @@ public final class CeHooks {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
             B_PXZ[bN * 2 + 1] = le.getZ();
+            B_SY[bN] = le.moonrise$getSectionY();
+            B_SEQ[bN] = ORD_SEQ[le.getId() & AMASK];
             Vec3 dv = le.getDeltaMovement();
             B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
             Entity veh = le.isPassenger() ? le.getVehicle() : null;
@@ -792,6 +801,8 @@ public final class CeHooks {
             B_PF[bN] = 0;
             B_PXZ[bN * 2] = 0.0;
             B_PXZ[bN * 2 + 1] = 0.0;
+            B_SY[bN] = 0;
+            B_SEQ[bN] = 0;
             B_DV[bN * 3] = 0.0; B_DV[bN * 3 + 1] = 0.0; B_DV[bN * 3 + 2] = 0.0;
             B_VID[bN] = 0;
         }
@@ -872,7 +883,7 @@ public final class CeHooks {
         if (bN > 0 || dbN > 0) {
             batchesFlushed++;
             batchEntries += bN;
-            nativeFlush(bN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID,
+            nativeFlush(bN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID, B_SY, B_SEQ,
                     dbN, DB_IDS, DB_DV);
             bN = 0;
             dbN = 0;
@@ -1041,6 +1052,191 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
+
+    // ------------------------------------------------------------------
+    // L37 — VANILLA SCAN ORDER. The parity A/B (run 40529103630) proved the
+    // fast path's candidate ORDER is behavior-visible: ItemEntity.tryToMerge
+    // keeps the FIRST candidate in vanilla scan order, and the
+    // maxEntityCollisions cap keeps the FIRST candidates — a different order
+    // merges different items and caps different mobs, and the SHARED_RANDOM
+    // stream never re-converges (mobs leg: 14 ZOMBIE-vs-CHICKEN id flips,
+    // 8 extra entities; items leg: 143/95 different merge survivors).
+    //
+    // Vanilla EntityLookup.getEntities iterates regions (Z outer, X inner),
+    // chunks (Z outer, X inner — equivalent to plain chunkZ-major order),
+    // sections Y ascending, then each section's BasicEntityList in
+    // INSERTION order (add appends; removal is an arraycopy shift, so
+    // relative order of the survivors is preserved; moveEntity re-appends
+    // on a real section change). Therefore the exact order key per entity
+    // is (chunkZ, chunkX, sectionY, insertionSeq):
+    //   - chunkZ/X and sectionY: the entity's own moonrise-tracked section
+    //     fields (moonrise$getSectionZ/X/Y — public final, updated by the
+    //     same moveEntity body we mirror);
+    //   - insertionSeq: a global counter bumped at addEntity (probeAdd) and
+    //     at moveEntity's real-change re-append (probeMoveSection). A global
+    //     counter is exact: within one section the later insertion has the
+    //     larger seq; cross-section order is decided by the (Z, X, Y) key
+    //     first. Removals preserve relative order — no renumbering needed.
+    // ------------------------------------------------------------------
+    public static final int[] ORD_SEQ = new int[ARENA.length];
+    private static final java.util.concurrent.atomic.AtomicInteger ORD_CNT =
+            new java.util.concurrent.atomic.AtomicInteger(1);
+
+    private static void ordStamp(Entity e) {
+        ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+    }
+
+    /** Prefix of EntityLookup.moveEntity(Entity): the vanilla RE-APPEND
+     *  point (removeEntity + addEntity on a real section change). onMove
+     *  calls moveEntity on EVERY position change; at prefix time the
+     *  entity's moonrise section fields still hold the OLD section while
+     *  the position field is already new (setPosRaw assigned it before the
+     *  callback) — so the exact change test (including the section-Y clamp
+     *  the body applies) is computable without touching the body. */
+    public static void probeMoveSection(Entity e) {
+        try {
+            if (!ACTIVE || !INDEXING || e == null) return;
+            net.minecraft.world.level.Level lvl = e.level();
+            if (lvl == null || lvl.isClientSide()) return;
+            int oz = e.moonrise$getSectionZ();
+            int ox = e.moonrise$getSectionX();
+            int oy = e.moonrise$getSectionY();
+            int nx = (int) Math.floor(e.getX()) >> 4;
+            int nz = (int) Math.floor(e.getZ()) >> 4;
+            int nyr = (int) Math.floor(e.getY()) >> 4;
+            int ny = nyr < lvl.getMinSectionY() ? lvl.getMinSectionY()
+                    : nyr > lvl.getMaxSectionY() ? lvl.getMaxSectionY() : nyr;
+            if (nx != ox || nz != oz || ny != oy) {
+                ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+            }
+        } catch (Throwable t) {
+            // never break movement: a missed stamp costs order fidelity on
+            // one entity, a throw here would desync every world tick
+        }
+    }
+
+    // Sort scratch (server-thread confined — fastQuery/rowQuery callers).
+    private static Entity[] ORD_E = new Entity[0];
+    private static long[] ORD_KA = new long[0];
+    private static long[] ORD_KB = new long[0];
+
+    /** The two-long vanilla order key: ka = (chunkZ biased 22b) << 22 |
+     *  (chunkX biased 22b); kb = (sectionY biased 22b) << 40 | seq (32b). */
+    private static void ordKey(Entity e, int i) {
+        int cz = e.moonrise$getSectionZ();
+        int cx = e.moonrise$getSectionX();
+        int sy = e.moonrise$getSectionY();
+        int seq = ORD_SEQ[e.getId() & AMASK];
+        ORD_KA[i] = ((((long) cz + 2097152L) & 0x3FFFFFL) << 22)
+                | (((long) cx + 2097152L) & 0x3FFFFFL);
+        ORD_KB[i] = ((((long) sy + 2097152L) & 0x3FFFFFL) << 40)
+                | ((long) seq & 0xFFFFFFFFL);
+    }
+
+    private static boolean ordLess(int i, long ta, long tb) {
+        long a = ORD_KA[i];
+        return a > ta || (a == ta && ORD_KB[i] > tb);
+    }
+
+    /** L37: stamp every entity that never passed probeAdd/probeMoveSection
+     *  (added before the arm — world load during boot) in the EXACT vanilla
+     *  scan order. A full-world EntityLookup.getEntities walk IS the vanilla
+     *  order (regions Z,X -> chunks Z,X -> sections Y -> insertion), so the
+     *  seq stamp IS the section-list position. Also backfills the ARENA. */
+    private static void ordBackfillWorlds() {
+        try {
+            Class<?> bukkit = Class.forName("org.bukkit.Bukkit");
+            java.util.List<?> worlds = (java.util.List<?>) bukkit
+                    .getMethod("getWorlds").invoke(null);
+            Class<?> craftWorld = Class.forName("org.bukkit.craftbukkit.CraftWorld");
+            java.lang.reflect.Method getHandle = craftWorld.getMethod("getHandle");
+            java.lang.reflect.Method getLookup = net.minecraft.server.level.ServerLevel.class
+                    .getMethod("moonrise$getEntityLookup");
+            Class<?> lookupClass = Class.forName(
+                    "ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup");
+            java.lang.reflect.Method getEnts = null;
+            for (java.lang.reflect.Method m : lookupClass.getMethods()) {
+                if (m.getName().equals("getEntities")
+                        && m.getParameterCount() == 4
+                        && m.getParameterTypes()[0] == Entity.class) {
+                    getEnts = m;
+                }
+            }
+            if (getEnts == null) {
+                lastErrorText = "ordBackfill: EntityLookup.getEntities(Entity,AABB,List,Pred) not found";
+                return;
+            }
+            AABB full = new AABB(-3.0E7, -2.0E7, -3.0E7, 3.0E7, 2.0E7, 3.0E7);
+            for (Object w : worlds) {
+                Object sl = getHandle.invoke(w);
+                if (!(sl instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
+                    continue;
+                }
+                Object lookup = getLookup.invoke(serverLevel);
+                List<Entity> all = new ArrayList<>();
+                getEnts.invoke(lookup, null, full, all, null);
+                for (int i = 0; i < all.size(); i++) {
+                    Entity en = all.get(i);
+                    ARENA[en.getId() & AMASK] = en;
+                    ordStamp(en);
+                }
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "ordBackfillWorlds: " + t;
+        }
+    }
+
+    /** Sort `out` into the exact vanilla EntityLookup.getEntities order.
+     *  Insertion sort for the common sizes (push/merge/sensing scans are
+     *  tens of candidates); comparator fallback for the rare big scans. */
+    private static void ordSortVanilla(java.util.ArrayList<Entity> out) {
+        int n = out.size();
+        if (n < 2) return;
+        if (n <= 512) {
+            if (ORD_E.length < n) {
+                ORD_E = new Entity[n];
+                ORD_KA = new long[n];
+                ORD_KB = new long[n];
+            }
+            for (int i = 0; i < n; i++) {
+                Entity en = out.get(i);
+                ORD_E[i] = en;
+                ordKey(en, i);
+            }
+            for (int i = 1; i < n; i++) {
+                Entity te = ORD_E[i];
+                long ta = ORD_KA[i];
+                long tb = ORD_KB[i];
+                int j = i - 1;
+                while (j >= 0 && ordLess(j, ta, tb)) {
+                    ORD_E[j + 1] = ORD_E[j];
+                    ORD_KA[j + 1] = ORD_KA[j];
+                    ORD_KB[j + 1] = ORD_KB[j];
+                    j--;
+                }
+                ORD_E[j + 1] = te;
+                ORD_KA[j + 1] = ta;
+                ORD_KB[j + 1] = tb;
+            }
+            for (int i = 0; i < n; i++) out.set(i, ORD_E[i]);
+        } else {
+            Entity[] arr = out.toArray(new Entity[0]);
+            java.util.Arrays.sort(arr, (a, b) -> {
+                long cza = a.moonrise$getSectionZ();
+                long czb = b.moonrise$getSectionZ();
+                if (cza != czb) return Long.compare(cza, czb);
+                long cxa = a.moonrise$getSectionX();
+                long cxb = b.moonrise$getSectionX();
+                if (cxa != cxb) return Long.compare(cxa, cxb);
+                long sya = a.moonrise$getSectionY();
+                long syb = b.moonrise$getSectionY();
+                if (sya != syb) return Long.compare(sya, syb);
+                return Integer.compare(ORD_SEQ[a.getId() & AMASK], ORD_SEQ[b.getId() & AMASK]);
+            });
+            for (int i = 0; i < n; i++) out.set(i, arr[i]);
+        }
+    }
 
     // ------------------------------------------------------------------
     // Fast query: flush pending probes, Rust exact query -> resolve ids.
@@ -1242,6 +1438,11 @@ public final class CeHooks {
             mDesync++;
             return null; // desync guard
         }
+        // L37: the index scan order is NOT the vanilla EntityLookup order —
+        // the merge partner choice, the maxEntityCollisions cap and every
+        // other order-sensitive consumer need the exact (chunkZ, chunkX,
+        // sectionY, insertionSeq) sequence.
+        ordSortVanilla(out);
         return out;
     }
 
@@ -1500,6 +1701,9 @@ public final class CeHooks {
         rowHomeMiss += homeMiss;
         rowFast++;
         if (narrow) rowNarrow++;
+        // L37: the row walk order (cells, rows, packed windows) is not the
+        // vanilla EntityLookup order — same sort as the native path.
+        ordSortVanilla(out);
         return out;
     }
 
@@ -1628,6 +1832,17 @@ public final class CeHooks {
                     cplugReady = true;
                 }
             }
+            // L37: entities added BEFORE the arm (world load during boot)
+            // never passed probeAdd/probeMoveSection — stamp them in the
+            // EXACT vanilla scan order (a full-world EntityLookup walk IS
+            // the vanilla order). A failure leaves them unstamped (seq 0):
+            // they tie and sort in index order — the fast path still serves
+            // the exact SET, only the order of pre-arm entities degrades.
+            try {
+                ordBackfillWorlds();
+            } catch (Throwable t) {
+                lastErrorText = "ordBackfill: " + t;
+            }
         }
         if (!on) {
             cplugReady = false;
@@ -1673,6 +1888,7 @@ public final class CeHooks {
     public static native void nativeFlush(
             int n, long[] ids, double[] boxes,
             int[] pf, double[] pxz, double[] dv, int[] vid,
+            int[] sy, int[] seq,
             int dbn, long[] dbIds, double[] dbDv);
     /** L12 push kernel: compute one `LivingEntity.pushEntities()` natively.
      *  Returns a packed long: bit0 = ok (vanilla body suppressed), bit1 =

@@ -40,6 +40,7 @@ def main():
     off_path, on_path = sys.argv[1], sys.argv[2]
     tol = 0.0
     max_report = 12
+    dump_path = None
     args = sys.argv[3:]
     i = 0
     while i < len(args):
@@ -47,6 +48,8 @@ def main():
             tol = float(args[i + 1]); i += 2
         elif args[i] == "--max-report":
             max_report = int(args[i + 1]); i += 2
+        elif args[i] == "--dump":
+            dump_path = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -77,7 +80,8 @@ def main():
         if field not in worst or abs(delta) > abs(worst[field]):
             worst[field] = delta
 
-    exact_fields = ["onG", "fire", "alive", "hurtT", "amt", "pd"]
+    exact_fields = ["onG", "fire", "alive", "hurtT", "amt", "pd",
+                    "tc", "at"]  # tc/at: L37 diagnostics (tickCount/activatedTick)
     float_fields = {
         "x": 1.0, "y": 1.0, "z": 1.0,
         "yaw": 1e-4, "pitch": 1e-4,
@@ -125,6 +129,42 @@ def main():
         print("  PARITY-GATE: FAIL")
         for f in fails:
             print("    " + f)
+        if dump_path:
+            try:
+                dump = {
+                    "off": off_path,
+                    "on": on_path,
+                    "tag": a.get("tag"),
+                    "n_off": a["n"], "n_on": b["n"],
+                    "only_off": only_off[:max_report],
+                    "only_on": only_on[:max_report],
+                    "type_mismatches": [
+                        {"id": eid, "off": ea[eid]["t"], "on": eb[eid]["t"]}
+                        for eid in sorted(set(ea) & set(eb))
+                        if ea[eid]["t"] != eb[eid]["t"]
+                    ][:max_report],
+                    "worst": worst,
+                    "drifted_sample": [
+                        {"id": eid, "f": f, "off": va, "on": vb, "delta": d}
+                        for eid, f, va, vb, d in drifted[:40]
+                    ],
+                }
+                # attach full pairs for the first drifted ids (bounded)
+                ids_seen = []
+                for eid, _f, _va, _vb, _d in drifted:
+                    if eid not in ids_seen:
+                        ids_seen.append(eid)
+                    if len(ids_seen) >= 12:
+                        break
+                dump["entity_pairs"] = [
+                    {"id": eid, "off": ea.get(eid), "on": eb.get(eid)}
+                    for eid in ids_seen
+                ]
+                with open(dump_path, "w") as df:
+                    json.dump(dump, df, indent=1)
+                print(f"  dump: {dump_path}")
+            except Exception as ex:
+                print(f"  dump failed: {ex}")
         return 1
     print("  PARITY-GATE: PASS (bit-identical state)" if tol == 0 else f"  PARITY-GATE: PASS (within tol={tol})")
     return 0

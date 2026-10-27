@@ -654,7 +654,8 @@ impl EntityIndex {
 
     /// L12 push kernel: exact candidate scan of ONE cell (f32 AVX2
     /// prefilter + exact f64 re-check), appending ids in the cell's block
-    /// order — id order after [`EntityIndex::sort_cell_by_id`]. Same
+    /// order — the vanilla EntityLookup scan order via
+    /// [`EntityIndex::sort_cell_by_keys`]. Same
     /// superset contract as [`EntityIndex::query`] (MARGIN-expanded bounds,
     /// no oversize walk — oversize entities are never pushable candidates
     /// here because the pushable filter classifies them separately).
@@ -721,16 +722,21 @@ impl EntityIndex {
         }
     }
 
-    /// L12 push kernel support: sort one cell's entries by id, in place,
-    /// rebuilding the blocked-SoA box store and fixing every entry's cpos.
+    /// L12 push kernel support: sort one cell's entries by a caller-supplied
+    /// order key, in place, rebuilding the blocked-SoA box store and fixing
+    /// every entry's cpos.
     ///
-    /// WHY: vanilla's per-section candidate order is section-insertion
-    /// order; for the farm populations that equals entity-id order. The
-    /// push kernel serves its candidate loop in this order so the
+    /// WHY: vanilla's per-section candidate order is the EntityLookup scan
+    /// order (chunkZ, chunkX, sectionY, section-insertion seq) — the push
+    /// kernel serves its candidate loop in this order so the
     /// maxEntityCollisions cap picks the same neighbors and the f64 force
-    /// accumulation runs in the same order (bit-parity for static piles).
-    /// Amortized: callers sort at most once per (cell, tick).
-    pub fn sort_cell_by_id(&mut self, world: u16, cx: i32, cz: i32) {
+    /// accumulation runs in the same order (exact parity for dense piles,
+    /// where the cap binds and merge/AI cascade on the order). Amortized:
+    /// callers sort at most once per (cell, tick).
+    pub fn sort_cell_by_keys<F>(&mut self, world: u16, cx: i32, cz: i32, mut key_of: F)
+    where
+        F: FnMut(i64) -> (i64, i64),
+    {
         let key = cell_key(world, cx, cz);
         let Some(cid) = self.cellmap.find(key) else {
             return;
@@ -741,11 +747,13 @@ impl EntityIndex {
             return;
         }
         let bx = &self.cell_box[cid];
-        let mut rows: Vec<(i64, u32, [f32; 6])> = Vec::with_capacity(n);
+        let mut rows: Vec<(i64, u32, [f32; 6], i64, i64)> = Vec::with_capacity(n);
         for p in 0..n {
             let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            let id = self.cell_ids[cid][p];
+            let (ka, kb) = key_of(id);
             rows.push((
-                self.cell_ids[cid][p],
+                id,
                 self.cell_slots[cid][p],
                 [
                     bx[base],
@@ -755,12 +763,16 @@ impl EntityIndex {
                     bx[base + 32],
                     bx[base + 40],
                 ],
+                ka,
+                kb,
             ));
         }
-        rows.sort_unstable_by_key(|r| r.0);
+        rows.sort_unstable_by(|a, b| {
+            (a.3, a.4).cmp(&(b.3, b.4))
+        });
         let mut blocks: Vec<f32> = Vec::with_capacity(((n + 7) >> 3) * BLOCK_F32);
         let mut chunk: [f32; 6] = [0.0; 6];
-        for (i, (_id, slot, b6)) in rows.iter().enumerate() {
+        for (i, (_id, slot, b6, _, _)) in rows.iter().enumerate() {
             let lane = i & 7;
             if lane == 0 {
                 // fresh block: self-rejecting padding for unallocated lanes
