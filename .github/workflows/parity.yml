@@ -1,0 +1,115 @@
+name: parity
+
+# Behavioral-equivalence A/B ("honest A/B"): each scenario runs TWICE on the
+# same runner — vanilla Paper (MODULE=off) and Paper + c-entities (MODULE=on)
+# — under a deterministic-replay regime:
+#   * fixed level-seed,
+#   * no bench bot (player motion is wallclock-random),
+#   * the plugin's spawn layout is seeded (Random(42)) and the fill window
+#     starts at a FIXED tick,
+#   * Paper's shared entity RNG (Entity.SHARED_RANDOM) is re-seeded to a
+#     fixed seed at identical logical points (every fill tick + once at
+#     fill-done) in BOTH legs.
+# From fill-done the RNG stream free-runs: if the module consumes randomness
+# differently than vanilla anywhere (extra draw, different order), or picks
+# different goals, or moves entities differently — the divergence compounds
+# and the state snapshots stop matching.
+# Gate: full entity-state snapshots (positions/yaw/pitch/velocity/health/
+# fire/onGround/item fields, bit-exact) at fill-done+50, +300 and at the end
+# must be IDENTICAL across the legs. Timings are ignored here — this is the
+# "mobs do exactly what Paper's mobs do" proof.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'baseline/**'
+      - 'scripts/run-baseline.sh'
+      - 'scripts/parity-compare.py'
+      - '.github/workflows/parity.yml'
+
+permissions:
+  contents: read
+
+env:
+  PARITY_SEED: '4242'
+  FILL_TICKS: '200'
+  WARMUP_TICKS: '100'
+  MEASURE_TICKS: '600'
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CRUSSTY (runtime + sdk path deps live at repo-parent)
+        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 server/paper.jar
+      - name: Build ce-baseline plugin (parity harness inside)
+        run: bash scripts/build-plugin.sh
+      - name: Determinism belt — identity hash codes must not depend on addresses
+        run: echo "EXTRA_JVM=-XX:hashCode=5" >> "$GITHUB_ENV"
+
+      - name: Paired parity runs (off/on per scenario)
+        run: |
+          set -euo pipefail
+          run_leg() { # name scale items stands area module
+            echo "=== parity leg $1 (module=$6) ==="
+            RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
+            TILE_HOPPERS=0 TILE_FURNACES=0 \
+            FILL_TICKS="$FILL_TICKS" WARMUP_TICKS="$WARMUP_TICKS" MEASURE_TICKS="$MEASURE_TICKS" \
+            PARITY=1 PARITY_SEED="$PARITY_SEED" \
+            MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
+            bash scripts/run-baseline.sh
+          }
+          # Scenario set: every entity family the perf benches use, at a
+          # scale vanilla holds comfortably (wallclock is irrelevant for the
+          # parity state — only the tick sequence matters — but a runner
+          # budget still applies).
+          #   zombies stroll (AI goals, navigation, look control), items merge
+          #   (physics + merge scans), stands are inert markers, spread loads
+          #   a wide chunk area.
+          run_leg parity-mobs-off   2500 0.0 0.0 150 off
+          run_leg parity-mobs-on    2500 0.0 0.0 150 on
+          run_leg parity-items-off 20000 1.0 0.0 150 off
+          run_leg parity-items-on  20000 1.0 0.0 150 on
+          run_leg parity-mixed-off 15000 0.7 0.2 150 off
+          run_leg parity-mixed-on  15000 0.7 0.2 150 on
+          run_leg parity-spread-off 10000 0.6 0.2 300 off
+          run_leg parity-spread-on  10000 0.6 0.2 300 on
+
+      - name: Parity gate — snapshots must be identical across legs
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for SC in mobs items mixed spread; do
+            OFF=bench/parity-$SC-off/results
+            ON=bench/parity-$SC-on/results
+            # tags: "final" + "T<tick>" snapshots; match by tag — both legs
+            # share the fixed fill window, so the tick tags must agree 1:1
+            TAGS=$(ls "$OFF"/parity-*.json 2>/dev/null | sed -n 's/.*\/parity-\(.*\)\.json/\1/p' | sort -u)
+            for TAG in $TAGS; do
+              if ! python3 scripts/parity-compare.py "$OFF/parity-$TAG.json" "$ON/parity-$TAG.json"; then
+                FAIL=1
+              fi
+            done
+          done
+          echo "PARITY-A-B-GATE: $([ "$FAIL" = 0 ] && echo PASS || echo FAIL)"
+          exit "$FAIL"
+
+      - name: Upload parity results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-results
+          path: bench/
+          retention-days: 30

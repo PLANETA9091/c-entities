@@ -23,15 +23,20 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.Set;
 
 /**
  * Baseline harness: fills the world with a configurable entity/tile load
@@ -43,6 +48,16 @@ import java.util.Random;
  *  AREA (entity spread, blocks), INNER_RADIUS (active mob zone),
  *  PCT_ITEMS, PCT_STANDS (rest = zombies), PCT_MERGABLE (share of items
  *  that merge), TILE_HOPPERS, TILE_FURNACES, TILE_AREA.
+ *
+ *  PARITY=1 switches on the behavioral-equivalence harness: the fill window
+ *  starts at a FIXED tick (wallclock-independent, no bot), Paper's shared
+ *  entity RNG is re-seeded to a fixed seed at deterministic logical points
+ *  (every fill tick + once at fill-done), and full entity-state snapshots
+ *  (bit-exact hex fields) are written at fill-done offsets +50/+300 and at
+ *  the end. Two servers (module off/on) then MUST produce identical
+ *  snapshots — any extra/missing RNG draw, different goal decision or
+ *  movement drift in the optimized paths diverges the state and fails the
+ *  parity gate.
  */
 public class BaselinePlugin extends JavaPlugin implements Listener {
 
@@ -65,6 +80,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private long measureEndTick = -1;
     private int spawnedItems = 0, spawnedStands = 0, spawnedZombies = 0;
     private int placedHoppers = 0, placedFurnaces = 0;
+
+    // --- behavioral parity harness ---
+    private boolean parity = false;
+    private long paritySeed = 4242L;
+    private int parityFillStartTick = 100; // fixed-tick fill window start
+    private long fillDoneTick = -1;
+    private Object sharedRandom;           // net.minecraft...Entity.SHARED_RANDOM
+    private boolean sharedRandomTried;
+    private static final int[] PARITY_SNAP_OFFSETS = {50, 300};
+    private final Set<Long> snapDone = new HashSet<>();
 
     private Location anchor = null;
     private int groundY = -60;
@@ -91,6 +116,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         tileHoppers = intEnv("TILE_HOPPERS", 0);
         tileFurnaces = intEnv("TILE_FURNACES", 0);
         tileArea = intEnv("TILE_AREA", 260);
+        parity = "1".equals(env("PARITY", "0"));
+        paritySeed = longEnv("PARITY_SEED", 4242L);
 
         // Neutralize non-entity noise.
         for (World w : Bukkit.getWorlds()) {
@@ -127,6 +154,51 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 begin(null);
             }
         }, 20L * 45L);
+
+        if (parity) {
+            // Parity mode: NO bot (player-driven motion is wallclock-random).
+            // The fill window starts at a fixed TICK so both legs of the A/B
+            // begin spawning on the same tick number regardless of boot speed.
+            seedSharedRandom("onEnable");
+            getLogger().info("PARITY harness armed: seed=" + paritySeed
+                    + " fillStartTick=" + parityFillStartTick + " (bot ignored)");
+            Bukkit.getScheduler().runTaskTimer(this, () -> {
+                if (!started && tickNo >= parityFillStartTick) {
+                    getLogger().info("PARITY: fixed-tick fill start at T" + tickNo);
+                    begin(null);
+                }
+            }, 1L, 1L);
+        }
+    }
+
+    private static long longEnv(String k, long d) {
+        try { return Long.parseLong(env(k, String.valueOf(d))); } catch (Exception e) { return d; }
+    }
+
+    // ------------------------------------------------------------------
+    // Paper's entities share ONE RandomSource (Entity.SHARED_RANDOM, public
+    // static — paper patch). Vanilla seeds it once per process from an
+    // entropy source, so two identical servers diverge in mob AI even with
+    // the same world seed. Re-seeding it at identical LOGICAL points (every
+    // fill tick + once at fill-done) makes the whole AI decision stream
+    // reproducible across processes: if the module consumes RNG differently
+    // than vanilla anywhere (extra draw, different order), every downstream
+    // decision diverges and the snapshots stop matching.
+    // ------------------------------------------------------------------
+    private void seedSharedRandom(String where) {
+        try {
+            if (!sharedRandomTried) {
+                sharedRandomTried = true;
+                Class<?> c = Class.forName("net.minecraft.world.entity.Entity", false, getClass().getClassLoader());
+                Field f = c.getField("SHARED_RANDOM");
+                sharedRandom = f.get(null);
+            }
+            if (sharedRandom != null) {
+                sharedRandom.getClass().getMethod("setSeed", long.class).invoke(sharedRandom, paritySeed);
+            }
+        } catch (Throwable t) {
+            getLogger().warning("PARITY: cannot seed SHARED_RANDOM (" + where + "): " + t);
+        }
     }
 
     private static String env(String k, String d) {
@@ -190,6 +262,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private void fillStep() {
         World w = Bukkit.getWorlds().get(0);
         if (tickNo < 1) return;
+
+        // Parity: every fill tick starts from the SAME RNG seed (both arms),
+        // so the spawn layout AND every mob decision within the tick are
+        // process-independent. Entities spawned on earlier fill ticks ticked
+        // under the same re-seeded streams -> identical state at fill-done
+        // even if chunk-load timing shifted a tick or two between legs.
+        if (parity && "FILL".equals(phase)) {
+            seedSharedRandom("fillTick");
+        }
 
         // --- entities ---
         if (spawnedItems + spawnedStands + spawnedZombies < scale) {
@@ -279,15 +360,33 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         if (entDone && tileDone && "FILL".equals(phase)) {
             phase = "WARMUP";
             measureEndTick = tickNo + warmupTicks + measureTicks;
+            if (parity) {
+                // The one re-seed both legs take into the free-running phase:
+                // from here on the RNG stream is NEVER reset again — any
+                // behavioral divergence compounds until the snapshots break.
+                fillDoneTick = tickNo;
+                seedSharedRandom("fillDone");
+            }
             getLogger().info(String.format(Locale.ROOT,
                     "fill done: items=%d stands=%d zombies=%d hoppers=%d furnaces=%d — warmup %d ticks",
                     spawnedItems, spawnedStands, spawnedZombies, placedHoppers, placedFurnaces, warmupTicks));
+            if (parity) getLogger().info("PARITY: fillDoneTick=" + fillDoneTick + " — free-running RNG from here");
         }
     }
 
     @EventHandler
     public void onTickEnd(ServerTickEndEvent e) {
         tickNo++;
+        // Parity snapshots at fill-done offsets (mid-warmup, mid-measure) —
+        // resolved in onTickEnd so the schedule works in EVERY phase
+        // (offset 300 lands past the warmup->measure transition).
+        if (parity && fillDoneTick > 0) {
+            for (int off : PARITY_SNAP_OFFSETS) {
+                if (tickNo == fillDoneTick + off) {
+                    writeParitySnapshot("T" + tickNo, off);
+                }
+            }
+        }
         switch (phase) {
             case "WARMUP" -> {
                 if (tickNo >= measureEndTick - measureTicks) {
@@ -377,6 +476,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
 
     private void finish() {
         phase = "DONE";
+        if (parity) writeParitySnapshot("final", -1);
         double[] ds = new double[tickDurations.size()];
         for (int i = 0; i < ds.length; i++) ds[i] = tickDurations.get(i)[1];
         Arrays.sort(ds);
@@ -458,5 +558,72 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             getLogger().severe("failed to write baseline.json: " + ex);
         }
         Bukkit.getScheduler().runTaskLater(this, Bukkit::shutdown, 40L);
+    }
+
+    // ------------------------------------------------------------------
+    // Behavioral parity snapshot: the FULL observable entity state, written
+    // with EXACT bit patterns (hex floats/doubles — no decimal rounding),
+    // sorted by entity id. Two servers (module off/on) that behave
+    // identically MUST produce identical files; sha256 of each snapshot is
+    // logged as PARITY-SNAP for a quick CI grep gate.
+    // ------------------------------------------------------------------
+    private void writeParitySnapshot(String tag, int offset) {
+        if (!snapDone.add((long) tag.hashCode())) return;
+        try {
+            List<org.bukkit.entity.Entity> ents = new ArrayList<>(Bukkit.getWorlds().get(0).getEntities());
+            ents.sort(Comparator.comparingInt(org.bukkit.entity.Entity::getEntityId));
+            StringBuilder sb = new StringBuilder(ents.size() * 160 + 128);
+            sb.append("{\"tag\":\"").append(tag).append("\",\"tick\":").append(tickNo)
+                    .append(",\"seed\":").append(paritySeed)
+                    .append(",\"fillDone\":").append(fillDoneTick)
+                    .append(",\"n\":").append(ents.size())
+                    .append(",\"entities\":[\n");
+            for (int i = 0; i < ents.size(); i++) {
+                org.bukkit.entity.Entity en = ents.get(i);
+                Location l = en.getLocation();
+                org.bukkit.util.Vector v = en.getVelocity();
+                sb.append("{\"id\":").append(en.getEntityId())
+                        .append(",\"t\":\"").append(en.getType().name()).append('\"')
+                        .append(",\"x\":").append(hex(l.getX()))
+                        .append(",\"y\":").append(hex(l.getY()))
+                        .append(",\"z\":").append(hex(l.getZ()))
+                        .append(",\"yaw\":").append(hexf(l.getYaw()))
+                        .append(",\"pitch\":").append(hexf(l.getPitch()))
+                        .append(",\"vx\":").append(hex(v.getX()))
+                        .append(",\"vy\":").append(hex(v.getY()))
+                        .append(",\"vz\":").append(hex(v.getZ()))
+                        .append(",\"onG\":").append(en.isOnGround() ? 1 : 0)
+                        .append(",\"fire\":").append(en.getFireTicks())
+                        .append(",\"alive\":").append(en.isValid() ? 1 : 0);
+                if (en instanceof org.bukkit.entity.LivingEntity le) {
+                    sb.append(",\"hp\":").append(hex(le.getHealth()))
+                            .append(",\"hurtT\":").append(le.getNoActionTicks());
+                }
+                if (en instanceof org.bukkit.entity.Item it) {
+                    sb.append(",\"amt\":").append(it.getItemStack().getAmount())
+                            .append(",\"pd\":").append(it.getPickupDelay());
+                }
+                sb.append('}').append(i + 1 < ents.size() ? "," : "").append('\n');
+            }
+            sb.append("]}\n");
+            byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+            File out = new File(Bukkit.getWorldContainer(), "parity-" + tag + ".json");
+            Files.write(out.toPath(), bytes);
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            StringBuilder hx = new StringBuilder(64);
+            for (byte b : md.digest(bytes)) hx.append(String.format("%02x", b));
+            getLogger().info("PARITY-SNAP tag=" + tag + (offset >= 0 ? " off=" + offset : "")
+                    + " n=" + ents.size() + " sha256=" + hx);
+        } catch (Exception ex) {
+            getLogger().severe("PARITY: snapshot " + tag + " failed: " + ex);
+        }
+    }
+
+    private static String hex(double d) {
+        return "\"" + Double.toHexString(d) + "\"";
+    }
+
+    private static String hexf(float f) {
+        return "\"" + Float.toHexString(f) + "\"";
     }
 }

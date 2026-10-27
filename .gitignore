@@ -16,3 +16,6 @@ __pycache__/
 /bench/
 baseline/plugin/target/
 e2e/
+/cache/
+/libraries/
+/versions/

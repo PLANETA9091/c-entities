@@ -43,6 +43,10 @@ spawn-protection=0
 spawn-monsters=false
 max-tick-time=300000
 motd=ce-baseline
+# Fixed world seed — the parity A/B (PARITY=1) requires byte-identical
+# terrain in both legs; harmless for the perf legs (spawn layout is plugin-
+# seeded anyway).
+level-seed=620856203
 # 26.3 flipped the white-list default to ON (1.21.8 defaulted OFF and the
 # bot joined without this line) — the bench bot must never be gated.
 white-list=false
@@ -155,11 +159,16 @@ WDPID=$!
 # bot.js resolves modules from its own directory upward, which never reaches
 # tools/ — pass NODE_PATH explicitly (the require() fallback path).
 cd "$ROOT/tools" 2>/dev/null || cd "$ROOT"
-# Belt against the runner-OOM pattern: cap the bot's heap so a packet
-# storm degrades the BOT (graceful FATAL) instead of the whole VM.
-NODE_HEAP="--max-old-space-size=1536"
-NODE_PATH="$ROOT/tools/node_modules${NODE_PATH:+:$NODE_PATH}" node $NODE_HEAP "$ROOT/scripts/bot.js" &
-BOTPID=$!
+BOTPID=0
+if [ "${PARITY:-0}" != "1" ]; then
+  # Belt against the runner-OOM pattern: cap the bot's heap so a packet
+  # storm degrades the BOT (graceful FATAL) instead of the whole VM.
+  NODE_HEAP="--max-old-space-size=1536"
+  NODE_PATH="$ROOT/tools/node_modules${NODE_PATH:+:$NODE_PATH}" node $NODE_HEAP "$ROOT/scripts/bot.js" &
+  BOTPID=$!
+else
+  echo "PARITY=1: bot skipped (player motion is wallclock-random — it would break determinism)"
+fi
 
 JSON_OK=0
 for i in $(seq 1 "$RUN_TIMEOUT"); do
@@ -182,12 +191,15 @@ echo "baseline.json present — waiting for graceful JVM exit (JFR dump)"
 for i in $(seq 1 90); do kill -0 "$JPID" 2>/dev/null || break; sleep 2; done
 kill -TERM "$JPID" 2>/dev/null || true
 sleep 5
-kill "$BOTPID" 2>/dev/null || true
+[ "$BOTPID" != 0 ] && kill "$BOTPID" 2>/dev/null || true
 kill "$WDPID" 2>/dev/null || true
 kill -9 "$JPID" 2>/dev/null || true
 
 cp "$S/baseline.json" "$R/"
 cp "$S/logs/latest.log" "$R/" 2>/dev/null || true
+# Parity snapshots: copy every parity-*.json the run produced (the A/B
+# gate compares them across the off/on legs).
+cp "$S"/parity-*.json "$R/" 2>/dev/null || true
 # Crash forensics: JVM fatal-error reports land next to the server dir —
 # without them a SIGSEGV in a GC barrier is undebuggable from CI alone
 # (the hs_err stack is the ONLY place the corrupting thread's frames live).
