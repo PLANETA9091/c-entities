@@ -100,7 +100,16 @@ jobs:
             ON=bench/parity-$SC-on/results
             # tags: "final" + "T<tick>" snapshots; match by tag — both legs
             # share the fixed fill window, so the tick tags must agree 1:1
-            TAGS=$(ls "$OFF"/parity-*.json 2>/dev/null | sed -n 's/.*\/parity-\(.*\)\.json/\1/p' | sort -u)
+            # (|| true: ls under pipefail+set -e exits 2 on no matches, which
+            # killed the gate before it could NAME the missing snapshots)
+            TAGS=$( { ls "$OFF"/parity-*.json 2>/dev/null || true; } | sed -n 's/.*\/parity-\(.*\)\.json/\1/p' | sort -u)
+            TAGS_ON=$( { ls "$ON"/parity-*.json 2>/dev/null || true; } | sed -n 's/.*\/parity-\(.*\)\.json/\1/p' | sort -u)
+            if [ -z "$TAGS" ] || [ -z "$TAGS_ON" ]; then
+              echo "PARITY-GATE: FAIL — missing snapshots for $SC (off: '$TAGS', on: '$TAGS_ON'); check the legs' server logs for 'PARITY: snapshot failed'"
+              ls "$OFF" "$ON" 2>/dev/null || true
+              FAIL=1
+              continue
+            fi
             for TAG in $TAGS; do
               if ! python3 scripts/parity-compare.py "$OFF/parity-$TAG.json" "$ON/parity-$TAG.json" \
                   --dump "bench/parity-dumps/$SC-$TAG.json"; then

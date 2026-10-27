@@ -580,10 +580,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // tickCount/activatedTick pinpoint WHERE the streams split
             // (activation windows, dispatcher phase) long before positions
             // drift visibly. Parity mode only; perf is irrelevant here.
-            if (PARITY_GET_HANDLE == null) {
+            // getHandle lives on CraftEntity (CraftBukkit), NOT on the
+            // Bukkit Entity interface — bind it from the first entity's
+            // RUNTIME class or every snapshot dies NoSuchMethodException
+            // (observed 2026-10-27: zero parity files, gate exit 2).
+            List<org.bukkit.entity.Entity> ents = new ArrayList<>(Bukkit.getWorlds().get(0).getEntities());
+            if (!ents.isEmpty() && PARITY_GET_HANDLE == null) {
                 synchronized (BaselinePlugin.class) {
                     if (PARITY_GET_HANDLE == null) {
-                        PARITY_GET_HANDLE = org.bukkit.entity.Entity.class
+                        PARITY_GET_HANDLE = ents.get(0).getClass()
                                 .getMethod("getHandle");
                         Class<?> nms = PARITY_GET_HANDLE.getReturnType();
                         PARITY_TICK_COUNT = nms.getField("tickCount");
@@ -591,7 +596,6 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     }
                 }
             }
-            List<org.bukkit.entity.Entity> ents = new ArrayList<>(Bukkit.getWorlds().get(0).getEntities());
             ents.sort(Comparator.comparingInt(org.bukkit.entity.Entity::getEntityId));
             StringBuilder sb = new StringBuilder(ents.size() * 160 + 128);
             sb.append("{\"tag\":\"").append(tag).append("\",\"tick\":").append(tickNo)
