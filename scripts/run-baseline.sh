@@ -31,7 +31,38 @@ cp "$PAPER_JAR" "$S/paper.jar"
 cat > "$S/eula.txt" <<'EOF'
 eula=true
 EOF
-cat > "$S/server.properties" <<'EOF'
+if [ "${PARITY:-0}" = "1" ]; then
+  # PARITY legs: the world generator uses the THE_VOID biome — chunk
+  # generation must not create ANY entities. The first parity run failed
+  # with chickens interleaved into the entity-id sequence at chunk-gen
+  # timing (which differs between legs): each chicken consumed the shared
+  # SHARED_RANDOM stream (Entity creation draws it for the UUID) at a
+  # DIFFERENT point per leg, desyncing the whole mob-AI decision stream.
+  # the_void has zero creature spawns in its chunk-gen step, so every
+  # entity in both legs is plugin-spawned on the main thread, after the
+  # one-shot SHARED_RANDOM seed. The 4-layer floor (bedrock/dirt/grass)
+  # keeps the world walkable for the zombie legs.
+  cat > "$S/server.properties" <<'EOF'
+level-type=minecraft\:flat
+generate-structures=false
+online-mode=false
+gamemode=creative
+force-gamemode=true
+view-distance=4
+simulation-distance=10
+spawn-protection=0
+spawn-monsters=false
+spawn-animals=false
+spawn-npcs=false
+max-tick-time=300000
+motd=ce-baseline
+level-seed=620856203
+white-list=false
+enforce-whitelist=false
+generator-settings={"layers":[{"block":"minecraft:bedrock","height":1},{"block":"minecraft:dirt","height":2},{"block":"minecraft:grass_block","height":1}],"biome":"minecraft:the_void","features":false}
+EOF
+else
+  cat > "$S/server.properties" <<'EOF'
 level-type=minecraft:flat
 generate-structures=false
 online-mode=false
@@ -52,6 +83,7 @@ level-seed=620856203
 white-list=false
 enforce-whitelist=false
 EOF
+fi
 cat > "$S/spigot.yml" <<'EOF'
 settings:
   timeout-time: 300
