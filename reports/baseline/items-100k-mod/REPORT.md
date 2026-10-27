@@ -6,31 +6,31 @@ Server: `26.3-227-7f9c797 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 62863 -> 62863) |
+| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 63041 -> 63041) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 12.197 / 16.915 / 78.118 / 119.510 |
-| MSPT mean, ms | 15.563 |
+| MSPT p50 / p90 / p99 / max, ms | 28.259 / 76.386 / 137.903 / 186.039 |
+| MSPT mean, ms | 38.063 |
 | TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 1427.5 / 4096.0 |
+| heap used / max, MB | 1335.8 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 14.41% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 7544` |
-| 2 | 5.55% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 3 | 3.78% | `dev.planeta9091.centities.CeHooks.ttlFastPath(Entity, Object, Object) line: 7491` |
-| 4 | 3.46% | `net.minecraft.world.entity.Entity.level() line: 5416` |
-| 5 | 3.23% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 4604` |
-| 6 | 2.01% | `net.minecraft.world.entity.Entity.setDeltaMovement(Vec3) line: 5074` |
-| 7 | 1.93% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 2417` |
-| 8 | 1.90% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 2463` |
-| 9 | 1.80% | `net.minecraft.world.entity.Entity.isRemoved() line: 5329` |
-| 10 | 1.67% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 3895` |
-| 11 | 1.56% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 12 | 1.14% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 13 | 1.14% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup$ArrayIterable$ArrayIterator.next() line: 164` |
-| 14 | 1.01% | `net.minecraft.world.entity.Entity.isOnPortalCooldown() line: 997` |
-| 15 | 0.87% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 2492` |
+| 1 | 12.05% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 7554` |
+| 2 | 7.11% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 3905` |
+| 3 | 4.69% | `net.minecraft.world.level.Level.guardEntityTick(Consumer, Entity) line: 1526` |
+| 4 | 4.58% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 5 | 4.36% | `net.minecraft.world.entity.Entity.setDeltaMovement(Vec3) line: 5074` |
+| 6 | 3.70% | `dev.planeta9091.centities.CeHooks.ttlFastPath(Entity, Object, Object) line: 7501` |
+| 7 | 3.15% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 2503` |
+| 8 | 3.15% | `dev.planeta9091.centities.CeHooks.appendDispatch(ItemEntity, boolean) line: 2601` |
+| 9 | 2.55% | `net.minecraft.world.entity.Entity.level() line: 5416` |
+| 10 | 2.29% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup$ArrayIterable$ArrayIterator.next() line: 164` |
+| 11 | 1.65% | `net.minecraft.world.entity.Entity.isRemoved() line: 5329` |
+| 12 | 1.37% | `net.minecraft.world.entity.Entity.getType() line: 633` |
+| 13 | 1.23% | `dev.planeta9091.centities.CeHooks.itemCheckActive(ItemEntity) line: 2554` |
+| 14 | 1.10% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 3911` |
+| 15 | 0.90% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 4614` |
 
