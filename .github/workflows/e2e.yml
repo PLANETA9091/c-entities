@@ -96,6 +96,11 @@ jobs:
            # a burning zombie is fine — it only needs a few goal ticks.
            echo "summon minecraft:zombie 8 -59 8 {persistence_required:1b}";
            echo "summon minecraft:armor_stand 10 -59 10 {marker:1b,gravity:0b}";
+           # a villager exercises the AI floor's REFUSED path deterministically
+           # (Brain engine — the floor declines, vanilla GoalSelector serves,
+           # the gs bridge keeps traffic even in a short activity window —
+           # prev runs got this only from natural spawns)
+           echo "summon minecraft:villager 12 -59 12 {persistence_required:1b}";
            sleep 2;
            echo 'summon minecraft:item 0 50 0 {Item:{id:"minecraft:stone",count:1},PickupDelay:32767}';
            sleep 6;
@@ -192,7 +197,16 @@ jobs:
           echo "$LAST_HOOKS" | grep -Eq "ticklist=[1-9]"         || fail "tick-list raw walk never executed"
           # L15: the goal bridge executed (mirror while disarmed / floor after)
           # and the no-op write gates served traffic.
-          echo "$LAST_HOOKS" | grep -Eq "gs=[1-9]"               || fail "goal-selector bridge never executed (linkage or weave dead)"
+          # L30/L22 note: when the native AI floor classifies EVERY
+          # GoalSelector mob in the window, the vanilla GoalSelector.tick
+          # bridge may legitimately run ZERO times (gs=0) — the pipeline is
+          # then proven live by the floor's own request counter
+          # (mob=ticks/fallbacks/REQUESTS/... with requests>0). Either
+          # counts; both prove the goal pipeline executes.
+          GS_LIVE=0
+          echo "$LAST_HOOKS" | grep -Eq "gs=[1-9]"               && GS_LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "mob=[0-9]+/[0-9]+/[1-9]" && GS_LIVE=1
+          [ "$GS_LIVE" = "1" ] || fail "goal pipeline dead (neither the gs bridge nor the AI floor requests moved)"
           echo "$LAST_HOOKS" | grep -Eq "froz=[0-9]+/[1-9]"      || fail "frozen gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "conv=[0-9]+/[1-9]"      || fail "conv gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        || fail "tracker-tick gate never served a provable no-op"
