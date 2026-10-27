@@ -3866,19 +3866,29 @@ public final class CeHooks {
                     // despawn). MODE_REV is stamped with the POST-drain
                     // revision so a stale-but-boring world revision does not
                     // herd every rest item vanilla.
+                    //
+                    // L37f REST DISABLED (parity): the fixed point is REAL on
+                    // %4 gate-open ticks (the collision zeroes the gravity —
+                    // dy 0.0 -> 0.0 — the trace-proven rest arm at
+                    // items-T389), but the inline guard then runs COUNTERS
+                    // ONLY: it misses the every-%4 gravity+move+friction
+                    // cycle and the 1-in-20 activation windows that vanilla
+                    // still applies to a rested item (Paper 26.3
+                    // checkIfActive's ItemEntity %4 exception keeps items
+                    // full-ticking forever). Until the inline path mirrors
+                    // the full per-tick semantics, rest stays off: items
+                    // stay in the native batch where tick_item is exact.
                     Entity r0 = IB_REF[i];
-                    // the tick above ran on the PRE-drain section cache: an
-                    // environment section invalidated by THIS drain must
-                    // not enter rest (the proof sat on stale blocks)
-                    if ((bits & (1 << 15)) != 0
+                    if (false
+                            && (bits & (1 << 15)) != 0
                             && r0 instanceof ItemEntity ie0
                             && !restSectionTouched(ie0)) {
                         MODE_VAL[mSlot] = 2;
                         REST_ID[mSlot] = IB_IDS[i];
                         MODE_REV[mSlot] = WORLD_REV;
                     } else {
-                        MODE_VAL[mSlot] = 1;
                         MODE_REV[mSlot] = revBefore;
+                        MODE_VAL[mSlot] = 1;
                     }
                 } else {
                     MODE_REV[mSlot] = revBefore;
