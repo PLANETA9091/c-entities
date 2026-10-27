@@ -234,8 +234,9 @@ fn falling_item_lands_exactly_on_ground_with_land_event() {
     assert!(out.has(TickOutcome::MOVED));
     assert_eq!(st.y, 64.36);
     assert_eq!(
-        st.dy, -0.6272,
-        "air Y drag is the double literal 0.98 (not f32)"
+        st.dy,
+        -0.64 * (0.98f32 as f64),
+        "air Y drag is the float-promoted 0.98F (the parity trace proved\n     vanilla widens the FLOAT 0.98F, not the f64 0.98 — L37)"
     );
     assert!(!out.has(TickOutcome::ON_GROUND));
     assert!(
@@ -366,9 +367,9 @@ fn cobweb_sets_stuck_multiplier_natively() {
         "re-applied every tick inside the web"
     );
     assert_eq!(st.dy, 0.0, "setDeltaMovement(Vec3.ZERO) inside move");
-    // dy after tick 1: -0.14 * 0.98 (air drag double); tick 2: dy_g = that - 0.04,
-    // movement scaled by stuck.y = 0.05
-    let dy1 = -0.14 * 0.98;
+    // dy after tick 1: -0.14 * 0.98F (the float-promoted air drag — L37);
+    // tick 2: dy_g = that - 0.04, movement scaled by stuck.y = 0.05
+    let dy1 = -0.14 * (0.98f32 as f64);
     let expected = 64.06 + (dy1 - 0.04) * 0.05;
     assert_eq!(
         st.y, expected,
