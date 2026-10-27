@@ -57,7 +57,10 @@ jobs:
       - name: Build ce-baseline plugin (parity harness inside)
         run: bash scripts/build-plugin.sh
       - name: Determinism belt — identity hash codes must not depend on addresses
-        run: echo "EXTRA_JVM=-XX:hashCode=5" >> "$GITHUB_ENV"
+        # -XX:hashCode is experimental on JDK 25: the unlock flag must
+        # PRECEDE it (run-baseline.sh appends EXTRA_JVM after the other
+        # options, so both travel in one string, unlock first).
+        run: echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5" >> "$GITHUB_ENV"
 
       - name: Paired parity runs (off/on per scenario)
         run: |
