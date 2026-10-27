@@ -442,6 +442,8 @@ public final class CeHooks {
                 + " flag=" + flagCalls + "/" + flagGate + "/" + flagWrites
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
+                + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
+                + " eff=" + effCalls + "/" + effGate + "/" + (EFF_ON ? 1 : 0)
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
                 + " oddJ=" + mobAiOddJava
@@ -4946,6 +4948,33 @@ public final class CeHooks {
             if (VH_ENT_DATA.off >= 0) {
                 O_ED = VH_ENT_DATA.off;
             }
+            // L29: freeze the static accessor indices once the offsets are
+            // in. The reads below are the SAME capture pattern the flag
+            // gate uses for DATA_SHARED_FLAGS_ID (static-field Unsafe read
+            // — identity preserved), and each accessor is instanceof'd
+            // before its record component is read.
+            if (U != null && O_ED >= 0 && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0) {
+                try {
+                    java.lang.reflect.Field ff = Entity.class
+                            .getDeclaredField("DATA_TICKS_FROZEN");
+                    ff.setAccessible(true);
+                    Object fa = U.getObject(U.staticFieldBase(ff),
+                            U.staticFieldOffset(ff));
+                    if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
+                        IDX_FROZEN = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
+                    }
+                } catch (Throwable frozenIdx) {
+                    IDX_FROZEN = -1;
+                }
+                if (FLAGS_ID instanceof net.minecraft.network.syncher.EntityDataAccessor) {
+                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>) FLAGS_ID).id();
+                }
+                // FLAGS_ID is captured by initFlagHandles which may run
+                // after us; EDV_OK then flips in initFlagHandles too.
+                if (IDX_FROZEN >= 0 && IDX_FLAGS >= 0) {
+                    EDV_OK = true;
+                }
+            }
             FROZEN_HANDLES_OK = true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -4961,6 +4990,27 @@ public final class CeHooks {
      *  and any miss routes the exact vanilla chain. */
     private static long O_ED = -1;
     private static long O_CT_MOB = -1, O_CT_ID = -1, O_ACC_ID = -1;
+
+    // L29 — precomputed data-array indices for the STATIC accessors. An
+    // EntityDataAccessor's id is assigned once in the owner's <clinit> and
+    // never reassigned, and the SynchedEntityData.items array is indexed by
+    // exactly that id (entityDataValue javap-ground since L25), so the id
+    // is a run-constant int. Freezing it kills the per-call record
+    // accessor call + the accessor instanceof on every gate read. The
+    // identity is re-verified at init (the accessor read from the class
+    // must itself be an EntityDataAccessor) and the lean reader below
+    // still bounds-checks idx against the live array length, so a
+    // hypothetical layout change degrades to the vanilla chain, never to
+    // a wrong read.
+    private static int IDX_FROZEN = -1, IDX_FLAGS = -1;
+    /** true when O_ED/O_ED_ITEMS/O_DI_VALUE resolved AND the two static
+     *  indices froze — the lean reader's single readiness gate. */
+    private static volatile boolean EDV_OK = false;
+    // L29-converting: the ConversionTracker's accessor field holds the
+    // same static accessor for every tracker of a mob type; a one-slot
+    // identity cache skips the instanceof + record call on the hot repeat.
+    private static Object CONV_ACC_CACHE;
+    private static int CONV_ACC_IDX = -1;
 
     /** The current value of the accessor `acc` on the entity `e` — the
      *  direct-read gate core. Returns null when any shape check fails (the
@@ -5019,6 +5069,39 @@ public final class CeHooks {
         return null;
     }
 
+    /** L29 — the lean direct read for the STATIC accessors whose array
+     *  index is frozen (IDX_*). Same loads as entityDataValue: the
+     *  Entity.entityData hop (offset belongs to Entity, the receiver is
+     *  the weave-guaranteed `this` of the replaced setter — the field's
+     *  declared type is SynchedEntityData, so the null check is the full
+     *  value-type check the JVM typing already guarantees), the items[]
+     *  hop (checkcast kept), the bounds-checked slot load, the DataItem
+     *  instanceof (the element type is NOT declared — this check stays),
+     *  the value hop. Returns null on any structural doubt — the caller
+     *  routes the vanilla chain exactly as with entityDataValue. */
+    private static Object entityDataValueIdx(Entity e, int idx) {
+        if (!EDV_OK) {
+            return null;
+        }
+        try {
+            Object ed = U.getObject(e, O_ED);
+            if (!(ed instanceof net.minecraft.network.syncher.SynchedEntityData sde)) {
+                return edvProbe("idx ed=" + ed);
+            }
+            Object[] items = (Object[]) U.getObject(sde, O_ED_ITEMS);
+            if (idx < 0 || idx >= items.length) {
+                return edvProbe("idx=" + idx + " len=" + items.length);
+            }
+            Object di = items[idx];
+            if (!(di instanceof net.minecraft.network.syncher.SynchedEntityData.DataItem)) {
+                return edvProbe("idx di=" + di);
+            }
+            return U.getObject(di, O_DI_VALUE);
+        } catch (Throwable t) {
+            return edvProbe("idx throw " + t);
+        }
+    }
+
     // ===================================================================
     // L18 — the setSharedFlag gate. Entity.setSharedFlag (javap, 26.3) is a
     // data read + conditional write of ONE byte; SynchedEntityData.set
@@ -5051,6 +5134,18 @@ public final class CeHooks {
             }
             if (FLAGS_ID != null) {
                 FLAGG_HANDLES_OK = true;
+                // L29: the flags index may freeze here when initFlagHandles
+                // runs before initFrozenHandles (or re-freeze after).
+                if (U != null && IDX_FROZEN >= 0 && O_ED >= 0
+                        && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0
+                        && FLAGS_ID instanceof
+                                net.minecraft.network.syncher.EntityDataAccessor) {
+                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
+                            FLAGS_ID).id();
+                    if (IDX_FLAGS >= 0) {
+                        EDV_OK = true;
+                    }
+                }
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -5397,7 +5492,12 @@ public final class CeHooks {
     public static boolean getSharedFlag$(Entity e, int flag) {
         flagrCalls++;
         if (FLAGR_ON && FLAGR_HANDLES_OK) {
-            Object cur = entityDataValue(e, FLAGS_ID);
+            // L29: the frozen-index read first; the accessor walk stays as
+            // the structural fallback for a lean miss.
+            Object cur = entityDataValueIdx(e, IDX_FLAGS);
+            if (cur == null) {
+                cur = entityDataValue(e, FLAGS_ID);
+            }
             if (cur instanceof Byte b0) {
                 flagrHits++;
                 return ((1 << flag) & b0.byteValue()) != 0;
@@ -6707,7 +6807,12 @@ public final class CeHooks {
             // vanilla's SynchedEntityData.set would make (ObjectUtils
             // .notEqual on the boxed byte).
             try {
-                Object cur = entityDataValue(e, FLAGS_ID);
+                // L29: the frozen-index read first; the accessor walk stays
+                // as the structural fallback for a lean miss.
+                Object cur = entityDataValueIdx(e, IDX_FLAGS);
+                if (cur == null) {
+                    cur = entityDataValue(e, FLAGS_ID);
+                }
                 if (cur instanceof Byte b0) {
                     int old = b0.byteValue();
                     int nw = set
@@ -6888,6 +6993,256 @@ public final class CeHooks {
         }
     }
 
+    // ==================================================================
+    // L30 — the tracker-loop floor. The vanilla ChunkMap.newTrackerTick
+    // (javap, 26.3) per entity: moonrise$getTrackedEntity (interface),
+    // moonrise$getChunkData().nearbyPlayers, moonrise$tick(chunk), then
+    // moonrise$hasPlayers()/chunk-status gate + sendChanges. With NO
+    // players anywhere the whole per-entity cost collapses: javap
+    // moonrise$tick proves the bookkeeping writes are value-invisible
+    // while seenBy is empty (clearPlayers early-outs on empty seenBy —
+    // bc 16-24; the removal pass runs only when the stamp compare fails
+    // and is a no-op over an empty seenBy; the only other readers of
+    // lastChunkUpdate/lastTrackedChunk are this gate's own probes, which
+    // degrade to vanilla on a stale value), and sendChanges' empty-
+    // tracking tail is the L24a-proven updateDataBeforeSync + tickCount++
+    // pair. The replacement body below is the byte-exact vanilla loop
+    // (the same ReferenceList raw walk, the same iteratingTrackerEntities
+    // try/finally protocol, the same hasPlayers/chunk-status gate) with
+    // ONE fused fast path: no chunk players AND seenBy empty AND
+    // trackedPlayers empty AND interp NO_OP AND !hardColliding AND
+    // !syncVelocity -> updateDataBeforeSync + tickCount++, skip the rest.
+    // TTL_ON gates ONLY the fast path; the mirror is always the body.
+    // ==================================================================
+
+    public static volatile boolean TTL_ON = false;
+    public static volatile boolean TTL_HANDLES_OK = false;
+    public static final boolean TTL_FLAG_ON =
+            !"false".equals(System.getProperty("centities.trackerLoop", "true"));
+    public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
+
+    private static volatile RefField VH_CM_TRACKERS;  // ChunkMap.trackerEntities
+    private static volatile RefField VH_CM_ITERATING; // ChunkMap.iteratingTrackerEntities
+    private static volatile RefField VH_TE_SERVERENT; // TrackedEntity.serverEntity (public final)
+    private static long O_TE_SE = -1;                 // the same field's direct offset
+    private static long O_ENT_TRACKED = -1;           // Entity.trackedEntity (private final)
+
+    public static void initTrackerLoopHandles() {
+        try {
+            Class<?> cm = Class.forName("net.minecraft.server.level.ChunkMap");
+            VH_CM_TRACKERS = new RefField(cm, "trackerEntities");
+            VH_CM_ITERATING = new RefField(cm, "iteratingTrackerEntities");
+            Class<?> te = Class.forName("net.minecraft.server.level.ChunkMap$TrackedEntity");
+            VH_TE_SERVERENT = new RefField(te, "serverEntity");
+            O_TE_SE = VH_TE_SERVERENT.off;
+            O_ENT_TRACKED = offOf(Entity.class, "trackedEntity");
+            TTL_HANDLES_OK = VH_CM_TRACKERS.off >= 0 && VH_CM_ITERATING.off >= 0
+                    && O_TE_SE >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initTrackerLoopHandles: " + t;
+            TTL_HANDLES_OK = false;
+        }
+    }
+
+    public static void setTrackerLoopOn(boolean on) {
+        TTL_ON = on;
+    }
+
+    /** The iteratingTrackerEntities write. The field is a BOOLEAN — a raw
+     *  Unsafe.putInt would store 4 bytes into a 1-byte slot (the SE_FAST
+     *  hazard class), so this goes through the VarHandle (or reflection)
+     *  which types the store. Called twice per server tick — cold. */
+    private static void setIterating(Object cmObj, boolean v) {
+        RefField rf = VH_CM_ITERATING;
+        try {
+            if (rf.vh != null) {
+                rf.vh.set(cmObj, v);
+                return;
+            }
+            rf.f.setBoolean(cmObj, v);
+        } catch (IllegalAccessException neverWithSetAccessible) {
+            throw new IllegalStateException(neverWithSetAccessible);
+        }
+    }
+
+    /** The L30 fused fast path. All reads are pure (the L15b REORDER rule —
+     *  running the probes BEFORE vanilla's moonrise$tick order is free);
+     *  a decline routes the exact vanilla pair. */
+    private static boolean ttlFastPath(Entity ent, Object te, Object chunk) {
+        ttlFuseChecks++;
+        if (!TTL_ON || !TTL_HANDLES_OK || U == null) return false;
+        if (O_TE_SEEN <= 0 || O_TE_SE <= 0 || O_SE_TRACKED_PLAYERS <= 0
+                || O_SE_INTERP <= 0 || O_SE_TICKCOUNT <= 0) {
+            return false;
+        }
+        try {
+            // 1. the chunk side: the VIEW_DISTANCE player list. null chunk
+            //    or null/empty list = the clearPlayers-or-nothing case.
+            if (chunk != null) {
+                ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk tc =
+                        (ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk;
+                ca.spottedleaf.moonrise.common.list.ReferenceList<?> players =
+                        tc.getPlayers(ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.VIEW_DISTANCE);
+                if (players != null && players.size() != 0) return false;
+            }
+            // 2. seenBy empty — no removals could fire, updatePlayer loop
+            //    provably empty.
+            Object seen = U.getObject(te, O_TE_SEEN);
+            if (!(seen instanceof java.util.Set<?> ss) || !ss.isEmpty()) return false;
+            // 3. the ServerEntity side: the sendChanges fast-exit shape
+            //    (the L24a conditions — same equivalence, now from the loop).
+            Object se = U.getObject(te, O_TE_SE);
+            if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+                return false;
+            }
+            Object trk = U.getObject(serverEntity, O_SE_TRACKED_PLAYERS);
+            if (!(trk instanceof java.util.Set<?> ts) || !ts.isEmpty()) return false;
+            if (U.getObject(serverEntity, O_SE_INTERP)
+                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) return false;
+            if (ent.moonrise$isHardColliding() || ent.syncVelocity) return false;
+            // ALL conditions passed: this entity's tracker tick emits
+            // nothing. Reproduce the two unconditional effects:
+            ent.updateDataBeforeSync();                       // sendChanges bc 19-23
+            U.putInt(serverEntity, O_SE_TICKCOUNT,
+                    U.getInt(serverEntity, O_SE_TICKCOUNT) + 1); // bc 1106-1113
+            return true;
+        } catch (Throwable fuseFail) {
+            return false; // route the exact vanilla pair — never break tracking
+        }
+    }
+
+    /** Replacement body of ChunkMap.newTrackerTick() — the byte-exact
+     *  vanilla loop (javap-anchored) with the L30 fused fast path. */
+    public static void newTrackerTick$(Object cmObj) {
+        ttlCalls++;
+        setIterating(cmObj, true);
+        try {
+            Object listObj = VH_CM_TRACKERS.getObj(cmObj);
+            ca.spottedleaf.moonrise.common.list.ReferenceList<?> list =
+                    (ca.spottedleaf.moonrise.common.list.ReferenceList<?>) listObj;
+            // vanilla checkcasts the raw data to Entity[] (bc 14) — the
+            // same cast here; a CCE is the honest vanilla-shaped failure.
+            Entity[] raw = (Entity[]) list.getRawDataUnchecked();
+            int size = list.size();
+            for (int i = 0; i < size; i++) {
+                Entity ent = raw[i];
+                // moonrise$getTrackedEntity is a one-field final read — the
+                // direct offset when resolved, the interface call otherwise.
+                Object te = (O_ENT_TRACKED >= 0 && U != null)
+                        ? U.getObject(ent, O_ENT_TRACKED)
+                        : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
+                                .moonrise$getTrackedEntity();
+                if (te == null) continue;                     // vanilla bc 46-51
+                Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                        .moonrise$getChunkData().nearbyPlayers;
+                // L30: the fused no-tracking fast path (declines to the
+                // exact vanilla pair on any doubt).
+                if (ttlFastPath(ent, te, chunk)) {
+                    ttlFuse++;
+                    continue;
+                }
+                ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                        .moonrise$tick((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk);
+                if (!((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                        .moonrise$hasPlayers()
+                        || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                                .moonrise$getChunkStatus()
+                                .isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
+                    ((net.minecraft.server.level.ServerEntity) VH_TE_SERVERENT.getObj(te))
+                            .sendChanges();
+                }
+            }
+        } finally {
+            setIterating(cmObj, false);
+        }
+    }
+
+    // ==================================================================
+    // L33 — the tickEffects empty-map early-out. Vanilla LivingEntity
+    // .tickEffects() (javap, 26.3) with an EMPTY activeEffects map still
+    // allocates the keySet iterator, writes tickingEffects true/false and
+    // polls the deferred queue — per mob per tick (1.2-1.4% of the mob
+    // profiles). The guard replicates the empty case EXACTLY: the loop
+    // runs zero iterations (nothing observes tickingEffects=true — the
+    // MobEffectInstance.tickServer callbacks are the only in-loop readers
+    // and they never fire), so the guard skips straight to the finally's
+    // semantics: tickingEffects=false + the deferred poll-run drain, run
+    // under the same flag value the vanilla finally drains under. A
+    // non-empty map, a shape doubt or any handle failure routes the exact
+    // vanilla body (the guard is a prefix, never a replacement).
+    // ==================================================================
+
+    public static volatile boolean EFF_ON = false;
+    public static volatile boolean EFF_HANDLES_OK = false;
+    public static final boolean EFF_FLAG_ON =
+            !"false".equals(System.getProperty("centities.tickEffects", "true"));
+    public static long effCalls = 0, effGate = 0;
+    private static volatile RefField VH_LE_EFFECTS;   // LivingEntity.activeEffects
+    private static volatile RefField VH_LE_TICKING;   // LivingEntity.tickingEffects
+    private static volatile RefField VH_LE_DEFERRED;  // LivingEntity.deferredEffectUpdates
+
+    public static void initEffHandles() {
+        try {
+            VH_LE_EFFECTS = new RefField(
+                    net.minecraft.world.entity.LivingEntity.class, "activeEffects");
+            VH_LE_TICKING = new RefField(
+                    net.minecraft.world.entity.LivingEntity.class, "tickingEffects");
+            VH_LE_DEFERRED = new RefField(
+                    net.minecraft.world.entity.LivingEntity.class, "deferredEffectUpdates");
+            EFF_HANDLES_OK = VH_LE_EFFECTS.off >= 0 && VH_LE_TICKING.off >= 0
+                    && VH_LE_DEFERRED.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initEffHandles: " + t;
+            EFF_HANDLES_OK = false;
+        }
+    }
+
+    public static void setTickEffectsGateOn(boolean on) {
+        EFF_ON = on;
+    }
+
+    private static void setTickingFlag(net.minecraft.world.entity.LivingEntity e, boolean v) {
+        RefField rf = VH_LE_TICKING;
+        try {
+            if (rf.vh != null) {
+                rf.vh.set(e, v);
+                return;
+            }
+            rf.f.setBoolean(e, v);
+        } catch (IllegalAccessException neverWithSetAccessible) {
+            throw new IllegalStateException(neverWithSetAccessible);
+        }
+    }
+
+    /** tickEffects() guard: TRUE = the empty-map early-out ran (the vanilla
+     *  body is skipped); FALSE = route the exact vanilla body. */
+    public static boolean tickEffectsNoOp(net.minecraft.world.entity.LivingEntity e) {
+        effCalls++;
+        if (!EFF_ON || !EFF_HANDLES_OK) return false;
+        try {
+            Object m = VH_LE_EFFECTS.getObj(e);
+            if (!(m instanceof java.util.Map<?, ?> mm) || !mm.isEmpty()) return false;
+            // The vanilla finally semantics, byte-for-byte: the flag write
+            // (typed — a raw Unsafe putInt would store 4 bytes into the
+            // 1-byte boolean slot) then the poll-run drain. An exception
+            // from a runnable propagates EXACTLY like vanilla's finally
+            // (already-run runnables stay run, the rest stay queued).
+            setTickingFlag(e, false);
+            Object q = VH_LE_DEFERRED.getObj(e);
+            if (!(q instanceof java.util.Queue<?> qq)) return false; // shape doubt
+            effGate++;
+            Runnable r;
+            while ((r = (Runnable) qq.poll()) != null) {
+                r.run();
+            }
+            return true;
+        } catch (Throwable effFail) {
+            return false; // route vanilla — never break effects
+        }
+    }
+
     /** Replacement body of Entity.setTicksFrozen(int). */
     public static void setTicksFrozen$(Entity e, int i) {
         frozenCalls++;
@@ -6900,7 +7255,10 @@ public final class CeHooks {
             // top of the proven L18 gate, never its replacement.
             // frozenDirect attributes which layer actually wins.
             try {
-                Object cur = entityDataValue(e, Entity.DATA_TICKS_FROZEN);
+                Object cur = entityDataValueIdx(e, IDX_FROZEN);
+                if (cur == null) {
+                    cur = entityDataValue(e, Entity.DATA_TICKS_FROZEN);
+                }
                 if (cur instanceof Integer iv && iv.intValue() == i) {
                     frozenDirect++;
                     frozenGate++;
@@ -6937,8 +7295,26 @@ public final class CeHooks {
             try {
                 Object m = U.getObject(tracker, O_CT_MOB);
                 if (m instanceof net.minecraft.world.entity.Mob mb) {
+                    // L29-converting: one-slot accessor identity cache —
+                    // every tracker of a mob type holds the same static
+                    // accessor, so the repeat calls read the value by the
+                    // frozen index; a different accessor re-resolves (and
+                    // a non-accessor routes the proven walk).
                     Object acc = U.getObject(tracker, O_CT_ID);
-                    Object cur = entityDataValue(mb, acc);
+                    Object cur;
+                    if (acc == CONV_ACC_CACHE && CONV_ACC_IDX >= 0) {
+                        cur = entityDataValueIdx(mb, CONV_ACC_IDX);
+                    } else if (acc instanceof
+                            net.minecraft.network.syncher.EntityDataAccessor accE) {
+                        CONV_ACC_CACHE = acc;
+                        CONV_ACC_IDX = accE.id();
+                        cur = entityDataValueIdx(mb, CONV_ACC_IDX);
+                    } else {
+                        cur = null;
+                    }
+                    if (cur == null) {
+                        cur = entityDataValue(mb, acc);
+                    }
                     if (cur instanceof Boolean bv && bv.booleanValue() == z) {
                         convDirect++;
                         convGate++;

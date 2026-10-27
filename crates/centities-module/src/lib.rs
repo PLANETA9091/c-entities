@@ -37,6 +37,8 @@ const MOB_CLASS: &str = "net/minecraft/world/entity/Mob";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
 const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
+/// L30: the tracker-loop floor target — ChunkMap.newTrackerTick replace_body.
+const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -391,6 +393,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(MOB_CLASS, |_n, b| patch_mob(b));
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
+    cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
@@ -443,6 +446,7 @@ fn arm_module() {
     precompute_conversion(loader);
     precompute_sensing(loader);
     precompute_trackedentity(loader);
+    precompute_chunkmap(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -460,6 +464,7 @@ fn arm_module() {
         MOB_CLASS,
         CONVERSION_TRACKER_CLASS,
         TRACKED_ENTITY_CLASS,
+        CHUNKMAP_CLASS,
         SENSING_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
@@ -626,6 +631,23 @@ fn arm_module() {
                         ));
                     }
                 }
+                // L30 deferred weave: ChunkMap may load post-arm on some
+                // boot orders — same stash/retry protocol as TrackedEntity.
+                if !TTL_WOVEN.load(Ordering::Acquire)
+                    && !TTL_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(CHUNKMAP_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_chunkmap(loader as jni::jobject);
+                    if TTL_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(CHUNKMAP_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred tracker-loop floor applied, rc={rc}"
+                        ));
+                    }
+                }
             }
             let snap = read_hook_counters();
             // L15 arming: flip a gate ON only when its replaced body is
@@ -667,6 +689,31 @@ fn arm_module() {
                 if set_java_bool("setTrackerTickGateOn", true) {
                     TT_ARMED.store(true, Ordering::Release);
                     cplug_sdk::log::info("[c-entities] tracker-tick gate ARMED (verified live)");
+                }
+            }
+            // L30 arming: ttlCalls bumps on every newTrackerTick$ entry even
+            // with the fast path disarmed (the mirror IS the body) — the
+            // counter proves the replaced loop is live before the fast path
+            // is allowed to fire.
+            if TTL_WOVEN.load(Ordering::Acquire)
+                && !TTL_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::TTLoopChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setTrackerLoopOn", true) {
+                    TTL_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] tracker-loop floor ARMED (verified live)");
+                }
+            }
+            // L33 arming: effCalls bumps on every tickEffectsNoOp entry even
+            // disarmed (the gate declines and the vanilla body runs) — the
+            // counter proves the woven call is live.
+            if EFF_WOVEN.load(Ordering::Acquire)
+                && !EFF_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::EffChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setTickEffectsGateOn", true) {
+                    EFF_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] tickEffects gate ARMED (verified live)");
                 }
             }
             if FLAGG_WOVEN.load(Ordering::Acquire)
@@ -883,6 +930,14 @@ static CONV_ARMED: AtomicBool = AtomicBool::new(false);
 static TT_WOVEN: AtomicBool = AtomicBool::new(false);
 static TT_DECLINED: AtomicBool = AtomicBool::new(false);
 static TT_ARMED: AtomicBool = AtomicBool::new(false);
+/// L30: the ChunkMap.newTrackerTick tracker-loop floor weave state.
+static TTL_WOVEN: AtomicBool = AtomicBool::new(false);
+static TTL_DECLINED: AtomicBool = AtomicBool::new(false);
+static TTL_ARMED: AtomicBool = AtomicBool::new(false);
+/// L33: the LivingEntity.tickEffects empty-map early-out weave state.
+static EFF_WOVEN: AtomicBool = AtomicBool::new(false);
+static EFF_DECLINED: AtomicBool = AtomicBool::new(false);
+static EFF_ARMED: AtomicBool = AtomicBool::new(false);
 /// L18: the Entity.setSharedFlag no-op-write gate weave is prepared.
 static FLAGG_WOVEN: AtomicBool = AtomicBool::new(false);
 static FLAGG_DECLINED: AtomicBool = AtomicBool::new(false);
@@ -1134,11 +1189,28 @@ fn precompute_livingentity(loader: jni::jobject) {
         check_name: "mobTravelNative",
         check_desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/phys/Vec3;)Z",
     };
+    // L33: the tickEffects empty-map early-out — a THIRD independent guard
+    // on the same class, chained after whatever the mode selection kept.
+    let eff_ok = read_java_flag("EFF_FLAG_ON") == Some(true)
+        && prove_handles("initEffHandles", "EFF_HANDLES_OK") == Some(true);
+    if !eff_ok {
+        EFF_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] tickEffects gate declined (flag/handles) — vanilla kept",
+        );
+    }
+    let eff_spec = cplug_sdk::asm::EarlyReturnGuard2 {
+        method_name: "tickEffects",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "tickEffectsNoOp",
+        check_desc: "(Lnet/minecraft/world/entity/LivingEntity;)Z",
+    };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         // CE_WEAVE_MODE=push|travel|both (default both) — the bisect lever
         // for the two-guard FAILS_VERIFICATION hunt
         let mode = std::env::var("CE_WEAVE_MODE").unwrap_or_else(|_| "both".into());
-        match mode.as_str() {
+        let base = match mode.as_str() {
             "push" => cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &push_spec),
             "travel" => {
                 cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &travel_spec)
@@ -1163,6 +1235,41 @@ fn precompute_livingentity(loader: jni::jobject) {
                 };
                 Some(b2)
             }
+        };
+        // L33 chain: a refusal of the tickEffects guard keeps the base
+        // guards (all three are optional weaves).
+        if !eff_ok {
+            return base;
+        }
+        match base {
+            Some(b) => match cplug_sdk::asm::insert_early_return_guard2(
+                env,
+                loader,
+                &b,
+                &eff_spec,
+            ) {
+                Some(b2) => {
+                    EFF_WOVEN.store(true, Ordering::Release);
+                    Some(b2)
+                }
+                None => Some(b),
+            },
+            None => {
+                // no base guard survived; the eff guard alone is still worth
+                // applying — vanilla keeps the other two bodies.
+                match cplug_sdk::asm::insert_early_return_guard2(
+                    env,
+                    loader,
+                    &bytes,
+                    &eff_spec,
+                ) {
+                    Some(b2) => {
+                        EFF_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
+                    }
+                    None => None,
+                }
+            }
         }
     });
     match patched {
@@ -1175,9 +1282,15 @@ fn precompute_livingentity(loader: jni::jobject) {
             if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
                 let _ = std::fs::write(format!("{}/LivingEntity.patched.class", dir), &b);
             }
-            cplug_sdk::log::info(
-                "[c-entities] precomputed LivingEntity push + quiet-travel guards",
-            );
+            if EFF_WOVEN.load(Ordering::Acquire) {
+                cplug_sdk::log::info(
+                    "[c-entities] precomputed LivingEntity push + quiet-travel + tickEffects guards",
+                );
+            } else {
+                cplug_sdk::log::info(
+                    "[c-entities] precomputed LivingEntity push + quiet-travel guards",
+                );
+            }
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -2282,6 +2395,98 @@ fn patch_trackedentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// L30: the ChunkMap.newTrackerTick tracker-loop floor — the body becomes
+/// `CeHooks.newTrackerTick$(Object)` (the byte-exact vanilla loop mirror +
+/// the fused no-tracking fast path; the mirror is always the body, the fast
+/// path arms after the ttlCalls liveness proof).
+fn trackerloop_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "newTrackerTick",
+        method_desc: "()V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "newTrackerTick$",
+        bridge_desc: "(Ljava/lang/Object;)V",
+        args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+    }
+}
+
+fn precompute_chunkmap(loader: jni::jobject) {
+    if read_java_flag("TTL_FLAG_ON") != Some(true) {
+        TTL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] tracker-loop floor disabled (centities.trackerLoop) — vanilla kept",
+        );
+        return;
+    }
+    if prove_handles("initTrackerLoopHandles", "TTL_HANDLES_OK") != Some(true) {
+        TTL_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] tracker-loop handle probe failed — vanilla kept (lastErr in stats)",
+        );
+        return;
+    }
+    let Some(bytes) = STASH.lock().ok().and_then(|s| s.get(CHUNKMAP_CLASS).cloned())
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] ChunkMap not stashed yet — tracker-loop floor deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &trackerloop_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CHUNKMAP_CLASS, b);
+            }
+            TTL_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed ChunkMap.newTrackerTick loop floor");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ChunkMap tracker-loop floor — vanilla kept",
+            );
+        }
+    }
+}
+
+fn patch_chunkmap(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_chunkmap_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_chunkmap_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The floor is
+        // woven at arm time (precompute_chunkmap).
+        let mut st = STASH.lock().ok()?;
+        st.entry(CHUNKMAP_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(CHUNKMAP_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ChunkMap.newTrackerTick loop floor");
+            Some(b)
+        }
+        _ if !TTL_WOVEN.load(Ordering::Acquire) && !TTL_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(CHUNKMAP_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] ChunkMap bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 fn patch_livingentity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
         // Boot load: stash the original bytes, stay vanilla. The guard is
@@ -2324,6 +2529,8 @@ enum Counter {
     FrozenChecks,
     ConvChecks,
     TTChecks,
+    TTLoopChecks,
+    EffChecks,
     FlagChecks,
     DeltaChecks,
     SenseChecks,
@@ -2361,6 +2568,8 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::FrozenChecks, ("frozenCalls", "J")),
             (Counter::ConvChecks, ("convCalls", "J")),
             (Counter::TTChecks, ("ttCalls", "J")),
+            (Counter::TTLoopChecks, ("ttlCalls", "J")),
+            (Counter::EffChecks, ("effCalls", "J")),
             (Counter::FlagChecks, ("flagCalls", "J")),
             (Counter::DeltaChecks, ("deltaCalls", "J")),
             (Counter::SenseChecks, ("senseCalls", "J")),
