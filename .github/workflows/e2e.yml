@@ -210,6 +210,16 @@ jobs:
           echo "$LAST_HOOKS" | grep -Eq "froz=[0-9]+/[1-9]"      || fail "frozen gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "conv=[0-9]+/[1-9]"      || fail "conv gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        || fail "tracker-tick gate never served a provable no-op"
+          # L36 liveness: at least ONE of the three idle-control guards
+          # (nav/move/look) must have served a proven no-op for the soaked
+          # zombies (fields: navCalls/navIdleHits/moveCalls/moveIdleHits/
+          # lookCalls/lookIdleHits). A zero across all three hit fields
+          # means the guards declined or the weave never linked.
+          IDLE_LIVE=0
+          echo "$LAST_HOOKS" | grep -Eq "idle=[0-9]+/[1-9]"             && IDLE_LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "idle=[0-9]+/[0-9]+/[0-9]+/[1-9]" && IDLE_LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "idle=([0-9]+/){4}[0-9]+/[1-9]"  && IDLE_LIVE=1
+          [ "$IDLE_LIVE" = "1" ] || fail "no idle-control guard served a provable no-op (idle=...)"
           # L22a liveness: mob=ticks/fallbacks/requests/classified/refused/on.
           # The real (no_ai-less) zombie must be classified, floor-ticked,
           # and served WITHOUT a single engine fallback (a fallback would
