@@ -18,7 +18,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("queryNative2", "(IDDDDDDI[J[D)I"));
     s.insert(("nativeSetOutBuffer", "(Ljava/nio/ByteBuffer;)I"));
     // L12: the flush carries the push-state extension + the delta batch
-    s.insert(("nativeFlush", "(I[J[D[I[D[D[II[J[D)V"));
+    // L37: + the vanilla-order keys (sy, seq int arrays per entry)
+    s.insert(("nativeFlush", "(I[J[D[I[D[D[I[I[II[J[D)V"));
     s.insert(("nativePush", "(IIIIIIII)J"));
     s.insert(("nativePushNcol", "(I)I"));
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
