@@ -344,12 +344,14 @@ pub fn push_tick(
     }
 
     // numCollisions reset (vanilla: max(0, ncol - maxEC) BEFORE the loop).
-    let mut ncol_self = pc.ncol[self_slot];
-    ncol_self = if ncol_self > max_ec {
-        ncol_self - max_ec
+    // ncol_self_0 = the per-pass starting value (the detection pass replays
+    // the increments too — the apply pass must start from the SAME point).
+    let ncol_self_0 = if pc.ncol[self_slot] > max_ec {
+        pc.ncol[self_slot] - max_ec
     } else {
         0
     };
+    let mut ncol_self = ncol_self_0;
 
     // Candidate scan over the pushable-only index. L37: cells are visited
     // CZ-MAJOR (vanilla iterates regions Z outer/X inner, chunks Z outer/
@@ -369,6 +371,17 @@ pub fn push_tick(
     let cz0 = ((sz0 - ex).floor() as i32) >> centities_core::CELL_SHIFT;
     let cz1 = ((sz1 + ex).floor() as i32) >> centities_core::CELL_SHIFT;
 
+    // L37e CRAMMED-PUSH ROUTING. Vanilla Entity.push for d0 < 0.01 takes
+    // the CRAMMED branch: random-direction 0.05 offsets drawn from the
+    // entity's own RandomSource (2 nextDouble draws) — the kernel mirrors
+    // the seed but cannot draw. The old `if d0 < PUSH_EPS { continue; }`
+    // silently DROPPED the crammed force AND the draws (the parity trace:
+    // mobs id 1 t=207 — vanilla pushed the zombie, the kernel applied
+    // nothing). Fix: TWO passes — the detection pass replays the exact
+    // gate/ncol sequence with NO mutations; the first crammed pair routes
+    // the WHOLE push tick vanilla (ok stays false, the mirrors are
+    // untouched, the vanilla body computes everything including the RNG).
+    // The apply pass runs only when the tick is provably crammed-free.
     let mut hits_count: i32 = 0;
     let mut non_pass: i32 = 0;
     let mut ddx = 0.0f64;
@@ -377,6 +390,18 @@ pub fn push_tick(
     let mut base_dy = pc.dy[self_slot];
     let mut base_dz = pc.dz[self_slot];
 
+    for detect in [true, false] {
+    // per-pass reset: the detection pass's replay must not leak into the
+    // apply pass (pc.dx[self] stays unmutated until the tail write, so it
+    // is the correct base for both passes)
+    hits_count = 0;
+    non_pass = 0;
+    ddx = 0.0;
+    ddz = 0.0;
+    base_dx = pc.dx[self_slot];
+    base_dy = pc.dy[self_slot];
+    base_dz = pc.dz[self_slot];
+    ncol_self = ncol_self_0;
     for cz in cz0..=cz1 {
         for cx in cx0..=cx1 {
             let key = centities_core::cell_key_pub(world, cx, cz);
@@ -436,7 +461,9 @@ pub fn push_tick(
                 // ---- vanilla loop body: numCollisions bookkeeping happens
                 // BEFORE doPush — an Entity.push early return (same vehicle,
                 // noPhysics, eps) never undoes it (javap 295-319) ----
-                pc.ncol[hs] += 1;
+                if !detect {
+                    pc.ncol[hs] += 1;
+                }
                 ncol_self += 1;
                 // Entity.push pair gates (all live INSIDE push, after ncol++)
                 if is_pass && pc.vid[hs] == self_id {
@@ -458,6 +485,11 @@ pub fn push_tick(
                 let mut dz = opz - spz;
                 let d0 = abs_max(dx, dz);
                 if d0 < PUSH_EPS {
+                    // vanilla crammed branch: RNG-driven random offsets —
+                    // the kernel cannot draw; detect pass routes vanilla.
+                    if detect {
+                        return; // ok stays false, mirrors untouched
+                    }
                     continue;
                 }
                 let d = d0.sqrt();
@@ -480,7 +512,7 @@ pub fn push_tick(
                 }
                 // other.push(dx, 0, dz) when other is not a vehicle — the
                 // addition lands in the mirror AND the pending-kadd ledger
-                if fl & PF_VEHICLE == 0 {
+                if !detect && fl & PF_VEHICLE == 0 {
                     pc.dx[hs] += dx;
                     pc.dz[hs] += dz;
                     pc.kadd_dx[hs] += dx;
@@ -488,6 +520,10 @@ pub fn push_tick(
                     pc.flags[hs] |= PF_NEEDSSYNC;
                 }
             }
+        }
+        }
+        if !detect {
+            break;
         }
     }
 

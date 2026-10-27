@@ -698,6 +698,19 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     traceOut.flush();
                     return;
                 }
+                // bind the NMS accessors NOW (not at the first snapshot) —
+                // the tc/at columns must cover the trace from tick one (the
+                // item's %4 phase diagnosis needs tc at the diverging tick)
+                if (PARITY_GET_HANDLE == null) {
+                    synchronized (BaselinePlugin.class) {
+                        if (PARITY_GET_HANDLE == null) {
+                            PARITY_GET_HANDLE = traced.getClass().getMethod("getHandle");
+                            Class<?> nms = PARITY_GET_HANDLE.getReturnType();
+                            PARITY_TICK_COUNT = nms.getField("tickCount");
+                            PARITY_ACTIVATED = nms.getField("activatedTick");
+                        }
+                    }
+                }
             }
             if (!traced.isValid()) {
                 traceOut.write("t=" + tickNo + " REMOVED\n");
