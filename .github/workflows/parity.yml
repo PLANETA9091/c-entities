@@ -82,9 +82,12 @@ jobs:
       - name: Paired parity runs (off/on per scenario)
         run: |
           set -euo pipefail
-          IT="${{ inputs.item_tick || '1' }}"
-          MA="${{ inputs.mob_ai || '1' }}"
-          MG="${{ inputs.merge || '1' }}"
+          # NOTE: "0" is FALSY in GitHub expressions (string "0" coerces to
+          # number 0) — `inputs.x || '1'` silently turned knob=0 into 1
+          # (observed: both bisect runs logged itemTick=1). Compare strings.
+          IT="$([ "${{ inputs.item_tick }}" = "0" ] && echo 0 || echo 1)"
+          MA="$([ "${{ inputs.mob_ai }}" = "0" ] && echo 0 || echo 1)"
+          MG="$([ "${{ inputs.merge }}" = "0" ] && echo 0 || echo 1)"
           echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
