@@ -641,11 +641,13 @@ mod tests {
         assert!(pc.flags[s1] & PF_NEEDSSYNC != 0);
     }
 
-    /// At the SAME position (d0 = 0 < eps) vanilla returns from Entity.push
-    /// BEFORE the force, but the loop's numCollisions++ already ran, and the
-    /// entity IS a list candidate (the cramming audit counts it).
+    /// At the SAME position (d0 = 0 < eps) vanilla's Entity.push takes the
+    /// CRAMMED branch: random 0.05 offsets from SHARED_RANDOM (2 draws).
+    /// The kernel cannot draw — the detection pass routes the WHOLE tick
+    /// vanilla (ok=false) with the mirrors UNTOUCHED; the vanilla body runs
+    /// the numCollisions bookkeeping and the crammed push itself.
     #[test]
-    fn same_position_eps_return_keeps_counters() {
+    fn same_position_eps_routes_vanilla() {
         let mut pidx = idx_with(2, 0.0, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
         pc.upsert(2, 0, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
@@ -654,12 +656,14 @@ mod tests {
         push_tick(
             &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
         );
-        assert_eq!(out.non_passengers, 1);
-        assert_eq!(out.ncol, 1, "ncol++ happens before doPush");
+        assert!(!out.ok, "a crammed pair routes the whole tick vanilla");
+        assert_eq!(out.ncol, 0, "no kernel bookkeeping on the routed tick");
         let s2 = pc.slot_of(2).unwrap();
-        assert_eq!(pc.ncol[s2], 1);
-        assert_eq!(out.ddx, 0.0, "no force below eps");
-        assert!(!out.cramming, "1 hit <= cramming-1=23");
+        assert_eq!(pc.ncol[s2], 0, "mirrors untouched on the routed tick");
+        assert_eq!(out.ddx, 0.0);
+        let s1 = pc.slot_of(1).unwrap();
+        assert_eq!(pc.dx[s1], 0.0, "self delta untouched");
+        assert_eq!(pc.dx[s2], 0.0, "candidate delta untouched");
     }
 
     /// The maxEntityCollisions cap: 5 candidates, maxEC=2 -> the two LOWEST
