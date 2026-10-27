@@ -1497,25 +1497,39 @@ public final class CeHooks {
             if (!same) {
                 orderMismatches++;
                 if (orderMismatches <= 12) {
-                    StringBuilder sb = new StringBuilder(320);
+                    StringBuilder sb = new StringBuilder(420);
                     sb.append("ORDER-MISMATCH n_van=").append(van.size())
-                            .append(" n_fast=").append(out.size());
-                    int lim = Math.min(van.size(), out.size());
-                    for (int i = 0; i < lim; i++) {
-                        Entity a = van.get(i), b = out.get(i);
-                        if (a != b) {
-                            sb.append(" first@").append(i)
-                                    .append(" van_id=").append(a.getId())
-                                    .append(" sec=(").append(a.moonrise$getSectionZ())
-                                    .append(',').append(a.moonrise$getSectionX())
-                                    .append(',').append(a.moonrise$getSectionY())
-                                    .append(") fast_id=").append(b.getId())
-                                    .append(" sec=(").append(b.moonrise$getSectionZ())
-                                    .append(',').append(b.moonrise$getSectionX())
-                                    .append(',').append(b.moonrise$getSectionY())
-                                    .append(") van_seq=").append(ORD_SEQ[a.getId() & AMASK])
-                                    .append(" fast_seq=").append(ORD_SEQ[b.getId() & AMASK]);
-                            break;
+                            .append(" n_fast=").append(out.size())
+                            .append(" box=(")
+                            .append(box.minX).append(',').append(box.minY).append(',').append(box.minZ)
+                            .append(")-(")
+                            .append(box.maxX).append(',').append(box.maxY).append(',').append(box.maxZ)
+                            .append(')')
+                            .append(" src=").append(srcId);
+                    java.util.HashSet<Entity> vanSet = new java.util.HashSet<>(van);
+                    int shown = 0;
+                    for (Entity fe : out) {
+                        if (!vanSet.contains(fe) && shown < 4) {
+                            AABB fb = fe.getBoundingBox();
+                            sb.append(" FASTONLY id=").append(fe.getId())
+                                    .append(" pos=(").append(fe.getX()).append(',')
+                                    .append(fe.getY()).append(',').append(fe.getZ())
+                                    .append(") sec=(").append(fe.moonrise$getSectionZ())
+                                    .append(',').append(fe.moonrise$getSectionX())
+                                    .append(',').append(fe.moonrise$getSectionY())
+                                    .append(") box6=(").append(fb.minX).append(',')
+                                    .append(fb.minY).append(',').append(fb.minZ)
+                                    .append(")-(").append(fb.maxX).append(',')
+                                    .append(fb.maxY).append(',').append(fb.maxZ).append(')');
+                            shown++;
+                        }
+                    }
+                    java.util.HashSet<Entity> fastSet = new java.util.HashSet<>(out);
+                    shown = 0;
+                    for (Entity ve : van) {
+                        if (!fastSet.contains(ve) && shown < 4) {
+                            sb.append(" VANONLY id=").append(ve.getId());
+                            shown++;
                         }
                     }
                     System.err.println("[c-entities] " + sb);
