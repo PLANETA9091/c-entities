@@ -441,6 +441,8 @@ public final class CeHooks {
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
+                + " idle=" + navCalls + "/" + navIdleHits + "/" + moveCalls + "/" + moveIdleHits
+                + "/" + lookCalls + "/" + lookIdleHits
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
@@ -3235,6 +3237,25 @@ public final class CeHooks {
             if (off >= 0) { U.putObject(o, off, v); return; }
             try {
                 if (vh != null) vh.set(o, v); else f.set(o, v);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        // L36: primitive readers for the idle-control guards. getBool reads
+        // the 1-byte boolean slot via Unsafe.getByte (a raw getInt would
+        // straddle into the adjacent field — the L33 1-byte rule).
+        boolean getBool(Object o) {
+            if (off >= 0) return U.getByte(o, off) != 0;
+            try {
+                return vh != null ? (boolean) vh.get(o) : f.getBoolean(o);
+            } catch (IllegalAccessException neverWithSetAccessible) {
+                throw new IllegalStateException(neverWithSetAccessible);
+            }
+        }
+        float getFloat(Object o) {
+            if (off >= 0) return U.getFloat(o, off);
+            try {
+                return vh != null ? (float) vh.get(o) : f.getFloat(o);
             } catch (IllegalAccessException neverWithSetAccessible) {
                 throw new IllegalStateException(neverWithSetAccessible);
             }
@@ -7401,5 +7422,173 @@ public final class CeHooks {
                 (net.minecraft.network.syncher.EntityDataAccessor<Boolean>)
                         VH_CONV_ID.getObj(tracker);
         m.getEntityData().set(id, z);
+    }
+
+    // ==================================================================
+    // L36 — the idle AI-control floors (nav/move/look early-outs).
+    //
+    // A standing mob's serverAiStep tail calls three control objects every
+    // tick. javap (26.3) proves each body collapses to same-value writes
+    // for a settled, pathless mob:
+    //
+    //  - PathNavigation.tick: the whole body is under `if (!isDone())`
+    //    (bc 21-25; isDone == path==null || path.isDone()), and the
+    //    unconditional prefix is `tick++` (bc 0-7) plus the
+    //    hasDelayedRecomputation recompute branch (bc 10-19). With
+    //    path==null && !hasDelayedRecomputation the body only ticks its
+    //    PRIVATE counter — no observable state.
+    //  - MoveControl.tick: the WAIT branch (bc 579-584) is exactly
+    //    mob.setZza(0.0F) then return; setZza is a plain putfield. With
+    //    operation==WAIT && mob.zza==0.0F the write is a same-value store.
+    //  - LookControl.tick: resetXRotOnTick() -> setXRot(0F) (same-value
+    //    when xRot==0); the cooldown branch is skipped at
+    //    lookAtCooldown<=0; the else branch writes yHeadRot =
+    //    rotateTowards(yHeadRot, yBodyRot, 10) — from==to is the EXACT
+    //    fixed point (Mth.rotateTowards returns `from + 0`); and
+    //    clampHeadRotationToBody() is gated on !navigation.isDone().
+    //    No-op on xRot==0 && lookAtCooldown<=0 && yHeadRot==yBodyRot &&
+    //    navigation.isDone(). isDone() is called virtually (one
+    //    monomorphic frame) so a GroundPathNavigation override stays
+    //    authoritative.
+    //
+    // Every guard is best-effort: a handle failure or shape doubt routes
+    // the exact vanilla body. Kill switches:
+    // centities.navIdle / centities.moveIdle / centities.lookIdle.
+    // Counters: idle= nav/move/look calls, then the three hit counters
+    // (appended to the hooks@ line as idle=).
+    // ==================================================================
+
+    public static final boolean NAV_FLAG_ON =
+            !"false".equals(System.getProperty("centities.navIdle", "true"));
+    public static final boolean MOVE_FLAG_ON =
+            !"false".equals(System.getProperty("centities.moveIdle", "true"));
+    public static final boolean LOOK_FLAG_ON =
+            !"false".equals(System.getProperty("centities.lookIdle", "true"));
+
+    private static volatile RefField VH_NAV_DELAYED, VH_NAV_PATH;
+    private static volatile RefField VH_MOVE_OP, VH_MOVE_MOB;
+    private static volatile RefField VH_LOOK_CD, VH_LOOK_MOB;
+    private static volatile RefField VH_MOB_XROT, VH_MOB_YHEAD, VH_MOB_YBODY, VH_MOB_NAV;
+    private static RefField VH_MOB_ZZA;
+    private static Object MOVE_OP_WAIT_IDLE; // captured enum constant (identity cmp)
+    public static volatile boolean NAV_HANDLES_OK, MOVE_HANDLES_OK, LOOK_HANDLES_OK;
+
+    // PLAIN longs (same reasoning as gsFloorTicks — server-thread only).
+    public static long navCalls = 0, navIdleHits = 0;
+    public static long moveCalls = 0, moveIdleHits = 0;
+    public static long lookCalls = 0, lookIdleHits = 0;
+
+    public static void initNavHandles() {
+        try {
+            VH_NAV_DELAYED = new RefField(
+                    net.minecraft.world.entity.ai.navigation.PathNavigation.class,
+                    "hasDelayedRecomputation");
+            VH_NAV_PATH = new RefField(
+                    net.minecraft.world.entity.ai.navigation.PathNavigation.class,
+                    "path");
+            NAV_HANDLES_OK = VH_NAV_DELAYED.off >= 0 && VH_NAV_PATH.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initNavHandles: " + t;
+            NAV_HANDLES_OK = false;
+        }
+    }
+
+    public static void initMoveHandles() {
+        try {
+            VH_MOVE_OP = new RefField(
+                    net.minecraft.world.entity.ai.control.MoveControl.class,
+                    "operation");
+            VH_MOVE_MOB = new RefField(
+                    net.minecraft.world.entity.ai.control.MoveControl.class,
+                    "mob");
+            // Operation is PROTECTED in MoveControl (javap) — capture via
+            // reflection, same as the L22 init's Enum.valueOf capture.
+            MOVE_OP_WAIT_IDLE = java.lang.Enum.valueOf(
+                    (Class<? extends java.lang.Enum>) Class.forName(
+                            "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
+                    "WAIT");
+            MOVE_HANDLES_OK = VH_MOVE_OP.off >= 0 && VH_MOVE_MOB.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initMoveHandles: " + t;
+            MOVE_HANDLES_OK = false;
+        }
+    }
+
+    public static void initLookHandles() {
+        try {
+            VH_LOOK_CD = new RefField(
+                    net.minecraft.world.entity.ai.control.LookControl.class,
+                    "lookAtCooldown");
+            VH_LOOK_MOB = new RefField(
+                    net.minecraft.world.entity.ai.control.LookControl.class,
+                    "mob");
+            VH_MOB_XROT = new RefField(net.minecraft.world.entity.Entity.class, "xRot");
+            VH_MOB_YHEAD = new RefField(net.minecraft.world.entity.Mob.class, "yHeadRot");
+            VH_MOB_YBODY = new RefField(net.minecraft.world.entity.Mob.class, "yBodyRot");
+            VH_MOB_NAV = new RefField(net.minecraft.world.entity.Mob.class, "navigation");
+            VH_MOB_ZZA = new RefField(net.minecraft.world.entity.LivingEntity.class, "zza");
+            LOOK_HANDLES_OK = VH_LOOK_CD.off >= 0 && VH_LOOK_MOB.off >= 0
+                    && VH_MOB_XROT.off >= 0 && VH_MOB_YHEAD.off >= 0
+                    && VH_MOB_YBODY.off >= 0 && VH_MOB_NAV.off >= 0
+                    && VH_MOB_ZZA.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initLookHandles: " + t;
+            LOOK_HANDLES_OK = false;
+        }
+    }
+
+    /** PathNavigation.tick() guard: TRUE = the body is a provable no-op. */
+    public static boolean navIdle$(net.minecraft.world.entity.ai.navigation.PathNavigation nav) {
+        navCalls++;
+        if (!NAV_FLAG_ON || !NAV_HANDLES_OK) return false;
+        try {
+            if (VH_NAV_DELAYED.getBool(nav)) return false;      // recompute pending
+            if (VH_NAV_PATH.getObj(nav) != null) return false;  // active path
+            navIdleHits++;
+            return true;
+        } catch (Throwable t) {
+            return false; // route vanilla — never break navigation
+        }
+    }
+
+    /** MoveControl.tick() guard: TRUE = the body is a provable no-op. */
+    public static boolean moveIdle$(net.minecraft.world.entity.ai.control.MoveControl mc) {
+        moveCalls++;
+        if (!MOVE_FLAG_ON || !MOVE_HANDLES_OK) return false;
+        try {
+            if (VH_MOVE_OP.getObj(mc) != MOVE_OP_WAIT_IDLE) return false;
+            Object mob = VH_MOVE_MOB.getObj(mc);
+            if (!(mob instanceof net.minecraft.world.entity.Mob)) return false;
+            if (VH_MOB_ZZA.getFloat(mob) != 0.0f) return false;
+            moveIdleHits++;
+            return true;
+        } catch (Throwable t) {
+            return false; // route vanilla — never break movement
+        }
+    }
+
+    /** LookControl.tick() guard: TRUE = the body is a provable no-op. */
+    public static boolean lookIdle$(net.minecraft.world.entity.ai.control.LookControl lc) {
+        lookCalls++;
+        if (!LOOK_FLAG_ON || !LOOK_HANDLES_OK) return false;
+        try {
+            Object mob = VH_LOOK_MOB.getObj(lc);
+            if (!(mob instanceof net.minecraft.world.entity.Mob)) return false;
+            if (VH_LOOK_CD.getInt(lc) > 0) return false;          // look target active
+            if (VH_MOB_XROT.getFloat(mob) != 0.0f) return false;  // pitch reset pending
+            if (VH_MOB_YHEAD.getFloat(mob) != VH_MOB_YBODY.getFloat(mob)) return false;
+            Object nav = VH_MOB_NAV.getObj(mob);
+            if (!(nav instanceof net.minecraft.world.entity.ai.navigation.PathNavigation pn)
+                    || !pn.isDone()) {
+                return false; // head clamp pending while a path is live
+            }
+            lookIdleHits++;
+            return true;
+        } catch (Throwable t) {
+            return false; // route vanilla — never break look control
+        }
     }
 }

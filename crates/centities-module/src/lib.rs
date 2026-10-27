@@ -39,6 +39,10 @@ const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 /// L30: the tracker-loop floor target — ChunkMap.newTrackerTick replace_body.
 const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
+// L36: the idle AI-control classes (nav/move/look early-out guards).
+const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNavigation";
+const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
+const LOOK_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/LookControl";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 
 // ---------------------------------------------------------------------------
@@ -395,6 +399,9 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
     cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
+    cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
+    cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
+    cplug_sdk::hooks::register_bytes(LOOK_CONTROL_CLASS, |_n, b| patch_lookcontrol(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -413,6 +420,170 @@ pub unsafe extern "C" fn cplugin_init(
 // ---------------------------------------------------------------------------
 // arming
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// L36 — idle AI-control guards (nav/move/look early-outs).
+//
+// Three INDEPENDENT no-arg-instance-method guards (op-4, receiver-as-local-0
+// — the tickEffects lesson): PathNavigation.tick / MoveControl.tick /
+// LookControl.tick. The Java checks (navIdle$/moveIdle$/lookIdle$) return
+// true only when the javap-proven no-op conditions hold; any doubt routes
+// the exact vanilla body. A refusal of one guard keeps the other two.
+// ---------------------------------------------------------------------------
+
+static NAV_WOVEN: AtomicBool = AtomicBool::new(false);
+static NAV_DECLINED: AtomicBool = AtomicBool::new(false);
+static MOVE_WOVEN: AtomicBool = AtomicBool::new(false);
+static MOVE_DECLINED: AtomicBool = AtomicBool::new(false);
+static LOOK_WOVEN: AtomicBool = AtomicBool::new(false);
+static LOOK_DECLINED: AtomicBool = AtomicBool::new(false);
+
+fn patch_navigation(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_idle_inner(bytes, NAVIGATION_CLASS, &NAV_WOVEN))
+        .ok()
+        .flatten()
+}
+
+fn patch_movecontrol(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_idle_inner(bytes, MOVE_CONTROL_CLASS, &MOVE_WOVEN))
+        .ok()
+        .flatten()
+}
+
+fn patch_lookcontrol(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_idle_inner(bytes, LOOK_CONTROL_CLASS, &LOOK_WOVEN))
+        .ok()
+        .flatten()
+}
+
+fn patch_idle_inner(bytes: &[u8], cls: &'static str, woven: &AtomicBool) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(cls).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(cls).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            Some(b)
+        }
+        _ if !woven.load(Ordering::Acquire) => {
+            // post-arm load (or a pending precompute) — stash for the
+            // verifier's deferred weave, keep the class vanilla meanwhile.
+            let mut st = STASH.lock().ok()?;
+            st.entry(cls).or_insert_with(|| bytes.to_vec());
+            None
+        }
+        _ => None,
+    }
+}
+
+fn precompute_idle_controls(loader: jni::jobject) {
+    // (class, woven, declined, java check name, java check desc, init, ok flag,
+    //  log label). Each entry is fully independent.
+    type IdleSpec = (
+        &'static str,
+        &'static AtomicBool,
+        &'static AtomicBool,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+    let specs: [IdleSpec; 3] = [
+        (
+            NAVIGATION_CLASS,
+            &NAV_WOVEN,
+            &NAV_DECLINED,
+            "navIdle$",
+            "(Lnet/minecraft/world/entity/ai/navigation/PathNavigation;)Z",
+            "initNavHandles",
+            "NAV_HANDLES_OK",
+            "navIdle",
+        ),
+        (
+            MOVE_CONTROL_CLASS,
+            &MOVE_WOVEN,
+            &MOVE_DECLINED,
+            "moveIdle$",
+            "(Lnet/minecraft/world/entity/ai/control/MoveControl;)Z",
+            "initMoveHandles",
+            "MOVE_HANDLES_OK",
+            "moveIdle",
+        ),
+        (
+            LOOK_CONTROL_CLASS,
+            &LOOK_WOVEN,
+            &LOOK_DECLINED,
+            "lookIdle$",
+            "(Lnet/minecraft/world/entity/ai/control/LookControl;)Z",
+            "initLookHandles",
+            "LOOK_HANDLES_OK",
+            "lookIdle",
+        ),
+    ];
+    for (cls, woven, declined, check_name, check_desc, init, ok_flag, label) in specs {
+        if woven.load(Ordering::Acquire) || declined.load(Ordering::Acquire) {
+            continue;
+        }
+        // Property kill switch (the CeHooks FLAG_ON static is folded at class
+        // init from the same property — this read just mirrors the decision
+        // in the rust log).
+        let flag_field = match label {
+            "navIdle" => "NAV_FLAG_ON",
+            "moveIdle" => "MOVE_FLAG_ON",
+            _ => "LOOK_FLAG_ON",
+        };
+        if read_java_flag(flag_field) != Some(true) {
+            declined.store(true, Ordering::Release);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] {label} guard disabled (property) — vanilla kept"
+            ));
+            continue;
+        }
+        if prove_handles(init, ok_flag) != Some(true) {
+            declined.store(true, Ordering::Release);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] {label} guard handle probe failed — vanilla kept"
+            ));
+            continue;
+        }
+        let Some(bytes) = STASH.lock().ok().and_then(|mut s| s.remove(cls)) else {
+            // not loaded yet — leave UNDECIDED (the verifier retries when
+            // the class loads); never decline on a missing stash.
+            continue;
+        };
+        let spec = cplug_sdk::asm::EarlyReturnGuard {
+            method_name: "tick",
+            method_desc: "()V",
+            check_class: HOOKS_CLASS,
+            check_name,
+            check_desc,
+        };
+        let patched = cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+        });
+        match patched {
+            Some(Some(b)) if !b.is_empty() => {
+                if let Ok(mut pc) = PRECOMPUTED.lock() {
+                    pc.insert(cls, b);
+                }
+                woven.store(true, Ordering::Release);
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] precomputed {label} idle guard"
+                ));
+            }
+            _ => {
+                declined.store(true, Ordering::Release);
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] FAILED to precompute {label} guard — vanilla kept"
+                ));
+            }
+        }
+    }
+}
 
 fn arm_module() {
     // define_bridge returns (GLOBAL ref of the Level class loader, GLOBAL ref
@@ -445,6 +616,7 @@ fn arm_module() {
     precompute_mob(loader);
     precompute_conversion(loader);
     precompute_sensing(loader);
+    precompute_idle_controls(loader);
     precompute_trackedentity(loader);
     precompute_chunkmap(loader);
 
@@ -466,6 +638,9 @@ fn arm_module() {
         TRACKED_ENTITY_CLASS,
         CHUNKMAP_CLASS,
         SENSING_CLASS,
+        NAVIGATION_CLASS,
+        MOVE_CONTROL_CLASS,
+        LOOK_CONTROL_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -645,6 +820,23 @@ fn arm_module() {
                         let rc = cplug_sdk::retransform_class(CHUNKMAP_CLASS);
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred tracker-loop floor applied, rc={rc}"
+                        ));
+                    }
+                }
+                // L36 deferred weave: the AI-control classes load with the
+                // first mobs (same wave as Sensing) — same stash/retry
+                // protocol. Each guard is independent; retransform only the
+                // classes whose weave actually landed.
+                precompute_idle_controls(loader as jni::jobject);
+                for (cls, woven) in [
+                    (NAVIGATION_CLASS, &NAV_WOVEN),
+                    (MOVE_CONTROL_CLASS, &MOVE_WOVEN),
+                    (LOOK_CONTROL_CLASS, &LOOK_WOVEN),
+                ] {
+                    if woven.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(cls);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred idle guard applied to {cls}, rc={rc}"
                         ));
                     }
                 }
