@@ -100,6 +100,17 @@ public final class CeHooks {
      *  fixed JNI toll. Genuinely dense cells (mobs-25k ~700, items-100k ~830 per
      *  cell) still bail to the native Rust filter. */
     private static final int ROW_TOTAL_CAP = 512;
+    /** L35 narrow-shape total cap: a query box whose X and Z spans are both
+     *  <= 8 blocks (mob collision ~0.6-1.9, item merge scans ~1-2.5) pays a
+     *  packed-x-window scan of ~3-4ns/entry that skips 75-96% of the row
+     *  WITHOUT a deref, so the per-candidate Java cost applies only to the
+     *  overlap fraction. Valid rows are each <= ROW_CAP (510) entries and a
+     *  narrow box covers <= 4x4 = 16 rows, so 8192 is a belt, not the real
+     *  bound; the EMA still prices the bucket and flips to the mirror when
+     *  the row scan loses. Wide shapes (targeting/sensor scans 7-35 blocks)
+     *  keep the flat 512 cap — their window pass fraction is near 100%, so
+     *  the scan cost there is per-CANDIDATE, not per-ENTRY. */
+    private static final int ROW_TOTAL_CAP_NARROW = 8192;
 
     // Row-path diagnostics: hits and every distinct miss reason.
     public static volatile long rowFast = 0;
@@ -107,6 +118,7 @@ public final class CeHooks {
     public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
     public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
     public static volatile long rowWinSkip = 0; // L4c: candidates skipped by the packed x-window
+    public static volatile long rowNarrow = 0;  // L35: narrow-shape serves (raised cap)
 
     // ------------------------------------------------------------------
     // L2a RESTING ITEMS — the woven ItemEntity.tick guard calls itemSkip
@@ -413,7 +425,7 @@ public final class CeHooks {
                 + " row=" + rowFast + "/" + rowMulti + "/" + rowStale + "/" + rowPending
                 + "/" + rowNoRow + "/" + rowKey + "/" + rowBig + "/" + rowNoPub
                 + "/" + rowOv + "/" + rowEmpty + "/" + rowHomeMiss + "/" + rowStaleCand
-                + "/w" + rowWinSkip
+                + "/w" + rowWinSkip + "/n" + rowNarrow
                 + " rest=" + restFast + "/" + restMarks + "/" + restWakes + "/" + restChecks + "/" + hurtProbes
                 + " wakes=" + wakesDelta + "/" + wakesBox + "/" + wakesSelf
                 + " restF=" + restFailGround + "/" + restFailDelay + "/" + restFailAge
@@ -1276,6 +1288,12 @@ public final class CeHooks {
         // L32: the window is 4x4 (span <= 3). Wider boxes (the really wide
         // targeting scans) still refuse into the native/mirror paths.
         if (cx1 - cx0 > 3 || cz1 - cz0 > 3) { rowMulti++; return null; }
+        // L35: narrow shapes (collision, merge scans) get the raised total
+        // cap — the packed x-window below does the mass skip for them.
+        double wxs = box.maxX - box.minX;
+        double wzs = box.maxZ - box.minZ;
+        boolean narrow = wxs <= 8.0 && wzs <= 8.0;
+        int totalCap = narrow ? ROW_TOTAL_CAP_NARROW : ROW_TOTAL_CAP;
         int nr = 0;
         int total = 0;
         // L32 freshness proof for the null-skip below: the publisher only
@@ -1402,8 +1420,8 @@ public final class CeHooks {
         // ~30us/query x 6.7k/tick = ~200ms/tick, +10% p50 over vanilla.
         // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
         // on the native path while serving mid-density rows at ~10-20us.
-        if (total > ROW_TOTAL_CAP) { rowBig++; return null; }
-        ArrayList<Entity> out = new ArrayList<>(Math.min(total, ROW_TOTAL_CAP));
+        if (total > totalCap) { rowBig++; return null; }
+        ArrayList<Entity> out = new ArrayList<>(Math.min(total, totalCap));
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
         for (int r = 0; r < nr; r++) {
@@ -1479,6 +1497,7 @@ public final class CeHooks {
         rowStaleCand += stale;
         rowHomeMiss += homeMiss;
         rowFast++;
+        if (narrow) rowNarrow++;
         return out;
     }
 
