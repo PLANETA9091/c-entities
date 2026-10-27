@@ -148,22 +148,38 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 runName, scale, pctItems, pctStands, tileHoppers, tileFurnaces, measureTicks));
 
         // Failsafe: if the fake player never joins, start anyway (marked no-player).
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (!started) {
-                getLogger().warning("no player joined within 45s — starting without player (mobs will be inactive)");
-                begin(null);
-            }
-        }, 20L * 45L);
+        // PARITY mode replaces this with its own fixed-tick start (a wallclock
+        // 45s failsafe would begin the fill at a DIFFERENT tick in each leg).
+        if (!parity) {
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (!started) {
+                    getLogger().warning("no player joined within 45s — starting without player (mobs will be inactive)");
+                    begin(null);
+                }
+            }, 20L * 45L);
+        }
 
         if (parity) {
             // Parity mode: NO bot (player-driven motion is wallclock-random).
             // The fill window starts at a fixed TICK so both legs of the A/B
             // begin spawning on the same tick number regardless of boot speed.
-            seedSharedRandom("onEnable");
+            //
+            // SEEDING (javap, 26.3): Entity.SHARED_RANDOM is an
+            // Entity$RandomRandomSource whose setSeed LOCKS on first use —
+            // later calls are logged and IGNORED ("Ignoring setSeed on
+            // Entity.SHARED_RANDOM"). One seed, applied here before any
+            // entity exists, is the ONLY lever — and it is sufficient: the
+            // fixed-tick fill window pins the spawn schedule to identical
+            // tick numbers in both legs, and from there the single global
+            // stream evolves identically tick-by-tick. Any behavioral
+            // difference (extra draw, different decision) diverges it.
+            boolean seeded = seedSharedRandom("onEnable");
             getLogger().info("PARITY harness armed: seed=" + paritySeed
+                    + " seeded=" + seeded
                     + " fillStartTick=" + parityFillStartTick + " (bot ignored)");
             Bukkit.getScheduler().runTaskTimer(this, () -> {
                 if (!started && tickNo >= parityFillStartTick) {
+                    started = true; // ONE-SHOT — begin() must never run twice
                     getLogger().info("PARITY: fixed-tick fill start at T" + tickNo);
                     begin(null);
                 }
@@ -176,16 +192,14 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     }
 
     // ------------------------------------------------------------------
-    // Paper's entities share ONE RandomSource (Entity.SHARED_RANDOM, public
-    // static — paper patch). Vanilla seeds it once per process from an
-    // entropy source, so two identical servers diverge in mob AI even with
-    // the same world seed. Re-seeding it at identical LOGICAL points (every
-    // fill tick + once at fill-done) makes the whole AI decision stream
-    // reproducible across processes: if the module consumes RNG differently
-    // than vanilla anywhere (extra draw, different order), every downstream
-    // decision diverges and the snapshots stop matching.
+    // Paper's entities share ONE RandomSource (Entity.SHARED_RANDOM,
+    // Entity$RandomRandomSource — a package-private inner class whose
+    // setSeed is `public synchronized` but INVOKABLE only via
+    // setAccessible). The source LOCKS on its first setSeed — later seeds
+    // are logged and ignored — so this must run exactly once, before any
+    // entity exists. Returns whether the seed was actually applied.
     // ------------------------------------------------------------------
-    private void seedSharedRandom(String where) {
+    private boolean seedSharedRandom(String where) {
         try {
             if (!sharedRandomTried) {
                 sharedRandomTried = true;
@@ -193,11 +207,14 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 Field f = c.getField("SHARED_RANDOM");
                 sharedRandom = f.get(null);
             }
-            if (sharedRandom != null) {
-                sharedRandom.getClass().getMethod("setSeed", long.class).invoke(sharedRandom, paritySeed);
-            }
+            if (sharedRandom == null) return false;
+            java.lang.reflect.Method m = sharedRandom.getClass().getMethod("setSeed", long.class);
+            m.setAccessible(true); // the declaring class is package-private
+            m.invoke(sharedRandom, paritySeed);
+            return true;
         } catch (Throwable t) {
             getLogger().warning("PARITY: cannot seed SHARED_RANDOM (" + where + "): " + t);
+            return false;
         }
     }
 
@@ -262,15 +279,6 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private void fillStep() {
         World w = Bukkit.getWorlds().get(0);
         if (tickNo < 1) return;
-
-        // Parity: every fill tick starts from the SAME RNG seed (both arms),
-        // so the spawn layout AND every mob decision within the tick are
-        // process-independent. Entities spawned on earlier fill ticks ticked
-        // under the same re-seeded streams -> identical state at fill-done
-        // even if chunk-load timing shifted a tick or two between legs.
-        if (parity && "FILL".equals(phase)) {
-            seedSharedRandom("fillTick");
-        }
 
         // --- entities ---
         if (spawnedItems + spawnedStands + spawnedZombies < scale) {
@@ -361,16 +369,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             phase = "WARMUP";
             measureEndTick = tickNo + warmupTicks + measureTicks;
             if (parity) {
-                // The one re-seed both legs take into the free-running phase:
-                // from here on the RNG stream is NEVER reset again — any
-                // behavioral divergence compounds until the snapshots break.
                 fillDoneTick = tickNo;
-                seedSharedRandom("fillDone");
+                getLogger().info("PARITY: fillDoneTick=" + fillDoneTick
+                        + " — RNG stream free-runs from the single onEnable seed");
             }
             getLogger().info(String.format(Locale.ROOT,
                     "fill done: items=%d stands=%d zombies=%d hoppers=%d furnaces=%d — warmup %d ticks",
                     spawnedItems, spawnedStands, spawnedZombies, placedHoppers, placedFurnaces, warmupTicks));
-            if (parity) getLogger().info("PARITY: fillDoneTick=" + fillDoneTick + " — free-running RNG from here");
         }
     }
 
