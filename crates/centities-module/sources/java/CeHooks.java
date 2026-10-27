@@ -65,6 +65,9 @@ public final class CeHooks {
     // Phase timings (nanos, cumulative): where the fast path spends time.
     public static volatile long fastNanos = 0, queryNanos = 0, resolveNanos = 0;
     public static volatile long candidatesSeen = 0, candidatesResolved = 0;
+    /** L37d: candidates dropped by the exact AABB re-check (the index's
+     *  margin superset) — zero means the index was already exact. */
+    public static volatile long marginExtra = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
@@ -427,6 +430,7 @@ public final class CeHooks {
                 + " fastMs=" + fastNanos / 1_000_000 + " qMs=" + queryNanos / 1_000_000
                 + " resMs=" + resolveNanos / 1_000_000
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
+                + " marginExtra=" + marginExtra
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
@@ -1452,9 +1456,24 @@ public final class CeHooks {
                 }
             }
             resolved++;
-            // NOTE: no per-candidate box.intersects — the Rust index is exact
-            // (property-tested vs brute force in centities-core); the vanilla
-            // predicate still applies, as it must.
+            // L37d EXACT AABB RE-CHECK. The Rust index is a MARGIN SUPERSET:
+            // EntityIndex.query expands the scan bounds by
+            // max_half_span + MARGIN (the big-entity safety net), so a
+            // candidate can sit up to ~0.7 blocks OUTSIDE the query box
+            // (the parity ORDER-CHECK caught merge scans returning items
+            // 0.64 blocks away — vanilla's section scan excludes them; the
+            // extra candidates merged items beyond the merge radius and
+            // pushed zombies outside the push box — THE item and mob
+            // divergence in one). The vanilla test is
+            // entity.getBoundingBox().intersects(box) on the LIVE box.
+            AABB eb = e.getBoundingBox();
+            if (!(eb.minX < box.maxX && eb.maxX > box.minX
+                    && eb.minY < box.maxY && eb.maxY > box.minY
+                    && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
+                marginExtra++;
+                continue;
+            }
+            // NOTE: the vanilla predicate still applies, as it must.
             if (predicate.test(e)) {
                 out.add(e);
             }
