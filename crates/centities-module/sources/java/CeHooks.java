@@ -1140,9 +1140,16 @@ public final class CeHooks {
 
     /** L37: stamp every entity that never passed probeAdd/probeMoveSection
      *  (added before the arm — world load during boot) in the EXACT vanilla
-     *  scan order. A full-world EntityLookup.getEntities walk IS the vanilla
-     *  order (regions Z,X -> chunks Z,X -> sections Y -> insertion), so the
-     *  seq stamp IS the section-list position. Also backfills the ARENA. */
+     *  scan order. Per-REGION boxes built from the Bukkit loaded-chunk list:
+     *  a full-world box would make EntityLookup.getEntities iterate ~3.5
+     *  BILLION region coordinates (observed: the arm thread hung forever —
+     *  no ARMED line at all). Within one region the walk IS the vanilla
+     *  order (chunks Z-major -> sections Y -> insertion), and cross-section
+     *  order needs no stamps (the live moonrise section fields decide the
+     *  key) — so region-level coarseness is exact. The arm thread may read
+     *  slices concurrently with the tick: BasicEntityList is an index-scanned
+     *  plain array (SW mr-designed), worst case a missed stamp that the
+     *  entity's next add/move probe heals. Also backfills the ARENA. */
     private static void ordBackfillWorlds() {
         try {
             Class<?> bukkit = Class.forName("org.bukkit.Bukkit");
@@ -1166,19 +1173,42 @@ public final class CeHooks {
                 lastErrorText = "ordBackfill: EntityLookup.getEntities(Entity,AABB,List,Pred) not found";
                 return;
             }
-            AABB full = new AABB(-3.0E7, -2.0E7, -3.0E7, 3.0E7, 2.0E7, 3.0E7);
+            java.lang.reflect.Method getChunks = Class.forName("org.bukkit.World")
+                    .getMethod("getLoadedChunks");
             for (Object w : worlds) {
                 Object sl = getHandle.invoke(w);
                 if (!(sl instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
                     continue;
                 }
                 Object lookup = getLookup.invoke(serverLevel);
-                List<Entity> all = new ArrayList<>();
-                getEnts.invoke(lookup, null, full, all, null);
-                for (int i = 0; i < all.size(); i++) {
-                    Entity en = all.get(i);
-                    ARENA[en.getId() & AMASK] = en;
-                    ordStamp(en);
+                Object[] chunks = (Object[]) getChunks.invoke(w);
+                // region key -> [minCx, maxCx, minCz, maxCz]
+                java.util.HashMap<Long, int[]> regions = new java.util.HashMap<>();
+                for (Object c : chunks) {
+                    int cx = (Integer) c.getClass().getMethod("getX").invoke(c);
+                    int cz = (Integer) c.getClass().getMethod("getZ").invoke(c);
+                    long rk = (long) (cx >> 5) << 32 | (long) ((cz >> 5) & 0xFFFFFFFFL);
+                    int[] b = regions.get(rk);
+                    if (b == null) {
+                        regions.put(rk, new int[]{cx, cx, cz, cz});
+                    } else {
+                        if (cx < b[0]) b[0] = cx;
+                        if (cx > b[1]) b[1] = cx;
+                        if (cz < b[2]) b[2] = cz;
+                        if (cz > b[3]) b[3] = cz;
+                    }
+                }
+                for (int[] b : regions.values()) {
+                    AABB box = new AABB(
+                            (double) (b[0] << 4), -2048.0, (double) (b[2] << 4),
+                            (double) ((b[1] + 1) << 4), 2048.0, (double) ((b[3] + 1) << 4));
+                    List<Entity> all = new ArrayList<>();
+                    getEnts.invoke(lookup, null, box, all, null);
+                    for (int i = 0; i < all.size(); i++) {
+                        Entity en = all.get(i);
+                        ARENA[en.getId() & AMASK] = en;
+                        ordStamp(en);
+                    }
                 }
             }
         } catch (Throwable t) {
