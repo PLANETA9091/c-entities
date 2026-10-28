@@ -44,6 +44,12 @@ on:
       ai_floor:
         description: 'CE_AI_FLOOR (1=shipped, 0=vanilla GoalSelector via -Dcentities.aiFloor=false)'
         default: '1'
+      collide:
+        description: 'CE_COLLIDE (1=shipped, 0=vanilla canCollideWithBukkit body in ON leg)'
+        default: '1'
+      merge_mirror:
+        description: 'CE_MERGE_MIRROR (1=shipped, 0=MH-based isMergable predicate)'
+        default: '1'
       trace_id:
         description: 'PARITY_TRACE_ID: per-tick trace of this entity id in BOTH legs (−1 = off)'
         default: '-1'
@@ -99,6 +105,11 @@ jobs:
           fi
           EJ="${{ inputs.extra_jvm || '' }}"
           echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5$BISECT_JVM $EJ" >> "$GITHUB_ENV"
+          # env-knobs read natively (Rust precompute / CeHooks statics)
+          CC="$([ "${{ inputs.collide }}" = "0" ] && echo 0 || echo 1)"
+          MM="$([ "${{ inputs.merge_mirror }}" = "0" ] && echo 0 || echo 1)"
+          echo "CE_COLLIDE=$CC" >> "$GITHUB_ENV"
+          echo "CE_MERGE_MIRROR=$MM" >> "$GITHUB_ENV"
 
       - name: Paired parity runs (off/on per scenario)
         run: |
@@ -110,7 +121,7 @@ jobs:
           MA="$([ "${{ inputs.mob_ai }}" = "0" ] && echo 0 || echo 1)"
           MG="$([ "${{ inputs.merge }}" = "0" ] && echo 0 || echo 1)"
           TR="${{ inputs.trace_id }}"
-          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR"
+          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR CE_COLLIDE=${CE_COLLIDE:-1} CE_MERGE_MIRROR=${CE_MERGE_MIRROR:-1}"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
             RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
@@ -119,6 +130,7 @@ jobs:
             PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" \
             MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
             CE_ITEM_TICK="$IT" CE_MOB_AI="$MA" CE_MERGE="$MG" \
+            CE_COLLIDE="${CE_COLLIDE:-1}" CE_MERGE_MIRROR="${CE_MERGE_MIRROR:-1}" \
             bash scripts/run-baseline.sh
           }
           # Scenario set: every entity family the perf benches use, at a

@@ -328,7 +328,8 @@ public final class CeHooks {
             if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
                 IDX_ITEM = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
             }
-            MERGP_ON = O_IE_DESPAWN >= 0 && O_STACK_COUNT >= 0 && IDX_ITEM >= 0;
+            MERGP_ON = O_IE_DESPAWN >= 0 && O_STACK_COUNT >= 0 && IDX_ITEM >= 0
+                    && !"0".equals(System.getenv("CE_MERGE_MIRROR"));
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "initMergeMirror: " + t;
