@@ -388,6 +388,10 @@ struct Oversize {
     id: i64,
     world: u16,
     b: Aabb, // exact f64, no quantization concerns
+    /// vanilla scan-order stamps (moonrise section Y + insertion seq) —
+    /// the query's oversize merge sorts by the same key as cell entries
+    sy: i32,
+    seq: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -417,6 +421,20 @@ pub struct EntityIndex {
     worlds: Vec<u16>,
     homes: Vec<u32>, // 1-based cell id
     cpos: Vec<u32>,  // position inside the home cell's arrays
+    // PARITY ORDER (doc 36b): the vanilla EntityLookup.getEntities candidate
+    // order is (chunkZ, chunkX, sectionY, insertion seq). The Java probes
+    // carry the entity's exact moonrise section Y and ORD_SEQ insertion
+    // stamp with every upsert; each cell keeps an order version that is
+    // bumped whenever a member's (sy, seq) or membership changes, and the
+    // blocked-SoA layout is re-sorted to the vanilla key before a query
+    // streams it (ensure_cell_order). Queries traverse cells chunkZ-major,
+    // so the concatenated stream is bit-identical to vanilla's scan order —
+    // merge partner ties, maxEntityCollisions caps and targeting all see
+    // the same neighbor sequence as the vanilla server.
+    sy: Vec<i32>,       // per-slot section Y stamp
+    seq: Vec<i64>,      // per-slot insertion seq stamp
+    cell_ov: Vec<u64>,  // per-cell order version (bumped on order change)
+    cell_sv: Vec<u64>,  // per-cell version the layout was last sorted to
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
     cell_ids: Vec<Vec<i64>>,
     cell_box: Vec<Vec<f32>>,   // blocked-SoA: blocks of 48 f32 (simd.rs)
@@ -436,6 +454,10 @@ impl EntityIndex {
             worlds: Vec::new(),
             homes: Vec::new(),
             cpos: Vec::new(),
+            sy: Vec::new(),
+            seq: Vec::new(),
+            cell_ov: vec![0], // cell 0 unused
+            cell_sv: vec![0],
             cell_ids: vec![Vec::new()], // cell 0 unused
             cell_box: vec![Vec::new()],
             cell_slots: vec![Vec::new()],
@@ -457,17 +479,26 @@ impl EntityIndex {
         self.max_half_span
     }
 
-    /// Insert or update an entity's AABB. O(1) typical (same-cell update is
-    /// 6 stores into the cell's contiguous arrays). `world` is a
-    /// caller-assigned small id per Level instance. Returns the cell-level
-    /// change (see [`UpsertEv`]).
+    /// Insert or update an entity's AABB without order stamps (pidx view /
+    /// tests). The cell layout of this index is then order-insensitive.
     pub fn upsert(&mut self, id: i64, world: u16, b: &Aabb) -> UpsertEv {
+        self.upsert_ord(id, world, b, 0, 0)
+    }
+
+    /// Insert or update an entity's AABB with its vanilla scan-order stamps.
+    /// `sy` = moonrise section Y, `seq` = the ORD_SEQ insertion stamp Java
+    /// maintains at addEntity / moveEntity re-append (0,0 = unknown: treated
+    /// as a stable key — two stamps of (0,0) never bump the cell version).
+    /// O(1) typical (same-cell update is 6 stores into the cell's
+    /// contiguous arrays). `world` is a caller-assigned small id per Level
+    /// instance. Returns the cell-level change (see [`UpsertEv`]).
+    pub fn upsert_ord(&mut self, id: i64, world: u16, b: &Aabb, sy: i32, seq: i64) -> UpsertEv {
         let hx = (b.x1 - b.x0) * 0.5;
         let hz = (b.z1 - b.z0) * 0.5;
         let half = hx.max(hz);
 
         if half > MAX_HALF_SPAN {
-            return self.upsert_oversize(id, world, *b);
+            return self.upsert_oversize_ord(id, world, *b, sy, seq);
         }
         if half > self.max_half_span {
             self.max_half_span = half;
@@ -491,14 +522,26 @@ impl EntityIndex {
                 box_[base + 24] = (b.x1 - ocx as f64 * CELL as f64) as f32;
                 box_[base + 32] = b.y1 as f32;
                 box_[base + 40] = (b.z1 - ocz as f64 * CELL as f64) as f32;
+                // order stamps: a changed (sy, seq) means vanilla re-appended
+                // this entity (or its section moved) — the cell's vanilla
+                // order is stale and must be re-sorted before the next stream
+                if self.sy[slot as usize] != sy || self.seq[slot as usize] != seq {
+                    self.sy[slot as usize] = sy;
+                    self.seq[slot as usize] = seq;
+                    self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+                }
                 return UpsertEv::Same;
             }
             // moved cell (or world): O(1) swap-remove + push
             self.cell_remove(home, self.cpos[slot as usize] as usize);
+            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
             let new_home = self.cell_id(world, ncx, ncz);
             self.cell_add(new_home, slot as usize, b, ncx, ncz);
             self.homes[slot as usize] = new_home;
             self.worlds[slot as usize] = world;
+            self.sy[slot as usize] = sy;
+            self.seq[slot as usize] = seq;
+            self.cell_ov[new_home as usize] = self.cell_ov[new_home as usize].wrapping_add(1);
             return UpsertEv::Moved {
                 old: home,
                 new: new_home,
@@ -516,6 +559,8 @@ impl EntityIndex {
                 self.worlds.push(world);
                 self.homes.push(0);
                 self.cpos.push(0);
+                self.sy.push(sy);
+                self.seq.push(seq);
                 (self.ids.len() - 1) as u32
             };
             let home = self.cell_id(world, ncx, ncz);
@@ -523,6 +568,7 @@ impl EntityIndex {
             self.homes[slot as usize] = home;
             self.idmap.insert(id, slot);
             self.stats.entities += 1;
+            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
             return UpsertEv::New {
                 cell: home,
                 from_oversize,
@@ -533,6 +579,7 @@ impl EntityIndex {
     pub fn remove(&mut self, id: i64) -> RemoveEv {
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
+            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
             self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
             self.free_slot(slot as usize);
@@ -575,6 +622,8 @@ impl EntityIndex {
         self.worlds.clear();
         self.homes.clear();
         self.cpos.clear();
+        self.sy.clear();
+        self.seq.clear();
         for v in self.cell_ids.iter_mut() {
             v.clear();
         }
@@ -589,6 +638,10 @@ impl EntityIndex {
         self.cell_ids.truncate(1);
         self.cell_box.truncate(1);
         self.cell_slots.truncate(1);
+        self.cell_ov.truncate(1);
+        self.cell_ov[0] = 0;
+        self.cell_sv.truncate(1);
+        self.cell_sv[0] = 0;
         self.cellmap = CellMap::new(1 << 12);
         self.idmap = IdMap::new(1 << 12);
         self.oversize.clear();
@@ -596,10 +649,13 @@ impl EntityIndex {
     }
 
     /// Exact candidate query (see module contract). Appends ids to `out`
-    /// (cleared first). False positives allowed; false negatives impossible:
+    /// (cleared first) in the EXACT vanilla EntityLookup.getEntities scan
+    /// order: cells chunkZ-major, each cell's members by (sectionY, seq).
+    /// False positives allowed; false negatives impossible:
     ///   - single-homing safety: query XZ box expanded by max_half_span,
     ///   - quantization safety: + MARGIN,
-    ///   - oversize entities scanned exactly.
+    ///   - oversize entities scanned exactly (and full-order-sorted when
+    ///     they match — rare; benches carry none).
     ///
     /// L5: the per-cell scan is a flat sequential read of the cell's
     /// contiguous id/box arrays (no pointer chasing).
@@ -612,7 +668,13 @@ impl EntityIndex {
     /// re-checked by the EXACT f64-promoted compare, so the result set is
     /// bit-identical to the scalar path (differential-tested in
     /// tests/simd_parity.rs). No AVX2 (or mode=1): the scalar exact scan.
-    pub fn query(&self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
+    ///
+    /// PARITY ORDER (doc 36b): the physical blocked-SoA layout is re-sorted
+    /// to the vanilla key lazily (ensure_cell_order) — a versioned,
+    /// amortized once-per-cell-between-changes operation — so scan_cells
+    /// streams survivors in the vanilla order and the concatenated stream
+    /// across the chunkZ-major cell walk is bit-identical to vanilla's.
+    pub fn query(&mut self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
         out.clear();
         let ex = self.max_half_span + MARGIN as f64;
         let qx0 = b.x0 - ex;
@@ -626,27 +688,152 @@ impl EntityIndex {
         let my0 = (b.y0 - MARGIN as f64) as f32;
         let my1 = (b.y1 + MARGIN as f64) as f32;
 
-        for cx in cx0..=cx1 {
-            for cz in cz0..=cz1 {
+        // chunkZ-MAJOR cell walk: vanilla iterates regions/chunks Z outer,
+        // X inner — the concatenated per-cell streams must follow it.
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
                 let key = cell_key(world, cx, cz);
                 let cid = match self.cellmap.find(key) {
                     Some(v) => v as usize,
                     None => continue,
                 };
-                let ids = &self.cell_ids[cid];
-                let n = ids.len();
+                let n = self.cell_ids[cid].len();
                 if n == 0 {
                     continue;
                 }
+                // vanilla order for this cell's members (versioned; no-op
+                // when the layout is already current)
+                self.ensure_cell_order(cid as u32);
+                let ids = &self.cell_ids[cid];
                 let bx = &self.cell_box[cid];
                 let (ox, oz) = cell_origin(cx, cz);
                 simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
             }
         }
+        let mut any_ov = false;
         for o in &self.oversize {
             if o.world == world && o.b.intersects(b) {
                 out.push(o.id);
+                any_ov = true;
             }
+        }
+        if any_ov {
+            // Oversize entities live in vanilla sections interleaved with
+            // the cell population; restore the exact global order. Rare —
+            // the oversize list is empty in every bench scenario.
+            let mut keyed: Vec<(i64, i64, i64)> = out
+                .iter()
+                .map(|&id| {
+                    let (ka, kb) = self.order_key_of(id).unwrap_or((i64::MAX, i64::MAX));
+                    (ka, kb, id)
+                })
+                .collect();
+            keyed.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            out.clear();
+            out.extend(keyed.into_iter().map(|(_, _, id)| id));
+        }
+    }
+
+    /// The two-long vanilla order key of `id` — ka = (chunkZ biased)<<22 |
+    /// chunkX biased, kb = (sectionY biased)<<40 | seq — the same shape as
+    /// CeHooks.ordKey. Used by the oversize merge in [`EntityIndex::query`].
+    fn order_key_of(&self, id: i64) -> Option<(i64, i64)> {
+        const B: i64 = 2097152;
+        const M: i64 = 0x3F_FFFF;
+        if let Some(slot) = self.idmap.find(id) {
+            let home = self.homes[slot as usize] as usize;
+            let key = self.cell_keys[home];
+            let (cx, cz) = key_coords(key);
+            let ka = ((((cz as i64) + B) & M) << 22) | (((cx as i64) + B) & M);
+            let kb = ((((self.sy[slot as usize] as i64) + B) & M) << 40)
+                | (self.seq[slot as usize] & 0xFFFF_FFFF);
+            return Some((ka, kb));
+        }
+        if let Some(o) = self.oversize.iter().find(|o| o.id == id) {
+            let cx = (o.b.center_x().floor() as i64) >> CELL_SHIFT;
+            let cz = (o.b.center_z().floor() as i64) >> CELL_SHIFT;
+            let ka = ((((cz) + B) & M) << 22) | (((cx) + B) & M);
+            let kb = ((((o.sy as i64) + B) & M) << 40) | (o.seq & 0xFFFF_FFFF);
+            return Some((ka, kb));
+        }
+        None
+    }
+
+    /// Public wrapper for the module-side row publisher: bring one cell's
+    /// physical layout to the vanilla order before the row is copied to
+    /// Java (rowQuery serves candidates in row order — the row must be
+    /// vanilla-ordered for the merge/targeting tie-breaks to stay exact).
+    pub fn ensure_order(&mut self, cell: u32) {
+        self.ensure_cell_order(cell);
+    }
+
+    /// Re-sort one cell's physical blocked-SoA layout into the vanilla
+    /// (sectionY, seq) order — no-op when the layout already matches the
+    /// cell's current order version. Amortized: runs once per cell between
+    /// actual order changes, not once per query.
+    fn ensure_cell_order(&mut self, cell: u32) {
+        let c = cell as usize;
+        if self.cell_sv[c] == self.cell_ov[c] {
+            return;
+        }
+        let n = self.cell_ids[c].len();
+        if n > 1 {
+            // (slot, keyB) rows; keyB = (sy biased)<<40 | seq — within one
+            // cell chunkZ/chunkX are constant, so the key halves reduce to
+            // sectionY + seq.
+            let mut rows: Vec<(u32, i64)> = Vec::with_capacity(n);
+            for p in 0..n {
+                let slot = self.cell_slots[c][p] as usize;
+                let kb = ((((self.sy[slot] as i64) + 2097152) & 0x3F_FFFF) << 40)
+                    | (self.seq[slot] & 0xFFFF_FFFF);
+                rows.push((slot as u32, kb));
+            }
+            rows.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            let order: Vec<u32> = rows.into_iter().map(|(s, _)| s).collect();
+            self.write_cell_layout(c, &order);
+        }
+        self.cell_sv[c] = self.cell_ov[c];
+    }
+
+    /// Physically rebuild one cell's blocked-SoA arrays in the given slot
+    /// order (shared by ensure_cell_order and sort_cell_by_keys).
+    fn write_cell_layout(&mut self, c: usize, order: &[u32]) {
+        let mut blocks: Vec<f32> = Vec::with_capacity(((order.len() + 7) >> 3) * BLOCK_F32);
+        let old_box = std::mem::take(&mut self.cell_box[c]);
+        let mut chunk: [f32; 6] = [0.0; 6];
+        for (i, &slot) in order.iter().enumerate() {
+            let lane = i & 7;
+            if lane == 0 {
+                let mut blk = [0.0f32; BLOCK_F32];
+                for l in 0..8 {
+                    blk[l] = PAD_X0;
+                    blk[24 + l] = PAD_X1;
+                }
+                blocks.extend_from_slice(&blk);
+            }
+            let oldp = self.cpos[slot as usize] as usize;
+            let oldbase = (oldp >> 3) * BLOCK_F32 + (oldp & 7);
+            // blocked-SoA segments: x0@0, y0@8, z0@16, x1@24, y1@32, z1@40
+            chunk[0] = old_box[oldbase];
+            chunk[1] = old_box[oldbase + 8];
+            chunk[2] = old_box[oldbase + 16];
+            chunk[3] = old_box[oldbase + 24];
+            chunk[4] = old_box[oldbase + 32];
+            chunk[5] = old_box[oldbase + 40];
+            let base = (i >> 3) * BLOCK_F32 + lane;
+            let bl = &mut blocks[base..base + 41];
+            bl[0] = chunk[0];
+            bl[8] = chunk[1];
+            bl[16] = chunk[2];
+            bl[24] = chunk[3];
+            bl[32] = chunk[4];
+            bl[40] = chunk[5];
+            self.cpos[slot as usize] = i as u32;
+        }
+        self.cell_box[c] = blocks;
+        for (i, &slot) in order.iter().enumerate() {
+            self.cell_ids[c][i] = self.ids[slot as usize];
+            self.cell_slots[c][i] = slot;
         }
     }
 
@@ -812,6 +999,8 @@ impl EntityIndex {
         self.cell_box.push(Vec::new());
         self.cell_slots.push(Vec::new());
         self.cell_keys.push(key);
+        self.cell_ov.push(0);
+        self.cell_sv.push(0);
         let id = (self.cell_keys.len() - 1) as u32;
         self.cellmap.insert(key, id);
         self.stats.cells += 1;
@@ -890,10 +1079,14 @@ impl EntityIndex {
             let moved_world = self.worlds[last];
             let moved_home = self.homes[last];
             let moved_cpos = self.cpos[last];
+            let moved_sy = self.sy[last];
+            let moved_seq = self.seq[last];
             self.ids[slot] = moved_id;
             self.worlds[slot] = moved_world;
             self.homes[slot] = moved_home;
             self.cpos[slot] = moved_cpos;
+            self.sy[slot] = moved_sy;
+            self.seq[slot] = moved_seq;
             let mp = moved_cpos as usize;
             self.cell_slots[moved_home as usize][mp] = slot as u32;
             self.idmap.insert(moved_id, slot as u32);
@@ -902,28 +1095,31 @@ impl EntityIndex {
         self.worlds.pop();
         self.homes.pop();
         self.cpos.pop();
+        self.sy.pop();
+        self.seq.pop();
     }
 
-    fn upsert_oversize(&mut self, id: i64, world: u16, b: Aabb) -> UpsertEv {
+    fn upsert_oversize_ord(&mut self, id: i64, world: u16, b: Aabb, sy: i32, seq: i64) -> UpsertEv {
         if let Some(slot) = self.idmap.find(id) {
             // was a normal entity: detach it first
             let home = self.homes[slot as usize];
+            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
             self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
             self.free_slot(slot as usize);
             self.stats.entities -= 1;
             if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
-                self.oversize[p] = Oversize { id, world, b };
+                self.oversize[p] = Oversize { id, world, b, sy, seq };
                 return UpsertEv::ToOversize { old: Some(home) };
             }
-            self.oversize.push(Oversize { id, world, b });
+            self.oversize.push(Oversize { id, world, b, sy, seq });
             self.stats.oversize += 1;
             return UpsertEv::ToOversize { old: Some(home) };
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
-            self.oversize[p] = Oversize { id, world, b };
+            self.oversize[p] = Oversize { id, world, b, sy, seq };
             return UpsertEv::OversizeSame;
         }
-        self.oversize.push(Oversize { id, world, b });
+        self.oversize.push(Oversize { id, world, b, sy, seq });
         self.stats.oversize += 1;
         UpsertEv::ToOversize { old: None }
     }

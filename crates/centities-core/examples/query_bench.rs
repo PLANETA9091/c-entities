@@ -8,7 +8,7 @@
 use centities_core::{Aabb, EntityIndex};
 use std::time::Instant;
 
-fn bench(label: &str, idx: &EntityIndex, boxes: &[Aabb], iters: usize) {
+fn bench(label: &str, idx: &mut EntityIndex, boxes: &[Aabb], iters: usize) {
     let mut out: Vec<i64> = Vec::with_capacity(4096);
     let mut sink = 0usize;
     // warmup
@@ -92,7 +92,7 @@ fn main() {
         idx.stats().cells,
         idx.max_half_span()
     );
-    bench("dense-pile mob query", &idx, &qboxes, 4);
+    bench("dense-pile mob query", &mut idx, &qboxes, 4);
 
     // ---- workload 2: spread (isolated items, same boxes) ----
     let mut idx2 = EntityIndex::new();
@@ -117,7 +117,7 @@ fn main() {
         idx2.stats().entities,
         idx2.stats().cells
     );
-    bench("spread mob query", &idx2, &qb2, 4);
+    bench("spread mob query", &mut idx2, &qb2, 4);
 
     // candidate-count probe for context
     let mut out = Vec::new();

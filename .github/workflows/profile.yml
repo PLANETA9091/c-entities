@@ -65,7 +65,7 @@ jobs:
           esac
           MEAS="${{ inputs.measure }}"
           if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
-          RUN_NAME="prof-$SC" \
+          RUN_NAME="prof-$SC-on" \
           SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
           AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
           MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \

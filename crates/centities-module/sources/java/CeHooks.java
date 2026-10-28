@@ -729,8 +729,16 @@ public final class CeHooks {
                 // may skip the entry. Without this, a moving entity's own
                 // pending probe would force its every query onto the native
                 // path (observed: falling items never hit the row path).
+                // PARITY ORDER (doc 36b): a section-Y change WITHIN the cell
+                // (y crossing a 16-block boundary) is a vanilla RE-APPEND —
+                // the row's id ORDER changes even though the id LIST does
+                // not, so it must NOT classify row-neutral (the row keeps
+                // its old order until the next dirty republish).
                 AABB oldBox = e.getBoundingBox();
-                boolean rowNeutral = oldBox != null
+                int curSy = e.moonrise$getSectionY();
+                boolean syMoved = LAST_SY[e.getId() & AMASK] != curSy;
+                LAST_SY[e.getId() & AMASK] = curSy;
+                boolean rowNeutral = !syMoved && oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
                 batchUpsert(e.getId(), worldId(e.level()), e, newBox, rowNeutral);
             }
@@ -800,12 +808,17 @@ public final class CeHooks {
         int o = bN * 6;
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
+        // PARITY ORDER (doc 36b): the exact (sectionY, insertion seq) stamps
+        // travel with EVERY entry — items merge-scan through the same index
+        // and their ties are order-sensitive (vanilla EntityLookup order:
+        // chunkZ, chunkX, sectionY, seq). moonrise$getSectionY and the
+        // ORD_SEQ stamp live on plain Entity, not just LivingEntity.
+        B_SY[bN] = e.moonrise$getSectionY();
+        B_SEQ[bN] = ORD_SEQ[e.getId() & AMASK];
         if (e instanceof net.minecraft.world.entity.LivingEntity le) {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
             B_PXZ[bN * 2 + 1] = le.getZ();
-            B_SY[bN] = le.moonrise$getSectionY();
-            B_SEQ[bN] = ORD_SEQ[le.getId() & AMASK];
             Vec3 dv = le.getDeltaMovement();
             B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
             Entity veh = le.isPassenger() ? le.getVehicle() : null;
@@ -814,8 +827,6 @@ public final class CeHooks {
             B_PF[bN] = 0;
             B_PXZ[bN * 2] = 0.0;
             B_PXZ[bN * 2 + 1] = 0.0;
-            B_SY[bN] = 0;
-            B_SEQ[bN] = 0;
             B_DV[bN * 3] = 0.0; B_DV[bN * 3 + 1] = 0.0; B_DV[bN * 3 + 2] = 0.0;
             B_VID[bN] = 0;
         }
@@ -1065,6 +1076,10 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
+    // PARITY ORDER: the last section-Y seen per id (probeBox) — a change
+    // within the same home cell is a vanilla re-append and must force a
+    // dirty republish (see the rowNeutral classification in probeBox).
+    private static final int[] LAST_SY = new int[ARENA.length];
 
     // ------------------------------------------------------------------
     // L37 — VANILLA SCAN ORDER. The parity A/B (run 40529103630) proved the
@@ -1109,6 +1124,7 @@ public final class CeHooks {
     public static void probeMoveSection(Entity e) {
         try {
             if (!ACTIVE || !INDEXING || e == null) return;
+            if (SECTION_STAMP_SCHEME != 0) return; // slices-append scheme owns the stamp
             net.minecraft.world.level.Level lvl = e.level();
             if (lvl == null || lvl.isClientSide()) return;
             int oz = e.moonrise$getSectionZ();
@@ -1125,6 +1141,63 @@ public final class CeHooks {
         } catch (Throwable t) {
             // never break movement: a missed stamp costs order fidelity on
             // one entity, a throw here would desync every world tick
+        }
+    }
+
+    // The stamp-scheme selection (patch_lookup): 1 = the SLICES scheme — the
+    // seq stamp + moonrise field pre-write happen in the ChunkEntitySlices.
+    // addEntity PREFIX, which is the ONLY point where the live section
+    // structure, the moonrise fields and the order key are simultaneously
+    // consistent (between removeEntity and addEntity the entity is INVISIBLE
+    // to vanilla scans, so the pre-written fields cannot desync anything);
+    // 0 = the legacy moveEntity-PREFIX scheme — the stamp lands BEFORE the
+    // actual re-append, and every query inside the remove+add+setSection
+    // window sorts a (stale section, fresh seq) key that disagrees with the
+    // live structure — THE residual parity divergence (run 40647817613:
+    // 12/16500 merge flips, jockey lottery desync). The slices patch is
+    // attempted first; a refusal falls back to 0 (exact-ish, never worse).
+    public static final int SECTION_STAMP_SCHEME = 1;
+
+    /** PARITY ORDER (doc 36b): the ChunkEntitySlices.addEntity PREFIX —
+     *  the vanilla re-append point. The receiver slices' chunkX/chunkZ are
+     *  the NEW chunk coords and `sy` the (already clamped) new section Y.
+     *  We PRE-WRITE the moonrise section fields and bump the insertion seq
+     *  HERE: the live structure still holds the entity in the old section
+     *  (the body appends it), but between removeEntity and addEntity the
+     *  entity is invisible to every vanilla scan — no observer can read the
+     *  transient state. From this point on (new fields + fresh seq) the
+     *  order key is consistent with the live structure FOREVER — the
+     *  moveEntity-prefix window (remove+add+setSection, dozens of ops with
+     *  allocations) is gone. Also pushes an immediate batchUpsert so the
+     *  Rust index/published rows re-sync in the SAME tick. */
+    public static void probeSectionAppend(Entity e, int sy) {
+        try {
+            if (!ACTIVE || !INDEXING || e == null) return;
+            net.minecraft.world.level.Level lvl = e.level();
+            if (lvl == null || lvl.isClientSide()) return;
+            // moveEntity computes the target chunk from blockPosition right
+            // before calling addEntity, and chunk-load paths add entities at
+            // their own position — deriving the new chunk coords from the
+            // entity is exact. `sy` is the ALREADY clamped section Y the
+            // slices body receives.
+            int nx = (int) Math.floor(e.getX()) >> 4;
+            int nz = (int) Math.floor(e.getZ()) >> 4;
+            e.moonrise$setSectionX(nx);
+            e.moonrise$setSectionY(sy);
+            e.moonrise$setSectionZ(nz);
+            ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+            LAST_SY[e.getId() & AMASK] = sy;
+            if (lvl instanceof net.minecraft.server.level.ServerLevel) {
+                AABB b = e.getBoundingBox();
+                if (b != null) {
+                    int wid = worldId(lvl);
+                    if (wid >= 0) {
+                        batchUpsert(e.getId(), wid, e, b, false);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // never break movement — same reasoning as probeMoveSection
         }
     }
 
@@ -1343,7 +1416,7 @@ public final class CeHooks {
             // DIRECT OUT BUFFER path (doc 21): one JNI crossing, zero per-
             // query array ops; ids are read back via intrinsified getLong.
             n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    bn, B_IDS, B_BOX);
+                    bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -1359,7 +1432,7 @@ public final class CeHooks {
                     // regrow that actually grows — latent since doc 21.
                     dbb = IDS_BUF;
                     n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                            0, B_IDS, B_BOX);
+                            0, B_IDS, B_BOX, B_SY, B_SEQ);
                 }
             }
             if (n == -1) {
@@ -1398,7 +1471,7 @@ public final class CeHooks {
             // queries). batchN>0 only on the first attempt; retries must NOT
             // re-apply.
             n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    ids, bn, B_IDS, B_BOX);
+                    ids, bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -1408,7 +1481,7 @@ public final class CeHooks {
                 ids = new long[n];
                 QBUF.set(ids);
                 n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                        ids, 0, B_IDS, B_BOX);
+                        ids, 0, B_IDS, B_BOX, B_SY, B_SEQ);
             }
             if (n < 0) {
                 mNotReady++;
@@ -1996,7 +2069,8 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            long[] out, int batchN, long[] batchIds, double[] batchBoxes);
+            long[] out, int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     public static native void nativeFlush(
             int n, long[] ids, double[] boxes,
             int[] pf, double[] pxz, double[] dv, int[] vid,
@@ -2032,7 +2106,8 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative2(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            int batchN, long[] batchIds, double[] batchBoxes);
+            int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     /** Registers a direct buffer as the query out-buffer; returns the
      *  capacity in longs, or 0 on any failure (legacy path stays armed). */
     public static native int nativeSetOutBuffer(java.nio.ByteBuffer buf);
