@@ -175,13 +175,20 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // stream evolves identically tick-by-tick. Any behavioral
             // difference (extra draw, different decision) diverges it.
             boolean seeded = seedSharedRandom("onEnable");
+            boolean lvlSeeded = seedLevelRandom("onEnable");
             getLogger().info("PARITY harness armed: seed=" + paritySeed
-                    + " seeded=" + seeded
+                    + " seeded=" + seeded + " lvlSeeded=" + lvlSeeded
                     + " fillStartTick=" + parityFillStartTick + " (bot ignored)");
             Bukkit.getScheduler().runTaskTimer(this, () -> {
                 if (!started && tickNo >= parityFillStartTick) {
                     started = true; // ONE-SHOT — begin() must never run twice
-                    getLogger().info("PARITY: fixed-tick fill start at T" + tickNo);
+                    // Re-pin the WORLD random at fill-start: boot-phase draws
+                    // (spawn-point search, worldgen edges) may consume a
+                    // variable count of Level.random — a fresh seed here makes
+                    // the fill window's starting state seed-exact regardless.
+                    boolean lvl2 = seedLevelRandom("fill-start");
+                    getLogger().info("PARITY: fixed-tick fill start at T" + tickNo
+                            + " lvlSeeded=" + lvl2);
                     begin(null);
                 }
             }, 1L, 1L);
@@ -215,6 +222,54 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             return true;
         } catch (Throwable t) {
             getLogger().warning("PARITY: cannot seed SHARED_RANDOM (" + where + "): " + t);
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Level.random (protected final RandomSource on Level) is a SECOND
+    // entropy stream the old harness never pinned. Mob.finalizeSpawn —
+    // invoked by CraftRegionAccessor.addEntity on EVERY Bukkit-spawned
+    // mob (randomizeData=true) — draws its canPickUpLoot / baby-odds /
+    // CHICKEN-JOCKEY / canBreakDoors / equipment rolls from
+    // `level.getRandom()` (Mob.java:1201, 26.3), NOT from
+    // SHARED_RANDOM. Unpinned, the two legs rolled different jockeys:
+    // the vanilla off-leg itself varied across CI runs (n_off=2505/2506/
+    // 2508 at mobs-T382) and every knob config "failed" with ~10-12
+    // CHICKEN<->ZOMBIE flips that were NEVER the module's fault.
+    // LegacyRandomSource.setSeed is freely re-callable (no lock, unlike
+    // SHARED_RANDOM) — pin it once at enable and once at fill-start
+    // (a fill-start re-pin also absorbs any variable boot-phase draw
+    // count, making the fill window's starting state seed-exact).
+    // ------------------------------------------------------------------
+    private java.lang.reflect.Method lvlSeedM;
+    private Object lvlRandom;
+    private boolean lvlRandomTried;
+
+    private boolean seedLevelRandom(String where) {
+        try {
+            if (!lvlRandomTried) {
+                lvlRandomTried = true;
+                World w = Bukkit.getWorlds().get(0);
+                Object sl = w.getClass().getMethod("getHandle").invoke(w);
+                Field f = null;
+                for (Class<?> c = sl.getClass(); c != null && f == null; c = c.getSuperclass()) {
+                    try {
+                        f = c.getDeclaredField("random");
+                    } catch (NoSuchFieldException ignore) { }
+                }
+                if (f == null) return false;
+                f.setAccessible(true);
+                lvlRandom = f.get(sl);
+                if (lvlRandom == null) return false;
+                lvlSeedM = lvlRandom.getClass().getMethod("setSeed", long.class);
+                lvlSeedM.setAccessible(true);
+            }
+            if (lvlRandom == null || lvlSeedM == null) return false;
+            lvlSeedM.invoke(lvlRandom, paritySeed ^ 0x9E3779B97F4A7C15L);
+            return true;
+        } catch (Throwable t) {
+            getLogger().warning("PARITY: cannot seed Level.random (" + where + "): " + t);
             return false;
         }
     }
