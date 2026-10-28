@@ -393,6 +393,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 }
             }
         }
+        if (parity) {
+            logParityHash();
+        }
         if (parity && traceId >= 0) {
             traceStep();
         }
@@ -667,6 +670,127 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // activatedTick (parity mode only — perf irrelevant there).
     private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
     private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED;
+
+    // ------------------------------------------------------------------
+    // PARITY PHASH: per-tick ORDER-INDEPENDENT checksum of the whole
+    // observable entity state. One "PH t=.. h=.. n=.. adds=.." line per
+    // tick in each leg's log (parity mode only); a post-hoc diff of the
+    // two legs' log streams names the FIRST diverging tick and scenario —
+    // the snapshot triple only shows T+50/+300/+650 accumulations, which
+    // is useless for locating the seed of a cascade (observed: mixed has
+    // 3814 type flips by T389 — the seed is ticks earlier, invisible in
+    // snapshots). Order-independent by construction: commutative sum of a
+    // per-entity 64-bit avalanche, so the world's entity-list iteration
+    // order can neither fake nor mask a divergence. Spawn divergence is
+    // visible through adds= (entity ids are monotonic within a session,
+    // so id > watermark <=> new entity); removals are derivable post-hoc
+    // (n_prev - n + adds). Zero allocation: MethodHandles with primitive
+    // signatures (no boxing), ~8 invokes + 7 multiplies per entity.
+    // ------------------------------------------------------------------
+    private static volatile java.lang.invoke.MethodHandle PH_GET_HANDLE,
+            PH_X, PH_Y, PH_Z, PH_DM, PH_VX, PH_VY, PH_VZ;
+    private long phMaxId;
+    private long phLines;
+
+    private static long phMix(long k) {
+        k *= 0x9E3779B97F4A7C15L;
+        k ^= k >>> 30; k *= 0xBF58476D1CE4E5B9L;
+        k ^= k >>> 27; k *= 0x94D049BB133111EBL;
+        return k ^ (k >>> 31);
+    }
+
+    private void phBind(Object nmsSample) {
+        try {
+            var lk = java.lang.invoke.MethodHandles.lookup();
+            Class<?> nms = nmsSample.getClass();
+            java.lang.reflect.Method m;
+            m = nms.getMethod("getX"); PH_X = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getY"); PH_Y = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getZ"); PH_Z = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getDeltaMovement");
+            PH_DM = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
+            Class<?> vec3 = m.getReturnType();
+            m = vec3.getMethod("getX"); PH_VX = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = vec3.getMethod("getY"); PH_VY = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = vec3.getMethod("getZ"); PH_VZ = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+        } catch (Throwable t) {
+            getLogger().warning("PH bind failed (n/adds only): " + t);
+        }
+    }
+
+    private void logParityHash() {
+        try {
+            List<Entity> ents = Bukkit.getWorlds().get(0).getEntities();
+            int n = ents.size();
+            // seed the sum with the tick so a symmetric remove+respawn in
+            // one tick cannot produce a constant stream
+            long h = phMix(tickNo);
+            long adds = 0, maxId = phMaxId;
+            if (ents.isEmpty()) {
+                phMaxId = maxId;
+                getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
+                        + " n=0 adds=0");
+                return;
+            }
+            if (PH_GET_HANDLE == null) {
+                phBindRoot(ents.get(0));
+            }
+            boolean bound = PH_GET_HANDLE != null;
+            if (bound && PH_X == null) {
+                Object sample = PH_GET_HANDLE.invoke(ents.get(0));
+                if (sample != null) phBind(sample);
+                bound = PH_X != null;
+            }
+            for (int i = 0; i < n; i++) {
+                Entity be = ents.get(i);
+                int id = be.getEntityId();
+                if (id > maxId) { adds++; maxId = id; }
+                if (!bound) continue;
+                Object e = PH_GET_HANDLE.invoke(be);
+                double x = (double) PH_X.invokeExact(e);
+                double y = (double) PH_Y.invokeExact(e);
+                double z = (double) PH_Z.invokeExact(e);
+                Object dm = (Object) PH_DM.invokeExact(e);
+                long m = phMix(id);
+                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(x)), 7);
+                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(y)), 17);
+                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(z)), 27);
+                if (dm != null) {
+                    double vx = (double) PH_VX.invokeExact(dm);
+                    double vy = (double) PH_VY.invokeExact(dm);
+                    double vz = (double) PH_VZ.invokeExact(dm);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vx)), 37);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vy)), 47);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vz)), 57);
+                }
+                h += phMix(m);
+            }
+            phMaxId = maxId;
+            phLines++;
+            getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
+                    + " n=" + n + " adds=" + adds);
+        } catch (Throwable t) {
+            if (phLines < 3) getLogger().warning("PH step failed: " + t);
+        }
+    }
+
+    private void phBindRoot(Entity be) {
+        try {
+            var lk = java.lang.invoke.MethodHandles.lookup();
+            java.lang.reflect.Method gh = be.getClass().getMethod("getHandle");
+            PH_GET_HANDLE = lk.unreflect(gh)
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
+        } catch (Throwable t) {
+            getLogger().warning("PH root bind failed: " + t);
+        }
+    }
 
     // ------------------------------------------------------------------
     // PARITY_TRACE_ID: per-tick EXACT trace of ONE entity (both legs write
