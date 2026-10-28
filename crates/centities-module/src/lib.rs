@@ -1152,6 +1152,7 @@ static TTL_DECLINED: AtomicBool = AtomicBool::new(false);
 static TTL_ARMED: AtomicBool = AtomicBool::new(false);
 /// L33: the LivingEntity.tickEffects empty-map early-out weave state.
 static EFF_WOVEN: AtomicBool = AtomicBool::new(false);
+static COLLIDE_WOVEN: AtomicBool = AtomicBool::new(false);
 static EFF_DECLINED: AtomicBool = AtomicBool::new(false);
 static EFF_ARMED: AtomicBool = AtomicBool::new(false);
 /// L18: the Entity.setSharedFlag no-op-write gate weave is prepared.
@@ -1462,7 +1463,7 @@ fn precompute_livingentity(loader: jni::jobject) {
         if !eff_ok {
             return base;
         }
-        match base {
+        let base = match base {
             Some(b) => match cplug_sdk::asm::insert_early_return_guard(
                 env,
                 loader,
@@ -1491,6 +1492,38 @@ fn precompute_livingentity(loader: jni::jobject) {
                     None => None,
                 }
             }
+        };
+        // L38 chain: the collide fast path (CE_COLLIDE=0 disables). An
+        // OPTIONAL ReplaceBody — a refusal keeps the guards above.
+        if std::env::var("CE_COLLIDE").as_deref() == Ok("0") {
+            return base;
+        }
+        let collide_spec = cplug_sdk::asm::ReplaceBody {
+            method_name: "canCollideWithBukkit",
+            method_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+            bridge_owner: HOOKS_CLASS,
+            bridge_name: "canCollideWithBukkit$",
+            bridge_desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/Entity;)Z",
+            args: &[
+                cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+                cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            ],
+        };
+        match base {
+            Some(b) => match cplug_sdk::asm::replace_body(env, loader, &b, &collide_spec) {
+                Some(b2) if !b2.is_empty() => {
+                    COLLIDE_WOVEN.store(true, Ordering::Release);
+                    Some(b2)
+                }
+                _ => Some(b),
+            },
+            None => match cplug_sdk::asm::replace_body(env, loader, &bytes, &collide_spec) {
+                Some(b2) if !b2.is_empty() => {
+                    COLLIDE_WOVEN.store(true, Ordering::Release);
+                    Some(b2)
+                }
+                _ => None,
+            },
         }
     });
     match patched {

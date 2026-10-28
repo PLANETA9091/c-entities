@@ -1212,6 +1212,27 @@ public final class CeHooks {
     private static long[] ORD_KA = new long[0];
     private static long[] ORD_KB = new long[0];
 
+    /** L38 — the collide fast path (CE_COLLIDE=0 disables the weave).
+     *  Byte-exact port of LivingEntity.canCollideWithBukkit (26.3):
+     *  `isPushable() && collides != collidableExemptions.contains(uuid)` —
+     *  with the EMPTY-SET fast path. A default Paper server keeps
+     *  collidableExemptions empty (Bukkit-API opt-in), and HashSet.contains
+     *  pays a full UUID hash + table probe for an answer that is provably
+     *  FALSE for an empty set — EntitySelector.pushableBy evaluates this
+     *  per candidate per push/collision query, 7.1% of the mobs-25k-mod
+     *  profile (the single largest controllable leaf). isPushable() stays a
+     *  real virtual call; the exempt branch on a NON-empty set is exactly
+     *  vanilla (same hash, same probe, same result). */
+    public static boolean canCollideWithBukkit$(net.minecraft.world.entity.LivingEntity le,
+                                                net.minecraft.world.entity.Entity other) {
+        if (!le.isPushable()) {
+            return false;
+        }
+        java.util.Set<java.util.UUID> ex = le.collidableExemptions;
+        boolean exempt = ex != null && !ex.isEmpty() && ex.contains(other.getUUID());
+        return le.collides != exempt;
+    }
+
     /** The two-long vanilla order key: ka = (chunkZ biased 22b) << 22 |
      *  (chunkX biased 22b); kb = (sectionY biased 22b) << 40 | seq (32b). */
     private static void ordKey(Entity e, int i) {

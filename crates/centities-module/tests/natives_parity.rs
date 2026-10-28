@@ -14,8 +14,10 @@ use std::collections::BTreeSet;
 /// KEEP IN SYNC — the test fails on any drift from either direction.
 fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     let mut s = BTreeSet::new();
-    s.insert(("queryNative", "(IDDDDDD[JI[J[D)I"));
-    s.insert(("queryNative2", "(IDDDDDDI[J[D)I"));
+    // PARITY ORDER (doc 36b): the query natives carry the per-entry (sy, seq)
+    // stamp arrays (B_SY/B_SEQ) alongside ids+boxes.
+    s.insert(("queryNative", "(IDDDDDD[JI[J[D[I[I)I"));
+    s.insert(("queryNative2", "(IDDDDDDI[J[D[I[I)I"));
     s.insert(("nativeSetOutBuffer", "(Ljava/nio/ByteBuffer;)I"));
     // L12: the flush carries the push-state extension + the delta batch
     // L37: + the vanilla-order keys (sy, seq int arrays per entry)
