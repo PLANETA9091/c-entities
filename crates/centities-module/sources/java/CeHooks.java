@@ -2371,11 +2371,16 @@ public final class CeHooks {
                     java.lang.invoke.MethodHandles.lookup().unreflectSetter(f)
                             .asType(java.lang.invoke.MethodType.methodType(
                                     void.class, Entity.class, int.class));
-            // the PUBLIC getter — no setAccessible on the protected field
-            java.lang.reflect.Method g = net.minecraft.world.entity.LivingEntity.class
-                    .getDeclaredMethod("getRandom");
+            // 26.3 removed Entity.getRandom()/LivingEntity.getRandom() — the
+            // RandomSource is the protected final Entity.random FIELD
+            // (javap-verified: no getRandom on Entity/LivingEntity/Mob;
+            // observed: NoSuchMethodException killed the whole ncolMh bind
+            // and silently vanilla-routed the push kernel in every leg).
+            java.lang.reflect.Field rf = net.minecraft.world.entity.Entity.class
+                    .getDeclaredField("random");
+            rf.setAccessible(true);
             java.lang.invoke.MethodHandle rnd =
-                    java.lang.invoke.MethodHandles.lookup().unreflect(g)
+                    java.lang.invoke.MethodHandles.lookup().unreflectGetter(rf)
                             .asType(java.lang.invoke.MethodType.methodType(
                                     net.minecraft.util.RandomSource.class,
                                     net.minecraft.world.entity.LivingEntity.class));

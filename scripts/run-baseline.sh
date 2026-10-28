@@ -153,11 +153,20 @@ MOBAI_PROP=""
 if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-0}" = "1" ]; then
   MOBAI_PROP="-Dcentities.mobAi=1"
 fi
+# Same for the L15 GoalSelector floor: shipped = vanilla GoalSelector.
+# The CeHooks reader keeps the floor ON unless the property is literally
+# "false" — so the shipped path must PASS -Dcentities.aiFloor=false, and
+# CE_AI_FLOOR=1 (opt-in) omits the flag.
+AIFLOOR_PROP=""
+if [ "${MODULE:-off}" = "on" ] && [ "${CE_AI_FLOOR:-0}" != "1" ]; then
+  AIFLOOR_PROP="-Dcentities.aiFloor=false"
+fi
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1} mobAi=${MOBAI_PROP:+on}"
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
   ${MERGE_PROP} \
   ${MOBAI_PROP} \
+  ${AIFLOOR_PROP} \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
