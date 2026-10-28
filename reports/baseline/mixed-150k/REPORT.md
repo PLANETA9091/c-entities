@@ -6,31 +6,31 @@ Server: `26.3-227-7f9c797 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 150000 (items 105073 / stands 30072 / zombies 14855) (merge shrink: 110341 -> 110341) |
+| entities spawned | 150000 (items 105073 / stands 30072 / zombies 14855) (merge shrink: 110421 -> 110421) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 716.186 / 906.299 / 1354.557 / 1550.205 |
-| MSPT mean, ms | 755.024 |
-| TPS estimate (1000/p50) | 1.4 |
-| heap used / max, MB | 2455.7 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 507.602 / 635.920 / 936.162 / 1014.520 |
+| MSPT mean, ms | 530.466 |
+| TPS estimate (1000/p50) | 2.0 |
+| heap used / max, MB | 3010.5 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 39.70% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 3.92% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
-| 3 | 3.15% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 4 | 2.29% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
-| 5 | 1.71% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 6 | 1.42% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3908` |
-| 7 | 1.35% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
-| 8 | 1.33% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
-| 9 | 1.22% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 10 | 0.96% | `net.minecraft.server.level.ServerLevel.tick(BooleanSupplier) line: 892` |
-| 11 | 0.96% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 12 | 0.88% | `net.minecraft.world.entity.Entity.setOldPos(Vec3) line: 2404` |
-| 13 | 0.84% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 14 | 0.79% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 118` |
-| 15 | 0.73% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 1 | 28.14% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 4.18% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 3 | 3.04% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4707` |
+| 4 | 2.59% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 5 | 2.38% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
+| 6 | 2.03% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3908` |
+| 7 | 2.02% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 8 | 1.96% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
+| 9 | 1.76% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 10 | 1.62% | `net.minecraft.server.level.ChunkMap$TrackedEntity.moonrise$clearPlayers() line: 1336` |
+| 11 | 1.31% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 12 | 1.05% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 13 | 0.95% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 118` |
+| 14 | 0.93% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
+| 15 | 0.78% | `net.minecraft.world.entity.Entity.setSharedFlag(int, boolean) line: 3869` |
 
