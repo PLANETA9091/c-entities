@@ -437,6 +437,19 @@ public final class CeHooks {
             }
             mergeFast++;
             mergeCand += cands.size();
+            // MS: the scan's candidate list at PH_DUMP ticks — the parity
+            // diff names the exact candidate-order divergence (vanilla's
+            // first candidate kills the ticking item at equal counts, so
+            // a different first candidate flips the survivor ids).
+            if (phDumpTickNow()) {
+                StringBuilder msb = new StringBuilder(96);
+                msb.append("MS t=").append(CURRENT_TICK)
+                        .append(" self=").append(e.getId()).append(" n=").append(cands.size());
+                for (int k = 0; k < Math.min(cands.size(), 24); k++) {
+                    msb.append(' ').append(cands.get(k).getId());
+                }
+                System.out.println("[ce-baseline] " + msb);
+            }
             boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
             for (int k = 0; k < cands.size(); k++) {
                 ItemEntity other = (ItemEntity) cands.get(k);
@@ -2291,6 +2304,33 @@ public final class CeHooks {
     // ==================================================================
 
     public static final boolean ITEM_TICK_ON = !"0".equals(System.getenv("CE_ITEM_TICK"));
+
+    // MS diagnostics: the merge scan streams its candidate list when the
+    // current tick is inside the PH_DUMP window (one range — enough to aim
+    // the parity diff). CUR_TICK bumps once per itemTickFlush (the scans
+    // run only inside the flush, so it is exact for them).
+    private static final int[] MS_WINDOW = parseMsWindow(System.getenv("PH_DUMP"));
+    public static volatile int CUR_TICK = 0;
+
+    private static int[] parseMsWindow(String s) {
+        if (s == null || s.isBlank()) return new int[0];
+        try {
+            int dash = s.indexOf('-');
+            if (dash > 0) {
+                return new int[]{Integer.parseInt(s.substring(0, dash).trim()),
+                        Integer.parseInt(s.substring(dash + 1).split(",")[0].trim())};
+            }
+            int v = Integer.parseInt(s.trim().split(",")[0]);
+            return new int[]{v, v};
+        } catch (NumberFormatException quiet) {
+            return new int[0];
+        }
+    }
+
+    private static boolean phDumpTickNow() {
+        return MS_WINDOW.length == 2
+                && CUR_TICK >= MS_WINDOW[0] && CUR_TICK <= MS_WINDOW[1];
+    }
     // L15b: PLAIN (per item-tick, 100k/tick) — see the mergeChecks note.
     public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
@@ -3961,6 +4001,7 @@ public final class CeHooks {
     public static void itemTickFlush(Level level) {
         int n = ibN;
         itemFlushes++;
+        CUR_TICK++;
         if (n == 0) return;
         ibN = 0;
         int cdN = ibCDN;
