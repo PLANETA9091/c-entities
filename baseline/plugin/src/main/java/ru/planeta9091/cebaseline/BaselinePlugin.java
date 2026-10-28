@@ -958,6 +958,11 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .append('\n');
             traceOut.write(sb.toString());
             traceOut.flush();
+            // Stream into server.log too: the watchdog delta-tails it into
+            // the job log, making the per-tick trace diff instant (the
+            // parity-results artifact is 1.8GB and outlived its welcome).
+            getLogger().info("PTRACE t=" + tickNo + " "
+                    + sb.substring(sb.indexOf(" type=")).trim());
         } catch (Throwable t) {
             getLogger().warning("trace step failed: " + t);
         }
