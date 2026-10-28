@@ -664,8 +664,19 @@ unsafe fn n_item_tick_impl(
                                     zo: if has_cd { d[dbo + 2] } else { 0.0 },
                                     on_ground: (f & F_ON_GROUND) != 0,
                                     fall_dist: if has_cd { d[dbo + 6] as f32 } else { 0.0 },
-                                    // dispatcher-incremented; the core does NOT ++
-                                    tick_count: iv[k * 4],
+                                    // Batch tc semantics: PRE when the body was
+                                    // suppressed (IF_NATIVE — the dispatcher's ++
+                                    // runs after the tick body, trace-proven run
+                                    // 40728505667), POST when the vanilla body
+                                    // already ran (IF_RESYNC / IF_FORCE_VANILLA).
+                                    // The store convention is POST; tick_item's
+                                    // vanilla cadences read the PRE value via
+                                    // tc-1, so both paths must land on POST.
+                                    tick_count: if (f & F_NATIVE) != 0 {
+                                        iv[k * 4].wrapping_add(1)
+                                    } else {
+                                        iv[k * 4]
+                                    },
                                     age: iv[k * 4 + 1],
                                     pickup_delay: iv[k * 4 + 2],
                                     despawn_rate: iv[k * 4 + 3],
