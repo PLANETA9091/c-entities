@@ -774,8 +774,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             }
             phMaxId = maxId;
             phLines++;
-            getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
-                    + " n=" + n + " adds=" + adds);
+            // Adaptive emit: full per-tick resolution through t=200 (the seed
+            // zone — observed: mixed ids 9/10/45 vanish by T389), 1-in-8
+            // afterwards (the cascade is already lost there; the ±8-tick
+            // window is enough to aim a PARITY_TRACE_ID run). Keeps the
+            // streamed job log at ~270 lines/leg instead of ~72k.
+            if (tickNo <= 200 || tickNo % 8 == 0) {
+                getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
+                        + " n=" + n + " adds=" + adds);
+            }
         } catch (Throwable t) {
             if (phLines < 3) getLogger().warning("PH step failed: " + t);
         }

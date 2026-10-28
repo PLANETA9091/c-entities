@@ -166,6 +166,7 @@ JPID=$!
 # exact death phase (fill/measure), the module's last words and the RSS
 # of java/node are captured no matter how the leg dies.
 (
+  PHDONE=0
   for i in $(seq 1 120); do
     sleep 10
     kill -0 "$JPID" 2>/dev/null || break
@@ -183,6 +184,17 @@ JPID=$!
     # `|| true`: pipefail + grep-no-match kills the subshell silently.
     timeout 5 jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1 || true
     grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3 || true
+    # Delta-tail the parity stream into the job log: the per-tick state hash
+    # (PH) diff across legs is the FIRST-DIVERGENCE locator, and the
+    # parity-results artifact is ~1.8GB — pulling it after the fact timed
+    # out at 600s and the analysis never ran (observed 13:08 run). Lines
+    # streamed here survive any runner death.
+    TOTAL=$(wc -l < "$R/server.log" 2>/dev/null || echo 0)
+    if [ "$TOTAL" -gt "$PHDONE" ]; then
+      tail -n +$((PHDONE + 1)) "$R/server.log" 2>/dev/null \
+        | grep -aE "PH t=|PARITY-SNAP|measure window|hooks@" || true
+      PHDONE=$TOTAL
+    fi
   done
 ) &
 WDPID=$!
