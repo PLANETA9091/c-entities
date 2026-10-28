@@ -53,6 +53,9 @@ on:
       trace_id:
         description: 'PARITY_TRACE_ID: per-tick trace of this entity id in BOTH legs (−1 = off)'
         default: '-1'
+      ph_dump:
+        description: 'PH_DUMP: ticks for per-entity PD dumps (e.g. 140-158; empty = off)'
+        default: ''
       extra_jvm:
         description: 'extra JVM flags appended to EXTRA_JVM (e.g. -Dcentities.x=y)'
         default: ''
@@ -121,13 +124,14 @@ jobs:
           MA="$([ "${{ inputs.mob_ai }}" = "0" ] && echo 0 || echo 1)"
           MG="$([ "${{ inputs.merge }}" = "0" ] && echo 0 || echo 1)"
           TR="${{ inputs.trace_id }}"
-          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR CE_COLLIDE=${CE_COLLIDE:-1} CE_MERGE_MIRROR=${CE_MERGE_MIRROR:-1}"
+          PD="${{ inputs.ph_dump }}"
+          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR PH_DUMP=$PD CE_COLLIDE=${CE_COLLIDE:-1} CE_MERGE_MIRROR=${CE_MERGE_MIRROR:-1}"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
             RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
             TILE_HOPPERS=0 TILE_FURNACES=0 \
             FILL_TICKS="$FILL_TICKS" WARMUP_TICKS="$WARMUP_TICKS" MEASURE_TICKS="$MEASURE_TICKS" \
-            PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" \
+            PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" PH_DUMP="$PD" \
             MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
             CE_ITEM_TICK="$IT" CE_MOB_AI="$MA" CE_MERGE="$MG" \
             CE_COLLIDE="${CE_COLLIDE:-1}" CE_MERGE_MIRROR="${CE_MERGE_MIRROR:-1}" \

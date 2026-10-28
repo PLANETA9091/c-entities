@@ -748,6 +748,48 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private long phLines;
     private long phFails;
 
+    // PH_DUMP="140-158,170": at those ticks each leg additionally streams
+    // per-entity "PD t=.. id:m id:m .." lines (10 pairs/line) where m is the
+    // SAME per-entity avalanche the total PH h is built from — a post-hoc
+    // OFF-vs-ON diff of the (id -> m) multisets names the exact culprit
+    // ENTITY (and re-summing phMix(m) must reproduce h, which cross-checks
+    // the dump integrity). Stage 2 then aims PARITY_TRACE_ID at that id.
+    private int[] phDumpRanges;
+
+    private boolean phDumpActive() {
+        int[] r = phDumpRanges;
+        if (r == null) {
+            String s = System.getenv("PH_DUMP");
+            if (s == null || s.isBlank()) {
+                r = new int[0];
+            } else {
+                java.util.ArrayList<Integer> lo = new java.util.ArrayList<>();
+                java.util.ArrayList<Integer> hi = new java.util.ArrayList<>();
+                for (String tok : s.split(",")) {
+                    tok = tok.trim();
+                    if (tok.isEmpty()) continue;
+                    int dash = tok.indexOf('-');
+                    try {
+                        if (dash > 0) {
+                            lo.add(Integer.parseInt(tok.substring(0, dash)));
+                            hi.add(Integer.parseInt(tok.substring(dash + 1)));
+                        } else {
+                            int v = Integer.parseInt(tok);
+                            lo.add(v); hi.add(v);
+                        }
+                    } catch (NumberFormatException quiet) { }
+                }
+                r = new int[lo.size() * 2];
+                for (int i = 0; i < lo.size(); i++) { r[i * 2] = lo.get(i); r[i * 2 + 1] = hi.get(i); }
+            }
+            phDumpRanges = r;
+        }
+        for (int i = 0; i < r.length; i += 2) {
+            if (tickNo >= r[i] && tickNo <= r[i + 1]) return true;
+        }
+        return false;
+    }
+
     private static long phMix(long k) {
         k *= 0x9E3779B97F4A7C15L;
         k ^= k >>> 30; k *= 0xBF58476D1CE4E5B9L;
@@ -821,29 +863,47 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         && PH_DM != null && PH_VX != null
                         && PH_VY != null && PH_VZ != null;
             }
+            boolean dump = phDumpActive();
+            StringBuilder dsb = dump ? new StringBuilder(1024) : null;
+            int dcnt = 0;
             for (int i = 0; i < n; i++) {
                 Entity be = ents.get(i);
                 int id = be.getEntityId();
                 if (id > maxId) { adds++; maxId = id; }
-                if (!bound) continue;
-                Object e = PH_GET_HANDLE.invoke(be);
-                double x = (double) PH_X.invokeExact(e);
-                double y = (double) PH_Y.invokeExact(e);
-                double z = (double) PH_Z.invokeExact(e);
-                Object dm = (Object) PH_DM.invokeExact(e);
-                long m = phMix(id);
-                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(x)), 7);
-                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(y)), 17);
-                m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(z)), 27);
-                if (dm != null) {
-                    double vx = (double) PH_VX.invokeExact(dm);
-                    double vy = (double) PH_VY.invokeExact(dm);
-                    double vz = (double) PH_VZ.invokeExact(dm);
-                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vx)), 37);
-                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vy)), 47);
-                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vz)), 57);
+                long m = 0;
+                if (bound) {
+                    Object e = PH_GET_HANDLE.invoke(be);
+                    double x = (double) PH_X.invokeExact(e);
+                    double y = (double) PH_Y.invokeExact(e);
+                    double z = (double) PH_Z.invokeExact(e);
+                    Object dm = (Object) PH_DM.invokeExact(e);
+                    m = phMix(id);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(x)), 7);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(y)), 17);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(z)), 27);
+                    if (dm != null) {
+                        double vx = (double) PH_VX.invokeExact(dm);
+                        double vy = (double) PH_VY.invokeExact(dm);
+                        double vz = (double) PH_VZ.invokeExact(dm);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vx)), 37);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vy)), 47);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vz)), 57);
+                    }
+                    h += phMix(m);
                 }
-                h += phMix(m);
+                if (dump) {
+                    dsb.append(id);
+                    if (bound) dsb.append(':').append(String.format("%016x", m));
+                    dsb.append(' ');
+                    if (++dcnt == 10) {
+                        getLogger().info("PD t=" + tickNo + " " + dsb.toString().trim());
+                        dsb.setLength(0);
+                        dcnt = 0;
+                    }
+                }
+            }
+            if (dump && dcnt > 0) {
+                getLogger().info("PD t=" + tickNo + " " + dsb.toString().trim());
             }
             phMaxId = maxId;
             phLines++;
