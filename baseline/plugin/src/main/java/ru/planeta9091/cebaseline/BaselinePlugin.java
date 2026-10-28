@@ -768,12 +768,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             m = nms.getMethod("getDeltaMovement");
             PH_DM = lk.unreflect(m)
                     .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
+            // 26.3 Vec3: x/y/z are PUBLIC FINAL FIELDS (no getX accessors —
+            // observed: NoSuchMethodException Vec3.getX() killed the bind
+            // after PH_X/Y/Z/DM were assigned, so the loop ran with null
+            // PH_VX/VY/VZ and the NPE silenced every later tick).
             Class<?> vec3 = m.getReturnType();
-            m = vec3.getMethod("getX"); PH_VX = lk.unreflect(m)
+            PH_VX = lk.findGetter(vec3, "x", double.class)
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
-            m = vec3.getMethod("getY"); PH_VY = lk.unreflect(m)
+            PH_VY = lk.findGetter(vec3, "y", double.class)
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
-            m = vec3.getMethod("getZ"); PH_VZ = lk.unreflect(m)
+            PH_VZ = lk.findGetter(vec3, "z", double.class)
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
         } catch (Throwable t) {
             getLogger().warning("PH bind failed (n/adds only): " + t);
@@ -801,7 +805,12 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             if (bound && PH_X == null) {
                 Object sample = PH_GET_HANDLE.invoke(ents.get(0));
                 if (sample != null) phBind(sample);
-                bound = PH_X != null;
+                // ALL-OR-NOTHING: a partial bind (some handles assigned, some
+                // not) must never reach the loop — a null invokeExact would
+                // throw every tick and silence the stream (observed).
+                bound = PH_X != null && PH_Y != null && PH_Z != null
+                        && PH_DM != null && PH_VX != null
+                        && PH_VY != null && PH_VZ != null;
             }
             for (int i = 0; i < n; i++) {
                 Entity be = ents.get(i);
