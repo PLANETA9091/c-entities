@@ -746,6 +746,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             PH_X, PH_Y, PH_Z, PH_DM, PH_VX, PH_VY, PH_VZ;
     private long phMaxId;
     private long phLines;
+    private long phFails;
 
     private static long phMix(long k) {
         k *= 0x9E3779B97F4A7C15L;
@@ -757,7 +758,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private void phBind(Object nmsSample) {
         try {
             var lk = java.lang.invoke.MethodHandles.lookup();
-            Class<?> nms = nmsSample.getClass();
+            // Bind from the NMS BASE class, not the sample's runtime class:
+            // unreflect + asType inserts a CHECKCAST to the receiver type —
+            // a ServerItemEntity-typed handle throws CCE for the first
+            // zombie/stand/chicken and the stream dies (observed: mixed and
+            // spread streams end at t=140, the first non-item tick; items
+            // legs — 100% one class — lived).
+            Class<?> nms = Class.forName(
+                    "net.minecraft.world.entity.Entity",
+                    false, getClass().getClassLoader());
             java.lang.reflect.Method m;
             m = nms.getMethod("getX"); PH_X = lk.unreflect(m)
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
@@ -848,14 +857,26 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         + " n=" + n + " adds=" + adds);
             }
         } catch (Throwable t) {
-            if (phLines < 3) getLogger().warning("PH step failed: " + t);
+            // warn on the first FAILURES (not the first successes): a loop
+            // that starts dying at t=140 must not be silent about it
+            if (++phFails <= 3) getLogger().warning("PH step failed: " + t);
         }
     }
 
     private void phBindRoot(Entity be) {
         try {
             var lk = java.lang.invoke.MethodHandles.lookup();
-            java.lang.reflect.Method gh = be.getClass().getMethod("getHandle");
+            // Bind getHandle from the CraftEntity BASE class — a runtime-
+            // class bind (CraftItem) would checkcast-reject the first
+            // non-item entity and kill the stream (see phBind).
+            Class<?> craftEntity = be.getClass();
+            while (craftEntity != null && !"org.bukkit.craftbukkit.entity.CraftEntity"
+                    .equals(craftEntity.getName())
+                    && !"org.bukkit.craftbukkit.CraftEntity".equals(craftEntity.getName())) {
+                craftEntity = craftEntity.getSuperclass();
+            }
+            java.lang.reflect.Method gh = (craftEntity != null ? craftEntity : be.getClass())
+                    .getMethod("getHandle");
             PH_GET_HANDLE = lk.unreflect(gh)
                     .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
         } catch (Throwable t) {
