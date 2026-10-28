@@ -1156,7 +1156,13 @@ public final class CeHooks {
     // live structure — THE residual parity divergence (run 40647817613:
     // 12/16500 merge flips, jockey lottery desync). The slices patch is
     // attempted first; a refusal falls back to 0 (exact-ish, never worse).
-    public static final int SECTION_STAMP_SCHEME = 1;
+    // volatile (not final): the native side flips it to 0 when the slices
+    // weave is refused (the moveEntity fallback must then own the stamps).
+    public static volatile int SECTION_STAMP_SCHEME = 1;
+
+    public static void setSectionStampScheme(int v) {
+        SECTION_STAMP_SCHEME = v;
+    }
 
     /** PARITY ORDER (doc 36b): the ChunkEntitySlices.addEntity PREFIX —
      *  the vanilla re-append point. The receiver slices' chunkX/chunkZ are

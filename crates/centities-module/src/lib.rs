@@ -718,6 +718,24 @@ fn arm_module() {
                         ));
                     }
                 }
+                // PARITY ORDER (doc 36b): ChunkEntitySlices loads with the
+                // first chunks — usually BEFORE the arm; the stash/serve
+                // path applies the append-order probe at the verifier.
+                if !SLICES_WOVEN.load(Ordering::Acquire)
+                    && !SLICES_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(CHUNK_SLICES_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_chunk_slices(loader as jni::jobject);
+                    if SLICES_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(CHUNK_SLICES_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred ChunkEntitySlices weave applied, rc={rc}"
+                        ));
+                    }
+                }
                 // L15 deferred weaves: the GoalSelector/ConversionTracker
                 // classes load with the first mobs — usually AFTER the arm.
                 if !GOAL_WOVEN.load(Ordering::Acquire)
@@ -2006,6 +2024,28 @@ fn set_java_bool(setter: &str, value: bool) -> bool {
     .unwrap_or(false)
 }
 
+/// Set an int static setter on CeHooks (the stamp-scheme fallback switch).
+fn set_java_int(setter: &str, value: i32) -> bool {
+    cplug_sdk::jni_util::with_attached(|env| -> bool {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, setter, "(I)V") else {
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[jni::jvalue { i: value }]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return false;
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
 fn goal_tick_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     cplug_sdk::asm::ReplaceBody {
         method_name: "tick",
@@ -3261,8 +3301,30 @@ fn patch_chunk_slices(bytes: &[u8]) -> Option<Vec<u8>> {
         .flatten()
 }
 
+static SLICES_WOVEN: AtomicBool = AtomicBool::new(false);
+static SLICES_DECLINED: AtomicBool = AtomicBool::new(false);
+
 fn patch_chunk_slices_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(CHUNK_SLICES_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    // retransform serve: the verifier precomputed the weave
+    if let Some(b) = PRECOMPUTED
+        .lock()
+        .ok()?
+        .get(CHUNK_SLICES_CLASS)
+        .cloned()
+    {
+        if !b.is_empty() {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ChunkEntitySlices add-order probe");
+            return Some(b);
+        }
+    }
+    if SLICES_DECLINED.load(Ordering::Acquire) {
         return None;
     }
     match patch::insert_static_call_at_start(
@@ -3276,6 +3338,7 @@ fn patch_chunk_slices_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     ) {
         Ok(b) => {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            SLICES_WOVEN.store(true, Ordering::Release);
             cplug_sdk::log::info(
                 "[c-entities] patched ChunkEntitySlices.addEntity append-order probe",
             );
@@ -3283,12 +3346,58 @@ fn patch_chunk_slices_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            SLICES_DECLINED.store(true, Ordering::Release);
+            // the moveEntity fallback must own the stamps now
+            set_java_int("setSectionStampScheme", 0);
             cplug_sdk::log::info(&format!(
-                "[c-entities] ChunkEntitySlices.addEntity probe refused: {e}"
+                "[c-entities] ChunkEntitySlices.addEntity probe refused: {e} — moveEntity stamp scheme kept"
             ));
             None
         }
     }
+}
+
+/// Deferred weave: the ChunkEntitySlices class loads with the FIRST chunks —
+/// usually BEFORE the arm (the boot hook stashed the bytes). Precompute the
+/// weave from the stash; the verifier retransforms the class afterwards.
+fn precompute_chunk_slices(loader: jni::jobject) {
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(CHUNK_SLICES_CLASS))
+    else {
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        patch::insert_static_call_at_start(
+            bytes,
+            "addEntity",
+            "(Lnet/minecraft/world/entity/Entity;I)Z",
+            HOOKS_CLASS,
+            "probeSectionAppend",
+            "(Lnet/minecraft/world/entity/Entity;I)V",
+            &[(1, b'L'), (2, b'I')],
+        )
+    });
+    match patched {
+        Some(Ok(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CHUNK_SLICES_CLASS, b);
+            }
+            SLICES_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] precomputed ChunkEntitySlices add-order probe (deferred)",
+            );
+        }
+        _ => {
+            SLICES_DECLINED.store(true, Ordering::Release);
+            set_java_int("setSectionStampScheme", 0);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ChunkEntitySlices probe — moveEntity stamp scheme kept",
+            );
+        }
+    }
+    let _ = loader;
 }
 
 fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
