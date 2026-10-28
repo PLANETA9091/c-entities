@@ -142,11 +142,15 @@ XMX="${XMX:-8G}"
 export CE_ITEM_TICK="${CE_ITEM_TICK:-1}"
 if [ "${CE_MERGE:-1}" = "0" ]; then MERGE_PROP="-Dcentities.mergeFast=false"; else MERGE_PROP=""; fi
 # L22a native mob AI floor (Rust goal engine): ON by default for every
-# MODULE=on leg (baseline -mod runs + ab-paired on-legs). CE_MOB_AI=0 rolls
-# back to vanilla serverAiStep; with MODULE=off the property is inert
-# (no CeHooks class exists to read it).
+# MODULE=on leg (baseline -mod runs + ab-paired on-legs).
+# SHIPPED DEFAULT = vanilla serverAiStep: the L22a AI engine is opt-in
+# (CeHooks MOB_AI_ON_INIT defaults to "0") AND a measured net loss on the
+# 26.3 bench (e774d00: mobs-25k 193.2 with the engine vs 129.5 without)
+# AND its staged-request RNG protocol diverges level.random from vanilla
+# at t=143 (SR/LR probes, run 40771017055). The honest A/B tests what
+# ships: vanilla AI unless CE_MOB_AI=1 is explicitly requested.
 MOBAI_PROP=""
-if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-1}" = "1" ]; then
+if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-0}" = "1" ]; then
   MOBAI_PROP="-Dcentities.mobAi=1"
 fi
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1} mobAi=${MOBAI_PROP:+on}"

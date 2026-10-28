@@ -33,8 +33,8 @@ on:
         description: 'CE_ITEM_TICK (1=shipped, 0=vanilla item tick in ON leg)'
         default: '1'
       mob_ai:
-        description: 'CE_MOB_AI (1=shipped, 0=vanilla AI in ON leg)'
-        default: '1'
+        description: 'CE_MOB_AI (1=experimental engine, 0=shipped vanilla AI)'
+        default: '0'
       merge:
         description: 'CE_MERGE (1=shipped, 0=vanilla merge in ON leg)'
         default: '1'

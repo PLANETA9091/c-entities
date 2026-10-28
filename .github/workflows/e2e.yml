@@ -112,7 +112,6 @@ jobs:
            sleep 50; echo stop) | timeout 280 \
             java -Xms1G -Xmx4G \
             "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-26.3.jar" \
-            -Dcentities.mobAi=1 \
             -jar versions/paperclip-26.3.jar --nogui > e2e.log 2>&1 || true
           echo "## e2e markers" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
