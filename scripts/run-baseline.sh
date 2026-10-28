@@ -192,7 +192,7 @@ JPID=$!
     TOTAL=$(wc -l < "$R/server.log" 2>/dev/null || echo 0)
     if [ "$TOTAL" -gt "$PHDONE" ]; then
       tail -n +$((PHDONE + 1)) "$R/server.log" 2>/dev/null \
-        | grep -aE "PH t=|PD t=|PTRACE |PARITY-SNAP|measure window|hooks@" || true
+        | grep -aE "PH t=|PD t=|SR t=|LR t=|PTRACE |PARITY-SNAP|measure window|hooks@" || true
       PHDONE=$TOTAL
     fi
   done

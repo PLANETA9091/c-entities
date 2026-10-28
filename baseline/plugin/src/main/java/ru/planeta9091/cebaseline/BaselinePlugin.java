@@ -915,11 +915,86 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             if (tickNo <= 200 || tickNo % 8 == 0) {
                 getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
                         + " n=" + n + " adds=" + adds);
+                logEntropyStreams();
             }
         } catch (Throwable t) {
             // warn on the first FAILURES (not the first successes): a loop
             // that starts dying at t=140 must not be silent about it
             if (++phFails <= 3) getLogger().warning("PH step failed: " + t);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // SR/LR — per-tick ENTROPY-STREAM probes. The parity seeds both streams
+    // (Level.random + Entity.SHARED_RANDOM) identically, so their STATES
+    // must stay bit-equal across the legs forever. A diff of the SR/LR
+    // lines names the FIRST tick a stream desynced — and therefore which
+    // subsystem consumed it differently (the native AI advances SHARED
+    // natively; the spawner/baby-rolls consume LEVEL). One line per stream
+    // per tick, lazily-bound reflection reads, zero stream mutation.
+    // ------------------------------------------------------------------
+    private static volatile java.lang.invoke.MethodHandle SR_SEED, LR_XLO, LR_XHI;
+    private static volatile Object SR_OBJ, LR_OBJ;
+
+    private void logEntropyStreams() {
+        try {
+            if (SR_OBJ == null) {
+                Class<?> nms = Class.forName(
+                        "net.minecraft.world.entity.Entity",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
+                f.setAccessible(true);
+                Object sr = f.get(null);
+                // Paper's ThreadUnsafeRandom: the LCG state is the long 'value'
+                java.lang.reflect.Field sf = sr.getClass().getDeclaredField("value");
+                sf.setAccessible(true);
+                SR_SEED = java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(sf)
+                        .asType(java.lang.invoke.MethodType.methodType(
+                                long.class, Object.class));
+                SR_OBJ = sr;
+            }
+            if (LR_OBJ == null) {
+                Class<?> lvl = Class.forName(
+                        "net.minecraft.world.level.Level",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field rf = lvl.getDeclaredField("random");
+                rf.setAccessible(true);
+                Object lr = rf.get(Bukkit.getWorlds().get(0));
+                // XoroshiroRandomSource.randomNumberGenerator (Xoroshiro128PlusPlus)
+                // holds the state pair seedLo/seedHi — the pair IS the state.
+                java.lang.reflect.Field gen = lr.getClass().getDeclaredField("randomNumberGenerator");
+                gen.setAccessible(true);
+                Object g = gen.get(lr);
+                Class<?> gc = g.getClass();
+                java.lang.reflect.Field a = gc.getDeclaredField("seedLo");
+                java.lang.reflect.Field b = gc.getDeclaredField("seedHi");
+                a.setAccessible(true);
+                b.setAccessible(true);
+                LR_XLO = java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(a).asType(java.lang.invoke.MethodType
+                                .methodType(long.class, Object.class));
+                LR_XHI = java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(b).asType(java.lang.invoke.MethodType
+                                .methodType(long.class, Object.class));
+                LR_OBJ = g;
+            }
+            if (SR_SEED != null && SR_OBJ != null) {
+                long s = (long) SR_SEED.invokeExact(SR_OBJ);
+                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s));
+            }
+            if (LR_XLO != null && LR_OBJ != null) {
+                long a = (long) LR_XLO.invokeExact(LR_OBJ);
+                long b = (long) LR_XHI.invokeExact(LR_OBJ);
+                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a)
+                        + " b=" + Long.toHexString(b));
+            }
+        } catch (Throwable t) {
+            // one warning then disable — a broken probe must not spam
+            if (SR_SEED == null && SR_OBJ == null) {
+                SR_OBJ = new Object();
+                getLogger().warning("entropy probe disabled: " + t);
+            }
         }
     }
 
