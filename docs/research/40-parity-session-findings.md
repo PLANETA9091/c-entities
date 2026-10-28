@@ -60,15 +60,29 @@ Bytecode-verified vanilla semantics (26.3):
   All parity items are STONE x1 → the first candidate always survives.
 
 So the sole remaining variable is WHICH candidate is first in the
-scan: vanilla scans `level.getEntitiesOfClass(ItemEntity, bb,
-predicate)` in the moonrise ChunkEntitySlices order; the module's fast
-merge scan (L37 vanilla-key order was proven for rowQuery) must return
-the SAME first candidate. At t=159 the ON scan handed 971 a different
-first candidate than OFF. **Next: dump the module's merge-scan
-candidate list for 971's box at t=159 and diff it against the vanilla
-getEntitiesOfClass order (the L37 ordSortVanilla must be applied to
-the merge scan path too — verify it is reached at all for the
-merge dispatch).**
+scan — and it is NOT the scan order itself (fastQuery ends in
+ordSortVanilla). It is WHEN the scan runs relative to the other
+items' ticks:
+
+**Vanilla interleaves per item, in EntityTickList order**:
+for each item: [move tick] then [if active on its (tc+id)%4 tick:
+merge scan against the world AS OF ITS TURN]. A merge applied early in
+the tick removes an item that later tickers would otherwise scan, and
+grows a survivor that later candidates compare counts against.
+
+**The module batches**: the native core computes every item's move
+first and itemTickFlush applies the outcomes (merge POST — commit
+ed05fe4) AFTER the whole entity loop. Within-tick merge chains
+therefore pair against a FUTURE world → different survivors
+(exactly the t=159 971/1873 flip).
+
+**The fix (flush redesign, next session)**: itemTickFlush must walk
+the items in EntityTickList (insertion) order and, per item, apply its
+own move writeback AND run its merge scan at that point (the batch
+carries the computed move outcomes; the merge scans stay in Java via
+MH_TRY_MERGE). One JNI crossing is preserved — only the flush loop's
+internal order changes from [all moves; all merges] to
+[move+merge; move+merge; ...].
 
 ### R-C: late non-RNG mobs divergence (t=183-320, AI knobs off)
 With mob_ai=0 (40773720077): mobs PH diverges t=183 while SR/LR are
