@@ -238,7 +238,9 @@ public final class CeHooks {
 
     private static volatile java.lang.invoke.MethodHandle MH_TRY_MERGE;
     private static volatile java.lang.invoke.MethodHandle MH_IS_MERGABLE;
+    private static volatile java.lang.invoke.MethodHandle MH_MERGEWN;
     private static volatile boolean MH_FAILED = false;
+    private static volatile boolean MWN_FAILED = false;
 
     /** Lazy private-access handles: ItemEntity.tryToMerge(ItemEntity)V and
      *  ItemEntity.isMergable()Z. Runs once, on the server thread, from the
@@ -269,6 +271,46 @@ public final class CeHooks {
         try {
             return (boolean) MH_IS_MERGABLE.invokeExact(e);
         } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Lazy private-access handle: ItemEntity.mergeWithNeighbours()V — the
+     *  EXACT vanilla merge body, run when the fast scan refuses (index
+     *  unsure) or when the bisect knob turns the fast path off. Without it
+     *  the flush's return-value-ignored call DROPPED every refused merge:
+     *  104,383 dropped merges in one spread leg (run 40719262186,
+     *  mirror=104383) — each refusal meant vanilla would have merged and
+     *  the ON leg silently did not. */
+    private static synchronized boolean initMergeWn(Object sample) {
+        if (MWN_FAILED) return false;
+        if (MH_MERGEWN != null) return true;
+        try {
+            Class<?> ie = sample.getClass();
+            java.lang.reflect.Method mw = ie.getDeclaredMethod("mergeWithNeighbours");
+            mw.setAccessible(true);
+            MH_MERGEWN = java.lang.invoke.MethodHandles.lookup().unreflect(mw)
+                    .asType(java.lang.invoke.MethodType.methodType(void.class, ie));
+            return true;
+        } catch (Throwable t) {
+            MWN_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "mergeWn: " + t;
+            return false;
+        }
+    }
+
+    /** Runs the exact vanilla merge body (mergeWithNeighbours). Returns
+     *  false only if the handle could not be bound (the merge is then
+     *  dropped, as before — the kill-switch counters will show it). */
+    public static boolean runVanillaMerge(ItemEntity e) {
+        try {
+            if (MH_MERGEWN == null && !initMergeWn(e)) return false;
+            MH_MERGEWN.invokeExact(e);
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "runVanillaMerge: " + t;
             return false;
         }
     }
@@ -4132,7 +4174,16 @@ public final class CeHooks {
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
                     itemMerge++;
-                    mergeScanNative(e);
+                    // A refusal (index unsure) or a disabled fast path
+                    // (CE_MERGE=0 knob) MUST fall back to the vanilla body —
+                    // an ignored false here DROPPED the merge outright
+                    // (observed: 104,383 dropped merges in one spread leg).
+                    // State is fresh: age/pickupDelay/pos are already applied
+                    // above in vanilla tick order, so mergeWithNeighbours
+                    // sees exactly what vanilla's mid-tick body would see.
+                    if (!mergeScanNative(e)) {
+                        runVanillaMerge(e);
+                    }
                     if (e.isRemoved()) continue;
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
