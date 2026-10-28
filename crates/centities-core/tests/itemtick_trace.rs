@@ -122,7 +122,9 @@ fn resting_item_position_freezes_and_delta_oscillates() {
     let ground_friction = (0.6f32 * 0.98f32) as f64;
 
     for tick in 1..=12i32 {
-        st.tick_count = tick; // the dispatcher ++ed before the guard fires (post-increment)
+        // st.tick_count carries the POST value (ingest mirrors es+1); the
+        // vanilla cadences read the PRE value, trace-proven (run 40728505667)
+        st.tick_count = tick;
         let before = (st.x, st.y, st.z);
         let out = {
             let mut sc = SectionCache::new(&sg, &mut prov);
@@ -137,16 +139,20 @@ fn resting_item_position_freezes_and_delta_oscillates() {
         assert!(!out.has(TickOutcome::MOVED), "tick {tick}");
         assert!(out.has(TickOutcome::ON_GROUND), "tick {tick}");
         assert_eq!(st.age, tick);
-        if tick % 4 == 0 {
-            // gate tick: gravity accumulated 3 ticks then the move zeroes dy
+        if (tick - 1) % 4 == 0 {
+            // gate tick (PRE tickCount): gravity accumulated then the move
+            // zeroes dy. HAS_IMPULSE needs |ddelta|^2 > 0.01: 3 accumulated
+            // gravity ticks (0.12^2 = 0.0144) clear it; the FIRST gate tick
+            // (tick 1) has none (the item spawned resting, dy was 0).
             assert_eq!(st.dy, 0.0, "tick {tick}");
             assert!(out.has(TickOutcome::V_COLL), "tick {tick}");
-            assert!(
+            assert_eq!(
                 out.has(TickOutcome::HAS_IMPULSE),
-                "tick {tick}: |ddelta|^2 > 0.01"
+                tick > 1,
+                "tick {tick}: |ddelta|^2 vs 0.01"
             );
         } else {
-            let k = tick % 4; // gravity ticks since the last zeroing
+            let k = (tick - 1) % 4; // gravity ticks since the last zeroing
             assert_eq!(st.dy, -(k as f64) * 0.04, "tick {tick}");
             assert!(!out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
         }
@@ -155,8 +161,8 @@ fn resting_item_position_freezes_and_delta_oscillates() {
         assert_eq!(st.dx, 0.0);
         assert_eq!(st.dz, 0.0);
         let _ = ground_friction;
-        // merge cadence 40 (floor never changes): fires at tickCount % 40 == 0
-        assert_eq!(out.has(TickOutcome::MERGE), tick % 40 == 0, "tick {tick}");
+        // merge cadence 40 (floor never changes): fires at PRE tickCount % 40 == 0
+        assert_eq!(out.has(TickOutcome::MERGE), (tick - 1) % 40 == 0, "tick {tick}");
     }
 }
 
@@ -176,7 +182,8 @@ fn sliding_item_decays_and_merges_on_floor_change() {
         ..ItemState::new()
     };
 
-    // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: 1 % 40 != 0)
+    // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: PRE 0 % 40 == 0
+    // -> MERGE actually FIRES on the spawn tick, vanilla cadence 0%40==0)
     st.tick_count = 1;
     let out = {
         let mut sc = SectionCache::new(&sg, &mut prov);
@@ -186,8 +193,8 @@ fn sliding_item_decays_and_merges_on_floor_change() {
     assert_eq!(st.x, 0.9);
     assert_eq!(st.dx, 0.5 * (0.6f32 * 0.98f32) as f64, "friction 0.588f32");
     assert_eq!(st.dy, 0.0, "collide clamps dy to 0, fallOn zeroes it");
-    assert!(!out.has(TickOutcome::MERGE));
-    // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, tickCount 2
+    assert!(out.has(TickOutcome::MERGE), "PRE tickCount 0: 0%40==0 fires");
+    // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, PRE 1: 1%2!=0
     st.tick_count = 2;
     let out = {
         let mut sc = SectionCache::new(&sg, &mut prov);
@@ -195,10 +202,10 @@ fn sliding_item_decays_and_merges_on_floor_change() {
     };
     assert!(out.has(TickOutcome::MOVED));
     assert!(
-        out.has(TickOutcome::MERGE),
-        "floor changed -> cadence 2, tick 2 fires"
+        !out.has(TickOutcome::MERGE),
+        "floor changed -> cadence 2, PRE 1: 1%2 != 0"
     );
-    assert!(out.has(TickOutcome::MERGE2));
+    assert!(!out.has(TickOutcome::MERGE), "PRE 1: 1%2 != 0");
     let f = (0.6f32 * 0.98f32) as f64;
     assert_eq!(
         st.x,
@@ -268,7 +275,8 @@ fn gate_phase_follows_tick_count_plus_id() {
     let mut sg = SectionGrid::new();
     let mut prov = flat_world(None);
     let mut scratch = Scratch::new();
-    // id = 1: gate fires when (tickCount + 1) % 4 == 0 -> ticks 3, 7, ...
+    // id = 1: gate fires when (PRE tickCount + 1) % 4 == 0 -> ticks 4, 8
+    // (the PRE value is tick-1: (tick-1+1)%4 == tick%4)
     let mut st = resting_item();
     st.tick_count = 0;
     for tick in 1..=8i32 {
@@ -277,9 +285,9 @@ fn gate_phase_follows_tick_count_plus_id() {
             let mut sc = SectionCache::new(&sg, &mut prov);
             tick_item(&mut st, 1, &env, &mut sc, &mut scratch)
         };
-        let gate_tick = (tick + 1) % 4 == 0;
+        let gate_tick = tick % 4 == 0;
         assert_eq!(out.has(TickOutcome::V_COLL), gate_tick, "tick {tick}");
-        let k = if tick < 3 { tick } else { (tick + 1) % 4 }; // gravity ticks since the last zeroing
+        let k = tick % 4; // gravity ticks since the last zeroing
         assert_eq!(
             st.dy,
             if gate_tick { 0.0 } else { -(k as f64) * 0.04 },

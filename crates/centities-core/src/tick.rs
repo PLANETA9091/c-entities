@@ -239,8 +239,12 @@ pub fn tick_item(
 ) -> TickOutcome {
     let mut out = TickOutcome(0);
 
-    // NOTE: the dispatcher (tickNonPassenger) increments tickCount BEFORE the
-    // tick; the module injects the incremented value — no mirror ++ here.
+    // NOTE: the dispatcher increments tickCount AFTER the tick body (trace-
+    // proven, run 40728505667 item 35 t=353: vanilla gated CLOSED on
+    // (212+35)%4=3 while the post-tick trace shows tc=213 — the gate
+    // decision reads the PRE-increment value). The ingest stores the POST
+    // value (es.tick_count + 1, mirrored for the writeback); every vanilla
+    // cadence below must therefore read the PRE value: tc_pre = tc - 1.
 
     // ===== read-only phase =====
     let box_now = Aabb6::item_box(st.x, st.y, st.z);
@@ -284,7 +288,7 @@ pub fn tick_item(
     let horiz_sqr = st.dx * st.dx + st.dz * st.dz;
     let gate = !st.on_ground
         || horiz_sqr > GATE_HORZ_SQR
-        || (st.tick_count.wrapping_add(id as i32) % 4) == 0;
+        || (st.tick_count.wrapping_sub(1).wrapping_add(id as i32) % 4) == 0;
 
     // collide inputs (read-only)
     let mut mv = mv0;
@@ -556,12 +560,14 @@ pub fn tick_item(
         }
     }
 
-    // merge cadence
+    // merge cadence — vanilla reads super.tickCount INSIDE the tick body,
+    // which is the PRE-increment value (see the note at the top)
+    let tc_pre = st.tick_count.wrapping_sub(1);
     let floor_changed = mth_floor(st.xo) != mth_floor(st.x)
         || mth_floor(st.yo) != mth_floor(st.y)
         || mth_floor(st.zo) != mth_floor(st.z);
     let cadence: i32 = if floor_changed { 2 } else { 40 };
-    if st.tick_count % cadence == 0 {
+    if tc_pre % cadence == 0 {
         out.set(TickOutcome::MERGE);
         if floor_changed {
             out.set(TickOutcome::MERGE2);
