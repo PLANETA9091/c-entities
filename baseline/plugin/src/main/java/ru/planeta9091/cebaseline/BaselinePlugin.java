@@ -913,7 +913,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // window is enough to aim a PARITY_TRACE_ID run). Keeps the
             // streamed job log at ~270 lines/leg instead of ~72k.
             if (tickNo <= 200 || tickNo % 8 == 0) {
-                getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
+                getLogger().info("PH t=" + tickNo + " ct=" + ceCurTick()
+                        + " h=" + String.format("%016x", h)
                         + " n=" + n + " adds=" + adds);
                 logEntropyStreams();
             }
@@ -1003,6 +1004,27 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 SR_SEED = null;
             }
             getLogger().info("PH t=" + tickNo + " entropy-probe-disabled: " + t);
+        }
+    }
+
+    private static volatile java.lang.invoke.MethodHandle CT_GETTER;
+
+    /** CeHooks.CUR_TICK — the module flush counter — so the MS window can
+     *  be aimed in ct-space (the flush count may drift from tickNo). */
+    private long ceCurTick() {
+        try {
+            if (CT_GETTER == null) {
+                Class<?> ch = Class.forName("dev.planeta9091.centities.CeHooks",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field f = ch.getDeclaredField("CUR_TICK");
+                f.setAccessible(true);
+                CT_GETTER = java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(f).asType(java.lang.invoke.MethodType
+                                .methodType(int.class));
+            }
+            return CT_GETTER.invokeExact();
+        } catch (Throwable quiet) {
+            return -1;
         }
     }
 
