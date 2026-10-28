@@ -1020,9 +1020,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 f.setAccessible(true);
                 CT_GETTER = java.lang.invoke.MethodHandles.lookup()
                         .unreflectGetter(f).asType(java.lang.invoke.MethodType
-                                .methodType(int.class));
+                                .methodType(long.class));
             }
-            return CT_GETTER.invokeExact();
+            return (long) CT_GETTER.invokeExact();
         } catch (Throwable quiet) {
             return -1;
         }
