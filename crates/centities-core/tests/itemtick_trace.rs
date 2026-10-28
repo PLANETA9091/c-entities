@@ -161,8 +161,9 @@ fn resting_item_position_freezes_and_delta_oscillates() {
         assert_eq!(st.dx, 0.0);
         assert_eq!(st.dz, 0.0);
         let _ = ground_friction;
-        // merge cadence 40 (floor never changes): fires at PRE tickCount % 40 == 0
-        assert_eq!(out.has(TickOutcome::MERGE), (tick - 1) % 40 == 0, "tick {tick}");
+        // merge cadence 40 (floor never changes): EMPIRICAL (see tick.rs) —
+        // the merge reads the POST-increment tickCount
+        assert_eq!(out.has(TickOutcome::MERGE), tick % 40 == 0, "tick {tick}");
     }
 }
 
@@ -182,8 +183,7 @@ fn sliding_item_decays_and_merges_on_floor_change() {
         ..ItemState::new()
     };
 
-    // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: PRE 0 % 40 == 0
-    // -> MERGE actually FIRES on the spawn tick, vanilla cadence 0%40==0)
+    // tick 1: x 0.4 -> 0.9 (floor 0 -> 0, no change; no merge: POST 1 % 40 != 0)
     st.tick_count = 1;
     let out = {
         let mut sc = SectionCache::new(&sg, &mut prov);
@@ -193,19 +193,16 @@ fn sliding_item_decays_and_merges_on_floor_change() {
     assert_eq!(st.x, 0.9);
     assert_eq!(st.dx, 0.5 * (0.6f32 * 0.98f32) as f64, "friction 0.588f32");
     assert_eq!(st.dy, 0.0, "collide clamps dy to 0, fallOn zeroes it");
-    assert!(out.has(TickOutcome::MERGE), "PRE tickCount 0: 0%40==0 fires");
-    // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, PRE 1: 1%2!=0
+    assert!(!out.has(TickOutcome::MERGE), "POST 1: 1%40 != 0");
+    // tick 2: x 0.9 -> 1.194: floor 0 -> 1 CHANGED -> cadence 2, POST 2: 2%2==0
     st.tick_count = 2;
     let out = {
         let mut sc = SectionCache::new(&sg, &mut prov);
         tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
     };
     assert!(out.has(TickOutcome::MOVED));
-    assert!(
-        !out.has(TickOutcome::MERGE),
-        "floor changed -> cadence 2, PRE 1: 1%2 != 0"
-    );
-    assert!(!out.has(TickOutcome::MERGE), "PRE 1: 1%2 != 0");
+    assert!(out.has(TickOutcome::MERGE), "POST 2: floor changed, 2%2==0 fires");
+    assert!(out.has(TickOutcome::MERGE2));
     let f = (0.6f32 * 0.98f32) as f64;
     assert_eq!(
         st.x,

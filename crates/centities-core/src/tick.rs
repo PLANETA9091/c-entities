@@ -560,14 +560,17 @@ pub fn tick_item(
         }
     }
 
-    // merge cadence — vanilla reads super.tickCount INSIDE the tick body,
-    // which is the PRE-increment value (see the note at the top)
-    let tc_pre = st.tick_count.wrapping_sub(1);
+    // merge cadence — EMPIRICAL (runs 40723397672 vs 40733281619): the
+    // all-post convention held the items splits at 23/23, all-pre exploded
+    // them to 574/574 — the merge cadence reads the POST-increment value
+    // (the activation's commonTick++ lands before tick()). The %4 MOVE
+    // gate below stays on the PRE value (trace-proven zeroing at
+    // body-tc where (body+id)%4==0, runs 40728505667/40728510142).
     let floor_changed = mth_floor(st.xo) != mth_floor(st.x)
         || mth_floor(st.yo) != mth_floor(st.y)
         || mth_floor(st.zo) != mth_floor(st.z);
     let cadence: i32 = if floor_changed { 2 } else { 40 };
-    if tc_pre % cadence == 0 {
+    if st.tick_count % cadence == 0 {
         out.set(TickOutcome::MERGE);
         if floor_changed {
             out.set(TickOutcome::MERGE2);
