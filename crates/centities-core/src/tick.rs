@@ -282,13 +282,20 @@ pub fn tick_item(
     }
 
     // move gate (pre-move delta = post-gravity delta in vanilla)
+    // (st.tick_count + id) % 4 — st.tick_count is the ingest POST value
+    // (collect pre-baseTick field + 1), which EQUALS the tickCount the
+    // vanilla gate reads (Entity.baseTick increments BEFORE the gate).
+    // The previous `.wrapping_sub(1)` (PRE convention) fired the gate one
+    // tick late for every grounded idle item — run 40754993404 item 29:
+    // vanilla moved at field-tc 15,15.. the module at 16,16.. (parity
+    // PTRACE diff, both legs tc identical, positions one tick apart).
     let dy_g = st.dy - ITEM_GRAVITY;
     let delta_pre_gravity = (st.dx, st.dy, st.dz);
     let mv0 = (st.dx, dy_g, st.dz);
     let horiz_sqr = st.dx * st.dx + st.dz * st.dz;
     let gate = !st.on_ground
         || horiz_sqr > GATE_HORZ_SQR
-        || (st.tick_count.wrapping_sub(1).wrapping_add(id as i32) % 4) == 0;
+        || (st.tick_count.wrapping_add(id as i32) % 4) == 0;
 
     // collide inputs (read-only)
     let mut mv = mv0;

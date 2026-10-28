@@ -122,8 +122,10 @@ fn resting_item_position_freezes_and_delta_oscillates() {
     let ground_friction = (0.6f32 * 0.98f32) as f64;
 
     for tick in 1..=12i32 {
-        // st.tick_count carries the POST value (ingest mirrors es+1); the
-        // vanilla cadences read the PRE value, trace-proven (run 40728505667)
+        // st.tick_count carries the POST value (ingest mirrors es+1) which
+        // EQUALS the tickCount the vanilla gate reads: commonTick (tc++)
+        // runs BEFORE entity.tick (ServerLevel.tickNonPassenger, 26.3
+        // bytecode offset 56/69). Gate fires when (POST+id)%4==0.
         st.tick_count = tick;
         let before = (st.x, st.y, st.z);
         let out = {
@@ -139,20 +141,16 @@ fn resting_item_position_freezes_and_delta_oscillates() {
         assert!(!out.has(TickOutcome::MOVED), "tick {tick}");
         assert!(out.has(TickOutcome::ON_GROUND), "tick {tick}");
         assert_eq!(st.age, tick);
-        if (tick - 1) % 4 == 0 {
-            // gate tick (PRE tickCount): gravity accumulated then the move
+        if tick % 4 == 0 {
+            // gate tick (POST tickCount): gravity accumulated then the move
             // zeroes dy. HAS_IMPULSE needs |ddelta|^2 > 0.01: 3 accumulated
-            // gravity ticks (0.12^2 = 0.0144) clear it; the FIRST gate tick
-            // (tick 1) has none (the item spawned resting, dy was 0).
+            // gravity ticks (0.12^2 = 0.0144) clear it — the first gate tick
+            // (tick 4) already has them.
             assert_eq!(st.dy, 0.0, "tick {tick}");
             assert!(out.has(TickOutcome::V_COLL), "tick {tick}");
-            assert_eq!(
-                out.has(TickOutcome::HAS_IMPULSE),
-                tick > 1,
-                "tick {tick}: |ddelta|^2 vs 0.01"
-            );
+            assert!(out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
         } else {
-            let k = (tick - 1) % 4; // gravity ticks since the last zeroing
+            let k = tick % 4; // gravity ticks since the last zeroing
             assert_eq!(st.dy, -(k as f64) * 0.04, "tick {tick}");
             assert!(!out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
         }
@@ -272,8 +270,10 @@ fn gate_phase_follows_tick_count_plus_id() {
     let mut sg = SectionGrid::new();
     let mut prov = flat_world(None);
     let mut scratch = Scratch::new();
-    // id = 1: gate fires when (PRE tickCount + 1) % 4 == 0 -> ticks 4, 8
-    // (the PRE value is tick-1: (tick-1+1)%4 == tick%4)
+    // id = 1: gate fires when (POST tickCount + 1) % 4 == 0 -> ticks 3, 7
+    // (commonTick increments BEFORE the body — ServerLevel.tickNonPassenger,
+    // 26.3 — so the PTRACE field value IS the gate-time value; run
+    // 40754993404 item 29: vanilla moved at field-tc 15 = (15+29)%4==0.)
     let mut st = resting_item();
     st.tick_count = 0;
     for tick in 1..=8i32 {
@@ -282,9 +282,11 @@ fn gate_phase_follows_tick_count_plus_id() {
             let mut sc = SectionCache::new(&sg, &mut prov);
             tick_item(&mut st, 1, &env, &mut sc, &mut scratch)
         };
-        let gate_tick = tick % 4 == 0;
+        let gate_tick = tick % 4 == 3; // (tick + 1) % 4 == 0
         assert_eq!(out.has(TickOutcome::V_COLL), gate_tick, "tick {tick}");
-        let k = tick % 4; // gravity ticks since the last zeroing
+        // gravity ticks since the last zeroing: no gate before tick 3, so
+        // the first two ticks accumulate from the spawn (dy starts 0)
+        let k = if tick < 3 { tick } else { (tick + 1) % 4 };
         assert_eq!(
             st.dy,
             if gate_tick { 0.0 } else { -(k as f64) * 0.04 },
