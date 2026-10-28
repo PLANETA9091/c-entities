@@ -1,0 +1,98 @@
+name: profile
+
+# Lean per-scenario profiler for the -90% hunt: ONE module-on leg (same leg
+# config as ab-paired), then jfr_top.py + phase_split.py run ON THE RUNNER —
+# the hotspot tables print straight into the job log (no artifact download
+# needed). The raw rec.jfr is uploaded too, but reading the log is enough.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'mobs-25k | items-100k | mixed-150k | spread-100k'
+        default: 'mobs-25k'
+      measure:
+        description: 'MEASURE_TICKS'
+        default: '400'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CRUSSTY
+        run: git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 server/paper.jar
+      - name: Build ce-baseline plugin
+        run: bash scripts/build-plugin.sh
+      - name: Install mineflayer
+        run: mkdir -p tools && cd tools && npm install mineflayer minecraft-data@3.117.0 --no-save --loglevel=error
+      - name: Install ViaVersion + ViaBackwards
+        run: |
+          mkdir -p build/viaversion
+          fetch() {
+            curl -fsS "https://hangar.papermc.io/api/v1/projects/$1/versions" | \
+            python3 -c "import json,sys;raw=sys.stdin.read();d,_=json.JSONDecoder().raw_decode(raw);u=[(x.get('name') or '', (x.get('downloads') or {}).get('PAPER',{}).get('downloadUrl') or '') for x in d.get('result',[])];u=[t for t in u if t[1]];s=[x[1] for x in u if 'SNAPSHOT' not in x[0]];print(s[0] if s else (u[0][1] if u else ''))" || echo ""
+          }
+          VV=$(fetch ViaVersion);   [ -n "$VV" ] || { echo "FATAL: no ViaVersion URL";   exit 1; }
+          VB=$(fetch ViaBackwards); [ -n "$VB" ] || { echo "FATAL: no ViaBackwards URL"; exit 1; }
+          curl -fsSL -o build/viaversion/ViaVersion.jar "$VV"
+          curl -fsSL -o build/viaversion/ViaBackwards.jar "$VB"
+
+      - name: Profile leg (module ON)
+        run: |
+          set -euo pipefail
+          SC="${{ inputs.scenario }}"
+          case "$SC" in
+            mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0;;
+            items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0;;
+            mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;;
+            spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600;;
+            *) echo "FATAL: unknown scenario $SC"; exit 1;;
+          esac
+          MEAS="${{ inputs.measure }}"
+          if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
+          RUN_NAME="prof-$SC" \
+          SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
+          AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
+          MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
+          MODULE='on' \
+          bash scripts/run-baseline.sh
+          LOG="bench/prof-$SC-on/results/server.log"
+          grep -q "ARMED" "$LOG" || { echo "FATAL: not armed"; exit 1; }
+          grep "hooks@" "$LOG" | tail -1 || true
+
+      - name: Hotspot analysis (printed into the job log)
+        run: |
+          set -euo pipefail
+          SC="${{ inputs.scenario }}"
+          R="bench/prof-$SC-on/results"
+          echo "=============== jfr_top $SC (self-time leaves) ==============="
+          python3 scripts/jfr_top.py "$R/rec.jfr" || true
+          echo "=============== phase_split $SC ==============="
+          # phase_split needs wall-clock windows; run it per doc's default mode
+          python3 scripts/phase_split.py "$R/rec.jfr" 2>/dev/null || true
+          echo "=============== baseline.json ==============="
+          cat "$R/baseline.json" || true
+
+      - name: Upload JFR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-jfr-${{ inputs.scenario }}
+          path: bench/prof-*/results/rec.jfr
+          retention-days: 14
+          compression-level: 0
