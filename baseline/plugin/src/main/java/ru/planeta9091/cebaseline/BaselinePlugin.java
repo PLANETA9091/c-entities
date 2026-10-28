@@ -945,8 +945,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
                 f.setAccessible(true);
                 Object sr = f.get(null);
-                // Paper's ThreadUnsafeRandom: the LCG state is the long 'value'
-                java.lang.reflect.Field sf = sr.getClass().getDeclaredField("value");
+                // Entity$RandomRandomSource extends ThreadUnsafeRandom — the
+                // LCG state 'value' is INHERITED (getDeclaredField sees only
+                // declared fields — observed: NoSuchFieldException killed the
+                // probe silently on the first tick).
+                Object o = sr;
+                java.lang.reflect.Field sf = null;
+                for (Class<?> c = o.getClass(); c != null && sf == null; c = c.getSuperclass()) {
+                    try { sf = c.getDeclaredField("value"); } catch (NoSuchFieldException ignored) { }
+                }
+                if (sf == null) throw new NoSuchFieldException("value not found on SHARED_RANDOM hierarchy");
                 sf.setAccessible(true);
                 SR_SEED = java.lang.invoke.MethodHandles.lookup()
                         .unreflectGetter(sf)
@@ -955,12 +963,21 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 SR_OBJ = sr;
             }
             if (LR_OBJ == null) {
+                // the field belongs to the NMS Level — get the ServerLevel
+                // handle via CraftWorld.getHandle() (CraftWorld is the Bukkit
+                // wrapper; rf.get(craftWorld) throws IllegalArgumentException,
+                // and the CraftEntity-bound PH_GET_HANDLE checkcast-rejects a
+                // CraftWorld — observed: silent retry every tick).
+                Object handle = Bukkit.getWorlds().get(0)
+                        .getClass().getMethod("getHandle")
+                        .invoke(Bukkit.getWorlds().get(0));
+                if (handle == null) return;
                 Class<?> lvl = Class.forName(
                         "net.minecraft.world.level.Level",
                         false, getClass().getClassLoader());
                 java.lang.reflect.Field rf = lvl.getDeclaredField("random");
                 rf.setAccessible(true);
-                Object lr = rf.get(Bukkit.getWorlds().get(0));
+                Object lr = rf.get(handle);
                 // XoroshiroRandomSource.randomNumberGenerator (Xoroshiro128PlusPlus)
                 // holds the state pair seedLo/seedHi — the pair IS the state.
                 java.lang.reflect.Field gen = lr.getClass().getDeclaredField("randomNumberGenerator");
