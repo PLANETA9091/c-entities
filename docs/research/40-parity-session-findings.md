@@ -41,20 +41,34 @@ not order). **Next: ship aiFloor=0 (vanilla GoalSelector) like mobAi,
 keep the floor opt-in until the doc-30 pre-resolved-predicate redesign
 makes the staging provably draw-exact.**
 
-### R-B: itemcore merge-chain order (items t=159, mixed t=152, spread t=144-146)
+### R-B: itemcore merge-scan candidate order (items t=159, mixed t=152)
 SR/LR are IDENTICAL through t>1000 for items — the itemcore divergence
-is pure deterministic math, NOT RNG. Run 40776875677 PD t=159:
-OFF removes id=971 and keeps fresh id=1873; ON keeps 971 and loses
-1873. Vanilla `mergeWithNeighbours` (26.3 bytecode): the ticking item
-absorbs the candidate (`tryToMerge` → `merge(this, thisItem, other,
-otherItem)` → other.discard(MERGE)) — but a merge CHAIN within one
-tick can consume 971 via an intermediate absorber. The module's native
-merge scan pairs candidates in a different ORDER than vanilla's
-`getEntitiesOfClass` scan → a different absorber chain → different
-survivor ids. **Next: audit the Rust merge scan's candidate order
-against vanilla ChunkEntitySlices order for the merge query path
-(the L37/L38/L39 vanilla-key fixes covered rowQuery — verify the merge
-scan uses the same ordering).**
+is pure deterministic math, NOT RNG. Run 40780021246 PD t=159: OFF
+removes id=971 and keeps fresh id=1873; ON keeps 971 (its count grew —
+it absorbed something) and loses 1873.
+
+Bytecode-verified vanilla semantics (26.3):
+- ActivationRange.checkIfActive: an ItemEntity is ACTIVE only when
+  `(tickCount + id) % 4 == 0` (ifne 30 → the common path; ==0 returns
+  true) — the activation gate COINCIDES with the move gate. The
+  module's itemCheckActive gate `(field+1+id) % 4 == 0` is EQUIVALENT
+  (the guard runs pre-commonTick, field+1 == the vanilla read) — NOT
+  the bug.
+- ItemEntity.tryToMerge(other): if `other.count < this.count` → this
+  absorbs other; ELSE (tie included) → **other absorbs this — at equal
+  counts the SCAN CANDIDATE survives and the TICKING item dies**.
+  All parity items are STONE x1 → the first candidate always survives.
+
+So the sole remaining variable is WHICH candidate is first in the
+scan: vanilla scans `level.getEntitiesOfClass(ItemEntity, bb,
+predicate)` in the moonrise ChunkEntitySlices order; the module's fast
+merge scan (L37 vanilla-key order was proven for rowQuery) must return
+the SAME first candidate. At t=159 the ON scan handed 971 a different
+first candidate than OFF. **Next: dump the module's merge-scan
+candidate list for 971's box at t=159 and diff it against the vanilla
+getEntitiesOfClass order (the L37 ordSortVanilla must be applied to
+the merge scan path too — verify it is reached at all for the
+merge dispatch).**
 
 ### R-C: late non-RNG mobs divergence (t=183-320, AI knobs off)
 With mob_ai=0 (40773720077): mobs PH diverges t=183 while SR/LR are
