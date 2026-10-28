@@ -1179,6 +1179,24 @@ static FLAGR_DECLINED: AtomicBool = AtomicBool::new(false);
 static FLAGR_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
+    // L39: resolve the merge-mirror offsets (despawnRate/count/DATA_ITEM) —
+    // failure keeps the MH-based predicate (mergePredTest falls back).
+    let _ = cplug_sdk::jni_util::with_attached(|env| {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, "initMergeMirror", "()V") else {
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+        }
+        true
+    });
     let stash = STASH
         .lock()
         .ok()

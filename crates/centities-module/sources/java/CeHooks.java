@@ -288,8 +288,73 @@ public final class CeHooks {
     private static ItemEntity MERGE_SELF; // server-thread confined
 
     private static boolean mergePredTest(Entity o) {
-        if (!(o instanceof ItemEntity) || o == MERGE_SELF) return false;
-        return isMergableFast((ItemEntity) o);
+        if (!(o instanceof ItemEntity)) return false;
+        ItemEntity ie = (ItemEntity) o;
+        if (ie == MERGE_SELF) return false;
+        if (MERGP_ON) return isMergableMirror(ie);
+        return isMergableFast(ie);
+    }
+
+    // ---- L39 mirror merge predicate --------------------------------------
+    // Byte-exact port of ItemEntity.isMergable (26.3):
+    //   isAlive() && pickupDelay != 32767 && age != -32768
+    //   && age < despawnRate && item.getCount() < item.getMaxStackSize()
+    // with the three DEEP reads served by Unsafe hops instead of the method
+    // chain: item = entityData.items[IDX_ITEM].value (the synched-data walk
+    // SynchedEntityData.getItem was 2.91% of the items profile),
+    // despawnRate/count by field offset. getMaxStackSize stays the REAL
+    // virtual call (a DataComponents walk — no caching, the parity gate
+    // stays bit-exact even for plugins that mutate stack components).
+    // The predicate runs per candidate per merge scan (~2500 scans/tick at
+    // items-100k) — the L29 pattern applied to the merge family.
+    public static volatile boolean MERGP_ON = false;
+    private static volatile long O_IE_DESPAWN = -1, O_STACK_COUNT = -1;
+    private static volatile int IDX_ITEM = -1;
+
+    /** Resolves the three mirror offsets (ItemEntity.despawnRate,
+     *  ItemStack.count, the DATA_ITEM accessor id). Runs once at arm. */
+    public static void initMergeMirror() {
+        try {
+            java.lang.reflect.Field f;
+            f = ItemEntity.class.getDeclaredField("despawnRate");
+            f.setAccessible(true);
+            O_IE_DESPAWN = U.objectFieldOffset(f);
+            f = net.minecraft.world.item.ItemStack.class.getDeclaredField("count");
+            f.setAccessible(true);
+            O_STACK_COUNT = U.objectFieldOffset(f);
+            f = ItemEntity.class.getDeclaredField("DATA_ITEM");
+            f.setAccessible(true);
+            Object fa = U.getObject(U.staticFieldBase(f), U.staticFieldOffset(f));
+            if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
+                IDX_ITEM = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
+            }
+            MERGP_ON = O_IE_DESPAWN >= 0 && O_STACK_COUNT >= 0 && IDX_ITEM >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initMergeMirror: " + t;
+            MERGP_ON = false;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean isMergableMirror(ItemEntity e) {
+        if (e.isRemoved()) return false;                 // Entity.isAlive
+        if (e.pickupDelay == 32767 || e.age == -32768) return false;
+        int despawn = U.getInt(e, O_IE_DESPAWN);
+        if (e.age >= despawn) return false;
+        // item = entityData.items[IDX_ITEM].value — the L29 3-hop pattern
+        Object ed = U.getObject(e, O_ED);
+        if (ed == null) return isMergableFast(e);        // belt: pre-init data
+        Object[] items = (Object[]) U.getObject(ed, O_ED_ITEMS);
+        if (items == null || IDX_ITEM >= items.length) return isMergableFast(e);
+        Object di = items[IDX_ITEM];
+        if (di == null) return isMergableFast(e);
+        Object st = U.getObject(di, O_DI_VALUE);
+        if (!(st instanceof net.minecraft.world.item.ItemStack stack)) {
+            return isMergableFast(e);
+        }
+        int count = U.getInt(st, O_STACK_COUNT);
+        return count < stack.getMaxStackSize();          // the REAL virtual walk
     }
 
     private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
