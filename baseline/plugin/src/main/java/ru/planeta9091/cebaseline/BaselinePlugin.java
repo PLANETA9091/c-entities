@@ -933,41 +933,51 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // natively; the spawner/baby-rolls consume LEVEL). One line per stream
     // per tick, lazily-bound reflection reads, zero stream mutation.
     // ------------------------------------------------------------------
-    private static volatile java.lang.invoke.MethodHandle SR_SEED, LR_XLO, LR_XHI;
+    private static volatile java.lang.invoke.MethodHandle SR_SEED, LR_XLO;
     private static volatile Object SR_OBJ, LR_OBJ;
+
+    /** Walk the class hierarchy for a declared long field and bind a
+     *  primitive getter — both SHARED_RANDOM (Entity$RandomRandomSource) and
+     *  Level.random (ThreadUnsafeRandom, Paper-patched — NOT Xoroshiro, the
+     *  randomNumberGenerator bind NoSuchFieldException'd forever and the
+     *  silent catch hid it: run 40765408173 streamed zero SR/LR lines) keep
+     *  their LCG state in an INHERITED 'value' long. */
+    private static java.lang.invoke.MethodHandle bindValue(Object o) throws Throwable {
+        for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField("value");
+                f.setAccessible(true);
+                return java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(f)
+                        .asType(java.lang.invoke.MethodType.methodType(
+                                long.class, Object.class));
+            } catch (NoSuchFieldException ignored) { }
+        }
+        throw new NoSuchFieldException("value not found on " + o.getClass().getName());
+    }
 
     private void logEntropyStreams() {
         try {
+            // SR first, emitted BEFORE the LR bind — a LR failure must not
+            // suppress the SR stream again (the emit-after-bind ordering bug
+            // above zeroed BOTH streams for two whole runs).
             if (SR_OBJ == null) {
                 Class<?> nms = Class.forName(
                         "net.minecraft.world.entity.Entity",
                         false, getClass().getClassLoader());
                 java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
                 f.setAccessible(true);
-                Object sr = f.get(null);
-                // Entity$RandomRandomSource extends ThreadUnsafeRandom — the
-                // LCG state 'value' is INHERITED (getDeclaredField sees only
-                // declared fields — observed: NoSuchFieldException killed the
-                // probe silently on the first tick).
-                Object o = sr;
-                java.lang.reflect.Field sf = null;
-                for (Class<?> c = o.getClass(); c != null && sf == null; c = c.getSuperclass()) {
-                    try { sf = c.getDeclaredField("value"); } catch (NoSuchFieldException ignored) { }
-                }
-                if (sf == null) throw new NoSuchFieldException("value not found on SHARED_RANDOM hierarchy");
-                sf.setAccessible(true);
-                SR_SEED = java.lang.invoke.MethodHandles.lookup()
-                        .unreflectGetter(sf)
-                        .asType(java.lang.invoke.MethodType.methodType(
-                                long.class, Object.class));
-                SR_OBJ = sr;
+                SR_OBJ = f.get(null);
+                SR_SEED = bindValue(SR_OBJ);
+            }
+            if (SR_SEED != null && SR_OBJ != null) {
+                long s = (long) SR_SEED.invokeExact(SR_OBJ);
+                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s));
             }
             if (LR_OBJ == null) {
-                // the field belongs to the NMS Level — get the ServerLevel
-                // handle via CraftWorld.getHandle() (CraftWorld is the Bukkit
-                // wrapper; rf.get(craftWorld) throws IllegalArgumentException,
-                // and the CraftEntity-bound PH_GET_HANDLE checkcast-rejects a
-                // CraftWorld — observed: silent retry every tick).
+                // the field belongs to the NMS Level — CraftWorld is the
+                // Bukkit wrapper (rf.get(craftWorld) throws
+                // IllegalArgumentException); resolve the ServerLevel handle.
                 Object handle = Bukkit.getWorlds().get(0)
                         .getClass().getMethod("getHandle")
                         .invoke(Bukkit.getWorlds().get(0));
@@ -977,41 +987,22 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         false, getClass().getClassLoader());
                 java.lang.reflect.Field rf = lvl.getDeclaredField("random");
                 rf.setAccessible(true);
-                Object lr = rf.get(handle);
-                // XoroshiroRandomSource.randomNumberGenerator (Xoroshiro128PlusPlus)
-                // holds the state pair seedLo/seedHi — the pair IS the state.
-                java.lang.reflect.Field gen = lr.getClass().getDeclaredField("randomNumberGenerator");
-                gen.setAccessible(true);
-                Object g = gen.get(lr);
-                Class<?> gc = g.getClass();
-                java.lang.reflect.Field a = gc.getDeclaredField("seedLo");
-                java.lang.reflect.Field b = gc.getDeclaredField("seedHi");
-                a.setAccessible(true);
-                b.setAccessible(true);
-                LR_XLO = java.lang.invoke.MethodHandles.lookup()
-                        .unreflectGetter(a).asType(java.lang.invoke.MethodType
-                                .methodType(long.class, Object.class));
-                LR_XHI = java.lang.invoke.MethodHandles.lookup()
-                        .unreflectGetter(b).asType(java.lang.invoke.MethodType
-                                .methodType(long.class, Object.class));
-                LR_OBJ = g;
-            }
-            if (SR_SEED != null && SR_OBJ != null) {
-                long s = (long) SR_SEED.invokeExact(SR_OBJ);
-                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s));
+                LR_OBJ = rf.get(handle);
+                LR_XLO = bindValue(LR_OBJ);
             }
             if (LR_XLO != null && LR_OBJ != null) {
                 long a = (long) LR_XLO.invokeExact(LR_OBJ);
-                long b = (long) LR_XHI.invokeExact(LR_OBJ);
-                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a)
-                        + " b=" + Long.toHexString(b));
+                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a));
             }
         } catch (Throwable t) {
-            // one warning then disable — a broken probe must not spam
-            if (SR_SEED == null && SR_OBJ == null) {
+            // log ONCE then disable — but through INFO with the PH prefix so
+            // the watchdog streams it into the job log (server.log-only
+            // warnings were invisible for two runs)
+            if (SR_OBJ == null || SR_SEED == null) {
                 SR_OBJ = new Object();
-                getLogger().warning("entropy probe disabled: " + t);
+                SR_SEED = null;
             }
+            getLogger().info("PH t=" + tickNo + " entropy-probe-disabled: " + t);
         }
     }
 
