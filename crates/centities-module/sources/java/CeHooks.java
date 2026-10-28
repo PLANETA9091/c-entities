@@ -443,7 +443,7 @@ public final class CeHooks {
             // a different first candidate flips the survivor ids).
             if (phDumpTickNow()) {
                 StringBuilder msb = new StringBuilder(96);
-                msb.append("MS t=").append(CURRENT_TICK)
+                msb.append("MS t=").append(CUR_TICK)
                         .append(" self=").append(e.getId()).append(" n=").append(cands.size());
                 for (int k = 0; k < Math.min(cands.size(), 24); k++) {
                     msb.append(' ').append(cands.get(k).getId());
