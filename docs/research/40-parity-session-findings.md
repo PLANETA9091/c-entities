@@ -338,3 +338,29 @@ spread's 2182 shows the same class one scenario later). NEXT: audit
 mobTravelNative's ingest/onGround/friction classification against the
 26.3 LivingEntity.travel(bytecode) — the first-move tick is the
 reproducible shape (a standing mob's first stroll input).
+
+### MSQ findings (run 40904510292, the streamed MSQ lines)
+- `MSQ t=475 self=971 path=row rawN=0 win=163 home=0 stale=0` — 971's
+  scan: the ROW path staged rows, the packed x-window rejected ALL 163
+  candidates, ZERO derefs. The merge partner 1873 was never derefed.
+- `MSQ t=475 self=1384 path=row rawN=1 ids=[1873]` — the NEIGHBOR scan
+  (the row path, a different query box) DID find 1873: the index row
+  contains 1873, its packed window passes for 1384's interval.
+- `MSQ t=475 self=1383 path=native rawN=1 ids=[1637]` + `MS n=0` —
+  1383's scan went NATIVE (the row refused), the index returned ONE
+  candidate (1637), and the final list was EMPTY — 1637 was dropped by
+  the exact re-check or the predicate.
+
+The asymmetry (the row finds 1873 for 1384; the native misses it for
+1383; 971's row window rejects everything) points at the staged-row
+WINDOW geometry — the L41e diagnostic (598f8fe) dumps the staged rows'
+(cx, cz, n) per MSQ (`MSR ... rows=[(cx,cz,n),...]`), which pins the
+exact staged-cell/window disagreement. The sentinel fix (49caa57) is
+CONFIRMED working (the dense pile cells now refuse the row path —
+path=native for the in-pile scans).
+
+Analyzer notes: the streamed job log filters through run-baseline.sh's
+grep — MSQ/MSR were invisible until added to the pattern (883c8aa).
+The 0f3e16e commit shipped a non-compiling sampler (the field-name
+mangles msqRej/MSQ_REJ) — fixed in 2ce9476; always compile-check the
+Java before push (the local direct-javac harness catches it).
