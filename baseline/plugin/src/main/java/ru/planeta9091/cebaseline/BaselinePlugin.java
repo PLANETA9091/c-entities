@@ -906,6 +906,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         m ^= Long.rotateLeft(phMix(
                                 Double.doubleToLongBits(vle.getHealth())), 73);
                     }
+                    if (be instanceof org.bukkit.entity.Item ie2) {
+                        // L43: the STACK COUNT rides the avalanche. A partial
+                        // merge (the surviving from-stack loses only delta <
+                        // from.count) touches NO position, NO delta, NO hp —
+                        // PH-invisible until the count divergence flips a
+                        // later merge DIRECTION (the items t=159 pair
+                        // 971/1873: vanish/appear swapped, n equal). The
+                        // count is the merge arithmetic's whole state.
+                        m ^= Long.rotateLeft(phMix(ie2.getItemStack().getAmount()), 79);
+                    }
                     h += phMix(m);
                 }
                 if (dump) {
