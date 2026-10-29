@@ -825,6 +825,42 @@ public final class CeHooks {
         }
     }
 
+    /** L38f: LivingEntity.die(DamageSource) prefix. javap-verified 26.3:
+     *  hurtServer deducts hp through actuallyHurt BEFORE `this.die(source)`
+     *  (the isDeadOrDying gate at the tail of the hurt flow) — at the
+     *  prefix hp is ALREADY <= 0, so isAlive() is false and the freshly
+     *  recomputed pushFlags clear PF_PUSHABLE. Without this probe the
+     *  corpse (position frozen, zero box/delta events for the whole
+     *  ~20-tick deathTime animation) stays pushable in the mirror while
+     *  vanilla's getPushableEntities excludes it — the kernel's cramming
+     *  audit then counts it (hits/nonPass) and applies hurtServer where
+     *  vanilla does not: an extra hurt with ZERO RNG draw (cramming has
+     *  no source position -> dealDefaultKnockback passes xd=zd=0, no
+     *  Math.random, no velocity) and ZERO position impact — the exact
+     *  PH-invisible hp divergence that failed the T382+ snapshot gate
+     *  (doc 40). The upsert rides the pending batch; the next
+     *  nativePush of THIS tick drains it (flushIfPending / drain_direct
+     *  at the kernel entry), so the within-tick pusher order sees the
+     *  corpse exactly when vanilla's fresh per-pusher list does. */
+    public static void probeDie(Entity e) {
+        try {
+            if (ACTIVE && INDEXING && e != null
+                    && e instanceof net.minecraft.world.entity.LivingEntity
+                    && SERVER_THREAD.get()
+                    && e.level() != null && !e.level().isClientSide()) {
+                ARENA[e.getId() & AMASK] = e;
+                batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), true);
+            }
+        } catch (Throwable t) {
+            // uncertain -> the mirror stays as-is. The failure mode is the
+            // PRE-fix staleness (a missed flag refresh can only LEAVE a
+            // corpse in the kernel's view — an extra audit hit), never a
+            // spurious removal: this probe may only shrink the view.
+            lastError = System.nanoTime();
+            lastErrorText = "probeDie: " + t;
+        }
+    }
+
     /** Prefix of Entity.setBoundingBox(AABB): the NEW box arrives as an arg.
      *  This is the SINGLE choke point for box changes in 1.21.8:
      *  setPos(DDD) -> setPosRaw(DDD,Z) -> makeBoundingBox -> setBoundingBox

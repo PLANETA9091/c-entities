@@ -889,6 +889,23 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vy)), 47);
                         m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vz)), 57);
                     }
+                    // VITALS (doc 40): the cramming-hurt fields the snapshot
+                    // gate reads and the position avalanche cannot see. A
+                    // cramming-hurt divergence (an extra/missing hurtServer)
+                    // touches NO position and NO RNG draw (cramming has no
+                    // source position -> knockback xd=zd=0 -> zero draws) —
+                    // PH-invisible until hp/fire/alive ride the same hash.
+                    // Plain Bukkit reads (the exact calls the snapshot makes):
+                    // no NMS handles, nothing new to bind, no allocation.
+                    m ^= Long.rotateLeft(phMix(be.getFireTicks() & 0xFFFF_FFFFL), 67);
+                    m ^= Long.rotateLeft(phMix(be.isValid() ? 0x59L : 0x5AL), 71);
+                    if (be instanceof org.bukkit.entity.LivingEntity vle) {
+                        // getHealth() is a DOUBLE in this API (the snapshot's
+                        // hp field is Double.toHexString of the same read) —
+                        // mix the same 64 bits the snapshot prints
+                        m ^= Long.rotateLeft(phMix(
+                                Double.doubleToLongBits(vle.getHealth())), 73);
+                    }
                     h += phMix(m);
                 }
                 if (dump) {
@@ -1120,7 +1137,14 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .append(" vy=").append(hex(v.getY()))
                     .append(" vz=").append(hex(v.getZ()))
                     .append(" onG=").append(traced.isOnGround() ? 1 : 0)
-                    .append('\n');
+                    // vitals (doc 40): hp/fire ride the trace so a cramming
+                    // hurt divergence names its exact tick without a re-run
+                    .append(" fire=").append(traced.getFireTicks())
+                    .append(" alive=").append(traced.isValid() ? 1 : 0);
+            if (traced instanceof org.bukkit.entity.LivingEntity tle) {
+                sb.append(" hp=").append(hex(tle.getHealth()));
+            }
+            sb.append('\n');
             traceOut.write(sb.toString());
             traceOut.flush();
             // Stream into server.log too: the watchdog delta-tails it into

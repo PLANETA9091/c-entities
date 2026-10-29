@@ -44,6 +44,11 @@ const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNav
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
 const LOOK_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/LookControl";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
+/// L38f: LivingEntity.die(DamageSource) — the cramming-audit freshness feed
+/// (javap-verified 26.3 descriptor).
+const DIE_DESC: &str = "(Lnet/minecraft/world/damagesource/DamageSource;)V";
+/// The probe bridge signature shared by every Entity-receiver prefix probe.
+const PROBE_ENTITY_DESC: &str = "(Lnet/minecraft/world/entity/Entity;)V";
 
 // ---------------------------------------------------------------------------
 // 4b.2a — zero-JNI steady state: the native side publishes every changed
@@ -1527,7 +1532,7 @@ fn precompute_livingentity(loader: jni::jobject) {
                 cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
             ],
         };
-        match base {
+        let guarded: Option<Vec<u8>> = match base {
             Some(b) => match cplug_sdk::asm::replace_body(env, loader, &b, &collide_spec) {
                 Some(b2) if !b2.is_empty() => {
                     COLLIDE_WOVEN.store(true, Ordering::Release);
@@ -1541,6 +1546,53 @@ fn precompute_livingentity(loader: jni::jobject) {
                     Some(b2)
                 }
                 _ => None,
+            },
+        };
+        // L38f chain: the die-probe feed for the push view (doc 40). The
+        // cramming audit reads hits/nonPass from the mirror; a dying mob's
+        // flags are stale for its whole ~20-tick deathTime animation (no
+        // box/delta events) unless THIS prefix recomputes them — at the
+        // die() entry hp is already <= 0 (hurtServer deducted it before
+        // calling die, javap-verified), so the refresh clears PF_PUSHABLE
+        // and the corpse leaves the kernel's view in the same tick.
+        // INDEPENDENT of the guards above: applied to whatever survived
+        // them (or to the original bytes), optional on refusal.
+        match guarded {
+            Some(b) => match patch::insert_static_call_at_start(
+                b.clone(),
+                "die",
+                DIE_DESC,
+                HOOKS_CLASS,
+                "probeDie",
+                PROBE_ENTITY_DESC,
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => Some(b2),
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] LivingEntity.die probe refused: {e}"
+                    ));
+                    Some(b)
+                }
+            },
+            None => match patch::insert_static_call_at_start(
+                bytes.to_vec(),
+                "die",
+                DIE_DESC,
+                HOOKS_CLASS,
+                "probeDie",
+                PROBE_ENTITY_DESC,
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => Some(b2),
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] LivingEntity.die probe refused: {e}"
+                    ));
+                    None
+                }
             },
         }
     });
