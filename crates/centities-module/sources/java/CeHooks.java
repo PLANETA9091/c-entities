@@ -506,6 +506,12 @@ public final class CeHooks {
     private static boolean MSQ_COLLECT = false;
     private static String msqPath = null;
     private static long msqWin0 = 0, msqHome0 = 0, msqStale0 = 0;
+    // L41d marginExtra samples: the LIVE boxes of the first 8 rejects (the
+    // index box lives in the Rust mirror — the Rust side can be extended to
+    // dump its side; the live boxes alone already show the pile's spread).
+    private static final double[] MSQ_REJ = new double[48];
+    private static final int[] MSQ_REJ_IDS = new int[8];
+    private static int msqRejN = 0;
 
     private static String msqIds() {
         StringBuilder sb = new StringBuilder(msqN * 6 + 2);
@@ -545,6 +551,7 @@ public final class CeHooks {
                 msqWin0 = rowWinSkip;
                 msqHome0 = rowHomeMiss;
                 msqStale0 = rowStaleCand;
+                msqRejN = 0;
                 MSQ_COLLECT = true;
             }
             List<Entity> cands;
@@ -585,6 +592,18 @@ public final class CeHooks {
                         + " win=" + (rowWinSkip - msqWin0)
                         + " home=" + (rowHomeMiss - msqHome0)
                         + " stale=" + (rowStaleCand - msqStale0));
+                if (msqRejN > 0) {
+                    StringBuilder rb = new StringBuilder(160);
+                    for (int k = 0; k < msqRejN; k++) {
+                        rb.append(msqRejIds[k]).append(":[")
+                                .append((float) msqRej[k * 6]).append(',')
+                                .append((float) msqRej[k * 6 + 2]).append(',')
+                                .append((float) msqRej[k * 6 + 4]).append(']');
+                    }
+                    System.out.println("[ce-baseline] MSR t=" + CUR_TICK
+                            + " self=" + e.getId() + " rej=" + msqRejN
+                            + " liveMin=" + rb);
+                }
             }
             boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
             for (int k = 0; k < cands.size(); k++) {
@@ -1873,6 +1892,21 @@ public final class CeHooks {
                     && eb.minY < box.maxY && eb.maxY > box.minY
                     && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
                 marginExtra++;
+                // L41d: sample the first rejects' index-box vs LIVE-box —
+                // the Rust scan already filters all 3 axes against the
+                // INDEX box exactly, so an 84% rejection rate means the
+                // index box disagrees with the live box. The sample names
+                // which side is stale (the doc-41 exact-f64-query move).
+                if (MSQ_COLLECT && msqRejN < 8) {
+                    msqRej[msqRejN * 6] = eb.minX;
+                    msqRej[msqRejN * 6 + 1] = eb.maxX;
+                    msqRej[msqRejN * 6 + 2] = eb.minY;
+                    msqRej[msqRejN * 6 + 3] = eb.maxY;
+                    msqRej[msqRejN * 6 + 4] = eb.minZ;
+                    msqRej[msqRejN * 6 + 5] = eb.maxZ;
+                    msqRejIds[msqRejN] = cid;
+                    msqRejN++;
+                }
                 continue;
             }
             // NOTE: the vanilla predicate still applies, as it must.
