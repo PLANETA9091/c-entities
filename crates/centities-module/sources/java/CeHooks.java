@@ -2316,12 +2316,19 @@ public final class CeHooks {
         if (s == null || s.isBlank()) return new int[0];
         try {
             int dash = s.indexOf('-');
+            int lo, hi;
             if (dash > 0) {
-                return new int[]{Integer.parseInt(s.substring(0, dash).trim()),
-                        Integer.parseInt(s.substring(dash + 1).split(",")[0].trim())};
+                lo = Integer.parseInt(s.substring(0, dash).trim());
+                hi = Integer.parseInt(s.substring(dash + 1).split(",")[0].trim());
+            } else {
+                lo = hi = Integer.parseInt(s.trim().split(",")[0]);
             }
-            int v = Integer.parseInt(s.trim().split(",")[0]);
-            return new int[]{v, v};
+            // PH_DUMP is in PLUGIN-tick space; CUR_TICK counts flushes across
+            // ALL loaded levels (3 at parity: overworld+nether+end — run
+            // 40789269145: ct=423 at t=141) — scale and pad.
+            lo = lo * 3 - 15;
+            hi = hi * 3 + 15;
+            return new int[]{lo, hi};
         } catch (NumberFormatException quiet) {
             return new int[0];
         }
