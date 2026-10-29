@@ -107,3 +107,22 @@ needs its own floor. No single -30% move exists.
   may only skip work whose OUTCOME is provably identical, and every
   mirror read must carry a freshness story (probe, version, or phase
   contract).
+
+## Session note (2026-10-29, L42): the push-mirror delta fix landed
+
+The parity hunt's remaining 4 PH divergences were re-rooted: the
+first-move class (mobs t=183, spread) is the L12 push mirror's stale
+delta capture + the deferred candidate writes (doc 40 addendum 6) —
+fixed in bff37c3 (the value-carrying probeDelta + the immediate pair
+apply). The items/mixed merge class (t=159/t=152) keeps its MSQ
+diagnosis track: the fresh 6abd10f log shows the MSQ/MSR telemetry
+fires only in the 448-499 dump window while the divergence starts at
+152/159 — a PH_DUMP run at 150-170 (40922735974) re-arms it at the
+divergence tick.
+
+Profile (mixed-150k ON, 64f49f7, stackdepth=5 — now fixed to 64):
+AABB.intersects 8.3% (97% inside the vanilla/moonrise section scans,
+NOT our query paths — the vanilla query volume is the lever), the
+tracker floor ~2.8%, the attribute cluster ~2.2%, fastQuery 4.4%.
+The next profile run attributes the vanilla query roots (the
+74.85% bucket) with the full stacks.
