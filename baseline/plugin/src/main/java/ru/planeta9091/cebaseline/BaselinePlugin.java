@@ -912,7 +912,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // afterwards (the cascade is already lost there; the ±8-tick
             // window is enough to aim a PARITY_TRACE_ID run). Keeps the
             // streamed job log at ~270 lines/leg instead of ~72k.
-            if (tickNo <= 200 || tickNo % 8 == 0) {
+            if (tickNo <= 400 || tickNo % 8 == 0) {
                 getLogger().info("PH t=" + tickNo + " ct=" + ceCurTick()
                         + " h=" + String.format("%016x", h)
                         + " n=" + n + " adds=" + adds);
