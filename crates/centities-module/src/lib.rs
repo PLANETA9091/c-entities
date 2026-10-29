@@ -335,18 +335,41 @@ fn publish(env: &JniEnv, st: &mut CeState) {
         // See EntityIndex::cell_scan_packed for the conservativeness contract.
         let (count, overflow) = st.idx.cell_scan_packed(cell, &mut st.p.ids, ROW_CAP);
         if overflow {
-            // sticky dense: kill any published row (Java sees the sentinel)
+            // sticky dense: kill any published row (Java sees the sentinel).
+            // A cell that went dense BEFORE its first publish has a NULL slot
+            // — the row path's null contract ("never occupied = empty cell")
+            // would then answer an EMPTY candidate list for a cell holding
+            // thousands of entities: every merge scan inside the pile
+            // returned n=0, the merge survivors flipped (items t=159 971/1873,
+            // mixed t=152 469/964 — run 40889274763), and the merges were
+            // silently dropped. The sentinel MUST be visible: allocate the
+            // row array when absent (the Java side reads count=0x7FF >
+            // ROW_CAP -> rowBig -> the native path).
             if st.p.dense.len() <= ci {
                 st.p.dense.resize(ci + 1, false);
             }
             st.p.dense[ci] = true;
-            let row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
-            if !row.is_null() {
-                st.p.buf.resize(2 + ROW_CAP, 0);
-                st.p.buf[0] = key as i64;
-                st.p.buf[1] = (st.p.seq << 11) | ROW_SENTINEL;
-                env.set_long_array_region(row as jni::jlongArray, 0, 2, &st.p.buf[..2]);
+            let mut row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
+            if row.is_null() {
+                match env.new_long_array((2 + ROW_CAP) as i32) {
+                    Some(narr) => {
+                        env.set_object_array_element(
+                            info.rows as jni::jobjectArray,
+                            slot,
+                            narr,
+                        );
+                        row = narr;
+                    }
+                    None => {
+                        st.p.info = None; // OOM: publishing off for good
+                        return;
+                    }
+                }
             }
+            st.p.buf.resize(2 + ROW_CAP, 0);
+            st.p.buf[0] = key as i64;
+            st.p.buf[1] = (st.p.seq << 11) | ROW_SENTINEL;
+            env.set_long_array_region(row as jni::jlongArray, 0, 2, &st.p.buf[..2]);
             continue;
         }
         st.p.buf.resize(2 + ROW_CAP, 0);
