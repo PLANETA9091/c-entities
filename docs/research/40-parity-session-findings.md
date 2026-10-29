@@ -304,3 +304,37 @@ Analyzer additions: `scripts/pd_diff.py <log> <tickA> <tickB>` — the
 per-entity PD diff across the divergence boundary (named 971/1873 and
 469/964 directly); ph_diff fixed (ct= format + marker-baseline reset +
 tick-reset segmentation for markerless logs).
+
+## Session addendum 5 (2026-10-29): the pile sentinel (49caa57) + the mobs travel root
+
+### items/mixed — ROOT CAUSE FOUND AND FIXED (the dense-kill sentinel)
+The MS dump showed scan after scan returning n=0 INSIDE the pile (29
+scanners at CT=475, all n=0 except one). The pile (area=0 — every item
+spawns at the anchor) makes its cell cross ROW_CAP=510 before the first
+publish; the dense-kill wrote its sentinel ONLY into a non-null slot;
+the cell's slot stayed NULL forever; the row path's null contract
+("never occupied = an EMPTY cell", freshSeen satisfied by the other
+covered cells) answered an EMPTY candidate list for every scan in the
+pile — a "successful" empty answer, no vanilla fallback, the merges
+silently dropped. FIX 49caa57: allocate the row array for a dense cell
+and write the sentinel unconditionally (Java reads count=0x7FF >
+ROW_CAP -> rowBig -> the native path).
+
+The earlier L41b row expansion (9fb3648, the 1-cell single-homing
+coverage) is kept: it closes a REAL coverage gap vs vanilla's
+box-overlap section registration, but it was not THIS divergence.
+
+### mobs/spread — the roots are NAMED, the fix is the next session
+The PTRACE of 377 (mobs) at t=183 — the FIRST-MOVE tick after 12 ticks
+standing still (the AI's first stroll, the yaw identical in both legs —
+the RNG clean):
+  off: vx=0.0202 vy=-0.078 vz=0.0202   (the ground friction applied,
+                                        the gravity delta kept)
+  on : vx=0.046  vy=0.000  vz=0.046   (the full air speed, vy zeroed)
+The L20/L28 native travel classified the starting mob as NOT-on-ground
+(no slipperiness, the collision zeroed vy) while vanilla ran the ground
+branch. Every subsequent tick compounds the position error (the
+spread's 2182 shows the same class one scenario later). NEXT: audit
+mobTravelNative's ingest/onGround/friction classification against the
+26.3 LivingEntity.travel(bytecode) — the first-move tick is the
+reproducible shape (a standing mob's first stroll input).
