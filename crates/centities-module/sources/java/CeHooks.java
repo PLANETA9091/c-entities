@@ -116,13 +116,17 @@ public final class CeHooks {
      *  <= 8 blocks (mob collision ~0.6-1.9, item merge scans ~1-2.5) pays a
      *  packed-x-window scan of ~3-4ns/entry that skips 75-96% of the row
      *  WITHOUT a deref, so the per-candidate Java cost applies only to the
-     *  overlap fraction. Valid rows are each <= ROW_CAP (510) entries and a
-     *  narrow box covers <= 4x4 = 16 rows, so 8192 is a belt, not the real
-     *  bound; the EMA still prices the bucket and flips to the mirror when
-     *  the row scan loses. Wide shapes (targeting/sensor scans 7-35 blocks)
-     *  keep the flat 512 cap — their window pass fraction is near 100%, so
-     *  the scan cost there is per-CANDIDATE, not per-ENTRY. */
-    private static final int ROW_TOTAL_CAP_NARROW = 8192;
+     *  overlap fraction. Valid rows are each <= ROW_CAP (510) entries and —
+     *  since L41b — a narrow box stages up to 6x6 = 36 rows (the raw 4x4
+     *  plus the 1-cell single-homing expansion), so 18432 = 36x510 + slack
+     *  is the belt; the EMA still prices the bucket and flips to the mirror
+     *  when the row scan loses. The old 8192 (4x4 sizing) refused the
+     *  expanded dense windows wholesale (the mobs legs: rowBig exploded to
+     *  ~11k refusals, the row path's serving collapsed). Wide shapes
+     *  (targeting/sensor scans 7-35 blocks) keep the flat 512 cap — their
+     *  window pass fraction is near 100%, so the scan cost there is
+     *  per-CANDIDATE, not per-ENTRY. */
+    private static final int ROW_TOTAL_CAP_NARROW = 18432;
 
     // Row-path diagnostics: hits and every distinct miss reason.
     public static volatile long rowFast = 0;
