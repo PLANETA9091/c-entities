@@ -52,45 +52,33 @@ newTrackerTick 1.1, AttributeMap 1.1... The mob leg's remaining mass is
 the VANILLA AI + attribute + tracker long tail — many 1-3% frames, each
 needs its own floor. No single -30% move exists.
 
-## Ranked next moves
+## Ranked next moves (updated 2026-10-29 after the L41 measurement)
 
-1. **Merge-scan pre-resolved predicate (doc-30's redesign, items +
-   mixed + spread legs)**. `tryToMerge`'s conditions split into a
-   STATIC per-item-type part (maxStackSize, damage>0, enchantments/
-   component class — all type-level constants) and a DYNAMIC part
-   (count comparison, age/pickup). The static part is pre-resolved per
-   item TYPE into the kernel's mirror (a flag byte per entity, stamped
-   by the existing probe path — zero JNI at scan time); the dynamic
-   count compare moves into the Rust scan. The MH predicate stays the
-   fallback for any item whose static resolution is uncertain
-   (components present, non-vanilla stack). Expected: -8.3% direct
-   (getMaxStackSize) plus a cut of fastQuery's 14% (the predicate's
-   MH dispatch and per-pair Java work).
-   PARITY CONTRACT: the merge scan order and the survivor semantics
-   are PROVEN green (4242a2d + 5194968) — the specialization must
-   select the SAME survivor in the SAME order; the pre-resolved bit is
-   only allowed to replace the per-pair PREDICATE EVALUATION, never to
-   reorder or re-pair.
-2. **fastQuery row-path tightening (items/mixed)**. The row path pays
-   a per-candidate live-box filter + the exact AABB re-check in Java
-   for every merge scan. Two cheap cuts: (a) skip the f32-prefilter
-   double-filter when the row was published from the same-tick boxes
-   (the pending revision check already exists — reuse it as a skip
-   bit); (b) hoist the Entity.getId/hash lookups out of the per-row
-   loop (4.5% Entity.getId rides partly on this path).
-3. **The vanilla-AI long tail (mobs)**: GoalSelector.tick + tickRunning
-   (~2.4%) — the L15 microkernel is shipped; the remaining mass is the
-   vanilla goal BODY. The pre-resolved-predicate goal redesign (doc-30
-   item 4) only pays after 1-2 land.
-4. **AttributeMap.getValue/getInstance (~1.1-1.2% mobs/mixed)** — the
-   movement floors re-read attributes per tick; a per-tick attribute
-   snapshot in the existing mob mirror (stamped at ingest, refreshed
-   on updateAttributes) removes the Map lookups.
-5. **Unsafe.getObject 2.1-2.9%** — the arena ARENA[id&AMASK] /
-   ORD_SEQ reads inside probes. A collapsed long-keyed table (id →
-   packed (slot|rev)) could halve the probe cost; measure first — the
-   frames may be the publish path's ROW writes, which are already
-   minimal.
+0. **DONE — the merge max-stack pre-resolution (L41, 98483d2)**:
+   `ItemInstance.getMaxStackSize` 8.29% → **0.85%** (mixed-150k profile
+   40886854724). The merge predicate is no longer a top bucket.
+1. **The EXACT native query (f64 boxes in the index)** — was move 2,
+   promoted: the mixed-150k profile's new #1 is
+   `AABB.intersects(DDD)` at **8.30%** — the L37d exact re-check of the
+   native query's margin superset — with **marginExtra = 226.4M
+   candidates per 300-tick measure window**. The whole remaining item
+   tax is the f32 index's margin: the query returns ~5x the true
+   candidate count and Java re-checks every one. Options, in order of
+   preference:
+   a. store f64 boxes in the query index (100k entities × 48B = 4.8MB
+      — trivial) and drop the MARGIN entirely: the native query returns
+      EXACTLY vanilla's set, the Java re-check disappears, and the
+      marginExtra loop with its getBoundingBox calls (1.88%) goes with
+      it. The f32 prefilter stays as the SIMD first pass (a range
+      compare on the f32 copy, exact f64 confirm in Rust);
+   b. SIMD the Java re-check (21's AVX2 pattern) — cheaper to ship,
+      keeps the 5x candidate tax.
+2. **fastQuery row-path tightening** — unchanged (the shared-scratch
+   list for the merge-scan caller; the general getEntities keeps
+   allocating).
+3. **The vanilla-AI long tail (mobs)** — unchanged.
+4. **AttributeMap snapshot** — unchanged.
+5. **Unsafe.getObject 2.2%** — unchanged.
 
 ## Guardrails
 
