@@ -1976,14 +1976,15 @@ public final class CeHooks {
     }
 
     // Multi-cell scratch (server-thread only, reused — no per-query alloc).
-    // L32: widened 4 -> 16 — the staging rectangle is up to 4x4 cells
-    // (span <= 3 per axis); the scan below is already rectangle-general.
-    private static final long[][] MQ_ROWS = new long[16][];
-    private static final int[] MQ_CELL = new int[16];
+    // L32: widened 4 -> 16; L41b: 16 -> 36 — the staging rectangle is up to
+    // 6x6 cells (raw span <= 3 + the 1-cell single-homing expansion per
+    // axis); the scan below is already rectangle-general.
+    private static final long[][] MQ_ROWS = new long[36][];
+    private static final int[] MQ_CELL = new int[36];
     // L4c windowed rows: the UNWRAPPED cell x-origin of each covered row
     // (world blocks) — the reference frame for the packed candidate windows.
-    private static final long[] MQ_CELL_X0 = new long[16];
-    private static final long[] MQ_CELL_Z0 = new long[16];
+    private static final long[] MQ_CELL_X0 = new long[36];
+    private static final long[] MQ_CELL_Z0 = new long[36];
     // Pending row-neutral ids homed in a covered cell: their packed windows
     // are stale until the next publish, so the window test must not skip them.
     // Sized to PENDING_CAP: every pending row-neutral id of a covered cell
@@ -1994,13 +1995,26 @@ public final class CeHooks {
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
             Entity source, AABB box, Predicate<? super Entity> predicate) {
-        int cx0 = cellFloor(box.minX);
-        int cx1 = cellFloor(box.maxX);
-        int cz0 = cellFloor(box.minZ);
-        int cz1 = cellFloor(box.maxZ);
-        // L32: the window is 4x4 (span <= 3). Wider boxes (the really wide
-        // targeting scans) still refuse into the native/mirror paths.
-        if (cx1 - cx0 > 3 || cz1 - cz0 > 3) { rowMulti++; return null; }
+        // L41b CELL EXPANSION: an entity single-homes at its CENTER cell,
+        // while vanilla's moonrise EntityLookup registers it in EVERY section
+        // its BOX overlaps — a neighbor whose center sits just past a cell
+        // boundary but whose box overlaps the query box is INVISIBLE to a
+        // raw-cell row walk, while vanilla finds it. The native path expands
+        // by max_half_span + MARGIN for exactly this single-homing safety;
+        // the row path must too: a 1-cell expansion covers every center
+        // within half-span <= 16 (bigger boxes are oversize-listed and never
+        // homed here). run 40889274763: the items t=159 survivor flip
+        // (971/1873) is a merge scan of self=971 returning n=0 where
+        // vanilla found the cross-boundary 1873; mixed t=152 (469/964) —
+        // the same shape.
+        int cx0 = cellFloor(box.minX) - 1;
+        int cx1 = cellFloor(box.maxX) + 1;
+        int cz0 = cellFloor(box.minZ) - 1;
+        int cz1 = cellFloor(box.maxZ) + 1;
+        // L32: the window is 6x6 (span <= 5 after the expansion). Wider
+        // boxes (the really wide targeting scans) still refuse into the
+        // native/mirror paths.
+        if (cx1 - cx0 > 5 || cz1 - cz0 > 5) { rowMulti++; return null; }
         // L35: narrow shapes (collision, merge scans) get the raised total
         // cap — the packed x-window below does the mass skip for them.
         double wxs = box.maxX - box.minX;
