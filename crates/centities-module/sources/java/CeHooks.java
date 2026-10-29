@@ -2945,9 +2945,14 @@ public final class CeHooks {
                 long pid = PUSH_PAIR_IDS[i];
                 Entity pe = ARENA[(int) (pid & AMASK)];
                 if (pe == null || pe.getId() != (int) (pid & 0xFFFF_FFFFL)) {
-                    // unreachable by construction (the kernel's candidates
-                    // come from the mirror the ARENA feeds; no Java code runs
-                    // between n_push and this loop) — count and skip
+                    // unreachable once the JNI side writes the arrays IN
+                    // PLACE: the pair ids come from the mirror the ARENA
+                    // feeds, no Java code runs between n_push and this loop.
+                    // (The first CI run missed 210/223 because the arrays
+                    // were static-final and the JIT folded the ORIGINAL
+                    // empty-array reference while n_push swapped the field
+                    // to a fresh array each call — the compiled loop read
+                    // all-zero ids. The region-write fix keeps the object.)
                     pushPairMiss++;
                     continue;
                 }

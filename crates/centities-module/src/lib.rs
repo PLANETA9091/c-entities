@@ -4270,30 +4270,39 @@ pub extern "system" fn n_push(
             }
             // L42: the pushed-pair outputs. PUSH_PAIR_N rides EVERY ok call
             // (zero pairs -> 0, no stale replay into the next dispatch); the
-            // arrays are written only when non-empty (the Java side reads
-            // them only up to PUSH_PAIR_N).
+            // arrays are written IN PLACE (SetLongArrayRegion on the field's
+            // EXISTING array) — the Java arrays are `static final` and the
+            // JIT constant-folds the array REFERENCE, so replacing the field
+            // value with a fresh array (SetStaticObjectField) would leave
+            // every compiled reader on the original never-updated object
+            // (the first CI run: 210/223 pairs missed their ARENA resolve
+            // because the loop read all-zero ids).
             if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_N", "I") {
                 ((*vt).SetStaticIntField)(raw, cls, fid, npairs as i32);
             }
             if npairs > 0 {
                 if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_IDS", "[J") {
-                    let arr = ((*vt).NewLongArray)(raw, npairs as i32);
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
                     if !arr.is_null() {
-                        ((*vt).SetLongArrayRegion)(raw, arr, 0, npairs as i32, ids.as_ptr());
-                        ((*vt).SetStaticObjectField)(raw, cls, fid, arr);
+                        ((*vt).SetLongArrayRegion)(
+                            raw,
+                            arr as jni::jlongArray,
+                            0,
+                            npairs as i32,
+                            ids.as_ptr(),
+                        );
                     }
                 }
                 if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_D", "[D") {
-                    let arr = ((*vt).NewDoubleArray)(raw, (npairs * 2) as i32);
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
                     if !arr.is_null() {
                         ((*vt).SetDoubleArrayRegion)(
                             raw,
-                            arr,
+                            arr as jni::jdoubleArray,
                             0,
                             (npairs * 2) as i32,
                             ds.as_ptr(),
                         );
-                        ((*vt).SetStaticObjectField)(raw, cls, fid, arr);
                     }
                 }
             }
