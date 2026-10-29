@@ -2709,7 +2709,7 @@ public final class CeHooks {
                     // isTemporarilyActive toggle has no readers outside the
                     // skipped move path; MISC items take no immunity stamps)
                     boolean cadence = (e.tickCount + 1) % 40 == 0;
-                    boolean active = cadence && itemCheckActive(e);
+                    boolean active = cadence && itemCheckActive(e, true);
                     // dispatcher prologue mirror (the suppressed
                     // tickNonPassenger: setOldPosAndRot is value-identical
                     // at a fixed point, the counters are not)
@@ -2782,7 +2782,7 @@ public final class CeHooks {
                     return false;
                 }
             }
-            boolean active = itemCheckActive(e);
+            boolean active = itemCheckActive(e, false);
             appendDispatch(e, active);
             if (active) {
                 dispNative++;
@@ -2808,10 +2808,20 @@ public final class CeHooks {
      * tickCount read is (field + 1). The portal branches are unreachable:
      * itemDispatch routes portalProcess/portalCooldown items vanilla.
      */
-    private static boolean itemCheckActive(ItemEntity e) {
-        if ((e.tickCount + 1 + e.getId()) % 4 == 0) return true;
+    private static boolean itemCheckActive(ItemEntity e, boolean preIncrement) {
+        // The tickCount the vanilla checkIfActive reads is the POST-commonTick
+        // value (ServerLevel.tickNonPassenger: commonTick THEN tick, javap).
+        // TWO callers, TWO phases: itemDispatch runs at ItemEntity.tick's
+        // start — the field is ALREADY post (preIncrement=false); the rest
+        // path fully suppresses tickNonPassenger and mirrors the ++ itself
+        // AFTER the gate — its field is still pre (preIncrement=true). The
+        // old unconditional "+1" shifted the dispatch phase by one: the MS
+        // scan lists (run 40791707738, item 971) show the ON scan one tick
+        // earlier than vanilla — the merge survivor flip at t=159.
+        int tc = e.tickCount + (preIncrement ? 1 : 0);
+        if ((tc + e.getId()) % 4 == 0) return true;
         if (e.defaultActivationState) return true;
-        if (e.tickCount + 1 < 200) return true; // isAlive(): isRemoved gated above
+        if (tc < 200) return true; // isAlive(): isRemoved gated above
         long cur = net.minecraft.server.MinecraftServer.currentTick;
         boolean isActive = e.activatedTick >= cur;
         e.isTemporarilyActive = false;
