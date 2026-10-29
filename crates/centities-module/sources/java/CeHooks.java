@@ -490,6 +490,27 @@ public final class CeHooks {
 
     private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
 
+    // MSQ — the merge-scan query telemetry at PH_DUMP ticks (CUR_TICK
+    // space): the PRE-PREDICATE candidate ids of MERGE_SELF's scan, the
+    // path that served it (row/native/mirror), and the raw candidate
+    // count the index returned. A vanilla scan that finds a partner
+    // while the module's scan prints cands=0 names the exact query-path
+    // false negative (run 40889274763: MS t=475 self=971 n=0 — vanilla's
+    // scan of 971 found 1873, the tie absorbed 971, the leg diverged).
+    private static final int[] MSQ_IDS = new int[256];
+    private static int msqN = 0;
+    private static boolean MSQ_COLLECT = false;
+    private static String msqPath = null;
+    private static long msqWin0 = 0, msqHome0 = 0, msqStale0 = 0;
+
+    private static String msqIds() {
+        StringBuilder sb = new StringBuilder(msqN * 6 + 2);
+        for (int i = 0; i < msqN && i < 48; i++) {
+            sb.append(i == 0 ? "[" : ",").append(MSQ_IDS[i]);
+        }
+        return sb.append(msqN > 48 ? ",...]" : "]").toString();
+    }
+
     public static boolean mergeScanNative(ItemEntity e) {
         mergeChecks++;
         if (!MERGE_ON || !ACTIVE) return false;
@@ -513,14 +534,30 @@ public final class CeHooks {
                     w.paperConfig().entities.behavior.onlyMergeItemsHorizontally;
             AABB box = e.getBoundingBox().inflate(r, horizOnly ? 0.0 : r - 0.5, r);
             MERGE_SELF = e;
+            boolean msq = phDumpTickNow();
+            if (msq) {
+                msqN = 0;
+                msqPath = null;
+                msqWin0 = rowWinSkip;
+                msqHome0 = rowHomeMiss;
+                msqStale0 = rowStaleCand;
+                MSQ_COLLECT = true;
+            }
             List<Entity> cands;
             try {
                 cands = fastQuery(sl, e, box, MERGE_PRED);
             } finally {
+                MSQ_COLLECT = false;
                 MERGE_SELF = null;
             }
             if (cands == null) {
                 mergeMirror++;
+                if (msq) {
+                    msqPath = msqPath == null ? "mirror" : msqPath;
+                    System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                            + " self=" + e.getId() + " path=mirror"
+                            + " rawN=" + msqN + " ids=" + msqIds());
+                }
                 return false; // index unsure — vanilla body
             }
             mergeFast++;
@@ -537,6 +574,13 @@ public final class CeHooks {
                     msb.append(' ').append(cands.get(k).getId());
                 }
                 System.out.println("[ce-baseline] " + msb);
+                System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                        + " self=" + e.getId()
+                        + " path=" + (msqPath == null ? "row" : msqPath)
+                        + " rawN=" + msqN + " ids=" + msqIds()
+                        + " win=" + (rowWinSkip - msqWin0)
+                        + " home=" + (rowHomeMiss - msqHome0)
+                        + " stale=" + (rowStaleCand - msqStale0));
             }
             boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
             for (int k = 0; k < cands.size(); k++) {
@@ -1663,11 +1707,15 @@ public final class CeHooks {
                 rowOv++; // native oversize entities: exact scan is native-only
             } else {
                 List<Entity> out = rowQuery(sl, wid, source, box, predicate);
-                if (out != null) return out;
+                if (out != null) {
+                    msqPath = "row";
+                    return out;
+                }
             }
         } else if (PUBLISH_SEQ == 0) {
             rowNoPub++;
         }
+        msqPath = "native";
 
         // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is applied
         // by the SAME native call that runs the query — one JNI crossing and
@@ -1781,6 +1829,11 @@ public final class CeHooks {
                 // nothing but the source — that is not a desync.
                 srcSkip++;
                 continue;
+            }
+            if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
+                // the RAW candidate id — pre-window, pre-home, pre-box:
+                // the MSQ diff names WHICH stage dropped a merge partner
+                MSQ_IDS[msqN++] = cid;
             }
             // ZERO-RESOLVE: the probes keep refs in ARENA[id & AMASK]; the
             // id-match rejects stale/wrapped slots, the getter is only a
@@ -2149,8 +2202,13 @@ public final class CeHooks {
                     homeMiss++;
                     continue;
                 }
-                if (eb.intersects(box) && (predicate == null || predicate.test(e))) {
-                    out.add(e);
+                if (eb.intersects(box)) {
+                    if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
+                        MSQ_IDS[msqN++] = cid;
+                    }
+                    if (predicate == null || predicate.test(e)) {
+                        out.add(e);
+                    }
                 }
             }
         }
