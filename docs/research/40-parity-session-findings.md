@@ -107,3 +107,30 @@ random (SHARED), not level.random. Re-bind from net.minecraft.world.entity.Entit
   omits the seed; cosmetic).
 - vanilla-key order (ordSortVanilla) covers rowQuery; merge-scan path
   unverified (R-B).
+
+
+## Session addendum (the closing hours)
+
+### FIXED (the merge parity is GREEN)
+- itemCheckActive phase per-caller (4242a2d): the dispatch sees the
+  POST-commonTick tickCount (the +1 double-shifted the active gate one
+  tick — the MS scan lists proved ON's item 971 scanned at ~158 while
+  vanilla died scanning at 159); the rest path is PRE (+1 correct).
+- After the fix: PH identical across ALL emitted ticks through t=1064
+  (run 40795900185 — every tick through 400, 1-in-8 after) for all
+  four scenario groups.
+
+### THE REMAINING GAP: PH is blind to hp/fire/alive
+The snapshot gate still fails on hp fields (hp: 0.0 — death diffs) at
+T382+ while positions/velocities are bit-identical at every tick. The
+push kernel came ALIVE this session (the ncolMh 26.3 bind fix) — its
+cramming audit now applies hurtServer damage; a cramming-hurt
+divergence (extra/missing nextInt(4) draw or a different hurt) is
+PH-INVISIBLE because the PH hash covers only id/x/y/z/vx/vy/vz.
+
+**Next session, step 1**: extend the PH per-entity avalanche with
+hp (float bits), fire (int), alive (bool) — then the first divergent
+tick of the cramming damage will name itself, and PTRACE/PD will aim
+the fix. Step 2: audit pushcore's cramming branch against
+LivingEntity.pushEntities (26.3 javap): `list.size() > maxEntityCramming-1
+&& this.random.nextInt(4) == 0` → count non-passengers → hurtServer(cramming, 6.0f).
