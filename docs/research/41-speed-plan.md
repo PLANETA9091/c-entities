@@ -73,6 +73,21 @@ needs its own floor. No single -30% move exists.
       compare on the f32 copy, exact f64 confirm in Rust);
    b. SIMD the Java re-check (21's AVX2 pattern) — cheaper to ship,
       keeps the 5x candidate tax.
+
+   OPEN QUESTION (needs a diagnostic): the Rust scan already filters
+   all 3 axes exactly (AVX2 prefilter + exact_keep in Rust — the
+   survivors ARE tight against the INDEX box), so an 84% Java-side
+   rejection means the INDEX box disagrees with the LIVE box for 84%
+   of the surviving candidates. Bench geometry context: the profile
+   config is `area=0, inner_radius=28` — ALL 105k items pile in a
+   57x57 zone (~42 items/block²), so every merge scan's expanded box
+   covers thousands of co-located candidates and even a small
+   index-vs-live disagreement (probe lag within the flush cycle?
+   falling items during fill?) multiplies into hundreds of millions.
+   The native path serves only ~741 queries in the window (fast−row)
+   — each carries ~363k candidates — the pile cells. A marginExtra
+   sample diagnostic (index box + live box for the first N rejects)
+   settles which side is stale.
 2. **fastQuery row-path tightening** — unchanged (the shared-scratch
    list for the merge-scan caller; the general getEntities keeps
    allocating).
