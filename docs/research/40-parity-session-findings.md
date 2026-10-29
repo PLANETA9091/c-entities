@@ -429,3 +429,20 @@ skips the self-force, while the kernel computed the self base
 pre-audit. A >23-neighbor, 1-in-4-roll event; the mobs scenarios have
 not shown it. The candidates' own pushes are unaffected (the audit
 never hurts them).
+
+### L42b correction (run 40921675568): the pair arrays must be written IN PLACE
+
+The first L42 run MOVED the mobs divergence EARLIER (t=183 -> t=170,
+the pd pair 58/217) — a regression, not a fix-exposing shift: the
+pushDispatch pair apply missed 210/223 ARENA resolves (pushPairMiss).
+Root cause: PUSH_PAIR_IDS/PUSH_PAIR_D were `static final long[]/double[]`
+and n_push replaced the FIELD VALUE with a fresh array per call
+(SetStaticObjectField). The JIT constant-folds a static-final array
+REFERENCE in the compiled loop, so every compiled read kept the
+ORIGINAL empty arrays (the first ~13 interpreted reads landed, the
+compiled ones read all-zero ids). Fix (0261d4f): GetStaticObjectField +
+Set{Long,Double}ArrayRegion on the EXISTING array object; PUSH_PAIR_N
+(non-final int) stays the count gate. Lesson: JNI-written results go
+into preallocated non-replaced buffers when the Java reader can be
+constant-folded — the same discipline as the AI_IN/AI_OUT and the
+query out-buffers.
