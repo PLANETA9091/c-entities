@@ -509,8 +509,8 @@ public final class CeHooks {
     // L41d marginExtra samples: the LIVE boxes of the first 8 rejects (the
     // index box lives in the Rust mirror — the Rust side can be extended to
     // dump its side; the live boxes alone already show the pile's spread).
-    private static final double[] MSQ_REJ = new double[48];
-    private static final int[] MSQ_REJ_IDS = new int[8];
+    private static final double[] msqRej = new double[48];
+    private static final int[] msqRejIds = new int[8];
     private static int msqRejN = 0;
 
     private static String msqIds() {
