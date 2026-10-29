@@ -750,6 +750,7 @@ public final class CeHooks {
                 + "/" + lookCalls + "/" + lookIdleHits
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
+                + "/" + pushPairs + "/" + pushPairMiss
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
@@ -908,12 +909,35 @@ public final class CeHooks {
     // entities too) — the batch is a multi-producer append buffer.
     // ------------------------------------------------------------------
 
-    /** Prefix of Entity.setDeltaMovement(Vec3) AND setDeltaMovement(DDD):
-     *  wake-on-impulse. A resting item's tick is skipped, so any external
-     *  velocity change (a push, knockback, plugin velocity) must clear the
-     *  rest state or the item would never move while vanilla slides it away.
-     *  Waking a non-resting entity is one array read + branch (~3ns). */
-    public static void probeDelta(Entity e) {
+    /** Prefix of Entity.setDeltaMovement(Vec3) — the VALUE-CARRYING capture
+     *  (L42). The 26.3 body assigns the ARGUMENT (an isFinite-gated field
+     *  write), so the argument IS the post-write field value; the old
+     *  field-read capture (probeDelta(Entity)) always batched the PRE-write
+     *  value, which left the push mirror's delta permanently one write
+     *  behind — for a standing mob the box event re-captured the post-move
+     *  pre-tail (0, 0, 0) every tick (the tail's (0, -g*vf, 0) write was
+     *  value-identical, the L20b gate skipped it AND its probe event), so
+     *  the kernel's self writeback replaced the fresh vanilla travel result
+     *  with (stale base + push): vy=0.0 ("the collision zeroed vy"), the
+     *  un-frictioned vx — the exact mobs/spread first-move PH divergence
+     *  (doc 40 addendum 5, attributed there to the travel classification).
+     *  The DDD overload delegates to this one, so its own wake-only probe
+     *  fires first and this fires second — the LAST event per entity wins
+     *  at the drain and carries the new value. */
+    public static void probeDelta(Entity e, net.minecraft.world.phys.Vec3 v) {
+        if (v != null) {
+            probeDeltaCommon(e, v.x, v.y, v.z);
+        } else {
+            // never observed (vanilla constructs the Vec3 before the call);
+            // the wake must still fire, the batch must not
+            probeDeltaCommon(e, Double.NaN, Double.NaN, Double.NaN);
+        }
+    }
+
+    /** The shared capture body: the wake semantics are UNCHANGED (every
+     *  real setDeltaMovement call wakes a resting item), only the batched
+     *  values changed (the argument instead of the pre-write field). */
+    private static void probeDeltaCommon(Entity e, double x, double y, double z) {
         try {
             // L7 first: an external velocity change on a dispatch-owned item
             // clears its native mode (the applier's own writebacks run inside
@@ -928,20 +952,57 @@ public final class CeHooks {
                 if (ACTIVE && INDEXING && e instanceof net.minecraft.world.entity.LivingEntity
                         && SERVER_THREAD.get()) {
                     int pw = worldId(e.level());
-                    if (pw >= 0 && ARENA[m] == e) {
+                    if (pw >= 0 && ARENA[m] == e
+                            // the vanilla body SKIPS non-finite writes (the
+                            // Vec3 isFinite gate) — the field keeps the old
+                            // value, the mirror must too. Unreachable with
+                            // the L20b gate woven (it skips first); this is
+                            // the gate-off exactness guard.
+                            && Double.isFinite(x) && Double.isFinite(y)
+                            && Double.isFinite(z)) {
                         if (dbN >= BATCH_CAP) {
                             flush();
                         }
-                        Vec3 dv = e.getDeltaMovement();
                         DB_IDS[dbN] = ((pw & 0xFFFFL) << 32)
                                 | (e.getId() & 0xFFFF_FFFFL);
-                        DB_DV[dbN * 3] = dv.x;
-                        DB_DV[dbN * 3 + 1] = dv.y;
-                        DB_DV[dbN * 3 + 2] = dv.z;
+                        DB_DV[dbN * 3] = x;
+                        DB_DV[dbN * 3 + 1] = y;
+                        DB_DV[dbN * 3 + 2] = z;
                         dbN++;
                         if (dbN >= DRAIN_CAP) flush();
                     }
                 }
+                if (REST_GEN[m] != 0) { // resting: decide whether the impulse
+                    // is self-physics (this item's own marking tick) or an
+                    // external push; only the latter may break the rest.
+                    if (SELF_TICK_MASK == m && System.nanoTime() < SELF_TICK_UNTIL) {
+                        wakesSelf++;
+                    } else {
+                        REST_GEN[m] = 0;
+                        wakesDelta++;
+                        if (REST_CHURN[m] < 8) REST_CHURN[m]++;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeDelta: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
+
+    /** Prefix of Entity.setDeltaMovement(DDD) — wake-only. The 26.3 DDD
+     *  body DELEGATES to setDeltaMovement(Vec3) (javap-verified), so this
+     *  fires on the outer frame and the value-carrying probe above fires on
+     *  the inner one; the drain's last-event-wins keeps the mirror exact.
+     *  No batch here: the pre-write field read is now worthless (the inner
+     *  event carries the new value) and the double batch taxed the drain. */
+    public static void probeDelta(Entity e) {
+        try {
+            l7ExternalMutation(e);
+            if (e != null) {
+                int m = e.getId() & AMASK;
                 if (REST_GEN[m] != 0) { // resting: decide whether the impulse
                     // is self-physics (this item's own marking tick) or an
                     // external push; only the latter may break the rest.
@@ -2648,9 +2709,19 @@ public final class CeHooks {
     /** L12 kernel outputs (server-thread confined): the post-tick delta and
      *  the packed verdict of the last nativePush call. */
     public static double PUSH_SDX = 0.0, PUSH_SDY = 0.0, PUSH_SDZ = 0.0;
+    /** L42 pushed-pair outputs (server-thread confined): the kernel emits
+     *  (id, ddx, ddz) per pushed candidate instead of mutating the mirror —
+     *  the apply loop writes the candidate's delta THIS TICK (vanilla's
+     *  doPush lands both sides' forces inside the pusher's body), and the
+     *  write's own probe event re-syncs the mirror. Sized for the
+     *  maxEntityCollisions cap with headroom; the kernel caps the emission. */
+    public static final int PUSH_PAIR_CAP = 256;
+    public static final long[] PUSH_PAIR_IDS = new long[PUSH_PAIR_CAP];
+    public static final double[] PUSH_PAIR_D = new double[PUSH_PAIR_CAP * 2];
+    public static int PUSH_PAIR_N = 0;
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
-            pushCramming = 0, pushSelfDelta = 0;
+            pushCramming = 0, pushSelfDelta = 0, pushPairs = 0, pushPairMiss = 0;
     /** L12 kill switch: -Dcentities.pushNative=false keeps every push vanilla. */
     public static final boolean PUSH_ON =
             !"false".equals(System.getProperty("centities.pushNative", "true"));
@@ -2665,6 +2736,11 @@ public final class CeHooks {
     private static volatile java.lang.invoke.MethodHandle MH_RANDOM;
     private static volatile java.lang.invoke.MethodHandle MH_NEXT_INT;
     private static volatile boolean MH_NCOL_FAILED = false;
+    /** L42: the Unsafe offset of the PROTECTED Entity.numCollisions field —
+     *  the pushed candidates' per-pair increment (vanilla entityx
+     *  .numCollisions++ in the pusher's body) must reach the Java field
+     *  even when the candidate's own kernel run never writebacks it. */
+    private static long O_NCOL = -1;
 
     private static synchronized boolean initNcolMh(Entity sample) {
         if (MH_NCOL_FAILED) return false;
@@ -2702,11 +2778,13 @@ public final class CeHooks {
             MH_NCOL = ncol;
             MH_RANDOM = rnd;
             MH_NEXT_INT = next;
+            O_NCOL = U.objectFieldOffset(f);
             return true;
         } catch (Throwable t) {
             MH_NCOL = null;
             MH_RANDOM = null;
             MH_NEXT_INT = null;
+            O_NCOL = -1;
             MH_NCOL_FAILED = true;
             lastError = System.nanoTime();
             lastErrorText = "ncolMh: " + t;
@@ -2849,6 +2927,35 @@ public final class CeHooks {
                     le.hurtServer(sl, sl.damageSources().cramming(), 6.0f);
                 }
             }
+            // L42: the pushed candidates' own writes — vanilla applies them
+            // INSIDE the pusher's body (doPush -> entityx.push(this) mutates
+            // BOTH deltas; the audit runs BEFORE the pair loop, hence this
+            // placement). The old mirror-only deferral lost the force
+            // whenever the candidate's own kernel run declined, and the
+            // pusher's writeback then carried the stale mirror base — the
+            // first-move PH divergence (doc 40 addendum 5). entityx
+            // .numCollisions++ precedes doPush in vanilla; the push() call
+            // is the EXACT vanilla 3-arg overload (no event, needsSync,
+            // the probe captures the new value for the mirror).
+            if (O_NCOL < 0) {
+                return false; // cannot maintain the candidates' counters
+            }
+            int pn = PUSH_PAIR_N;
+            for (int i = 0; i < pn; i++) {
+                long pid = PUSH_PAIR_IDS[i];
+                Entity pe = ARENA[(int) (pid & AMASK)];
+                if (pe == null || pe.getId() != (int) (pid & 0xFFFF_FFFFL)) {
+                    // unreachable by construction (the kernel's candidates
+                    // come from the mirror the ARENA feeds; no Java code runs
+                    // between n_push and this loop) — count and skip
+                    pushPairMiss++;
+                    continue;
+                }
+                U.putInt(pe, O_NCOL, U.getInt(pe, O_NCOL) + 1);
+                pe.push(PUSH_PAIR_D[i * 2], 0.0, PUSH_PAIR_D[i * 2 + 1]);
+            }
+            pushPairs += pn;
+            PUSH_PAIR_N = 0;
             return true;
         } catch (Throwable t) {
             lastError = System.nanoTime();

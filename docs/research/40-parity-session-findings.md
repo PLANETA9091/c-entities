@@ -364,3 +364,68 @@ grep — MSQ/MSR were invisible until added to the pattern (883c8aa).
 The 0f3e16e commit shipped a non-compiling sampler (the field-name
 mangles msqRej/MSQ_REJ) — fixed in 2ce9476; always compile-check the
 Java before push (the local direct-javac harness catches it).
+
+## Session addendum 6 (2026-10-29): the first-move root was the PUSH MIRROR,
+### not the travel classification
+
+The addendum-5 verdict ("the L20/L28 native travel classified the starting
+mob as NOT-on-ground") was WRONG about the mechanism. The native travel
+NEVER ran on the diverging tick: mobTravelNative requires input==0 (the
+guard's first gate), and the first stroll input is non-zero — vanilla
+travelInAir ran in the ON leg and wrote the correct
+(x*0.546, -g*0.98, z*0.546) tail. The trace's vy=0.000 was UNREACHABLE
+from travelInAir (its tail always subtracts gravity post-move) — the
+delta was OVERWRITTEN AFTER travel by the L12 push kernel's self
+writeback.
+
+THE CHAIN (end-to-end, 26.3):
+1. Entity.move() ends with setDeltaMovement(the clipped delta) — the
+   collided axes zeroed: (0.037, 0.0, 0.037) on the first-move tick.
+2. The travelInAir tail then writes (0.0202, -0.0784, 0.0202).
+3. probeDelta was a PREFIX reading e.getDeltaMovement() — the PRE-write
+   field. Every setDeltaMovement therefore batched the value the write
+   was ABOUT to replace; the drain applies the events in order and the
+   LAST event per entity wins.
+4. The last event before the kernel is the TAIL's own prefix capture:
+   the PRE-tail field = the post-move clipped delta — vy 0.0 (the
+   collision zeroed it), vx un-frictioned. The box event (setPos ->
+   batchUpsert) captured the same pre-tail moment.
+   For a 12-tick STANDING mob the tail write (0, -g*vf, 0) is
+   value-identical every tick — the L20b gate skipped it AND its probe
+   event, leaving only the box-event captures: the mirror was fed
+   (0, -0.0784, 0)-then-(0, 0, 0)-class values, never the tail.
+5. n_push's self writeback then REPLACED the fresh vanilla tail with
+   (stale base + push): vy=0.0, the un-frictioned vx — exactly the
+   addendum-5 trace ("the collision zeroed vy", "no slipperiness").
+
+SECOND HALF: the pushed CANDIDATES' forces lived only in the mirror
+(kadd ledger); the candidate's own Java field got the force only when
+ITS OWN kernel run writebacked — lost whenever that run declined
+(the density gate, the mirror miss, the crammed route). The NEEDSSYNC
+flag was set but never consumed by any Java code.
+
+FIX (L42, this session):
+- probeDelta on setDeltaMovement(Vec3) is now VALUE-CARRYING: the 26.3
+  body assigns the ARGUMENT (an isFinite-gated write), so the probe
+  batches the post-write field value. The DDD overload delegates to the
+  Vec3 one, so its probe stays wake-only (the inner value event lands
+  after it and wins the drain). Non-finite values are never batched
+  (the vanilla body skips the write; the gate-off exactness guard).
+- pushcore emits the pushed pairs (id, ddx, ddz) instead of mutating
+  the candidate's mirror; pushDispatch applies them THIS TICK — the
+  exact vanilla doPush order (entityx.numCollisions++ via the new
+  O_NCOL Unsafe offset, then entityx.push(DDD) — the no-event 3-arg
+  overload, needsSync included). The write's own probe event re-syncs
+  the mirror before the next kernel read (every dispatch flushes
+  first). The kadd ledger is dead and removed; PF_NEEDSSYNC survives
+  only on self (diagnostics).
+- The kernel's self base is now the LIVE field: the writeback is
+  field + force, the friction/gravity tail survives.
+
+KNOWN REMAINING MICRO-GAP (pre-existing, unchanged by L42): a
+cramming-audit kill on the PUSHER inside the same dispatch — vanilla
+runs the audit BEFORE the pair loop and a dead pusher's isPushable
+skips the self-force, while the kernel computed the self base
+pre-audit. A >23-neighbor, 1-in-4-roll event; the mobs scenarios have
+not shown it. The candidates' own pushes are unaffected (the audit
+never hurts them).

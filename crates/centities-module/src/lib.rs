@@ -3723,14 +3723,20 @@ fn entity_probes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // both overloads write the field directly). Waking a NON-resting entity
     // is a no-op (one array read + branch, ~3ns — the common case for every
     // mob/stacked item), so the probe is free outside the rest guard.
+    // L42: the Vec3 overload's probe is VALUE-CARRYING — the 26.3 body
+    // assigns the argument, so the probe batches the post-write field value
+    // (the old field-read capture batched the PRE-write value and left the
+    // push mirror's delta permanently stale — the first-move divergence).
+    // The DDD overload DELEGATES to the Vec3 one, so its probe stays
+    // wake-only: the inner value event lands after it and wins the drain.
     let d1 = patch::insert_static_call_at_start(
         boxed,
         "setDeltaMovement",
         "(Lnet/minecraft/world/phys/Vec3;)V",
         HOOKS_CLASS,
         "probeDelta",
-        "(Lnet/minecraft/world/entity/Entity;)V",
-        &[(0, b'L')],
+        "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/Vec3;)V",
+        &[(0, b'L'), (1, b'L')],
     )?;
     patch::insert_static_call_at_start(
         d1,
@@ -4242,23 +4248,63 @@ pub extern "system" fn n_push(
     if res & 1 == 1 {
         // write the delta statics OUTSIDE the state borrow (server-thread
         // confined statics, no race)
-        let (dx, dy, dz) = PUSH_OUT.with(|o| {
+        let (dx, dy, dz, npairs, ids, ds) = PUSH_OUT.with(|o| {
             let o = o.borrow();
-            (o.dx, o.dy, o.dz)
+            (
+                o.dx,
+                o.dy,
+                o.dz,
+                o.pairs.len(),
+                o.pairs.iter().map(|p| p.0).collect::<Vec<i64>>(),
+                o.pairs.iter().flat_map(|p| [p.1, p.2]).collect::<Vec<f64>>(),
+            )
         });
         unsafe {
             let e = JniEnv::from_raw(env);
+            let raw = e.raw();
+            let vt = *raw;
             for (name, v) in [("PUSH_SDX", dx), ("PUSH_SDY", dy), ("PUSH_SDZ", dz)] {
                 if let Some(fid) = e.get_static_field_id(cls, name, "D") {
-                    let raw = e.raw();
-                    let vt = *raw;
                     ((*vt).SetStaticDoubleField)(raw, cls, fid, v);
+                }
+            }
+            // L42: the pushed-pair outputs. PUSH_PAIR_N rides EVERY ok call
+            // (zero pairs -> 0, no stale replay into the next dispatch); the
+            // arrays are written only when non-empty (the Java side reads
+            // them only up to PUSH_PAIR_N).
+            if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_N", "I") {
+                ((*vt).SetStaticIntField)(raw, cls, fid, npairs as i32);
+            }
+            if npairs > 0 {
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_IDS", "[J") {
+                    let arr = ((*vt).NewLongArray)(raw, npairs as i32);
+                    if !arr.is_null() {
+                        ((*vt).SetLongArrayRegion)(raw, arr, 0, npairs as i32, ids.as_ptr());
+                        ((*vt).SetStaticObjectField)(raw, cls, fid, arr);
+                    }
+                }
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_D", "[D") {
+                    let arr = ((*vt).NewDoubleArray)(raw, (npairs * 2) as i32);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw,
+                            arr,
+                            0,
+                            (npairs * 2) as i32,
+                            ds.as_ptr(),
+                        );
+                        ((*vt).SetStaticObjectField)(raw, cls, fid, arr);
+                    }
                 }
             }
             if e.exception_check() {
                 e.exception_clear();
             }
         }
+        // NOTE: no PUSH_PAIR_N reset on the declined path — the Java consume
+        // zeroes it after the apply loop, and every ok call rewrites it
+        // unconditionally; a GetStaticFieldID here would tax the hot
+        // mirror-route dispatches.
     }
     res
 }

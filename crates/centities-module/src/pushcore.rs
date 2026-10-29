@@ -100,15 +100,6 @@ pub struct PushCore {
     /// change — the per-tick sort cache would otherwise serve the old
     /// order to later pushes in that cell).
     pub home_key: Vec<u64>,
-    /// pending kernel delta additions (see the MERGE STATE note)
-    pub kadd_dx: Vec<f64>,
-    pub kadd_dz: Vec<f64>,
-    /// L12 MERGE STATE: the kernel's pending delta additions per slot.
-    /// mirror.dx == java_value + kernel_add_dx. Java-side delta events
-    /// (probeDelta/probeBox, which always see the PRE-kernel Java field)
-    /// rebaze the mirror onto the new Java value while PRESERVING the
-    /// pending kernel pushes; the self writeback resets kernel_add to zero
-    /// (the Java field then equals the mirror exactly).
     /// cell key -> tick of the last id-sort (the kernel sorts at most once
     /// per (cell, tick))
     pub sorted_at: HashMap<u64, u64>,
@@ -132,8 +123,6 @@ impl PushCore {
             sy: vec![0; PS_CAP],
             seq: vec![0; PS_CAP],
             home_key: vec![0; PS_CAP],
-            kadd_dx: vec![0.0; PS_CAP],
-            kadd_dz: vec![0.0; PS_CAP],
             sorted_at: HashMap::new(),
             population: 0,
         }
@@ -181,8 +170,6 @@ impl PushCore {
             }
             self.key[s] = id;
             self.ncol[s] = 0; // a fresh id starts the counter at zero
-            self.kadd_dx[s] = 0.0;
-            self.kadd_dz[s] = 0.0;
             structural = true; // a fresh member changes the cell list
         } else {
             // the ORDER key changes only when the seq/section-Y changes or
@@ -206,10 +193,9 @@ impl PushCore {
         self.box6[o + 5] = b.z1;
         self.px[s] = px;
         self.pz[s] = pz;
-        // Java-side delta view rebased onto the fresh Java field; the
-        // kernel's pending pushes survive (mirror = java + kadd)
-        self.dx[s] = dx + self.kadd_dx[s];
-        self.dz[s] = dz + self.kadd_dz[s];
+        // Java-side delta view rebased onto the fresh Java field
+        self.dx[s] = dx;
+        self.dz[s] = dz;
         self.dy[s] = dy;
         self.flags[s] = flags;
         self.vid[s] = vid;
@@ -239,12 +225,12 @@ impl PushCore {
     }
 
     /// Delta-only refresh (probeDelta events without a box change). The
-    /// event value is the JAVA field (pre-kernel): rebase the mirror onto
-    /// it and keep the kernel's pending additions.
+    /// event value is the POST-write field value (the L42 value-carrying
+    /// capture): rebase the mirror onto it.
     pub fn set_delta(&mut self, id: i64, dx: f64, dy: f64, dz: f64) {
         if let Some(s) = self.slot_of(id) {
-            self.dx[s] = dx + self.kadd_dx[s];
-            self.dz[s] = dz + self.kadd_dz[s];
+            self.dx[s] = dx;
+            self.dz[s] = dz;
             self.dy[s] = dy;
         }
     }
@@ -262,8 +248,6 @@ impl PushCore {
             self.key[s] = 0;
             self.flags[s] = 0;
             self.ncol[s] = 0;
-            self.kadd_dx[s] = 0.0;
-            self.kadd_dz[s] = 0.0;
             self.population -= 1;
         }
     }
@@ -277,12 +261,6 @@ impl PushCore {
         }
         for n in self.ncol.iter_mut() {
             *n = 0;
-        }
-        for v in self.kadd_dx.iter_mut() {
-            *v = 0.0;
-        }
-        for v in self.kadd_dz.iter_mut() {
-            *v = 0.0;
         }
         self.sorted_at.clear();
         self.population = 0;
@@ -318,6 +296,7 @@ pub fn push_tick(
     out.ddx = 0.0;
     out.ddy = 0.0;
     out.ddz = 0.0;
+    out.pairs.clear();
 
     let sc = self_slot * 6;
     let sx0 = pc.box6[sc];
@@ -515,14 +494,17 @@ pub fn push_tick(
                     ddx += -dx;
                     ddz += -dz;
                 }
-                // other.push(dx, 0, dz) when other is not a vehicle — the
-                // addition lands in the mirror AND the pending-kadd ledger
-                if !detect && fl & PF_VEHICLE == 0 {
-                    pc.dx[hs] += dx;
-                    pc.dz[hs] += dz;
-                    pc.kadd_dx[hs] += dx;
-                    pc.kadd_dz[hs] += dz;
-                    pc.flags[hs] |= PF_NEEDSSYNC;
+                // other.push(dx, 0, dz) when other is not a vehicle — L42:
+                // the force is EMITTED for the Java apply loop (the
+                // candidate's delta write lands THIS TICK, mirroring
+                // vanilla's doPush mutual push); the write's own probe event
+                // (the value-carrying capture) re-syncs the mirror before
+                // the next kernel read (every dispatch flushes first). The
+                // old mirror+kadd mutation deferred the write to the
+                // candidate's own kernel run — lost whenever that run
+                // declined (the first-move divergence, doc 40 addendum 5).
+                if !detect && fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
+                    out.pairs.push((id, dx, dz));
                 }
             }
         }
@@ -538,11 +520,9 @@ pub fn push_tick(
     pc.dy[self_slot] = base_dy;
     pc.dz[self_slot] = base_dz;
     // the Java writeback (the guard's setDeltaMovement with these exact
-    // values) makes the Java field equal the mirror — the pending ledger
-    // for self resets. The probeDelta event of that writeback rebases onto
-    // the same value (idempotent).
-    pc.kadd_dx[self_slot] = 0.0;
-    pc.kadd_dz[self_slot] = 0.0;
+    // values) makes the Java field equal the mirror; the write's own
+    // probe event (the L42 value-carrying capture) rebases onto the same
+    // value (idempotent).
     pc.flags[self_slot] |= PF_NEEDSSYNC;
 
     out.ok = true;
@@ -585,7 +565,16 @@ pub struct PushOut {
     pub ddx: f64,
     pub ddy: f64,
     pub ddz: f64,
+    /// L42: the pushed candidates' (id, ddx, ddz) — the Java apply loop
+    /// writes each candidate's delta at push time (the exact vanilla
+    /// doPush order); the write's probe event re-syncs the mirror.
+    pub pairs: Vec<(i64, f64, f64)>,
 }
+
+/// The emission cap — matches CeHooks.PUSH_PAIR_CAP (the Java statics are
+/// sized to it). The candidate loop already breaks at the
+/// maxEntityCollisions cap, so this only guards a pathological config.
+pub const MAX_PUSH_PAIRS: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -637,13 +626,18 @@ mod tests {
             out.ddx
         );
         assert_eq!(out.ddz, 0.0);
-        // the OTHER gained +force on X
+        // L42: the OTHER's force is EMITTED (the Java apply writes it); the
+        // candidate's mirror delta stays untouched (the apply's probe event
+        // re-syncs it)
         let s2 = pc.slot_of(2).unwrap();
-        assert!((pc.dx[s2] - want).abs() < 1e-18);
+        assert_eq!(out.pairs.len(), 1, "one emitted pair");
+        assert_eq!(out.pairs[0].0, 2, "the candidate's id");
+        assert!((out.pairs[0].1 - want).abs() < 1e-18, "the +force on X");
+        assert_eq!(out.pairs[0].2, 0.0);
+        assert_eq!(pc.dx[s2], 0.0, "the mirror no longer pre-applies");
         // numCollisions advanced on BOTH sides (before doPush)
         assert_eq!(pc.ncol[s2], 1);
         assert_eq!(out.ncol, 1);
-        assert!(pc.flags[s2] & PF_NEEDSSYNC != 0);
         assert!(pc.flags[s1] & PF_NEEDSSYNC != 0);
     }
 
@@ -793,11 +787,14 @@ mod tests {
         }
     }
 
-    /// THE MERGE SCHEME: a Java-side delta event (probeDelta) arriving
-    /// AFTER the kernel pushed a candidate must NOT erase the pending push.
-    /// mirror = java + kadd; the event rebases, the push survives.
+    /// THE L42 MERGE SCHEME: the kernel EMITS the candidate's force instead
+    /// of mutating the mirror; the Java apply's own delta event (the
+    /// post-write capture, force included) rebases the mirror onto the
+    /// field value. The events drain in capture order and the apply's
+    /// event is the entity's last, so a stale pre-apply event cannot erase
+    /// anything.
     #[test]
-    fn java_delta_event_preserves_pending_kernel_push() {
+    fn java_delta_event_resyncs_mirror_after_emitted_push() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
         pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
@@ -807,21 +804,17 @@ mod tests {
             &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
         );
         let s2 = pc.slot_of(2).unwrap();
-        let pushed = pc.dx[s2];
-        assert!(pushed > 0.0);
-        // Java writes its (pre-kernel) view of entity 2's delta: 0.0
-        pc.set_delta(2, 0.0, 0.0, 0.0);
-        assert_eq!(
-            pc.dx[s2], pushed,
-            "the pending kernel push survives the rebase"
-        );
-        // and the ledger matches the mirror-minus-java
-        assert_eq!(pc.kadd_dx[s2], pushed);
-        // self: the writeback resets the ledger
-        assert_eq!(pc.kadd_dx[s1], 0.0);
-        // a Java change on TOP of the pending push: java 0.1 -> mirror 0.1+pushed
-        pc.set_delta(2, 0.1, 0.0, 0.0);
-        assert!((pc.dx[s2] - (0.1 + pushed)).abs() < 1e-18);
+        assert_eq!(out.pairs.len(), 1, "one emitted pair");
+        let want = out.pairs[0].1;
+        assert!(want > 0.0);
+        assert_eq!(pc.dx[s2], 0.0, "the mirror holds the pre-push field value");
+        // the Java apply wrote field = 0 + want; its probe event re-syncs
+        pc.set_delta(2, want, 0.0, 0.0);
+        assert!((pc.dx[s2] - want).abs() < 1e-18);
+        // a LATER Java write (the candidate's own travel tail) rebases again
+        pc.set_delta(2, 0.1, -0.0784, 0.0);
+        assert!((pc.dx[s2] - 0.1).abs() < 1e-18);
+        assert!((pc.dy[s2] - (-0.0784)).abs() < 1e-18);
     }
 
     /// The density gate: below gate_min rows the kernel declines (ok=false)
