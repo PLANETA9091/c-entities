@@ -260,3 +260,47 @@ copyOnWrite (the first set detaches). Every patched stack (NBT
 components, plugin set()) fails the singleton check → the exact
 virtual walk. EMPTY-stack semantics preserved (count==0 → max 1 →
 mergeable, guarded at the call site).
+
+MEASURED (profile run 40886854724, mixed-150k with L41):
+`ItemInstance.getMaxStackSize` dropped from the items-profile's 8.29%
+to **0.85%** (#14). The new top bucket is
+`AABB.intersects(DDD)` at **8.30%** — the L37d exact re-check of the
+native query's MARGIN SUPERSET (`marginExtra` = 226.4M candidates per
+300-tick measure window on mixed-150k!). The next speed move (doc 41
+update): make the native query exact (f64 boxes in the index) or SIMD
+the re-check — 226M Java-side re-checks is the whole remaining item
+tax.
+
+## Session addendum 4 (2026-10-29): the "green PH" was FALSE — the real roots
+
+The die-probe/L41 parity runs failed, and the investigation exposed
+that **the previous session's "PH identical through t=1064" was a false
+green**: the ph_diff analyzer's regex never matched the ct= PH format
+(df2d659 added the field), zero lines were compared, and the broken
+inline fallback mis-paired the legs. The OLD head (443b8dc) and ALL new
+heads diverge IDENTICALLY:
+
+| scenario | first PH divergence | shape |
+|---|---:|---|
+| items | t=159 | off={1873} on={971} — n equal, changed=0 |
+| mixed | t=152 | off={469} on={964} — same shape |
+| mobs | t=183 | value diff, n equal (the doc's R-C) |
+| spread | t=193 | value diff, n equal |
+
+The items/mixed shape is the R-B survivor flip: the MS dump shows the
+ON leg's scan of **self=971 returning n=0** where vanilla's scan of the
+same item found 1873 (26.3 ties: the CANDIDATE absorbs the ticker —
+971 died in vanilla; in the module 971 survived and 1873 died to the
+counter-scan). **NOT an order problem — a query false negative.**
+
+MSQ (fdfe7ab) now prints, per merge scan of MERGE_SELF at PH_DUMP
+ticks: the serving path (row/native/mirror), the RAW pre-predicate
+candidate ids captured in BOTH the native resolve and the row path
+(before window/home/box/predicate rejections), and the
+win/home/stale skip deltas. The next dump run names the stage that
+drops 1873.
+
+Analyzer additions: `scripts/pd_diff.py <log> <tickA> <tickB>` — the
+per-entity PD diff across the divergence boundary (named 971/1873 and
+469/964 directly); ph_diff fixed (ct= format + marker-baseline reset +
+tick-reset segmentation for markerless logs).
