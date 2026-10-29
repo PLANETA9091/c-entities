@@ -23,7 +23,7 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // L37: + the vanilla-order keys (sy, seq int arrays per entry)
     s.insert(("nativeFlush", "(I[J[D[I[D[D[I[I[II[J[D)V"));
     s.insert(("nativePush", "(IIIIIIII)J"));
-    s.insert(("nativePushNcol", "(I)I"));
+    s.insert(("nativePushNcol", "(II)I"));
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
     s.insert(("nativeRemoveDirect", "(J)V"));
     s.insert(("nativeReset", "()V"));

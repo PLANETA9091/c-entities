@@ -3213,8 +3213,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativePushNcol",
-        "(I)I",
-        n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> i32
+        "(II)I",
+        n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i32) -> i32
     );
     push!(
         "nativeMobAiFloor",
@@ -4263,11 +4263,27 @@ pub extern "system" fn n_push(
     res
 }
 
-/// The numCollisions mirror value for `id`, or -1 (mirror miss). The Java
-/// decline path uses this to re-sync the field before running vanilla.
-pub extern "system" fn n_push_ncol(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i32) -> i32 {
+/// The numCollisions mirror value for `id`, or -1 (mirror miss). L41c: the
+/// value is returned ONLY when the kernel computed this entity's push in
+/// `cur_tick` — the mirror ncol of an entity the kernel never ran for is
+/// stale garbage (the vanilla body updates the real field every tick; the
+/// mirror never sees those writes), and resyncing it RESET the vanilla
+/// maxEntityCollisions cap (the mobs legs: pushNative=0, every dispatch
+/// declined, and the resync zeroed numCollisions every tick).
+pub extern "system" fn n_push_ncol(
+    _env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    id: i32,
+    cur_tick: i32,
+) -> i32 {
     with_state(|st| match st.push.slot_of(id as i64) {
-        Some(s) => st.push.ncol[s],
+        Some(s) => {
+            if st.push.ncol_tick[s] == cur_tick as u32 && cur_tick > 0 {
+                st.push.ncol[s]
+            } else {
+                -1
+            }
+        }
         None => -1,
     })
     .unwrap_or(-1)

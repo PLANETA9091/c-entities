@@ -2722,8 +2722,16 @@ public final class CeHooks {
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.
+                // L41c: the mirror value is authoritative ONLY when the
+                // kernel computed this entity's push THIS tick (the native
+                // gates it on its ncol_tick) — a stale mirror value would
+                // RESET the vanilla numCollisions (the vanilla body updates
+                // the real field every tick; the mirror never sees those
+                // writes) and remove the maxEntityCollisions cap from the
+                // vanilla pushes that follow (the mobs 377 trace: the ON
+                // leg's delta carried the un-capped push forces).
                 pushMirror++;
-                int ncolMirror = nativePushNcol(le.getId());
+                int ncolMirror = nativePushNcol(le.getId(), PUSH_CFG_TICK);
                 if (ncolMirror >= 0 && MH_NCOL != null) {
                     try {
                         MH_NCOL.invokeExact((Entity) le, ncolMirror);
@@ -2787,7 +2795,7 @@ public final class CeHooks {
 
     /** The numCollisions mirror value for `id`, or -1 (mirror miss). Read
      *  through a tiny native so the decline path can re-sync the field. */
-    private static native int nativePushNcol(int id);
+    private static native int nativePushNcol(int id, int curTick);
 
     /** Drain any pending probe batches before a kernel call: the kernel
      *  reads the push mirror, so its view must be current. No-op when the

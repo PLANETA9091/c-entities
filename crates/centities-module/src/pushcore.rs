@@ -82,6 +82,10 @@ pub struct PushCore {
     /// numCollisions mirror (the ONLY reader/writer outside is the vanilla
     /// pushEntities body — javap-verified — so the mirror is authoritative)
     pub ncol: Vec<i32>,
+    /// L41c: the tick of the last KERNEL-RUN ncol write per slot (0 = never).
+    /// The decline path's ncol resync is authoritative ONLY for an entity
+    /// the kernel computed THIS tick (see the note in new()).
+    pub ncol_tick: Vec<u32>,
     /// L37 vanilla-order key halves: the clamped section Y and the global
     /// insertion seq (Java bumps at addEntity / moveEntity re-append). With
     /// px/pz (chunkZ/X at sort time) the kernel sorts cell candidates into
@@ -124,6 +128,7 @@ impl PushCore {
             flags: vec![0; PS_CAP],
             vid: vec![0; PS_CAP],
             ncol: vec![0; PS_CAP],
+            ncol_tick: vec![0; PS_CAP],
             sy: vec![0; PS_CAP],
             seq: vec![0; PS_CAP],
             home_key: vec![0; PS_CAP],
@@ -528,6 +533,7 @@ pub fn push_tick(
     }
 
     pc.ncol[self_slot] = ncol_self;
+    pc.ncol_tick[self_slot] = tick as u32;
     pc.dx[self_slot] = base_dx;
     pc.dy[self_slot] = base_dy;
     pc.dz[self_slot] = base_dz;
