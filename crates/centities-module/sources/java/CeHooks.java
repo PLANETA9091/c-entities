@@ -344,9 +344,8 @@ public final class CeHooks {
     // with the three DEEP reads served by Unsafe hops instead of the method
     // chain: item = entityData.items[IDX_ITEM].value (the synched-data walk
     // SynchedEntityData.getItem was 2.91% of the items profile),
-    // despawnRate/count by field offset. getMaxStackSize stays the REAL
-    // virtual call (a DataComponents walk — no caching, the parity gate
-    // stays bit-exact even for plugins that mutate stack components).
+    // despawnRate/count by field offset. getMaxStackSize is pre-resolved
+    // (L41) when provably exact — see mergeMaxStack.
     // The predicate runs per candidate per merge scan (~2500 scans/tick at
     // items-100k) — the L29 pattern applied to the merge family.
     public static volatile boolean MERGP_ON = false;
@@ -372,11 +371,99 @@ public final class CeHooks {
             }
             MERGP_ON = O_IE_DESPAWN >= 0 && O_STACK_COUNT >= 0 && IDX_ITEM >= 0
                     && !"0".equals(System.getenv("CE_MERGE_MIRROR"));
+            initMergeMaxStack();
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "initMergeMirror: " + t;
             MERGP_ON = false;
         }
+    }
+
+    // ---- L41 merge max-stack pre-resolution -------------------------------
+    // ItemInstance.getMaxStackSize() (26.3) = getOrDefault(MAX_STACK_SIZE,1)
+    // = getComponents().getOrDefault(...): a DataComponents walk per PAIR —
+    // ItemInstance.getMaxStackSize was 8.29% of the items-100k profile.
+    // The walk is EXACTLY prototype.get(type) whenever the stack's
+    // PatchedDataComponentMap.patch is the shared fastutil EMPTY singleton:
+    //   * the ctor assigns Reference2ObjectMaps.emptyMap() — javap-verified
+    //     `getstatic EMPTY_MAP; areturn` (the global immutable instance);
+    //   * getFromPatchAndPrototype: patch.get(type) == null ->
+    //     prototype.get(type) — for the empty patch ALWAYS the prototype;
+    //   * ensureMapOwnership() REPLACES the patch object (new
+    //     Reference2ObjectArrayMap) BEFORE the first mutation — the
+    //     singleton is never mutated in place, and copy() shares it
+    //     only under copyOnWrite (the first set detaches). So
+    //     patch == EMPTY_MAP is a STABLE, permanent property.
+    // The prototype is the item-type's immutable default map: its
+    // MAX_STACK_SIZE answer is a per-type constant cached by identity
+    // (LAST_PROTO two-slot, server-thread confined like MERGE_SELF).
+    // Any patched stack (NBT components, plugin mutation, a fromPatch
+    // build with its own empty map) fails the singleton check and takes
+    // the exact virtual walk. Bit-exact under every mutation pattern.
+    // EMPTY-stack semantics stay vanilla: getComponents() returns
+    // DataComponentMap.EMPTY for count==0 -> max 1 -> 0 < 1 -> mergeable;
+    // the call site guards it before reaching here.
+    private static volatile long O_STACK_COMPONENTS = -1, O_PCM_PATCH = -1, O_PCM_PROTO = -1;
+    private static volatile Object EMPTY_PATCH;
+    private static volatile Object MSSTYPE;
+    private static Object LAST_PROTO;
+    private static int LAST_PROTO_MAX;
+
+    private static void initMergeMaxStack() {
+        try {
+            java.lang.reflect.Field f;
+            f = net.minecraft.world.item.ItemStack.class.getDeclaredField("components");
+            f.setAccessible(true);
+            O_STACK_COMPONENTS = U.objectFieldOffset(f);
+            Class<?> pcm = Class.forName(
+                    "net.minecraft.core.component.PatchedDataComponentMap", false,
+                    CeHooks.class.getClassLoader());
+            f = pcm.getDeclaredField("patch");
+            f.setAccessible(true);
+            O_PCM_PATCH = U.objectFieldOffset(f);
+            f = pcm.getDeclaredField("prototype");
+            f.setAccessible(true);
+            O_PCM_PROTO = U.objectFieldOffset(f);
+            f = net.minecraft.core.component.DataComponents.class.getDeclaredField(
+                    "MAX_STACK_SIZE");
+            f.setAccessible(true);
+            MSSTYPE = U.getObject(U.staticFieldBase(f), U.staticFieldOffset(f));
+            EMPTY_PATCH = it.unimi.dsi.fastutil.objects.Reference2ObjectMaps.EMPTY_MAP;
+        } catch (Throwable t) {
+            // any miss leaves the offsets -1 -> mergeMaxStack always walks
+            O_STACK_COMPONENTS = -1;
+            lastError = System.nanoTime();
+            lastErrorText = "initMergeMaxStack: " + t;
+        }
+    }
+
+    /** The max-stack answer for a NON-EMPTY stack: the prototype constant
+     *  when the patch map is the shared empty singleton, the exact walk
+     *  otherwise. */
+    private static int mergeMaxStack(Object st) {
+        long o1 = O_STACK_COMPONENTS, o2 = O_PCM_PATCH, o3 = O_PCM_PROTO;
+        Object mst = MSSTYPE;
+        if (o1 >= 0 && o2 >= 0 && o3 >= 0 && mst != null) {
+            Object map = U.getObject(st, o1);
+            if (map != null) {
+                Object patch = U.getObject(map, o2);
+                if (patch == EMPTY_PATCH) {
+                    Object proto = U.getObject(map, o3);
+                    if (proto == LAST_PROTO) return LAST_PROTO_MAX;
+                    try {
+                        Object v = ((net.minecraft.core.component.DataComponentMap) proto)
+                                .get((net.minecraft.core.component.DataComponentType<?>) mst);
+                        Integer iv = (Integer) v;
+                        LAST_PROTO_MAX = iv == null ? 1 : iv;
+                        LAST_PROTO = proto;
+                        return LAST_PROTO_MAX;
+                    } catch (Throwable quiet) {
+                        // fall through to the exact walk
+                    }
+                }
+            }
+        }
+        return ((net.minecraft.world.item.ItemStack) st).getMaxStackSize();
     }
 
     @SuppressWarnings("unchecked")
@@ -397,7 +484,8 @@ public final class CeHooks {
             return isMergableFast(e);
         }
         int count = U.getInt(st, O_STACK_COUNT);
-        return count < stack.getMaxStackSize();          // the REAL virtual walk
+        if (count == 0) return true;   // EMPTY-map semantics: max 1, 0 < 1
+        return count < mergeMaxStack(st);
     }
 
     private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
@@ -6524,6 +6612,18 @@ public final class CeHooks {
             Class<?> lalCls = Class.forName("net.minecraft.world.entity.ai.goal.LookAtPlayerGoal");
             MH_LOOKAT_CTX = java.lang.invoke.MethodHandles.privateLookupIn(lalCls, pub)
                     .unreflectGetter(lalCls.getDeclaredField("lookAtContext"));
+            // L22c fix: the classification walks the mob's GoalSelectors —
+            // the goalTypes/lockedFlags RefFields belong to THIS engine too.
+            // They used to live only in the L15 initAIHandles; with the
+            // GoalSelector floor shipped off (aiFloor=0) that init never ran
+            // and a classification NPE'd mid-tick on a half-mutated mob (run
+            // 40881390981). Resolve them HERE so the engine is
+            // self-contained; the mobAiFloor entry guard keeps the
+            // belt-and-suspenders fail-fast.
+            VH_GS_DISABLED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "goalTypes");
+            VH_GS_LOCKED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "lockedFlags");
             AI_HANDLES_SCRATCH_OK();
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -7037,7 +7137,19 @@ public final class CeHooks {
 
     /** The floor body — the EarlyReturnGuard check for Mob.serverAiStep. */
     public static boolean mobAiFloor(net.minecraft.world.entity.Mob mob) {
-        if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK) return false;
+        // VH_GS_DISABLED (GoalSelector.goalTypes) is resolved by the L15
+        // initAIHandles — a DIFFERENT init than initMobAiHandles. With the
+        // L15 GoalSelector floor shipped off (aiFloor=0) it stays null while
+        // MOB_AI_HANDLES_OK is true: a classification would then throw
+        // MID-TICK (after noActionTime++ and sensing.tick(), stepped=true)
+        // and the mirror-tail recovery desynced the leg (run 40881390981:
+        // push-triggered harness armed the engine via the parity.yml empty-
+        // input trap, the NPE fired at t~158, PH diverged at t=161, n=2507
+        // vs 2509 at T382). Fail-fast BEFORE any mutation instead: the
+        // guard declines, vanilla serverAiStep runs, behavior stays exact.
+        if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK || VH_GS_DISABLED == null) {
+            return false;
+        }
         boolean stepped = false;
         try {
             AiCtx ctx = aiClassify(mob);
