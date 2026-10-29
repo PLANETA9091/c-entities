@@ -512,6 +512,9 @@ public final class CeHooks {
     private static final double[] msqRej = new double[48];
     private static final int[] msqRejIds = new int[8];
     private static int msqRejN = 0;
+    // L41e: the staged rows' (cx, cz, n, skips) — up to 12 rows per MSQ
+    private static final long[] msqRows = new long[48];
+    private static int msqRowsN = 0;
 
     private static String msqIds() {
         StringBuilder sb = new StringBuilder(msqN * 6 + 2);
@@ -552,6 +555,7 @@ public final class CeHooks {
                 msqHome0 = rowHomeMiss;
                 msqStale0 = rowStaleCand;
                 msqRejN = 0;
+                msqRowsN = 0;
                 MSQ_COLLECT = true;
             }
             List<Entity> cands;
@@ -603,6 +607,18 @@ public final class CeHooks {
                     System.out.println("[ce-baseline] MSR t=" + CUR_TICK
                             + " self=" + e.getId() + " rej=" + msqRejN
                             + " liveMin=" + rb);
+                }
+                if (msqRowsN > 0) {
+                    StringBuilder sb2 = new StringBuilder(200);
+                    for (int k = 0; k < msqRowsN && k < 12; k++) {
+                        sb2.append(k == 0 ? "[" : ",")
+                                .append('(').append(msqRows[k * 4])
+                                .append(',').append(msqRows[k * 4 + 1])
+                                .append(",n=").append(msqRows[k * 4 + 2])
+                                .append(')');
+                    }
+                    System.out.println("[ce-baseline] MSR t=" + CUR_TICK
+                            + " self=" + e.getId() + " rows=" + sb2.append(']'));
                 }
             }
             boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
@@ -2207,6 +2223,18 @@ public final class CeHooks {
             // the answer. Typical push query: ~2.6 blocks wide in a 16-block
             // cell -> ~85% of candidates skipped at ~3ns each.
             long cellX0 = MQ_CELL_X0[r];
+            if (MSQ_COLLECT && msqRowsN < 12) {
+                // L41e: the staged rows' (cx, cz, n) + the query interval —
+                // the MSQ 971 case showed path=row rawN=0 win=163 (every
+                // candidate window-rejected) while the neighbor scan of the
+                // SAME cell found the merge partner: the staged-cell/window
+                // dump pins the exact disagreement.
+                msqRows[msqRowsN * 4] = (cellX0 >> 4);
+                msqRows[msqRowsN * 4 + 1] = (MQ_CELL_Z0[r] >> 4);
+                msqRows[msqRowsN * 4 + 2] = n;
+                msqRows[msqRowsN * 4 + 3] = 0;
+                msqRowsN++;
+            }
             double x0 = (double) cellX0;          // exact: |cx| << 49
             double z0 = (double) MQ_CELL_Z0[r];
             int qLo = ((int) Math.floor((box.minX - cellX0) * 1024.0)) - 2 + 32768;
