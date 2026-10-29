@@ -203,3 +203,60 @@ timed out; used direct javac against paper-api 26.3.build.218-stable +
 adventure 5.2.0 + jetbrains-annotations + local guava instead). The
 direct-javac check caught two REAL compile errors in the first PH
 vitals draft (float-vs-double getHealth) before push.
+
+## Session addendum 3 (2026-10-29): the push-trigger harness trap (98483d2)
+
+The die-probe parity run (40881390981, head 5194968) STILL failed — and
+the failure was NOT the die-probe: the OFF leg's snapshot shas were
+byte-identical to the previous run's (dee2a1edbd at T382), so vanilla
+was vanilla; the ON leg had n=2507 vs 2509 and a NEW error line:
+`lastErr=mobAiFloor: NPE ... VH_GS_DISABLED is null` (36 occurrences;
+the previous run had ZERO and mob=0/0/0/0).
+
+### The chain
+1. `parity.yml` resolved the mob_ai knob as
+   `[ inputs.mob_ai = "0" ] && 0 || 1` — on a PUSH trigger the input is
+   EMPTY → MA=1 → `-Dcentities.mobAi=1`: **every push-run armed the
+   experimental L22a engine that ships OFF.** The previous session's
+   green-PH runs were DISPATCHED with mob_ai=0 explicitly — the trap
+   never fired for them.
+2. The engine's `initMobAiHandles` resolved the Mob-side handles but
+   NOT the GoalSelector RefFields (goalTypes/lockedFlags lived only in
+   the L15 `initAIHandles`, which never runs when aiFloor ships off).
+   The first zombie classification therefore threw NPE MID-TICK —
+   after `noActionTime++` and `sensing.tick()` (stepped=true) — the
+   mirror-tail recovery ran on a half-mutated mob, vanilla
+   serverAiStep was skipped for that tick, and the leg desynced.
+3. Timeline check: the NPE at t≈158 (first hooks@ with lastErr), the
+   PH divergence at t=161 with n/adds still EQUAL (one mob's state
+   drifted), n permanently short by 2 at T382.
+
+### Fixes (98483d2)
+- `parity.yml`: EMPTY now resolves to the INPUT'S DEFAULT — mob_ai
+  arms only on an explicit `1`. item_tick/merge keep empty=1.
+- `initMobAiHandles` resolves goalTypes/lockedFlags itself: the engine
+  is self-contained with aiFloor=0 (a legitimate dispatch combination).
+- `mobAiFloor` fail-fasts on `VH_GS_DISABLED == null` BEFORE any
+  mutation — a mis-configured engine declines, vanilla runs, exact.
+
+### Analyzer note
+`scripts/ph_diff.py` mis-split the legs on this log (it keyed on a
+stale "parity leg" marker format) and reported IDENTICAL across 140
+ticks while the PH lines at t=161+ differed. The inline segmenter
+(new leg starts when the tick counter resets) is the reliable split;
+ph_diff.py needs the same rule.
+
+### L41 rides in 98483d2
+The merge predicate's max-stack pre-resolution (doc 41 move 1):
+`ItemInstance.getMaxStackSize()` (8.29% of items-100k) walks
+DataComponents per pair; when `PatchedDataComponentMap.patch` is the
+shared fastutil EMPTY singleton the walk is exactly
+`prototype.get(type)` — a per-type immutable constant cached by
+identity (two-slot, server-thread confined). Proof chain: the ctor
+assigns `Reference2ObjectMaps.emptyMap()` (javap: getstatic+areturn —
+the global singleton); `ensureMapOwnership()` REPLACES the patch object
+before the first in-place mutation; `copy()` shares only under
+copyOnWrite (the first set detaches). Every patched stack (NBT
+components, plugin set()) fails the singleton check → the exact
+virtual walk. EMPTY-stack semantics preserved (count==0 → max 1 →
+mergeable, guarded at the call site).
