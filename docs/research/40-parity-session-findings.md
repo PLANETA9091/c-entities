@@ -134,3 +134,72 @@ tick of the cramming damage will name itself, and PTRACE/PD will aim
 the fix. Step 2: audit pushcore's cramming branch against
 LivingEntity.pushEntities (26.3 javap): `list.size() > maxEntityCramming-1
 && this.random.nextInt(4) == 0` → count non-passengers → hurtServer(cramming, 6.0f).
+
+## Session addendum 2 (2026-10-29): ROOT FOUND AND FIXED — 5194968
+
+### The audit, step by step (26.3 decompile, not javap guesswork)
+`Level.getPushableEntities(pusher, bb)` = `getEntities(pusher, bb,
+EntitySelector.pushableBy(pusher))` where the predicate folds
+NO_SPECTATORS + `input.isPushable()` + BOTH-WAYS `canCollideWithBukkit`
++ team rules (26.3 Paper: the team slice rides canCollideWithBukkit,
+and `LivingEntity.isPushable()` = `isCollidable(fixClimbing...)` =
+**isAlwaysTicking || isPositionEntityTicking(blockPosition)** + isAlive
++ !spectator + collides + !onClimbable). The module's pushFlags mirror
+already folds the same slice (probeBox-fed, javap-verified) — the
+INPUTS matched only as long as they were FRESH.
+
+### The corpse-blindness
+`LivingEntity.hurtServer` deducts hp through `actuallyHurt` BEFORE
+calling `this.die(source)` — from that instant `isAlive()` is false and
+vanilla's per-pusher `getPushableEntities` excludes the corpse. But the
+corpse moves NOWHERE for its whole ~20-tick deathTime animation:
+zero box events, zero delta events → the mirror's PF_PUSHABLE stays 1
+for up to 20 ticks per death. Dense pens die constantly → a standing
+population of kernel-visible corpses.
+
+### Why the RNG stayed clean while hp diverged (the decisive reasoning)
+- `hits_count` gate: in a dense pen the size-gate (`> cramming-1`) is
+  ALREADY open without the corpses → the extra corpses do not flip it →
+  `nextInt(4)` draw counts MATCH → SR/LR identical (observed).
+- `nonPass` count: vanilla counts over the FRESH list (no corpses);
+  the kernel counted over hits INCLUDING them → ON's nonPass overcounts
+  → `roll==0 && nonPass > cramming-1` fires hurtServer in the ON leg
+  where vanilla declines → hp diverges.
+- No position impact: a cramming hurt applies NO knockback velocity —
+  decompile: cramming has no source position and no direct entity →
+  `dealDefaultKnockback` passes xd=zd=0 → no `Math.random` draws, no
+  delta → PH-pos blind, exactly the observed signature.
+
+### The fix (5194968)
+1. **`probeDie`** (CeHooks): woven as a prefix probe on
+   `LivingEntity.die(DamageSource)V` (descriptor javap-verified; the
+   method has no tableswitch — the patch util accepts it). At the die()
+   entry hp is ALREADY ≤ 0, so the fresh `pushFlags` recompute clears
+   PF_PUSHABLE mid-tick; the upsert rides the pending batch and the
+   next nativePush of the SAME tick drains it (flushIfPending /
+   drain_direct) — the within-tick pusher order sees the corpse exactly
+   when vanilla's fresh per-pusher list does. `n_flush`'s non-pushable
+   branch then drops it from the push view. Woven in
+   precompute_livingentity as an INDEPENDENT optional chain (applied to
+   whatever survived the guards; refusal keeps them, the failure mode
+   is the pre-fix staleness — a missed refresh can only LEAVE a corpse
+   in view, never spuriously remove one).
+   Known inert edge: a cancelled EntityDeathEvent revives the mob with
+   its mirror flags cleared until its next box probe (plugin territory;
+   the parity worlds run no plugins — doc-23 deviation window).
+2. **PH vitals** (BaselinePlugin): the per-entity avalanche now mixes
+   fire (int), alive (Bukkit isValid), hp (DOUBLE bits — getHealth()
+   is a double in the 26.3 API, the same read the snapshot prints as
+   Double.toHexString). A hurt-pattern divergence now NAMES its tick in
+   the PH stream instead of hiding until T382. PTRACE rows carry
+   fire/alive/hp. Line formats unchanged (analyzers compatible); all
+   previous PH hashes are re-baselined.
+
+### Environment note (local toolchain rebuilt)
+The workspace was reset (no cargo/JDK/Maven between sessions).
+Rebuilt: rustup stable (minimal), Temurin JDK 25.0.5 (javac — the 26.3
+mapped jar is class-file 69), Maven 3.9.9 partially (archive.apache
+timed out; used direct javac against paper-api 26.3.build.218-stable +
+adventure 5.2.0 + jetbrains-annotations + local guava instead). The
+direct-javac check caught two REAL compile errors in the first PH
+vitals draft (float-vs-double getHealth) before push.
