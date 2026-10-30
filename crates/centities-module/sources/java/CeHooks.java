@@ -370,7 +370,12 @@ public final class CeHooks {
      *  is one physics step past the vanilla view — the window must deref it
      *  and the home re-check must not drop it). */
     private static boolean isViewAfter(int cid) {
-        if (!IN_ITEM_APPLY) return false; // the view is apply-pass-only state
+        // L48: the map get boxes the id and hashes — per candidate x2 (the
+        // window-trust probe and the home-re-check probe) it was 0.91% of
+        // the mixed-150k profile. The view holds only the RARE resync /
+        // force-vanilla population: an empty view (the steady state) skips
+        // straight to false without touching the map.
+        if (viewN == 0 || !IN_ITEM_APPLY) return false;
         Integer vi = VIEW_MAP.get(cid);
         return vi != null && VIEW_KIDX[vi] > MS_KIDX;
     }
