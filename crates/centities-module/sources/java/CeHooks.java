@@ -577,6 +577,15 @@ public final class CeHooks {
     private static final double[] msqRej = new double[192];
     private static final int[] msqRejIds = new int[32];
     private static int msqRejN = 0;
+    // L44b: the window-skipped and home-missed candidate ids at MSQ scans —
+    // a merge partner that never reached the box test names itself here.
+    private static final int[] msqSkipId = new int[32];
+    private static final int[] msqSkipLo = new int[32];
+    private static final int[] msqSkipHi = new int[32];
+    private static final int[] msqSkipRow = new int[32];
+    private static int msqSkipN = 0;
+    private static final int[] msqHmId = new int[32];
+    private static int msqHmN = 0;
     // L41e: the staged rows' (cx, cz, n, skips) — up to 12 rows per MSQ
     private static final long[] msqRows = new long[48];
     private static int msqRowsN = 0;
@@ -621,6 +630,8 @@ public final class CeHooks {
                 msqStale0 = rowStaleCand;
                 msqRejN = 0;
                 msqRowsN = 0;
+                msqSkipN = 0;
+                msqHmN = 0;
                 MSQ_COLLECT = true;
             }
             List<Entity> cands;
@@ -687,6 +698,27 @@ public final class CeHooks {
                     System.out.println("[ce-baseline] MSR t=" + CUR_TICK
                             + " self=" + e.getId() + " rej=" + msqRejN
                             + " liveMin=" + rb);
+                }
+                if (msqSkipN > 0) {
+                    StringBuilder sb3 = new StringBuilder(220);
+                    for (int k = 0; k < msqSkipN; k++) {
+                        sb3.append(k == 0 ? "" : " ").append(msqSkipId[k])
+                                .append(':').append(msqSkipLo[k])
+                                .append('-').append(msqSkipHi[k])
+                                .append("@r").append(msqSkipRow[k]);
+                    }
+                    System.out.println("[ce-baseline] MSS t=" + CUR_TICK
+                            + " self=" + e.getId() + " skip=" + msqSkipN
+                            + " idLoHi@row=" + sb3);
+                }
+                if (msqHmN > 0) {
+                    StringBuilder sb4 = new StringBuilder(160);
+                    for (int k = 0; k < msqHmN; k++) {
+                        sb4.append(k == 0 ? "" : ",").append(msqHmId[k]);
+                    }
+                    System.out.println("[ce-baseline] MSH t=" + CUR_TICK
+                            + " self=" + e.getId() + " homeMiss=" + msqHmN
+                            + " ids=" + sb4);
                 }
                 if (msqRowsN > 0) {
                     StringBuilder sb2 = new StringBuilder(200);
@@ -2414,6 +2446,15 @@ public final class CeHooks {
                         && ((((int) (p >>> 48)) & 0xFFFF) < qLo
                             || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
                     rowWinSkip++;
+                    // L44b: name the skipped candidates (the merge partner's
+                    // packed interval vs the query window pins the staleness)
+                    if (MSQ_COLLECT && msqSkipN < 32) {
+                        msqSkipId[msqSkipN] = cid;
+                        msqSkipLo[msqSkipN] = ((int) (p >>> 32)) & 0xFFFF;
+                        msqSkipHi[msqSkipN] = ((int) (p >>> 48)) & 0xFFFF;
+                        msqSkipRow[msqSkipN] = r;
+                        msqSkipN++;
+                    }
                     continue;
                 }
                 Entity e = ARENA[cid & AMASK];
@@ -2445,11 +2486,13 @@ public final class CeHooks {
                     double ecx = (eb.minX + eb.maxX) * 0.5;
                     if (ecx < x0 || ecx >= x0 + 16.0) {
                         homeMiss++;
+                        if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
                         continue;
                     }
                     double ecz = (eb.minZ + eb.maxZ) * 0.5;
                     if (ecz < z0 || ecz >= z0 + 16.0) {
                         homeMiss++;
+                        if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
                         continue;
                     }
                 }
