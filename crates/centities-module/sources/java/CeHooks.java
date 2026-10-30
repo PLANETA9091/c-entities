@@ -312,6 +312,16 @@ public final class CeHooks {
         try {
             if (MH_MERGEWN == null && !initMergeWn(e)) return false;
             MH_MERGEWN.invokeExact(e);
+            // L47b: did the flush-time vanilla merge replay actually merge?
+            // The mirror body's live world is post-apply (view-stale) — this
+            // pin pairs with KPH/PD: a KVM removed=0 at the divergence tick
+            // while OFF's PD dropped the id means the replay saw the POST
+            // world and skipped the merge vanilla made.
+            if (phDumpTickNow()) {
+                System.out.println("[ce-baseline] KVM t=" + CUR_TICK
+                        + " self=" + e.getId()
+                        + " removed=" + (e.isRemoved() ? 1 : 0));
+            }
             return true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -2302,6 +2312,29 @@ public final class CeHooks {
     private static final int[] WIN_IDS = new int[64];
     private static int winN = 0;
 
+    // L49 — the pending-fresh view serve (the items t=219 fix). A pending
+    // batch entry whose (POST) home cell is covered used to refuse the row
+    // path outright; the refusal fell to the native (viewTouches) and then
+    // to the mirror — the vanilla body AT THE FLUSH, one physics step past
+    // the vanilla view — and the merge vanilla made (6931 absorbed by the
+    // fresh 7892 at its PRE spawn box) never happened. The exact semantics
+    // per covered entry (batch index i, batch box BB, live box LB):
+    //   i <= MS_KIDX (its body ran before the scanner): vanilla saw POST = LB.
+    //   i >  MS_KIDX (its body runs later): vanilla saw PRE — exact ONLY
+    //       when the entity is untouched since collect (LB == BB: a fresh
+    //       add's batch box IS its spawn box); a moved entry's PRE is
+    //       unknown -> refuse (unchanged conservative shape).
+    // Served entries join `out` before ordSortVanilla, so the answer stays
+    // in the exact vanilla scan order. Knob: CE_ROW_VIEW=0 restores the
+    // refusal.
+    private static final int PQ_CAP = 64;
+    private static final int[] PQ_ID = new int[PQ_CAP];
+    private static final int[] PQ_KIDX = new int[PQ_CAP];
+    private static final double[] PQ_BOX = new double[PQ_CAP * 6];
+    private static int pqN = 0;
+    private static final boolean ROW_VIEW_ON =
+            !"0".equals(System.getenv("CE_ROW_VIEW"));
+
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
             Entity source, AABB box, Predicate<? super Entity> predicate,
@@ -2404,6 +2437,7 @@ public final class CeHooks {
             // the row path now serves between drains instead of refusing.
             if (bN > 64) { rowPending++; fastRefuse = "pending64"; return null; } // bound the scan
             winN = 0;
+            pqN = 0;
             for (int i = 0; i < bN; i++) {
                 long l = B_IDS[i];
                 if (l < 0) continue;                 // removals resolve to null below
@@ -2429,18 +2463,57 @@ public final class CeHooks {
                 int o2 = i * 6;
                 int home = (cellFloor((B_BOX[o2] + B_BOX[o2 + 3]) * 0.5) & 0x3FF)
                         | ((cellFloor((B_BOX[o2 + 2] + B_BOX[o2 + 5]) * 0.5) & 0x3FF) << 10);
+                boolean pqAdded = false;
                 for (int r = 0; r < nr; r++) {
-                    if (MQ_CELL[r] == home) {
+                    if (MQ_CELL[r] != home) continue;
+                    // L49: the covered pending entry. Decide serve vs refuse
+                    // by the exactness rule in the PQ block comment.
+                    if (!ROW_VIEW_ON || pqN >= PQ_CAP) {
                         rowPending++;
                         fastRefuse = "pending";
                         return null;
                     }
+                    if (pqAdded) break;              // one row match is enough
+                    int pid = (int) (l & 0xFFFF_FFFFL);
+                    Entity pe = ARENA[pid & AMASK];
+                    if (pe == null || pe.getId() != pid) {
+                        rowPending++;
+                        fastRefuse = "pending";
+                        return null;
+                    }
+                    AABB lb = pe.getBoundingBox();
+                    boolean after = IN_ITEM_APPLY && i > MS_KIDX;
+                    if (after
+                            && !(lb.minX == B_BOX[o2] && lb.maxX == B_BOX[o2 + 3]
+                                 && lb.minY == B_BOX[o2 + 1] && lb.maxY == B_BOX[o2 + 4]
+                                 && lb.minZ == B_BOX[o2 + 2] && lb.maxZ == B_BOX[o2 + 5])) {
+                        // an AFTER-scanner entry whose body already moved it:
+                        // its PRE box is unknown — the conservative refusal.
+                        rowPending++;
+                        fastRefuse = "pending";
+                        return null;
+                    }
+                    PQ_ID[pqN] = pid;
+                    PQ_KIDX[pqN] = i;
+                    if (after) {
+                        System.arraycopy(B_BOX, o2, PQ_BOX, pqN * 6, 6);
+                    } else {
+                        PQ_BOX[pqN * 6] = lb.minX;
+                        PQ_BOX[pqN * 6 + 1] = lb.maxX;
+                        PQ_BOX[pqN * 6 + 2] = lb.minY;
+                        PQ_BOX[pqN * 6 + 3] = lb.maxY;
+                        PQ_BOX[pqN * 6 + 4] = lb.minZ;
+                        PQ_BOX[pqN * 6 + 5] = lb.maxZ;
+                    }
+                    pqN++;
+                    pqAdded = true;
                 }
             }
         } else {
             winN = 0;
+            pqN = 0;
         }
-        if (total == 0) {
+        if (total == 0 && pqN == 0) {
             // L16: the shared immutable empty list. At ~32k queries/tick the
             // per-query ArrayList(0) churned ~25MB/s of TLAB garbage that
             // shows up as allocator + GC pressure (Arrays.copyOf shows in the
@@ -2612,6 +2685,31 @@ public final class CeHooks {
         }
         rowStaleCand += stale;
         rowHomeMiss += homeMiss;
+        // L49: serve the covered pending entries collected above (see the
+        // PQ block comment). Their box was chosen at collect time by the
+        // exactness rule (PRE = the batch box for an untouched
+        // after-scanner entry, LIVE otherwise); the home re-check is
+        // skipped for them — vanilla registers a crosser in BOTH sections,
+        // and a fresh add's PRE registration is the covered cell itself.
+        for (int q = 0; q < pqN; q++) {
+            Entity pe = ARENA[PQ_ID[q] & AMASK];
+            if (pe == null || pe.getId() != PQ_ID[q]) continue;
+            boolean dup = false;
+            for (int k = 0; k < out.size(); k++) {
+                if (out.get(k).getId() == PQ_ID[q]) { dup = true; break; }
+            }
+            if (dup) continue;
+            double bx0 = PQ_BOX[q * 6], bx1 = PQ_BOX[q * 6 + 1];
+            double by0 = PQ_BOX[q * 6 + 2], by1 = PQ_BOX[q * 6 + 3];
+            double bz0 = PQ_BOX[q * 6 + 4], bz1 = PQ_BOX[q * 6 + 5];
+            if (bx0 < box.maxX && bx1 > box.minX
+                    && by0 < box.maxY && by1 > box.minY
+                    && bz0 < box.maxZ && bz1 > box.minZ) {
+                if (predicate == null || predicate.test(pe)) {
+                    out.add(pe);
+                }
+            }
+        }
         // (per-row MSS lines print inside the row loop — see MSSR above)
         rowFast++;
         if (narrow) rowNarrow++;
