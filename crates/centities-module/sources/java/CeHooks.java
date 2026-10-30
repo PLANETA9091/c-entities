@@ -655,33 +655,39 @@ public final class CeHooks {
                 MSQ_COLLECT = true;
             }
             List<Entity> cands;
+            // L46: the depth guard spans the query AND the consume loop — the
+            // scratch answer list must stay stable while mergeScanNative
+            // iterates it (a merge body that queries reentrantly lands at
+            // depth 2 and allocates its own list).
+            fqScratchDepth++;
             try {
-                if (msq) {
-                    System.out.println("[ce-baseline] QB t=" + CUR_TICK
-                            + " self=" + e.getId()
-                            + " q=[" + box.minX + "," + box.maxX
-                            + " " + box.minY + "," + box.maxY
-                            + " " + box.minZ + "," + box.maxZ + "]"
-                            + " r=" + r);
+                try {
+                    if (msq) {
+                        System.out.println("[ce-baseline] QB t=" + CUR_TICK
+                                + " self=" + e.getId()
+                                + " q=[" + box.minX + "," + box.maxX
+                                + " " + box.minY + "," + box.maxY
+                                + " " + box.minZ + "," + box.maxZ + "]"
+                                + " r=" + r);
+                    }
+                    cands = fastQuery(sl, e, box, MERGE_PRED, true);
+                } finally {
+                    MSQ_COLLECT = false;
+                    MERGE_SELF = null;
                 }
-                cands = fastQuery(sl, e, box, MERGE_PRED);
-            } finally {
-                MSQ_COLLECT = false;
-                MERGE_SELF = null;
-            }
-            if (cands == null) {
-                mergeMirror++;
-                if (msq) {
-                    msqPath = msqPath == null ? "mirror" : msqPath;
-                    System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
-                            + " self=" + e.getId() + " path=mirror"
-                            + " rawN=" + msqN + " ids=" + msqIds()
-                            + " refuse=" + fastRefuse);
+                if (cands == null) {
+                    mergeMirror++;
+                    if (msq) {
+                        msqPath = msqPath == null ? "mirror" : msqPath;
+                        System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                                + " self=" + e.getId() + " path=mirror"
+                                + " rawN=" + msqN + " ids=" + msqIds()
+                                + " refuse=" + fastRefuse);
+                    }
+                    return false; // index unsure — vanilla body
                 }
-                return false; // index unsure — vanilla body
-            }
-            mergeFast++;
-            mergeCand += cands.size();
+                mergeFast++;
+                mergeCand += cands.size();
             // MS: the scan's candidate list at PH_DUMP ticks — the parity
             // diff names the exact candidate-order divergence (vanilla's
             // first candidate kills the ticking item at equal counts, so
@@ -760,6 +766,9 @@ public final class CeHooks {
                 if (e.isRemoved()) return true; // absorbed — vanilla stops
             }
             return true;
+            } finally {
+                fqScratchDepth--;
+            }
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "mergeScan: " + t;
@@ -1899,10 +1908,36 @@ public final class CeHooks {
     private static final ThreadLocal<long[]> QBUF =
             ThreadLocal.withInitial(() -> new long[1024]);
 
+    // L46 (doc 41 move 2): the merge-scan caller consumes its candidate list
+    // synchronously inside mergeScanNative — a fresh ArrayList per scan
+    // (~32k scans/tick on items-100k) churned TLAB garbage that showed up as
+    // allocator + GC pressure inside fastQuery's 13.96% self-time bucket.
+    // The scratch list is server-thread-confined (fastQuery already refuses
+    // off-thread callers) and guarded by a depth counter: a REENTRANT
+    // fastQuery inside the consume loop (a merge body that queries) must
+    // never see its own answer list cleared under it — depth > 1 allocates
+    // normally. The general getEntities hook keeps allocating (callers may
+    // retain the list).
+    private static final ArrayList<Entity> FQ_SCRATCH = new ArrayList<>(512);
+    private static int fqScratchDepth = 0;
+    // L46 parity knob: CE_FQ_SCRATCH=0 restores the allocate-per-scan answer
+    // list (the bisect handle if a red gate pins anything to the scratch).
+    private static final boolean FQ_SCRATCH_ON =
+            !"0".equals(System.getenv("CE_FQ_SCRATCH"));
+
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, Entity source,
             AABB box, Predicate<? super Entity> predicate) {
+        return fastQuery(level, source, box, predicate, false);
+    }
+
+    private static List<Entity> fastQuery(
+            net.minecraft.world.level.Level level, Entity source,
+            AABB box, Predicate<? super Entity> predicate, boolean reuseScratch) {
         fastRefuse = null;
+        // L46: only the OUTERMOST guarded caller may take the scratch —
+        // a reentrant query inside a consume loop allocates (see FQ_SCRATCH).
+        final boolean useScratch = FQ_SCRATCH_ON && reuseScratch && fqScratchDepth == 1;
         if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
             mNotServerLevel++;
             fastRefuse = "notserverlevel";
@@ -1932,7 +1967,7 @@ public final class CeHooks {
             if (OVERSIZE_POP != 0) {
                 rowOv++; // native oversize entities: exact scan is native-only
             } else {
-                List<Entity> out = rowQuery(sl, wid, source, box, predicate);
+                List<Entity> out = rowQuery(sl, wid, source, box, predicate, useScratch);
                 if (out != null) {
                     msqPath = "row";
                     return out;
@@ -2057,7 +2092,10 @@ public final class CeHooks {
         }
         if (prof) queryNanos += System.nanoTime() - t1;
 
-        ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
+        ArrayList<Entity> out = useScratch
+                ? FQ_SCRATCH
+                : new ArrayList<>(Math.min(n, 64));
+        if (useScratch) { out.clear(); }
         int resolved = 0;
         int stale = 0;
         int srcSkip = 0;
@@ -2257,7 +2295,8 @@ public final class CeHooks {
 
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
-            Entity source, AABB box, Predicate<? super Entity> predicate) {
+            Entity source, AABB box, Predicate<? super Entity> predicate,
+            boolean useScratch) {
         // L41b CELL EXPANSION: an entity single-homes at its CENTER cell,
         // while vanilla's moonrise EntityLookup registers it in EVERY section
         // its BOX overlaps — a neighbor whose center sits just past a cell
@@ -2414,7 +2453,10 @@ public final class CeHooks {
         // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
         // on the native path while serving mid-density rows at ~10-20us.
         if (total > totalCap) { rowBig++; fastRefuse = "bigcap"; return null; }
-        ArrayList<Entity> out = new ArrayList<>(Math.min(total, totalCap));
+        ArrayList<Entity> out = useScratch
+                ? FQ_SCRATCH
+                : new ArrayList<>(Math.min(total, totalCap));
+        out.clear();
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
         for (int r = 0; r < nr; r++) {
