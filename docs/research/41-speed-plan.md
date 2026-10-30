@@ -52,6 +52,13 @@ newTrackerTick 1.1, AttributeMap 1.1... The mob leg's remaining mass is
 the VANILLA AI + attribute + tracker long tail — many 1-3% frames, each
 needs its own floor. No single -30% move exists.
 
+## Ranked next moves (updated 2026-10-31 after the fresh mixed-150k profile)
+0b. **DONE — L46 (move 2), f142684-pre c8747b6**: the merge-scan caller's
+   shared scratch answer list (FQ_SCRATCH, depth-guarded, knob
+   CE_FQ_SCRATCH=0). The general getEntities keeps allocating.
+0c. **DONE — L48**: the isViewAfter boxing HashMap.get hoisted behind a
+   viewN==0 gate (0.91% self-time on the fresh profile; the steady state
+   never touches the map now).
 ## Ranked next moves (updated 2026-10-29 after the L41 measurement)
 
 0. **DONE — the merge max-stack pre-resolution (L41, 98483d2)**:
