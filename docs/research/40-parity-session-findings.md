@@ -704,3 +704,24 @@ merge-removal gap (5..22 entities, the n-gap) riding the same flush-timing skew.
 history (2,3,43,47: ON changes at 340, OFF at 341/342, both meet at 342) is the same wave.
 L52 target: the item flush/fast-path must not run a gravity/physics step for entities
 vanilla also ticks this tick (double-tick at the spawn-batch flush).
+
+### L51 verdict (the 5992c32 gate run): the push family is DEAD
+mixed t=233 -> t=340 (+107), spread t=235 -> t=259 (+24). The remaining first
+divergences (items 340, mixed 340, mobs 275, spread 259) all sit at the
+tc=200 activation boundary of their item cohorts — the L52 family below.
+
+### L52 (this commit): the MODE-1 dispatch gate read the tickCount PRE-phase
+The dispatch weave OWNS the dispatcher for MODE-1 items (tickNonPassenger
+suppressed — commonTick has NOT run; the Rust core mirrors the ++ itself), so
+the gate sees the PRE field and must pass preIncrement=true — the rest branch
+(MODE-2) already did. The stale preIncrement=false (correct in the t=159-era
+weave, which did NOT own the dispatcher) read 199 where vanilla read 200:
+at the tc<200 activation-immunity end the engine granted ONE extra ACTIVE
+tick (gravity) — PTRACE item 2 (run 41133998643, trace_id=2): position
+bit-identical all window, vy -0.04 -> -0.08 (exactly one 0.04 step) at
+t=340, the wakeup settle 343 vs vanilla 342, tc bit-identical (196..207),
+activatedTick MIN_VALUE both legs (no sweep stamps — the wakeup phase is
+cur-driven and identical). The n-gap growth (5..22 entities) rode the same
+one-tick skew through the merge-removal cadence. The +1 changes behavior
+ONLY at the tc=200 crossing (young items return active under either phase),
+so the t=159 fix surface is untouched.

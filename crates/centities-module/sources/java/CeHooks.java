@@ -3554,7 +3554,18 @@ public final class CeHooks {
                     return false;
                 }
             }
-            boolean active = itemCheckActive(e, false);
+            // L52: the dispatch weave OWNS the dispatcher for MODE-1 items
+            // (tickNonPassenger suppressed — commonTick has NOT run this
+            // tick; the Rust core mirrors the ++ itself). The field is PRE,
+            // exactly the rest branch's phase: pass preIncrement=true. The
+            // old false read one-behind'ed the gate at the tc=200 activation
+            // boundary: the engine granted the item one extra ACTIVE tick
+            // (gravity) vanilla's checkIfActive denied — the items-340
+            // family (PTRACE item 2: vy -0.04 -> -0.08 at t=340, the settle
+            // 343 vs vanilla 342, tc bit-identical both legs). Young items
+            // (tc<200) are unaffected: every clause returns active either
+            // way.
+            boolean active = itemCheckActive(e, true);
             appendDispatch(e, active);
             if (active) {
                 dispNative++;
@@ -3583,13 +3594,20 @@ public final class CeHooks {
     private static boolean itemCheckActive(ItemEntity e, boolean preIncrement) {
         // The tickCount the vanilla checkIfActive reads is the POST-commonTick
         // value (ServerLevel.tickNonPassenger: commonTick THEN tick, javap).
-        // TWO callers, TWO phases: itemDispatch runs at ItemEntity.tick's
-        // start — the field is ALREADY post (preIncrement=false); the rest
-        // path fully suppresses tickNonPassenger and mirrors the ++ itself
-        // AFTER the gate — its field is still pre (preIncrement=true). The
-        // old unconditional "+1" shifted the dispatch phase by one: the MS
-        // scan lists (run 40791707738, item 971) show the ON scan one tick
-        // earlier than vanilla — the merge survivor flip at t=159.
+        // BOTH callers own the dispatcher for their items (the weave
+        // suppresses tickNonPassenger; the Rust core / the rest branch mirror
+        // the ++ themselves), so BOTH pass preIncrement=true and see the PRE
+        // field. HISTORY: the t=159-era weave did NOT own the dispatcher
+        // (field post) and an unconditional "+1" then shifted the MS scan
+        // lists one tick early (run 40791707738, item 971, the merge
+        // survivor flip) — preIncrement=false was correct THEN. The
+        // dispatcher ownership moved to the weave later; the stale false
+        // read went latent (young items return active under either phase —
+        // tc<200 and the (tc+id)%4 clause agree) until the first MODE-1
+        // cohort crossed tc=200: the engine's gate read 199 where vanilla
+        // read 200, granted ONE extra active tick (gravity), and the
+        // items-340 family was born (PTRACE item 2: vy -0.04 -> -0.08 at
+        // t=340; the settle 343 vs vanilla 342; tc bit-identical). L52.
         int tc = e.tickCount + (preIncrement ? 1 : 0);
         if ((tc + e.getId()) % 4 == 0) return true;
         if (e.defaultActivationState) return true;
