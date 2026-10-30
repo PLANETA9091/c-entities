@@ -621,3 +621,51 @@ view being empty)**, tickEffectsNoOp 0.77. AABB.intersects fell to
    PRE boxes ride B_SY/B_SEQ order stamps) so the merge scan never falls
    to the view-stale mirror for the pending+view shape.
 3. The isViewAfter hoist (a viewCount != 0 gate).
+
+### Session addendum 10 (2026-10-31): L49 lands — items 219 → 340; L50 targets the push family
+
+#### L49 (ad6b33f, VERIFIED by the gate run's PH map)
+The row path now SERVES the covered pending-fresh entries instead of
+refusing (the exactness rule: KIDX <= MS_KIDX → the live box;
+KIDX > MS_KIDX → the batch box, exact only when live == batch box —
+untouched since collect; a moved entry still refuses). The gate run's
+ph_first_div: **items first divergence t=219 → t=340** (+121 ticks);
+mobs 275 / mixed 233 / spread 235 unchanged (the push family — L50's
+target). The refuse chain confirmed the mechanism on the KPH run:
+`refuse=pending+view` (the row refusal was pending; the native's
+viewTouches stacked after it).
+
+#### The push family NAMED (the KPH run 41123470972)
+- mixed: zombie 927 → stand 235, first push ct=696 (t=232), force
+  -0.0026 == the stand's ON-leg vx at t=233 (the PTRACE match);
+  repeated at 699/702/705 while vanilla stayed zero.
+- spread: zombie 3895 (tc=18) → 4142 at ct=702.
+- mobs: zombie 78 → 1069 at ct=822 (t=274; the PD divergence at 275).
+The kernel's box compare is exact (strict f64, margin only widens the
+CELL walk) and the positions/boxes are fresh (travel precedes
+pushEntities in aiStep — decompile 3736/3752; the pending probes drain
+before nativePush) — the culprit was the CAP STATE.
+
+#### L50 (ded1978): the cap replay reads the REAL numCollisions
+Vanilla-routed pushEntities bodies (the density-gate refusals, the
+decline paths) increment candidates' REAL numCollisions without
+touching pc.ncol — the mirror lagged, the reset replay
+(max(0, ncol - maxEC)) started below vanilla's cap, and the kernel
+pushed pairs vanilla's `break` had already excluded. The Java guard
+reads the REAL field (one Unsafe read at dispatch) and passes it to
+nativePush; the replay uses it verbatim. JNI (IIIIIIIII)J.
+L50b: the pushcore tests (the e2e gate caught what the lib-only check
+missed — run cargo check/test --all-targets locally). L50c: the
+natives-parity manifest tracks the 9-int descriptor.
+VERDICT: pending — the ded1978/464c18e parity runs name the next
+first-divergence map (ph_first_div on their logs; the items-340 pair
+via the 8e741a8 dispatch with ph_dump=330-350).
+
+#### The fresh lean profiles (41112622574, bd5eef6)
+- mixed-150k mod p50 319.8 ms; items-100k mod p50 29.1 (−50.6% vs
+  vanilla 58.9); fastQuery GONE from both top-15s (was 13.96% on
+  items). The items top is now the tracker (12.04) + the flush
+  (12.54) + isViewAfter 3.13 (the L48 hoist's target).
+- mobs-25k stays a flat long tail (Unsafe 3.62 top).
+- The lean numbers are NOT comparable to the baseline.yml table
+  (different run parameters) — use them for SHAPE, not for deltas.
