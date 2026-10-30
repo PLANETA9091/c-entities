@@ -506,6 +506,13 @@ public final class CeHooks {
     private static boolean MSQ_COLLECT = false;
     private static String msqPath = null;
     private static long msqWin0 = 0, msqHome0 = 0, msqStale0 = 0;
+    // Per-scan diagnostics set by the CALLER (server-thread confined):
+    // MS_SRC 1 = the native-flush apply loop (the Rust cadence decided),
+    // 0 = the vanilla-body guard (vanilla's own gate opened). MS_MV 1 = the
+    // Rust cadence saw a floor change (rate 2), 2 = same floor (rate 40),
+    // 0 = unknown (guard path). Both are read+cleared by the MS print.
+    private static int MS_SRC = 0;
+    private static int MS_MV = 0;
     // L41d marginExtra samples: the LIVE boxes of the first 8 rejects (the
     // index box lives in the Rust mirror — the Rust side can be extended to
     // dump its side; the live boxes alone already show the pile's spread).
@@ -560,6 +567,14 @@ public final class CeHooks {
             }
             List<Entity> cands;
             try {
+                if (msq) {
+                    System.out.println("[ce-baseline] QB t=" + CUR_TICK
+                            + " self=" + e.getId()
+                            + " q=[" + box.minX + "," + box.maxX
+                            + " " + box.minY + "," + box.maxY
+                            + " " + box.minZ + "," + box.maxZ + "]"
+                            + " r=" + r);
+                }
                 cands = fastQuery(sl, e, box, MERGE_PRED);
             } finally {
                 MSQ_COLLECT = false;
@@ -583,8 +598,15 @@ public final class CeHooks {
             // a different first candidate flips the survivor ids).
             if (phDumpTickNow()) {
                 StringBuilder msb = new StringBuilder(96);
+                int mv = MS_MV;
+                MS_MV = 0;
+                int src = MS_SRC;
+                MS_SRC = 0;
                 msb.append("MS t=").append(CUR_TICK)
-                        .append(" self=").append(e.getId()).append(" n=").append(cands.size());
+                        .append(" self=").append(e.getId()).append(" n=").append(cands.size())
+                        .append(" tc=").append(e.tickCount)
+                        .append(" mv=").append(mv)
+                        .append(" src=").append(src);
                 for (int k = 0; k < Math.min(cands.size(), 24); k++) {
                     msb.append(' ').append(cands.get(k).getId());
                 }
@@ -2350,6 +2372,18 @@ public final class CeHooks {
                     if (predicate == null || predicate.test(e)) {
                         out.add(e);
                     }
+                } else if (MSQ_COLLECT && msqRejN < 8) {
+                    // row-path reject sample (the native resolve had one; the
+                    // 971 scan's 13 window-passed candidates were box-rejected
+                    // invisibly — this names them).
+                    msqRej[msqRejN * 6] = eb.minX;
+                    msqRej[msqRejN * 6 + 1] = eb.maxX;
+                    msqRej[msqRejN * 6 + 2] = eb.minY;
+                    msqRej[msqRejN * 6 + 3] = eb.maxY;
+                    msqRej[msqRejN * 6 + 4] = eb.minZ;
+                    msqRej[msqRejN * 6 + 5] = eb.maxZ;
+                    msqRejIds[msqRejN] = cid;
+                    msqRejN++;
                 }
             }
         }
@@ -4619,6 +4653,12 @@ public final class CeHooks {
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
                     itemMerge++;
+                    // MS diagnostics: the flush path decided this scan; mv
+                    // carries the Rust cadence's floor-change verdict (rate 2
+                    // vs 40) — the mixed t=152 / items t=159 analysis wants
+                    // the cadence split per scanner, not just the scan list.
+                    MS_SRC = 1;
+                    MS_MV = (bits & (1 << 6)) != 0 ? 1 : 2;
                     // A refusal (index unsure) or a disabled fast path
                     // (CE_MERGE=0 knob) MUST fall back to the vanilla body —
                     // an ignored false here DROPPED the merge outright

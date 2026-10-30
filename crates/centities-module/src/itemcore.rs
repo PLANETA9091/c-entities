@@ -395,6 +395,9 @@ const B_MOVED: i32 = 1;
 const B_ON_GROUND: i32 = 1 << 1;
 const B_IMPULSE: i32 = 1 << 2;
 const B_MERGE: i32 = 1 << 5;
+/// Diagnostic: the merge cadence saw a floor change (rate 2, not 40) —
+/// rides ONLY to feed the MS telemetry line (mv=1); the applier ignores it.
+const B_MERGE2: i32 = 1 << 6;
 const B_DESPAWN: i32 = 1 << 7;
 const B_VOID: i32 = 1 << 8;
 const B_LAND: i32 = 1 << 9;
@@ -899,6 +902,7 @@ unsafe fn n_item_tick_impl(
                                                     ob |= B_DELTA_SAME;
                                                 }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
+                                                if outcome.has(TickOutcome::MERGE2) { ob |= B_MERGE2; }
                                                 if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
                                                 if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
                                                 if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
