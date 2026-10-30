@@ -3200,11 +3200,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativePush",
-        "(IIIIIIII)J",
+        "(IIIIIIIII)J",
         n_push
             as extern "system" fn(
                 *mut jni::JNIEnv,
                 jni::jclass,
+                i32,
                 i32,
                 i32,
                 i32,
@@ -4213,6 +4214,7 @@ pub extern "system" fn n_push(
     max_ec: i32,
     cramming: i32,
     cur_tick: i32,
+    real_ncol: i32,
 ) -> i64 {
     let res = with_state(|st| {
         drain_direct(st);
@@ -4236,6 +4238,7 @@ pub extern "system" fn n_push(
                 cramming,
                 pushcore::GATE_MIN,
                 cur_tick as u64,
+                real_ncol,
                 &mut o,
             );
             if o.ok {

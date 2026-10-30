@@ -2907,10 +2907,14 @@ public final class CeHooks {
      *  Returns a packed long: bit0 = ok (vanilla body suppressed), bit1 =
      *  cramming audit needed, bits 2..21 = non-passenger hit count,
      *  bits 22..53 = numCollisions after the tick. The post-tick delta is
-     *  written into PUSH_SDX/SDY/SDZ (server-thread confined statics). */
+     *  written into PUSH_SDX/SDY/SDZ (server-thread confined statics).
+     *  L50: realNcol — the pusher's REAL numCollisions field read by the
+     *  caller (one Unsafe read); the authoritative pre-reset value (the
+     *  mirror lagged behind vanilla-routed bodies' candidate increments
+     *  and the cap replay under-counted — the extra-push family). */
     public static native long nativePush(
             int wid, int selfId, int selfVehicle, int selfPlayer,
-            int onlyPlayers, int maxEC, int cramming, int curTick);
+            int onlyPlayers, int maxEC, int cramming, int curTick, int realNcol);
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
@@ -3218,7 +3222,8 @@ public final class CeHooks {
             flushIfPending();
             long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
                     PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
-                    PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK);
+                    PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK,
+                    O_NCOL >= 0 && U != null ? U.getInt(le, O_NCOL) : 0);
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.

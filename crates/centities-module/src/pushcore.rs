@@ -287,6 +287,7 @@ pub fn push_tick(
     cramming: i32,
     gate_min: usize,
     tick: u64,
+    real_ncol: i32,
     out: &mut PushOut,
 ) {
     out.ok = false;
@@ -328,10 +329,19 @@ pub fn push_tick(
     }
 
     // numCollisions reset (vanilla: max(0, ncol - maxEC) BEFORE the loop).
-    // ncol_self_0 = the per-pass starting value (the detection pass replays
-    // the increments too — the apply pass must start from the SAME point).
-    let ncol_self_0 = if pc.ncol[self_slot] > max_ec {
-        pc.ncol[self_slot] - max_ec
+    // L50: the reset replay reads the REAL numCollisions field (passed in
+    // from the Java guard — one Unsafe read at dispatch), NOT the mirror:
+    // vanilla-routed pushEntities bodies (the density-gate refusals, the
+    // decline paths) increment candidates' REAL counters without touching
+    // pc.ncol, so the mirror lagged and the replay started below vanilla's
+    // cap — the kernel pushed pairs vanilla's `break` had already excluded
+    // (the KPH proof: zombie 927 pushed the resting stand 235 at t=232
+    // where vanilla stayed zero; the same one-tick family on spread 4142
+    // and mobs 1069). ncol_self_0 = the per-pass starting value (the
+    // detection pass replays the increments too — the apply pass must
+    // start from the SAME point).
+    let ncol_self_0 = if real_ncol > max_ec {
+        real_ncol - max_ec
     } else {
         0
     };
