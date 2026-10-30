@@ -669,3 +669,38 @@ via the 8e741a8 dispatch with ph_dump=330-350).
 - mobs-25k stays a flat long tail (Unsafe 3.62 top).
 - The lean numbers are NOT comparable to the baseline.yml table
   (different run parameters) — use them for SHAPE, not for deltas.
+
+## Session addendum 11 (2026-10-31): L51 — the push family NAMED and FIXED (ArmorStand); items-340 ground truth (the double gravity)
+
+### The extra-push family: the candidate-side predicate missed the OVERRIDES
+`EntitySelector.pushableBy(pusher)` = `input.isPushable() && input.canCollideWithBukkit(entity)
+&& entity.canCollideWithBukkit(input)`; `LivingEntity.isPushable()` = `isCollidable(cfg)` —
+**VIRTUAL**, and 26.3 ArmorStand OVERRIDES it to `return false` unconditionally (empty doPush,
+pushEntities = rideable-minecart lookups only, `MARKER_DIMENSIONS = 0x0`). The scenario mix
+spawns `pctStands` MARKER stands in EVERY scenario, so the push-family candidates were stands
+all along: mixed 235, spread 4142, mobs 1069 (the addendum-9/10 "zombie" naming was the PUSHER
+side; the pushed candidate is the stand). The kernel's L12 fold (`pushFlags`) inlined the
+LivingEntity BODY of isCollidable — field-for-field exact for plain LivingEntities, blind to
+every override — so stands entered the pushable-only index with a stale PRE-marker box (the
+0x0 box never arrives as a cell change) and the kernel pushed pairs vanilla never sees:
+mixed zombie 927 -> stand 235 at ct=696 force -0.0026 (the PTRACE-matched extra vx),
+repeats 699/702/705; spread 3895 -> 4142 ct=702; mobs 78 -> 1069 ct=822. L50's cap replay was
+real but not this bug (the post-L50 KPH run 41132152574 still pushed 927 -> 235).
+
+**L51 (5992c32)**: `pushFlags` PF_PUSHABLE = the VIRTUAL `le.isPushable()` — one call, exact
+for every subclass override (AbstractHorse/Parrot also override); the L38 collide fast path
+already made the same virtual call. Stands exit the pushable-only index in BOTH directions.
+
+### items-340: the PTRACE ground truth (run 41133998643, trace_id=2)
+Entity 2 (an old pile ITEM): position x/y/z BIT-IDENTICAL across the legs for the whole
+window; the ONLY diverging field is **vy**: t=339 both `-0x1.47ae147ae147bp-5` (-0.0808);
+t=340 ON = the same mantissa at p-**4** (-0.1616 = exactly 2x); t=342 OFF settles to vy=0.0
+(the ground clamp on its (tc+id)%4==0 move tick) while ON still -0.1616; t=343 SAME (ON's
+move tick caught up). So ON applied the item's gravity step TWICE at the batch tick (the
+vanilla tick AND the flush/fast-path), the extra vy never integrates into position (the
+shortcut ticks skip move(); the ground clamp hides the rest), and the legs re-converge after
+the next bounce tick — except the per-tick PH sees the vy bits and fails at t=340, with the
+merge-removal gap (5..22 entities, the n-gap) riding the same flush-timing skew. The m
+history (2,3,43,47: ON changes at 340, OFF at 341/342, both meet at 342) is the same wave.
+L52 target: the item flush/fast-path must not run a gravity/physics step for entities
+vanilla also ticks this tick (double-tick at the spawn-batch flush).
