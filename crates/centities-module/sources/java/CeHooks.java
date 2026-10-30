@@ -134,6 +134,7 @@ public final class CeHooks {
     public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
     public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
     public static volatile long rowWinSkip = 0; // L4c: candidates skipped by the packed x-window
+    public static volatile long mViewRefuse = 0; // L44: native queries refused (view-exactness)
     public static volatile long rowNarrow = 0;  // L35: narrow-shape serves (raised cap)
 
     // ------------------------------------------------------------------
@@ -333,6 +334,63 @@ public final class CeHooks {
      *  same call; off-thread callers take the mirror and never reach it). */
     private static ItemEntity MERGE_SELF; // server-thread confined
 
+    // === L44: the merge-scan VIEW (the pre-body boxes of resync entries) ===
+    // Vanilla runs each item's merge scan DURING its body: entities whose
+    // bodies FOLLOW the scanner's are seen at their PRE-move boxes. The
+    // flush runs AFTER the whole entity phase, so a resync (vanilla-routed)
+    // item's LIVE box is already POST-move — one physics step past the
+    // vanilla view. For falling young items that step is 0.1-0.3 blocks and
+    // the merge box's 0.25-tall Y window makes it decisive (items t=159:
+    // 1827's spawn box y=-58.997 WAS inside 971's scan window, its post-body
+    // y=-58.84 is 0.153 above it — exact numbers, run 41083916822 PTRACE).
+    // The batch captures each resync entry's PRE-body state at itemSkip;
+    // pass 1 overwrites IB_CD with the POST-body state for the tick
+    // compute. IB_PRE keeps the capture; the apply pass exposes it to the
+    // query paths as the VIEW for scanners positioned before that entry.
+    private static double[] IB_PRE = new double[1024 * 6];
+    private static final int[] VIEW_IDS = new int[256];
+    private static final double[] VIEW_BOX = new double[256 * 6];
+    private static final int[] VIEW_KIDX = new int[256];
+    private static int viewN = 0;
+    private static final java.util.HashMap<Integer, Integer> VIEW_MAP =
+            new java.util.HashMap<>();
+    private static int MS_KIDX = 0; // the current scanner's batch index
+
+    /** The merge-scan view box for a candidate: the PRE-body box when the
+     *  candidate is a resync entry whose body runs AFTER the scanner in the
+     *  entity order, else the live box (vanilla's per-body timing). */
+    private static AABB viewBox(int cid, AABB live) {
+        Integer vi = VIEW_MAP.get(cid);
+        if (vi == null || VIEW_KIDX[vi] <= MS_KIDX) return live;
+        return new AABB(VIEW_BOX[vi * 6], VIEW_BOX[vi * 6 + 1], VIEW_BOX[vi * 6 + 2],
+                VIEW_BOX[vi * 6 + 3], VIEW_BOX[vi * 6 + 4], VIEW_BOX[vi * 6 + 5]);
+    }
+
+    /** True when the candidate is an AFTER-scanner view entry (its live box
+     *  is one physics step past the vanilla view — the window must deref it
+     *  and the home re-check must not drop it). */
+    private static boolean isViewAfter(int cid) {
+        if (!IN_ITEM_APPLY) return false; // the view is apply-pass-only state
+        Integer vi = VIEW_MAP.get(cid);
+        return vi != null && VIEW_KIDX[vi] > MS_KIDX;
+    }
+
+    /** True when any AFTER-scanner view entry's PRE box intersects the query
+     *  box: the native resolve (index boxes = POST-move) would answer with
+     *  the wrong view, so the caller must not trust it. */
+    private static boolean viewTouches(AABB box) {
+        if (!IN_ITEM_APPLY) return false; // the view is apply-pass-only state
+        for (int v = 0; v < viewN; v++) {
+            if (VIEW_KIDX[v] <= MS_KIDX) continue;
+            if (VIEW_BOX[v * 6] <= box.maxX && VIEW_BOX[v * 6 + 3] >= box.minX
+                    && VIEW_BOX[v * 6 + 1] <= box.maxY && VIEW_BOX[v * 6 + 4] >= box.minY
+                    && VIEW_BOX[v * 6 + 2] <= box.maxZ && VIEW_BOX[v * 6 + 5] >= box.minZ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean mergePredTest(Entity o) {
         if (!(o instanceof ItemEntity)) return false;
         ItemEntity ie = (ItemEntity) o;
@@ -516,8 +574,8 @@ public final class CeHooks {
     // L41d marginExtra samples: the LIVE boxes of the first 8 rejects (the
     // index box lives in the Rust mirror — the Rust side can be extended to
     // dump its side; the live boxes alone already show the pile's spread).
-    private static final double[] msqRej = new double[48];
-    private static final int[] msqRejIds = new int[8];
+    private static final double[] msqRej = new double[192];
+    private static final int[] msqRejIds = new int[32];
     private static int msqRejN = 0;
     // L41e: the staged rows' (cx, cz, n, skips) — up to 12 rows per MSQ
     private static final long[] msqRows = new long[48];
@@ -1838,6 +1896,16 @@ public final class CeHooks {
             rowNoPub++;
         }
         msqPath = "native";
+        // L44: the native resolve filters against the INDEX boxes (POST-move
+        // for resync entries). When any AFTER-scanner view entry's PRE box
+        // touches the query, that answer is one physics step past vanilla's
+        // per-body view — refuse instead (the row path served it above; a
+        // refusal here falls to the mirror, which is equally view-stale but
+        // rare: it needs a row-path refusal AND a fresh spawn in range).
+        if (viewTouches(box)) {
+            mViewRefuse++;
+            return null;
+        }
 
         // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is applied
         // by the SAME native call that runs the query — one JNI crossing and
@@ -1987,6 +2055,11 @@ public final class CeHooks {
             // divergence in one). The vanilla test is
             // entity.getBoundingBox().intersects(box) on the LIVE box.
             AABB eb = e.getBoundingBox();
+            // L44: an AFTER-scanner resync entry is seen at its PRE-body box
+            // (the vanilla scan ran before that entry's body).
+            if (isViewAfter(cid)) {
+                eb = viewBox(cid, eb);
+            }
             if (!(eb.minX < box.maxX && eb.maxX > box.minX
                     && eb.minY < box.maxY && eb.maxY > box.minY
                     && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
@@ -1996,7 +2069,7 @@ public final class CeHooks {
                 // INDEX box exactly, so an 84% rejection rate means the
                 // index box disagrees with the live box. The sample names
                 // which side is stale (the doc-41 exact-f64-query move).
-                if (MSQ_COLLECT && msqRejN < 8) {
+                if (MSQ_COLLECT && msqRejN < 32) {
                     msqRej[msqRejN * 6] = eb.minX;
                     msqRej[msqRejN * 6 + 1] = eb.maxX;
                     msqRej[msqRejN * 6 + 2] = eb.minY;
@@ -2333,6 +2406,10 @@ public final class CeHooks {
                 for (int w = 0; w < winN; w++) {
                     if (WIN_IDS[w] == cid) { winTrusted = false; break; }
                 }
+                // L44: an AFTER-scanner resync entry's packed window rides its
+                // POST-move box — the vanilla scan view is the PRE-move box,
+                // so the window must not skip it.
+                if (winTrusted && isViewAfter(cid)) winTrusted = false;
                 if (winTrusted
                         && ((((int) (p >>> 48)) & 0xFFFF) < qLo
                             || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
@@ -2345,6 +2422,12 @@ public final class CeHooks {
                     if (e == null) { stale++; continue; }
                 }
                 AABB eb = e.getBoundingBox();
+                // L44: an AFTER-scanner resync entry is seen at its PRE-body
+                // box (the vanilla scan ran before that entry's body).
+                boolean viewAfter = isViewAfter(cid);
+                if (viewAfter) {
+                    eb = viewBox(cid, eb);
+                }
                 // home re-check (exactness): the entity's CURRENT home must
                 // still be the cell whose row we are reading; a pending
                 // cross-cell move drops out here exactly like vanilla's
@@ -2355,15 +2438,20 @@ public final class CeHooks {
                 // floor(center)==c as doubles <=> center in [c*16, c*16+16),
                 // and (min+max)*0.5 is exact (division by 2), so comparing
                 // center against the [x0, x0+16) interval is the SAME test.
-                double ecx = (eb.minX + eb.maxX) * 0.5;
-                if (ecx < x0 || ecx >= x0 + 16.0) {
-                    homeMiss++;
-                    continue;
-                }
-                double ecz = (eb.minZ + eb.maxZ) * 0.5;
-                if (ecz < z0 || ecz >= z0 + 16.0) {
-                    homeMiss++;
-                    continue;
+                // L44: view entries are dropped by the POST-home row but
+                // vanilla saw them registered at their PRE-move sections —
+                // the (PRE-)box test below is authoritative for them.
+                if (!viewAfter) {
+                    double ecx = (eb.minX + eb.maxX) * 0.5;
+                    if (ecx < x0 || ecx >= x0 + 16.0) {
+                        homeMiss++;
+                        continue;
+                    }
+                    double ecz = (eb.minZ + eb.maxZ) * 0.5;
+                    if (ecz < z0 || ecz >= z0 + 16.0) {
+                        homeMiss++;
+                        continue;
+                    }
                 }
                 if (eb.intersects(box)) {
                     if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
@@ -2372,7 +2460,7 @@ public final class CeHooks {
                     if (predicate == null || predicate.test(e)) {
                         out.add(e);
                     }
-                } else if (MSQ_COLLECT && msqRejN < 8) {
+                } else if (MSQ_COLLECT && msqRejN < 32) {
                     // row-path reject sample (the native resolve had one; the
                     // 971 scan's 13 window-passed candidates were box-rejected
                     // invisibly — this names them).
@@ -4412,6 +4500,22 @@ public final class CeHooks {
         IB_CD[o + 3] = d.x;
         IB_CD[o + 4] = d.y;
         IB_CD[o + 5] = d.z;
+        // L44: the PRE-body box capture (the vanilla per-body scan view).
+        // The ci-th entry's 6 doubles ride in IB_PRE[ci*6 .. +5]; the flush
+        // exposes them to the query paths as the VIEW for resync entries.
+        int ci6 = ci * 6;
+        if (IB_PRE.length < ci6 + 6) {
+            double[] np = new double[Math.max(ci6 + 6, IB_PRE.length * 2)];
+            System.arraycopy(IB_PRE, 0, np, 0, Math.min(IB_PRE.length, ci6));
+            IB_PRE = np;
+        }
+        AABB pbox = e.getBoundingBox();
+        IB_PRE[ci6] = pbox.minX;
+        IB_PRE[ci6 + 1] = pbox.minY;
+        IB_PRE[ci6 + 2] = pbox.minZ;
+        IB_PRE[ci6 + 3] = pbox.maxX;
+        IB_PRE[ci6 + 4] = pbox.maxY;
+        IB_PRE[ci6 + 5] = pbox.maxZ;
         IB_CD[o + 6] = fallDistOf(e);
         // stuck + supporting are store-owned; only resync entries get fresh
         // values (flush pass 1)
@@ -4529,6 +4633,48 @@ public final class CeHooks {
                 for (int si = 0; si < nSd; si++) {
                     SECT_REV[sectKeySlot(SD_X[si], SD_Y[si], SD_Z[si])] = WORLD_REV;
                 }
+            }
+
+            // L44: build the merge-scan view — the batch's RESYNC entries'
+            // PRE-body boxes (their bodies ran during the phase; the live
+            // boxes are already POST-move, one physics step past the vanilla
+            // per-body scan view). VIEW_MAP: id -> view slot; VIEW_KIDX: the
+            // entry's batch index (the vanilla body order).
+            viewN = 0;
+            VIEW_MAP.clear();
+            for (int i = 0; i < n; i++) {
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                // RESYNC and FORCE_VANILLA entries both ran their vanilla
+                // bodies DURING the phase (their live boxes are POST-move);
+                // inactive entries never move — no view needed for them.
+                if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) == 0
+                        || (f & IF_INACTIVE) != 0) continue;
+                if (viewN >= VIEW_IDS.length) break;
+                Entity ref = IB_REF[i];
+                if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
+                int cdSlot = (IB_FLAGS[i] >>> IF_CDSHIFT) - 1;
+                if (cdSlot < 0) continue;
+                VIEW_IDS[viewN] = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
+                int p6 = cdSlot * 6;
+                if (IB_PRE.length >= p6 + 6) {
+                    VIEW_BOX[viewN * 6] = IB_PRE[p6];
+                    VIEW_BOX[viewN * 6 + 1] = IB_PRE[p6 + 1];
+                    VIEW_BOX[viewN * 6 + 2] = IB_PRE[p6 + 2];
+                    VIEW_BOX[viewN * 6 + 3] = IB_PRE[p6 + 3];
+                    VIEW_BOX[viewN * 6 + 4] = IB_PRE[p6 + 4];
+                    VIEW_BOX[viewN * 6 + 5] = IB_PRE[p6 + 5];
+                } else {
+                    AABB lb = ref.getBoundingBox();
+                    VIEW_BOX[viewN * 6] = lb.minX;
+                    VIEW_BOX[viewN * 6 + 1] = lb.minY;
+                    VIEW_BOX[viewN * 6 + 2] = lb.minZ;
+                    VIEW_BOX[viewN * 6 + 3] = lb.maxX;
+                    VIEW_BOX[viewN * 6 + 4] = lb.maxY;
+                    VIEW_BOX[viewN * 6 + 5] = lb.maxZ;
+                }
+                VIEW_KIDX[viewN] = i;
+                VIEW_MAP.put(VIEW_IDS[viewN], viewN);
+                viewN++;
             }
 
             // pass 2: apply, in batch order (== vanilla entity tick order).
@@ -4659,6 +4805,9 @@ public final class CeHooks {
                     // the cadence split per scanner, not just the scan list.
                     MS_SRC = 1;
                     MS_MV = (bits & (1 << 6)) != 0 ? 1 : 2;
+                    // L44: this scanner's batch index = its vanilla body
+                    // position; the view entries after it are seen PRE-move.
+                    MS_KIDX = i;
                     // A refusal (index unsure) or a disabled fast path
                     // (CE_MERGE=0 knob) MUST fall back to the vanilla body —
                     // an ignored false here DROPPED the merge outright
