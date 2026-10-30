@@ -22,7 +22,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // L12: the flush carries the push-state extension + the delta batch
     // L37: + the vanilla-order keys (sy, seq int arrays per entry)
     s.insert(("nativeFlush", "(I[J[D[I[D[D[I[I[II[J[D)V"));
-    s.insert(("nativePush", "(IIIIIIII)J"));
+    // L50: + realNcol — the REAL numCollisions field the cap replay reads
+    s.insert(("nativePush", "(IIIIIIIII)J"));
     s.insert(("nativePushNcol", "(II)I"));
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
     s.insert(("nativeRemoveDirect", "(J)V"));
