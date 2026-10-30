@@ -503,3 +503,36 @@ query out-buffers.
   snapshot gate does not hash age/pickupDelay).
 - The mobs push-pair divergence (t=275, entities TBD by PD at 270-280) is
   the NEXT root — same flush-timing family, push mirror side.
+
+## Session addendum 8 (2026-10-30): L44c lands — two roots down, the map for the rest
+
+### Fixed this session (runs 41087703296 / 41108077155)
+| root | fix | effect |
+|---|---|---|
+| The flush-time scan view: vanilla-routed items seen POST-move by the flush scans, PRE-move by vanilla's per-body scans (exact numbers: 1827 spawn y=-58.997 inside 971's window, post-body y=-58.84 outside) | L44 d01f631: the batch captures the PRE-body AABB (IB_PRE); the apply pass builds the VIEW (resync+force-vanilla, inactive excluded); the row path substitutes the PRE box + never window-skips + skips the home re-check for AFTER-scanner entries; the native path substitutes in the exact re-check; fastQuery refuses the native when a view entry's PRE box touches | items t=159→219, mixed t=152→158 |
+| The row publish blackout: same-cell box updates returned UpsertEv::Same → no mark_dirty → the rows' packed x-intervals froze at the last New/Moved drain; the window false-skipped candidates whose CURRENT boxes overlapped (1088 skipped with a TWO-move-stale interval [33274,33535] vs window [33584,34869] — MSSR-proven) | L44c 0996e7f: UpsertEv::BoxChanged { cell } from the same-cell path; note_upsert marks dirty; the drain's publish rewrites the row. (The first L44c commit silently failed to patch the return — the MSSR dump of the follow-up run reproduced the stale interval verbatim; always verify a patch landed.) | mixed t=158→233, spread t=210→235 |
+
+### Instrumentation built this session (committed to scripts/)
+`ph_first_div.py` (the first PH/SR/LR divergence per leg pair), `pd_first_entity.py`
+(the first diverging ENTITY via PD), `ptrace_cmp.py` (the PTRACE field diff of one
+id across legs), `ms_forensics.py` / `ms_extract.py` (MS/MSQ/MSR/MSS/MSH/MSP/QB
+merge-scan telemetry). Markers live behind run-baseline.sh's stream grep —
+EVERY new marker must be added there (MSR, QB, MSS, MSP each bit once).
+
+### The remaining divergences (head 0996e7f)
+1. **items t=219 (6931/7892)**: 6931's scan went `path=mirror` — the L44 residual
+   (the row refused AND viewTouches refused the native → the vanilla body at the
+   flush, view-stale). Next: name the row refusal reason (row counters at the
+   scan) and decide: serve the row for that shape or pre-stage the refusal.
+2. **mixed t=233 (235/927), spread t=235 (3895/4142)**: the tc%40 resting-cadence
+   scans (tc=80, mv=2) with n=0/1 — the same family, needs the MSSR/MSP dump at
+   ct≈699/705 (the run 41110186252 window 210-240 covers it; the pairs are named).
+3. **mobs t=275**: the push mirror pair (PD at 265-285 needed) — same flush-timing
+   family on the push side (the L12 self writeback class), a separate hunt.
+
+### Toolchain note (the sandbox reset)
+cargo 1.99.1 (rustup minimal), Temurin JDK 25.0.5 (~/tools), the paper 26.3
+mapped jar via fetch-paper.sh + one paperclip boot (work/papermerged/paper-26.3.jar
++ libraries symlink), `cargo check -p centities-module` compiles CeHooks.java via
+build.rs (PAPER_JAR default path). paper-api 26.3.build.218-stable is PRUNED from
+repo.papermc.io — the local pom pins it; CI still resolves it from cache.
