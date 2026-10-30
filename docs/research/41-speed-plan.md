@@ -52,6 +52,16 @@ newTrackerTick 1.1, AttributeMap 1.1... The mob leg's remaining mass is
 the VANILLA AI + attribute + tracker long tail — many 1-3% frames, each
 needs its own floor. No single -30% move exists.
 
+### The fresh items-100k profile (lean run 41112622574, bd5eef6)
+mod p50 **29.1 ms** (vanilla 58.9 → **-50.6%**; target 5.9). fastQuery is
+GONE from the top-15 (was 13.96% — L44c's row publish + the L46 scratch
+changed the shape). New top: newTrackerTick$ 12.04, itemTickFlush
+11.16+1.38, guardEntityTick 5.02, Unsafe.getObject 4.52, ttlFastPath
+3.97, **isViewAfter 3.13 (the L48 hoist targets exactly this — items
+carries a bigger view population than mixed)**, appendDispatch 3.11,
+Entity.level() 2.37. The merge/query lever is spent; the tracker and
+the flush are the next floors.
+
 ## Ranked next moves (updated 2026-10-31 after the fresh mixed-150k profile)
 0b. **DONE — L46 (move 2), f142684-pre c8747b6**: the merge-scan caller's
    shared scratch answer list (FQ_SCRATCH, depth-guarded, knob
