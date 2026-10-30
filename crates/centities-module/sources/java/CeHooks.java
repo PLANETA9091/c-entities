@@ -699,18 +699,7 @@ public final class CeHooks {
                             + " self=" + e.getId() + " rej=" + msqRejN
                             + " liveMin=" + rb);
                 }
-                if (msqSkipN > 0) {
-                    StringBuilder sb3 = new StringBuilder(220);
-                    for (int k = 0; k < msqSkipN; k++) {
-                        sb3.append(k == 0 ? "" : " ").append(msqSkipId[k])
-                                .append(':').append(msqSkipLo[k])
-                                .append('-').append(msqSkipHi[k])
-                                .append("@r").append(msqSkipRow[k]);
-                    }
-                    System.out.println("[ce-baseline] MSS t=" + CUR_TICK
-                            + " self=" + e.getId() + " skip=" + msqSkipN
-                            + " idLoHi@row=" + sb3);
-                }
+
                 if (msqHmN > 0) {
                     StringBuilder sb4 = new StringBuilder(160);
                     for (int k = 0; k < msqHmN; k++) {
@@ -2411,6 +2400,8 @@ public final class CeHooks {
             // the answer. Typical push query: ~2.6 blocks wide in a 16-block
             // cell -> ~85% of candidates skipped at ~3ns each.
             long cellX0 = MQ_CELL_X0[r];
+            int rowSkipN = 0;
+            if (MSQ_COLLECT) { msqSkipN = 0; }
             if (MSQ_COLLECT && msqRowsN < 12) {
                 // L41e: the staged rows' (cx, cz, n) + the query interval —
                 // the MSQ 971 case showed path=row rawN=0 win=163 (every
@@ -2446,13 +2437,13 @@ public final class CeHooks {
                         && ((((int) (p >>> 48)) & 0xFFFF) < qLo
                             || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
                     rowWinSkip++;
-                    // L44b: name the skipped candidates (the merge partner's
-                    // packed interval vs the query window pins the staleness)
-                    if (MSQ_COLLECT && msqSkipN < 32) {
+                    // L44b: name the skipped candidates PER ROW (the packed
+                    // interval vs the row's qLo/qHi pins the staleness)
+                    if (MSQ_COLLECT && msqSkipN < 16) {
                         msqSkipId[msqSkipN] = cid;
                         msqSkipLo[msqSkipN] = ((int) (p >>> 32)) & 0xFFFF;
                         msqSkipHi[msqSkipN] = ((int) (p >>> 48)) & 0xFFFF;
-                        msqSkipRow[msqSkipN] = r;
+                        msqSkipRow[msqSkipN] = rowSkipN++;
                         msqSkipN++;
                     }
                     continue;
@@ -2517,9 +2508,25 @@ public final class CeHooks {
                     msqRejN++;
                 }
             }
+            // L44b: per-row skip dump — the packed interval vs this row's
+            // window, with the row origin, pins a stale row entry exactly.
+            if (MSQ_COLLECT && msqSkipN > 0) {
+                StringBuilder sb3 = new StringBuilder(240);
+                for (int k = 0; k < msqSkipN; k++) {
+                    sb3.append(k == 0 ? "" : " ").append(msqSkipId[k])
+                            .append(':').append(msqSkipLo[k])
+                            .append('-').append(msqSkipHi[k]);
+                }
+                System.out.println("[ce-baseline] MSSR t=" + CUR_TICK
+                        + " row=(" + (cellX0 >> 4) + ',' + (MQ_CELL_Z0[r] >> 4) + ')'
+                        + " win=[" + qLo + ',' + qHi + "] ox=" + cellX0
+                        + " skip=" + rowSkipN + " idLoHi=" + sb3);
+                msqSkipN = 0;
+            }
         }
         rowStaleCand += stale;
         rowHomeMiss += homeMiss;
+        // (per-row MSS lines print inside the row loop — see MSSR above)
         rowFast++;
         if (narrow) rowNarrow++;
         // L37: the row walk order (cells, rows, packed windows) is not the
