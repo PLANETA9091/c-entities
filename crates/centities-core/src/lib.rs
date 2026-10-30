@@ -343,7 +343,16 @@ impl IdMap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpsertEv {
     /// Box update within the same home cell (row id list unchanged).
+    /// L44c: DEPRECATED as a no-dirty event — same-cell box changes now
+    /// return `BoxChanged` so the caller republishes the cell's row: the
+    /// row's packed x-intervals must track the index boxes, or the window
+    /// pre-filter false-skips candidates (observed: mixed t=158, item 1088
+    /// skipped with a TWO-move-stale interval while vanilla's scan of 964
+    /// merged it — the row froze at the last New/Moved republish).
     Same,
+    /// Same-cell box update that changed the packed row data: the cell's
+    /// row must be republished before the next row-path query trusts it.
+    BoxChanged { cell: u32 },
     /// Entity gained a normal home cell (new insert, or came back from the
     /// oversize list). `from_oversize` also means the oversize population
     /// changed (Java's OVERSIZE_POP must be refreshed).

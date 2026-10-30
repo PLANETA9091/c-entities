@@ -185,6 +185,10 @@ impl CeState {
         use centities_core::UpsertEv as E;
         match ev {
             E::Same | E::OversizeSame => {}
+            // L44c: a same-cell box change altered the packed row data — the
+            // cell's row must be republished before the next row query (the
+            // window pre-filter reads the publish-time intervals).
+            E::BoxChanged { cell } => self.mark_dirty(cell),
             E::New {
                 cell,
                 from_oversize,
