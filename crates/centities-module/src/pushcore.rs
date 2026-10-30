@@ -625,8 +625,9 @@ mod tests {
         pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert!(out.ok);
         let want = sq * 0.05000000074505806;
@@ -663,8 +664,9 @@ mod tests {
         pc.upsert(2, 0, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert!(!out.ok, "a crammed pair routes the whole tick vanilla");
         assert_eq!(out.ncol, 0, "no kernel bookkeeping on the routed tick");
@@ -689,8 +691,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.non_passengers, 5, "all hits audited despite the cap");
         assert_eq!(out.ncol, 2, "the cap stops pair processing at maxEC");
@@ -714,8 +717,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.non_passengers, 30);
         assert!(out.cramming);
@@ -743,8 +747,9 @@ mod tests {
         );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
@@ -760,8 +765,9 @@ mod tests {
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.non_passengers, 0);
         assert_eq!(out.ncol, 0);
@@ -785,8 +791,9 @@ mod tests {
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
@@ -810,8 +817,9 @@ mod tests {
         pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(out.pairs.len(), 1, "one emitted pair");
@@ -837,16 +845,18 @@ mod tests {
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         // gate_min=96 with 2 rows -> decline, NO state changes
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, rn, &mut out,
         );
         assert!(!out.ok, "sparse world must route vanilla");
         assert_eq!(out.ncol, 0);
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(pc.ncol[s2], 0, "declined call must not touch mirrors");
         // gate_min=0 -> the tick runs
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert!(out.ok);
         assert_eq!(out.ncol, 1);
@@ -875,8 +885,9 @@ mod tests {
         );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
         );
         assert_eq!(out.ddy, 0.0);
         let s2 = pc.slot_of(2).unwrap();
