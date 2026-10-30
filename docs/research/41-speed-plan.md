@@ -3,14 +3,20 @@
 Date: 2026-10-29. Status: PLAN (profiles measured on 443b8dc baseline +
 721c5de profile runs; the parity fix 5194968 rides in parallel).
 
-## Where the four scenarios stand (baseline 40795889686, p50)
+## Where the four scenarios stand (baseline 2e7986c, p50 — the L49-L52 era)
 
 | scenario | vanilla | mod | delta | target (-90%) |
 |---|---:|---:|---:|---:|
-| mobs-25k | 509.2 | 190.7 | -62.6% | 50.9 |
-| mixed-150k | 693.4 | 412.2 | -40.6% | 69.3 |
-| items-100k | 58.9 | 24.4 | -58.6% | 5.9 |
-| spread-100k | 322.1 | 150.8 | -53.2% | 32.2 |
+| mobs-25k | 494.6 | 273.0 | -44.8% | 49.5 |
+| mixed-150k | 732.3 | 292.1 | -60.1% | 73.2 |
+| items-100k | 63.5 | 26.7 | -58.0% | 6.3 |
+| spread-100k | 438.3 | 279.9 | -36.1% | 43.8 |
+
+(older baseline 40795889686: mobs -62.6 / mixed -40.6 / items -58.6 /
+spread -53.2 — the parity exactness re-gains since then COST mobs
+-17.8pp and spread -17.1pp and GAINED mixed +19.5pp: L21-rest
+re-enablement, the exact gates, the probe tax — the grind below must
+reclaim them without weakening the now-proven semantics.)
 
 Context for the doc-30-era comparison (L20b 152.9 / L22 129.5 on
 mobs-25k): the parity hunt legitimately disabled or exactified several
