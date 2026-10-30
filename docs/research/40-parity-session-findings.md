@@ -536,3 +536,88 @@ mapped jar via fetch-paper.sh + one paperclip boot (work/papermerged/paper-26.3.
 + libraries symlink), `cargo check -p centities-module` compiles CeHooks.java via
 build.rs (PAPER_JAR default path). paper-api 26.3.build.218-stable is PRUNED from
 repo.papermc.io — the local pom pins it; CI still resolves it from cache.
+
+## Session addendum 9 (2026-10-30/31): the refusal named, the push family proven, L46/L47
+
+### The sandbox reset and the toolchain rebuild
+The session resumed into a recycled sandbox: rustup/Temurin/paper-jar gone,
+`gh` missing (the API + the git remote token carried everything). Rebuilt:
+cargo 1.99.1 (rustup minimal), Temurin JDK 25.0.5 (~/tools/jdk25),
+paper-26.3-231 via fetch-paper.sh + `paperclip.patchonly` boot, the
+mojang-mapped jar at work/paper-merged/paper-26.3.jar + `libraries` symlink
+(fastutil lives there; without it javac fails on it.unimi.dsi.fastutil).
+`PAPER_JAR=... cargo check -p centities-module` compiles CeHooks.java locally.
+
+### The ct=×3 key (why the old runs DID cover the divergence ticks)
+`MS_WINDOW = PH_DUMP × 3 levels ± 15` (parseMsWindow): CUR_TICK counts
+flushes across ALL loaded levels, so the markers printed at CUR_TICK
+616..733 ARE the server ticks 205..244 — the divergence window. "ct=" in
+ms_forensics prints the CUR_TICK (server tick ≈ ct/3). The old belief
+that the markers missed t=219/233/235 was wrong; the window input is in
+SERVER ticks and covers both the PD gate and the scan markers at once.
+
+### items t=219 (6931/7892) — the refusal named, mechanism confirmed
+L45 instrumented every fastQuery/rowQuery refusal point with fastRefuse
+and the mirror MSQ line now prints `refuse=`. The diag run (41119838068,
+ph_dump=210-285, trace_id=235):
+- 6931's scan at ct=655: `path=mirror rawN=0 ids=[] refuse=view` — the
+  row path refused (reason was OVERWRITTEN by the native leg of the
+  chain — fixed in the follow-up: the chain now prints e.g.
+  `pending+view`), the native refused on viewTouches (7892's PRE spawn
+  box touches), the mirror ran the vanilla body at flush time on the
+  view-stale world → the merge vanilla did (OFF: 6931 absorbed by the
+  fresh 7892) never happened. The exact L44 residual.
+- Also: msqIds() emitted `ids=]` for empty scans — the ms_forensics
+  regex (requires `[`) silently dropped EVERY mirror line. Fixed both
+  sides ("[]" + optional ids in the regex).
+
+### mixed t=233 (235/927) — the PTRACE verdict: an EXTRA PUSH
+trace_id=235 across both legs: entity 235 is an **ARMOR_STAND** frozen at
+(-0.5, -59.75, 0.5) — resting ON the item pile (box bottom exactly
+touching the pile's top at -59.75; onG=0 — entity-supported, cramming
+equilibrium). t=228..232 both legs identical, all-zero motion.
+**t=233: ON's stand gains vx≈-2.6e-3, vz≈+1.4e-2 while OFF stays zero**;
+the velocity persists (frozen at the t=236 value — the pile re-absorbs
+it). The kernel accepted a push pair vanilla's in-phase scan excludes.
+The kernel's compare is exact (pushcore.rs strict f64, margin only
+widens the CELL walk), so the culprit is the mirror state: a stale
+box6/position/flag on the candidate (or the pusher) at accept time.
+- spread t=235 (3895/4142): the same one-tick family (4142's hash froze
+  at a DIFFERENT resting value — one displaced rest).
+- mobs t=275: first diverger zombie 1069, cascade 78/916 — same class.
+- The pairs were re-confirmed on the fresh run's PD (210-285).
+
+### L46 (doc 41 move 2) — the shared scratch answer list
+mergeScanNative consumed its candidate list synchronously but every scan
+allocated a fresh ArrayList (~32k/tick on items-100k). FQ_SCRATCH is
+server-thread confined, depth-guarded (a reentrant query inside the
+consume loop allocates; getEntities keeps allocating), knob
+CE_FQ_SCRATCH=0. Core tests 43/43 green.
+
+### L47 — the push forensics + the refuse chain
+- `KPH t= self= tc= n= box=[...] id:dx,dz...` in the kernel-accepted
+  push path at PD ticks (added to run-baseline.sh's stream grep): the
+  pusher identity + live box + the exact pair set with forces. The OFF
+  leg's PD/PTRACE supplies the vanilla outcome; the diff names the
+  culprit pair.
+- fastRefuse keeps the ROW reason on the native view refusal (the
+  chain form `pending+view`).
+
+### The fresh mixed-150k profile (lean run 41112622574, bd5eef6)
+mod p50 **319.8 ms** (doc-41 era: 412.2 — L44c/L44d/L45 helped the A/B
+legs). Top module buckets (35658 samples): the tracker cluster
+newTrackerTick$ 3.90 + trackerDispatch 1.58 + SynchedEntityData 2.78 +
+getItem 1.44 + sendChanges 1.07 + sendDirtyEntityData 0.82 ≈ **11.6%**,
+Unsafe.getObject 3.24, tickListForEach 2.98, setTicksFrozen$ 2.42,
+itemTickFlush 2.28, ttlFastPath 2.51, **isViewAfter 0.91 (NEW LEVER: the
+L44 view membership check runs twice per row candidate — gate on the
+view being empty)**, tickEffectsNoOp 0.77. AABB.intersects fell to
+0.42 (the doc-41 8.3% bucket mostly went with L44c's row publish).
+
+### The next moves (in order)
+1. The KPH run names the mixed/spread/mobs culprit pair → fix the extra
+   push (mirror staleness or the PF_PUSHABLE refresh path).
+2. The items view-union: serve `rows ∪ view-entries` (the view entries'
+   PRE boxes ride B_SY/B_SEQ order stamps) so the merge scan never falls
+   to the view-stale mirror for the pending+view shape.
+3. The isViewAfter hoist (a viewCount != 0 gate).

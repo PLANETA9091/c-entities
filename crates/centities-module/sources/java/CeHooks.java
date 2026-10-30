@@ -1985,7 +1985,11 @@ public final class CeHooks {
         // rare: it needs a row-path refusal AND a fresh spawn in range).
         if (viewTouches(box)) {
             mViewRefuse++;
-            fastRefuse = "view";
+            // keep the ROW reason: the chain "pending+view" names BOTH the
+            // row refusal and the native view refusal in one print (the
+            // first L45 run overwrote it and the items t=219 row reason
+            // stayed unnameable).
+            fastRefuse = fastRefuse == null ? "view" : fastRefuse + "+view";
             return null;
         }
 
@@ -3209,6 +3213,32 @@ public final class CeHooks {
                 pe.push(PUSH_PAIR_D[i * 2], 0.0, PUSH_PAIR_D[i * 2 + 1]);
             }
             pushPairs += pn;
+            // L47 PUSH FORENSICS: the mixed t=233 PTRACE proved an EXTRA
+            // push on a resting armor stand (ON gained vx/vz at tc=90,
+            // vanilla stayed zero; spread t=235 4142 and mobs t=275 1069
+            // are the same one-tick family) — the kernel accepted a pair
+            // vanilla's in-phase scan excludes. At PD ticks, dump the
+            // pusher's identity + live box and the exact pair set with
+            // forces; the OFF leg's PD/PTRACE supplies the vanilla outcome,
+            // so the diff names the culprit pair and its geometry.
+            if (phDumpTickNow()) {
+                StringBuilder pb = new StringBuilder(96 + pn * 24);
+                AABB sbx = le.getBoundingBox();
+                pb.append("[ce-baseline] KPH t=").append(CUR_TICK)
+                        .append(" self=").append(le.getId())
+                        .append(" tc=").append(le.tickCount)
+                        .append(" n=").append(pn)
+                        .append(" box=[").append(sbx.minX).append(',').append(sbx.maxX)
+                        .append(' ').append(sbx.minY).append(',').append(sbx.maxY)
+                        .append(' ').append(sbx.minZ).append(',').append(sbx.maxZ)
+                        .append(']');
+                for (int i = 0; i < Math.min(pn, 16); i++) {
+                    pb.append(' ').append(PUSH_PAIR_IDS[i] & 0xFFFF_FFFFL)
+                            .append(':').append(PUSH_PAIR_D[i * 2])
+                            .append(',').append(PUSH_PAIR_D[i * 2 + 1]);
+                }
+                System.out.println(pb);
+            }
             PUSH_PAIR_N = 0;
             return true;
         } catch (Throwable t) {
