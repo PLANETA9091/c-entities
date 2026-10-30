@@ -625,6 +625,17 @@ public final class CeHooks {
             if (msq) {
                 msqN = 0;
                 msqPath = null;
+                if (bN > 0) {
+                    StringBuilder pb = new StringBuilder(200);
+                    int lim = Math.min(bN, 24);
+                    for (int k = 0; k < lim; k++) {
+                        pb.append(k == 0 ? "" : ",").append((int) (B_IDS[k] & 0xFFFF_FFFFL))
+                          .append(B_IDS[k] < 0 ? "!" : (B_IDS[k] & ROW_NEUTRAL) != 0 ? "~" : "+");
+                    }
+                    System.out.println("[ce-baseline] MSP t=" + CUR_TICK
+                            + " self=" + e.getId() + " bN=" + bN
+                            + " ids=" + pb + (bN > lim ? ",..." : ""));
+                }
                 msqWin0 = rowWinSkip;
                 msqHome0 = rowHomeMiss;
                 msqStale0 = rowStaleCand;
