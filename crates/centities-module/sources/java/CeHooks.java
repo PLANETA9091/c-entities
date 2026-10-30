@@ -1369,16 +1369,25 @@ public final class CeHooks {
         if (bN >= DRAIN_CAP) flush();
     }
 
-    /** L12: the pushableBy predicate's stateful slice, folded into flag bits
-     *  (javap-verified against 26.3 LivingEntity.isPushable ->
-     *  isCollidable(false): isAlwaysTicking false, ServerLevel,
-     *  isPositionEntityTicking(blockPosition), isAlive, !isSpectator,
-     *  collides, !onClimbable). The team-rule slice is NOT folded — any
-     *  entity WITH a team routes the whole push vanilla (the guard checks).
-     *  Rare state flips without a box event (sleeping villager, spectator
-     *  flip) re-classify on the entity's next box probe; the deviation
-     *  window is documented in docs/research/23 and is behaviorally inert
-     *  (deltas of non-traveling entities never integrate into position). */
+    /** L12: the pushableBy predicate's stateful slice, folded into flag bits.
+     *  PF_PUSHABLE = the VIRTUAL LivingEntity.isPushable() (= isCollidable(
+     *  paperConfig.collisions.fixClimbingBypassingCrammingRule)). The call
+     *  MUST stay virtual: ArmorStand OVERRIDES isCollidable(boolean) to
+     *  `return false` unconditionally in 26.3 (armor stands are never push
+     *  candidates and never push — their doPush is empty and pushEntities
+     *  only looks at rideable minecarts), and AbstractHorse/Parrot override
+     *  too. The previous inlined copy of the LivingEntity body missed every
+     *  override and classified ALL armor stands pushable — the kernel then
+     *  pushed marker stands (stale pre-marker box + PF_PUSHABLE) that
+     *  vanilla's EntitySelector.pushableBy excludes at input.isPushable():
+     *  the extra-push family (mixed t=233 stand 235, spread t=235 stand
+     *  4142, mobs t=275 stand 1069). The team-rule slice is NOT folded —
+     *  any entity WITH a team routes the whole push vanilla (the guard
+     *  checks). Rare state flips without a box event (sleeping villager,
+     *  spectator flip) re-classify on the entity's next box probe; the
+     *  deviation window is documented in docs/research/23 and is
+     *  behaviorally inert (deltas of non-traveling entities never
+     *  integrate into position). */
     private static int pushFlags(net.minecraft.world.entity.LivingEntity le) {
         // THROW-PROOF BY CONTRACT: the first A/B round lost the whole module
         // to `le.isSpectator()` NPE'ing on a MID-CONSTRUCTION ServerPlayer
@@ -1393,13 +1402,7 @@ public final class CeHooks {
             if (le.isVehicle()) f |= PF_VEHICLE;
             if (le.noPhysics) f |= PF_NOPHYSICS;
             if (le.isSpectator()) f |= PF_SPECTATOR;
-            if (!le.isAlwaysTicking()
-                    && le.level() instanceof net.minecraft.server.level.ServerLevel sl
-                    && sl.isPositionEntityTicking(le.blockPosition())
-                    && le.isAlive()
-                    && !le.isSpectator()
-                    && le.collides
-                    && !le.onClimbable()) {
+            if (le.isPushable()) {
                 f |= PF_PUSHABLE;
             }
         } catch (Throwable t) {
