@@ -539,7 +539,8 @@ impl EntityIndex {
                     self.seq[slot as usize] = seq;
                     self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
                 }
-                return UpsertEv::Same;
+                let _ = home;
+                return UpsertEv::BoxChanged { cell: home };
             }
             // moved cell (or world): O(1) swap-remove + push
             self.cell_remove(home, self.cpos[slot as usize] as usize);
