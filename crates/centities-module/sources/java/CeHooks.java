@@ -592,11 +592,20 @@ public final class CeHooks {
 
     private static String msqIds() {
         StringBuilder sb = new StringBuilder(msqN * 6 + 2);
+        sb.append('[');
         for (int i = 0; i < msqN && i < 48; i++) {
-            sb.append(i == 0 ? "[" : ",").append(MSQ_IDS[i]);
+            sb.append(i == 0 ? "" : ",").append(MSQ_IDS[i]);
         }
         return sb.append(msqN > 48 ? ",...]" : "]").toString();
     }
+
+    // L45: WHY did fastQuery refuse this scan? The mirror MSQ line used to
+    // say only path=mirror rawN=0 — the row-refusal reason (multi / key /
+    // stale / fresh / pending / big / view / notready / ...) was invisible,
+    // and the items t=219 hunt stalled on exactly that (run 41110186252:
+    // 6931 mirror rawN=0, reason unnameable). Set at every fastQuery /
+    // rowQuery refusal point; read by the mergeScanNative mirror branch.
+    public static volatile String fastRefuse = null;
 
     public static boolean mergeScanNative(ItemEntity e) {
         mergeChecks++;
@@ -666,7 +675,8 @@ public final class CeHooks {
                     msqPath = msqPath == null ? "mirror" : msqPath;
                     System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
                             + " self=" + e.getId() + " path=mirror"
-                            + " rawN=" + msqN + " ids=" + msqIds());
+                            + " rawN=" + msqN + " ids=" + msqIds()
+                            + " refuse=" + fastRefuse);
                 }
                 return false; // index unsure — vanilla body
             }
@@ -1892,8 +1902,10 @@ public final class CeHooks {
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, Entity source,
             AABB box, Predicate<? super Entity> predicate) {
+        fastRefuse = null;
         if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
             mNotServerLevel++;
+            fastRefuse = "notserverlevel";
             return null;
         }
         // The fast path touches server-thread-only state (batch arrays, gate
@@ -1902,11 +1914,13 @@ public final class CeHooks {
         // pre-existing batch-array race.
         if (!SERVER_THREAD.get()) {
             mOffThread++;
+            fastRefuse = "offthread";
             return null;
         }
         int wid = worldId(sl);
         if (wid < 0) {
             mBadWorld++;
+            fastRefuse = "badworld";
             return null;
         }
 
@@ -1936,6 +1950,7 @@ public final class CeHooks {
         // rare: it needs a row-path refusal AND a fresh spawn in range).
         if (viewTouches(box)) {
             mViewRefuse++;
+            fastRefuse = "view";
             return null;
         }
 
@@ -1979,10 +1994,12 @@ public final class CeHooks {
             }
             if (n == -1) {
                 mNotReady++;
+                fastRefuse = "notready";
                 return null; // index not ready / buffer vanished — mirror
             }
             if (n < 0) {
                 mRegrowFail++;
+                fastRefuse = "regrow";
                 return null; // regrow failed — mirror
             }
             if (n > 0) {
@@ -1992,6 +2009,7 @@ public final class CeHooks {
                 if (n > ids.length) {
                     if (n > (1 << 20)) {
                         mRegrowFail++;
+                        fastRefuse = "regrow2";
                         return null;
                     }
                     ids = new long[n];
@@ -1999,6 +2017,7 @@ public final class CeHooks {
                 }
                 if ((long) n << 3 > dbb.capacity()) {
                     mRegrowFail++;
+                    fastRefuse = "regrow3";
                     return null;
                 }
                 for (int k = 0; k < n; k++) {
@@ -2027,10 +2046,12 @@ public final class CeHooks {
             }
             if (n < 0) {
                 mNotReady++;
+                fastRefuse = "notready2";
                 return null; // index not ready — mirror
             }
             if (n > ids.length) {
                 mRegrowFail++;
+                fastRefuse = "regrow4";
                 return null; // regrow failed 3x — mirror
             }
         }
@@ -2256,7 +2277,7 @@ public final class CeHooks {
         // L32: the window is 6x6 (span <= 5 after the expansion). Wider
         // boxes (the really wide targeting scans) still refuse into the
         // native/mirror paths.
-        if (cx1 - cx0 > 5 || cz1 - cz0 > 5) { rowMulti++; return null; }
+        if (cx1 - cx0 > 5 || cz1 - cz0 > 5) { rowMulti++; fastRefuse = "multi"; return null; }
         // L35: narrow shapes (collision, merge scans) get the raised total
         // cap — the packed x-window below does the mass skip for them.
         double wxs = box.maxX - box.minX;
@@ -2295,6 +2316,7 @@ public final class CeHooks {
                         | (long) ((cz + (1 << 20)) & 0x3FFFFF);
                 if (row[0] != key) {
                     rowKey++;
+                    fastRefuse = "key";
                     if (dbgMisses < 3) {
                         dbgMisses++;
                         dbgExpKey = key;
@@ -2304,10 +2326,10 @@ public final class CeHooks {
                     return null;
                 }
                 long hdr = row[1];
-                if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
+                if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; fastRefuse = "stale"; return null; }
                 freshSeen = true;
                 int n = (int) (hdr & 0x7FF);
-                if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
+                if (n > ROW_CAP) { rowBig++; fastRefuse = "bigdense"; return null; } // dense-kill sentinel
                 MQ_ROWS[nr] = row;
                 MQ_CELL[nr] = (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 MQ_CELL_X0[nr] = (long) cx << 4;
@@ -2320,6 +2342,7 @@ public final class CeHooks {
             // L32: every covered cell is either null or stale-fresh — the
             // index proves nothing about this window; the native/mirror
             // paths decide (the pre-L32 behavior for any non-empty window).
+            fastRefuse = "nofresh";
             return null;
         }
         // Pending (unflushed) probe batch: an upsert whose NEW home cell is
@@ -2331,7 +2354,7 @@ public final class CeHooks {
             // L4e: bound raised 16 -> 64 to match DRAIN_CAP — probe-time
             // draining keeps bN <= 64, so the scan below stays O(64x4) while
             // the row path now serves between drains instead of refusing.
-            if (bN > 64) { rowPending++; return null; } // bound the scan
+            if (bN > 64) { rowPending++; fastRefuse = "pending64"; return null; } // bound the scan
             winN = 0;
             for (int i = 0; i < bN; i++) {
                 long l = B_IDS[i];
@@ -2361,6 +2384,7 @@ public final class CeHooks {
                 for (int r = 0; r < nr; r++) {
                     if (MQ_CELL[r] == home) {
                         rowPending++;
+                        fastRefuse = "pending";
                         return null;
                     }
                 }
@@ -2389,7 +2413,7 @@ public final class CeHooks {
         // ~30us/query x 6.7k/tick = ~200ms/tick, +10% p50 over vanilla.
         // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
         // on the native path while serving mid-density rows at ~10-20us.
-        if (total > totalCap) { rowBig++; return null; }
+        if (total > totalCap) { rowBig++; fastRefuse = "bigcap"; return null; }
         ArrayList<Entity> out = new ArrayList<>(Math.min(total, totalCap));
         int srcId = source == null ? -1 : source.getId();
         int stale = 0, homeMiss = 0;
