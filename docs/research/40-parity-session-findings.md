@@ -446,3 +446,60 @@ Set{Long,Double}ArrayRegion on the EXISTING array object; PUSH_PAIR_N
 into preallocated non-replaced buffers when the Java reader can be
 constant-folded — the same discipline as the AI_IN/AI_OUT and the
 query out-buffers.
+
+## Session addendum 7 (2026-10-30): the flush-time scan view — ROOT PROVEN (L44, d01f631)
+
+### The instruments that closed it
+1. **MS tc/mv/src** (59f134c): every merge scan now prints the cadence input
+   (tc = e.tickCount == the Rust st.tick_count), the floor-change verdict
+   (mv = the new B_MERGE2 output bit), and the caller (src: flush vs the
+   vanilla-body guard).
+2. **QB** (f4360ed): the exact query box + radius per MSQ scan (the marker
+   had to be added to run-baseline.sh's stream grep — same trap as MSQ).
+3. **PTRACE id 1827** (41083916822): the per-tick fields of the merge
+   partner — bit-identical across both legs, which killed the counter-phase
+   theory for good (the PTRACE t=150..158 of item 971: ZERO field diffs).
+
+### The exact-number proof (items t=159, the 971/1827 pair)
+- 971's scan at ct=475: QB Y=[-59.2439, -58.9939] (0.25 tall — the merge box
+  Y-inflate is 0 either way), mv=1, tc=10, 13 window-passed candidates, ALL
+  box-rejected, n=0.
+- 1827: spawned t=159 (tc=1), vy=+0.1568 (rising). Its POST-body box
+  y=[-58.84, -58.59] is 0.153 ABOVE the window — our flush-time box test
+  rejected it CORRECTLY for what it could see. Its PRE-body (spawn) box
+  y=-58.997 WAS INSIDE the window.
+- Vanilla's 971-scan runs DURING 971's body; 1827's body runs LATER
+  (id order) — vanilla saw the spawn box, merged (tie: the candidate
+  absorbs the ticker → 971 died — exactly the OFF-leg PD).
+- The flush runs AFTER the whole entity phase: 1827's body already moved
+  it one physics step past the vanilla view. Falling/rising young items
+  step 0.1-0.3 blocks/tick; the 0.25-tall Y window makes the step decisive.
+- mixed t=152 (469/830): the same mechanism, opposite sign — 830's spawn
+  box was OUTSIDE vanilla's 469-scan view, its post-body box INSIDE ours →
+  our extra merge. spread t=210: the miss variant. mobs t=275 (the SR/LR
+  divergence at 321-394 downstream, the PH divergence WITHOUT any RNG diff)
+  is the push mirror's own flavour of the same flush-timing class.
+
+### The fix (d01f631)
+- `appendItem` captures the PRE-body AABB of every entry (IB_PRE, the same
+  side-packed cd-slot; pass 1 keeps overwriting IB_CD with the POST state
+  for the tick compute).
+- The apply pass builds the VIEW: RESYNC + FORCE_VANILLA entries (their
+  bodies ran in-phase), inactive excluded — id -> (PRE box, batch idx).
+- A scanner at batch index i sees an entry j>i at its PRE box: the row
+  path never window-skips it (its packed interval rides the POST box) and
+  skips the home re-check (vanilla registers a crosser in BOTH sections);
+  the native path's exact re-check substitutes the PRE box the same way.
+- fastQuery refuses the native resolve when an AFTER-scanner view entry's
+  PRE box touches the query (the index boxes are POST-move — the answer
+  would be view-wrong). The view is apply-pass-only state (IN_ITEM_APPLY).
+
+### Known residuals (accepted, documented)
+- A row-path REFUSAL (dense cell/multi-cell) coinciding with a fresh spawn
+  in range falls to the mirror, which is equally view-stale — needs a
+  dense-pile scan to matter; not observed on the parity scenarios.
+- The merge's age/pickupDelay side effects land one body-step later than
+  vanilla's (max/min commute with the increments for young items; the
+  snapshot gate does not hash age/pickupDelay).
+- The mobs push-pair divergence (t=275, entities TBD by PD at 270-280) is
+  the NEXT root — same flush-timing family, push mirror side.
