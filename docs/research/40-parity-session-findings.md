@@ -725,3 +725,14 @@ cur-driven and identical). The n-gap growth (5..22 entities) rode the same
 one-tick skew through the merge-removal cadence. The +1 changes behavior
 ONLY at the tc=200 crossing (young items return active under either phase),
 so the t=159 fix surface is untouched.
+
+### L52 verdict (the fed6f56 gate run): the tc=200 crossing moved one cohort
+items t=340 -> t=353, mixed t=340 -> t=353: +13 ticks == EXACTLY the next
+item cohort's crossing (153+200=353) — the L52 phase fix is real and the
+divergence is a CHAIN of per-cohort boundary crossings. mobs 275 /
+spread 259 unchanged (pure-zombie stale-box class / a separate family;
+the trace_id=1069 dispatch is in flight). NEXT LAYER at the crossing:
+for ids with (tc+id)%4==0 (id == 2 mod 4) the crossing tick tc=200 ALSO
+hits the merge cadence (200%40==0) — an active-tick merge scan running
+at the activation boundary; the 353 pair needs the PD window 348-360 to
+name the cohort's diverging ids and the changed field (count vs vy).
