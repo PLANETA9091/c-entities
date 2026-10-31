@@ -937,3 +937,47 @@ ce5a471 with the workflow extra_env input).
   legs' line ranges (the first vx/vz split tick + the ratio table).
 - scripts/pd_pair_diff.py: the per-entity PD hash diff for given ticks
   (the diverging id set + the removal check).
+
+## Session addendum 15 (2026-10-31): the belt dust ROOT-CAUSED and FIXED — the flag-less RESYNC ingest clobbered the store's on_ground
+
+### The store view (the 41236407174 artifact logs — the tail stream LOST
+### the diag lines; the full server.log had them all: DTRACE 921, FTICK
+### 921, RTICK 416 for items-on)
+The FTICK/DTRACE timeline for item 1408 (items-on):
+- FTICK tc=256 (the t=410 rotation body, pre-body): onG=true, dx=-4.97e-17.
+- NO FTICK tc=257 and NO DTRACE t=411: the t=411 tick routed the item
+  VANILLA (the batch entry was RESYNC-flavored — tickable=false, so the
+  phase-2 FTICK never printed) — the vanilla body advanced tc 256->257.
+- FTICK tc=258 (the t=412 ingest, pre-body): **onG=FALSE** — the store
+  was clobbered in the t=411 window by a batch that never ticked
+  natively. The PD at t=412 was still bit-identical across the legs.
+- t=413 (cur%20==13 — the never-stamped wakeup): itemCheckActive fires
+  the wakeup in BOTH legs; the immunity read passes (JAVA onG=true,
+  horiz~1e-33) -> the body runs ACTIVE in both. Vanilla's move gate
+  reads the LIVE onGround (true: CLOSED — gravity only). The kernel's
+  gate reads the STORE's st.on_ground (clobbered false: OPEN) —
+  gravity+move+FRICTION, exactly one 0.588 vx/vz multiply.
+- The store re-heals on the next rotation tick (the L53 absolute bit);
+  the cadences re-sync — one extra step per clobber event.
+
+### The writer (the phase-1 ingest code read)
+The phase-1 RESYNC ingest commits `entry.on_ground = (f & F_ON_GROUND)
+!= 0` verbatim from the batch flags — but TWO of the three collect
+sites packed NO onGround flag: the fresh-flag-gate FORCE_VANILLA path
+(itemSkip) and the walk's INACTIVE|RESYNC collector
+(itemInactiveCollect). Any vanilla-routed tick for an on-ground item
+clobbered the store. The dispatch site (the third) already packed it.
+
+### The fix (d9a84c8, L55)
+Both sites pack `(e.onGround() ? IF_ON_GROUND : 0)`. The gate
+freshness story is now uniform: every RESYNC ingest carries the
+collect-time onGround truth; the store bit is never clobbered by a
+batch that did not tick natively.
+
+### The tooling lesson (why this took two CI cycles)
+The 30s tail-streamer interleaves and drops the diag lines mid-buffer —
+the job log showed 0 of every stream while the artifact server.log had
+them all. Diag evidence MUST be read from the artifacts. The TL bind
+also died silently (Object[].class has no getId — fixed in 18ad9aa:
+bind on net.minecraft.world.entity.Entity); the TL stream's first
+clean data is expected from the post-L55 runs.
