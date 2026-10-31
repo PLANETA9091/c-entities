@@ -882,3 +882,58 @@ delta at the same tick is the order proof).
 - pd_window.py: the per-leg PD diff in a window (the first divergent
   entity per scenario).
 - ptrace_win.py: the PTRACE diff per leg pair around a window.
+
+## Session addendum 14 (2026-10-31): the belt dust LOCALIZED — one extra friction step at t=413, a 53-id cohort, a closed move gate
+
+### The belt-dust hunt run (41221146878, 9ca0415; knobs itemTick=1 mobAi=0
+### merge=1 TRACE_ID=1408 PH_DUMP=405-425)
+The gate failure map: mobs T382/T632/final FAIL (yaw 5.34 at T382 — the
+push family), items T389 PASS (bit-identical — L53 holds), items
+T639/final FAIL, mixed/spread all FAIL. The items T639 diff: 1214 items
+drifted, vx/vz ONLY (x/y/z/yaw/vy all 0.0), worst deltas ~3.2e-20 —
+DUST. And the drift is a RATIO: every drifted id's off/on vx ratio is
+1.7006801 == 1/0.588 — EXACTLY one on-ground friction multiply. The ON
+leg is BEHIND by one 0.588 step: OFF carried one MORE friction multiply
+than ON — no, the PTRACE proves the opposite direction (below).
+
+### The PTRACE split (scripts/ptrace_split.py, item 1408, both legs)
+- t=412: vx bit-identical (-2.921755e-17 both), onG=1 both, tc=258.
+- t=413: ON vx = -1.717992e-17 (ONE 0.588 step APPLIED), OFF unchanged.
+  tc=259. The move rotation for id 1408 (1408%4==0) needs tc%4==0 —
+  259%4=3: NEITHER leg's rotation tick. ON ran a SPURIOUS move.
+- t=414: OFF applies ITS rotation friction (tc=260%4==0) — catches up to
+  ON's 413 value; ON applies the rotation too (-1.010e-17 both... ON
+  stays one step ahead: the ratio pins at exactly 1.7006801 forever).
+- The cadences RE-SYNC after the single spurious step (414, 418 both
+  legs) — the divergence is ONE extra multiply, not a phase shift: the
+  store's on_ground re-healed on the next rotation tick (the L53
+  absolute-bit write from the rotation's own move outcome).
+
+### The PD diff (scripts/pd_pair_diff.py, per-entity hashes, both legs)
+- t=410/411/412: 0 diverged of 16498 common (bit-identical).
+- t=413: 53 diverged — ALL id % 4 == 0, a CONTIGUOUS cohort
+  (1408, 1412, ... 1476, one belt segment), no removals (only_off=0,
+  only_on=0). 53 stays 53 through 415+; later waves (the T639 1214)
+  must hit the other id-residue classes at later ticks — the same
+  one-tick anchor repeats per cohort.
+
+### The mechanism (pending the store view)
+The spurious move needs the tick_item gate to open OUTSIDE the rotation:
+`(tc+id)%4==0 || !on_ground || horiz>1e-5` — onG=1 and horiz~1e-17 at
+413, so the KERNEL's st.on_ground said FALSE at the t=413 gate for the
+53. The t=412→413 boundary wrote on_ground=0 for one contiguous belt
+segment. The L53 fix makes tick_item_inactive SET the absolute bit —
+a preserve; if the FLUSH upsert clobbered the bit to 0 between the
+ticks, the inactive preserve carries the clobber and the next active
+gate opens. The FTICK/RTICK view (CE_RTRACE_ID — the store's
+tc/on_ground/delta AT the body's gate, plus the flush batch's flags)
+names the writer; run 41234855357's TL stream did NOT fire either
+(-Dce.tl.trace=1 never reached onEnable despite the step env dump —
+the property path is untrusted; the CE_TL_TRACE env arm landed in
+ce5a471 with the workflow extra_env input).
+
+### Tooling
+- scripts/ptrace_split.py: the per-tick PTRACE diff across the two
+  legs' line ranges (the first vx/vz split tick + the ratio table).
+- scripts/pd_pair_diff.py: the per-entity PD hash diff for given ticks
+  (the diverging id set + the removal check).
