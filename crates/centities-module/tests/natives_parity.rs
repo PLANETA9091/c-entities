@@ -25,6 +25,10 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // L50: + realNcol — the REAL numCollisions field the cap replay reads
     s.insert(("nativePush", "(IIIIIIIII)J"));
     s.insert(("nativePushNcol", "(II)I"));
+    // L53-diag: the marginExtra sample's Rust side — the INDEX box of
+    // (world, id) into a double[6] (CE_FQ_IBOX=1; read-only, never creates
+    // the state).
+    s.insert(("nativeIndexBox", "(IJ[D)I"));
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
     s.insert(("nativeRemoveDirect", "(J)V"));
     s.insert(("nativeReset", "()V"));

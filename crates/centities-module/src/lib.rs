@@ -3223,7 +3223,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeIndexBox",
-        "(JI[D)I",
+        "(IJ[D)I",
         n_index_box as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
