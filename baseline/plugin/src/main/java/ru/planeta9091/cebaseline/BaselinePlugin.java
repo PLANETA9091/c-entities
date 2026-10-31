@@ -1010,8 +1010,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 TL_SET_OBJ = set.get(tickList);
                 TL_GETLIST = TL_SET_OBJ.getClass().getMethod("getListRaw");
                 TL_GETSIZE = TL_SET_OBJ.getClass().getMethod("getListSize");
-                TL_GETID = ((Object[]) TL_GETLIST.invoke(TL_SET_OBJ)).getClass()
-                        .getComponentType().getMethod("getId");
+                // L54b fix (run 41236407174): the raw list's component type is
+                // Object[] (the field's declared type) — Object.getId() does
+                // not exist and the bind died with NoSuchMethodException,
+                // silently disabling the whole stream. Bind getId on the
+                // Entity class instead (every list member is an Entity).
+                TL_GETID = Class.forName("net.minecraft.world.entity.Entity")
+                        .getMethod("getId");
                 tlReady = true;
             } catch (Throwable t) {
                 tlReady = true; // stop retrying; the stream stays off

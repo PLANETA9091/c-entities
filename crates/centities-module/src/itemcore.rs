@@ -23,6 +23,18 @@ use crate::HOOKS_CLASS_GLOBAL;
 const STORE_CAP: usize = 1 << 17;
 const STORE_MASK: u64 = (STORE_CAP - 1) as u64;
 
+/// The L55-diag traced id (CE_RTRACE_ID) — shared by the FTICK flush print
+/// and the CMT commit witness. Cached: the env is fixed for the process.
+fn rtrace_id() -> i64 {
+    static RT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *RT.get_or_init(|| {
+        std::env::var("CE_RTRACE_ID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ItemEntry {
     tag: u64, // (id >> 17) | 1 — validity check against slot aliasing
@@ -1041,7 +1053,25 @@ unsafe fn n_item_tick_impl(
                                     entry.pickup_delay = oi[k * 4 + 1];
                                     entry.tick_count = oi[k * 4 + 3];
                                     entry.fall_dist = od[k * 8 + 6] as f32;
-                                    entry.on_ground = (oi[k * 4 + 2] & B_ON_GROUND) != 0;
+                                    // L55-diag: the commit-side witness for the
+                                    // traced id — the outcome bit AND the entry's
+                                    // pre/post on_ground at the SAME line. The
+                                    // belt dust (addendum 14) showed the store's
+                                    // on_ground false at a t=412 ingest with no
+                                    // body commit in the t=411 window; this names
+                                    // the writing commit (or proves the t=410
+                                    // rotation's own commit wrote FALSE while the
+                                    // writeback left the Java entity TRUE).
+                                    let cmt_pre_ong = entry.on_ground;
+                                    let cmt_out_ong = (oi[k * 4 + 2] & B_ON_GROUND) != 0;
+                                    let cmt_aborts = entry.aborts;
+                                    entry.on_ground = cmt_out_ong;
+                                    if rtrace_id() == id {
+                                        eprintln!(
+                                            "[ce] CMT id={} tc={} out_onG={} pre_onG={} aborts_in={}",
+                                            id, entry.tick_count, cmt_out_ong, cmt_pre_ong, cmt_aborts
+                                        );
+                                    }
                                     entry.aborts = 0;
                                     if (f & F_NATIVE) == 0 {
                                         // collector-carried entries refresh despawnRate
