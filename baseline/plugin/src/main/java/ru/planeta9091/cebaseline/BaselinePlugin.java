@@ -83,6 +83,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
 
     // --- behavioral parity harness ---
     private boolean parity = false;
+    private boolean tlTraceOn = false;
     private long paritySeed = 4242L;
     private int parityFillStartTick = 100; // fixed-tick fill window start
     private long fillDoneTick = -1;
@@ -119,6 +120,10 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         parity = "1".equals(env("PARITY", "0"));
         paritySeed = longEnv("PARITY_SEED", 4242L);
         traceId = (int) longEnv("PARITY_TRACE_ID", -1L);
+        // L54 diag: the tick-list order stream rides a SYSTEM property
+        // (ce.tl.trace=1) so a workflow_dispatch can arm it via extra_jvm
+        // (-Dce.tl.trace=1) without a new workflow input.
+        tlTraceOn = "1".equals(System.getProperty("ce.tl.trace", "0"));
 
         // Neutralize non-entity noise.
         for (World w : Bukkit.getWorlds()) {
@@ -453,6 +458,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
         if (parity && traceId >= 0) {
             traceStep();
+        }
+        if (parity && tlTraceOn && phDumpActive()) {
+            dumpTickList();
         }
         switch (phase) {
             case "WARMUP" -> {
@@ -951,6 +959,79 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             if (++phFails <= 3) getLogger().warning("PH step failed: " + t);
         }
     }
+
+    // ------------------------------------------------------------------
+    // L54 diag — the TICK-LIST ORDER dump (ce.tl.trace=1). At PD ticks,
+    // walk the overworld's EntityTickList raw array (the EXACT order the
+    // entity loop iterates: IteratorSafeOrderedReferenceSet keeps insertion
+    // order, removals null the slot, defrag compacts in order) and stream
+    // the ids 10/line. Both legs run this plugin, so the OFF leg streams
+    // too — the FIRST order divergence names its tick and the exact
+    // entities whose relative turn order flipped (the trace-823 family:
+    // the pushed-vs-integrated push delta at the tick end proves the
+    // pusher's turn ran on different sides of the target's body).
+    // Read-only reflection, cached; any failure disables the stream once.
+    // ------------------------------------------------------------------
+    private volatile boolean tlReady = false;
+    private volatile Object TL_SET_OBJ;
+
+    private void dumpTickList() {
+        if (!tlReady) {
+            try {
+                Object w = Bukkit.getWorlds().get(0);
+                Object sl = w.getClass().getMethod("getHandle").invoke(w);
+                // walk the hierarchy for entityTickList (ServerLevel declares it)
+                java.lang.reflect.Field list = null;
+                for (Class<?> c = sl.getClass(); c != null && list == null; c = c.getSuperclass()) {
+                    try {
+                        list = c.getDeclaredField("entityTickList");
+                    } catch (NoSuchFieldException ignored) { }
+                }
+                if (list == null) throw new NoSuchFieldException("entityTickList");
+                list.setAccessible(true);
+                Object tickList = list.get(sl);
+                java.lang.reflect.Field set = tickList.getClass().getDeclaredField("entities");
+                set.setAccessible(true);
+                TL_SET_OBJ = set.get(tickList);
+                TL_GETLIST = TL_SET_OBJ.getClass().getMethod("getListRaw");
+                TL_GETSIZE = TL_SET_OBJ.getClass().getMethod("getListSize");
+                TL_GETID = ((Object[]) TL_GETLIST.invoke(TL_SET_OBJ)).getClass()
+                        .getComponentType().getMethod("getId");
+                tlReady = true;
+            } catch (Throwable t) {
+                tlReady = true; // stop retrying; the stream stays off
+                getLogger().warning("TL dump bind failed: " + t);
+                return;
+            }
+        }
+        try {
+            if (TL_GETLIST == null) return;
+            Object[] arr = (Object[]) TL_GETLIST.invoke(TL_SET_OBJ);
+            int size = (Integer) TL_GETSIZE.invoke(TL_SET_OBJ);
+            StringBuilder sb = new StringBuilder(256);
+            int cnt = 0, emitted = 0;
+            for (int i = 0; i < size && i < arr.length; i++) {
+                Object e = arr[i];
+                if (e == null) continue;
+                int id = (Integer) TL_GETID.invoke(e);
+                sb.append(id).append(' ');
+                if (++cnt == 10) {
+                    getLogger().info("TL t=" + tickNo + " i=" + emitted + " " + sb.toString().trim());
+                    sb.setLength(0);
+                    cnt = 0;
+                    emitted += 10;
+                }
+            }
+            if (cnt > 0) {
+                getLogger().info("TL t=" + tickNo + " i=" + emitted + " " + sb.toString().trim());
+            }
+        } catch (Throwable t) {
+            getLogger().warning("TL dump failed: " + t);
+            TL_GETLIST = null; // disable the stream
+        }
+    }
+
+    private volatile java.lang.reflect.Method TL_GETLIST, TL_GETSIZE, TL_GETID;
 
     // ------------------------------------------------------------------
     // SR/LR — per-tick ENTROPY-STREAM probes. The parity seeds both streams
