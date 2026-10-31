@@ -59,6 +59,9 @@ on:
       extra_jvm:
         description: 'extra JVM flags appended to EXTRA_JVM (e.g. -Dcentities.x=y)'
         default: ''
+      extra_env:
+        description: 'extra KEY=VAL pairs exported to the legs (space-separated, e.g. "CE_RTRACE_ID=1408 CE_TL_TRACE=1")'
+        default: ''
   push:
     branches: [main]
     paths:
@@ -113,6 +116,12 @@ jobs:
           MM="$([ "${{ inputs.merge_mirror }}" = "0" ] && echo 0 || echo 1)"
           echo "CE_COLLIDE=$CC" >> "$GITHUB_ENV"
           echo "CE_MERGE_MIRROR=$MM" >> "$GITHUB_ENV"
+          # the diag env-knobs (CE_RTRACE_ID / CE_TL_TRACE / ...): word-
+          # split the space-separated KEY=VAL list and export each pair —
+          # the legs' java process inherits GITHUB_ENV like every other knob
+          for KV in ${{ inputs.extra_env || '' }}; do
+            echo "$KV" >> "$GITHUB_ENV"
+          done
 
       - name: Paired parity runs (off/on per scenario)
         run: |

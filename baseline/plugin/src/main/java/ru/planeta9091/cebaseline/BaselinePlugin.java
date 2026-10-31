@@ -122,8 +122,14 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         traceId = (int) longEnv("PARITY_TRACE_ID", -1L);
         // L54 diag: the tick-list order stream rides a SYSTEM property
         // (ce.tl.trace=1) so a workflow_dispatch can arm it via extra_jvm
-        // (-Dce.tl.trace=1) without a new workflow input.
-        tlTraceOn = "1".equals(System.getProperty("ce.tl.trace", "0"));
+        // (-Dce.tl.trace=1) without a new workflow input. The CE_TL_TRACE
+        // env var is the second, OBSERVED-RELIABLE arm path: the -D
+        // property failed to reach onEnable in the run 41234855357 leg
+        // (EXTRA_JVM carried the flag, the env dump showed it, zero TL
+        // lines and zero bind warnings — tlTraceOn stayed false), while
+        // every env() read in this class provably works (PD/PH fire).
+        tlTraceOn = "1".equals(firstNonEmpty(
+                System.getProperty("ce.tl.trace"), env("CE_TL_TRACE", "0")));
 
         // Neutralize non-entity noise.
         for (World w : Bukkit.getWorlds()) {
@@ -282,6 +288,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static String env(String k, String d) {
         String v = System.getenv(k);
         return v == null || v.isEmpty() ? d : v;
+    }
+
+    /** First non-null, non-empty candidate (the diag-knob arm path:
+     * a -D system property with an env fallback). */
+    private static String firstNonEmpty(String... vs) {
+        for (String v : vs) {
+            if (v != null && !v.isEmpty()) return v;
+        }
+        return "";
     }
 
     private static int intEnv(String k, int d) {
