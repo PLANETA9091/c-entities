@@ -238,6 +238,22 @@ pub fn tick_item(
     scratch: &mut Scratch,
 ) -> TickOutcome {
     let mut out = TickOutcome(0);
+    // L53-diag: the Rust-side mirror state for the traced id (CE_RTRACE_ID).
+    // Pairs with the bridge's DTRACE: the store's tc/on_ground/delta AT the
+    // body's gate — the move-gate phase question needs the STORE view.
+    static RTICK_ID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let rtick = *RTICK_ID.get_or_init(|| {
+        std::env::var("CE_RTRACE_ID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
+    });
+    if rtick >= 0 && id == rtick {
+        eprintln!(
+            "[ce] RTICK id={} st_tc={} st_onG={} st_dx={:e} st_dy={:e}",
+            id, st.tick_count, st.on_ground, st.dx, st.dy
+        );
+    }
 
     // NOTE: the dispatcher increments tickCount AFTER the tick body (trace-
     // proven, run 40728505667 item 35 t=353: vanilla gated CLOSED on
@@ -623,6 +639,20 @@ pub fn tick_item_inactive(st: &mut ItemState) -> TickOutcome {
     }
     if st.age >= st.despawn_rate {
         out.set(TickOutcome::DESPAWN);
+    }
+    // L53: ON_GROUND is an ABSOLUTE bit (the final onGround state) — the
+    // phase-3 commit applies it verbatim (entry.on_ground = bits & B_ON_GROUND).
+    // The inactive body runs NO physics (vanilla inactiveTick never touches
+    // onGround), but omitting the bit here clobbered the STORE to FALSE on
+    // every inactive tick; the next active tick's move gate (!st.on_ground)
+    // then opened and ran a SPURIOUS move — gravity+collide+FRICTION — that
+    // vanilla's (tc+id)%4 skip tick never does. Young items (tc<200, active
+    // every tick, the absolute bit always set) hid the bug; the tc=200
+    // activation crossings made 19/20 ticks inactive and the items-353 wave
+    // was born (801 items at T389, vx/vz only — one extra friction step per
+    // inactive->active pair).
+    if st.on_ground {
+        out.set(TickOutcome::ON_GROUND);
     }
     out
 }

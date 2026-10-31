@@ -852,6 +852,25 @@ unsafe fn n_item_tick_impl(
                                                 let id = id_c[j];
                                                 let f = f_c[j] & 0x3F;
                                                 let st = &mut st_c[j];
+                                                // L53-diag: the flush-level view of the
+                                                // traced id (CE_RTRACE_ID): the batch
+                                                // flags + the store state AT the tick.
+                                                static RTICK_ID: std::sync::OnceLock<i64> =
+                                                    std::sync::OnceLock::new();
+                                                let rtick = *RTICK_ID.get_or_init(|| {
+                                                    let v = std::env::var("CE_RTRACE_ID")
+                                                        .ok()
+                                                        .and_then(|v| v.parse::<i64>().ok())
+                                                        .unwrap_or(-1);
+                                                    eprintln!("[ce] RTICK init: env={} -> {}", std::env::var("CE_RTRACE_ID").unwrap_or_else(|_| "<absent>".into()), v);
+                                                    v
+                                                });
+                                                if rtick >= 0 && id == rtick {
+                                                    eprintln!(
+                                                        "[ce] FTICK id={} f={:#x} inactive={} tc={} onG={} dx={:e} dy={:e}",
+                                                        id, f, (f & F_INACTIVE) != 0, st.tick_count, st.on_ground, st.dx, st.dy
+                                                    );
+                                                }
                                                 // L16: pre-tick delta snapshot for
                                                 // the DELTA_SAME mask below; the
                                                 // rest of the state snapshots feed
