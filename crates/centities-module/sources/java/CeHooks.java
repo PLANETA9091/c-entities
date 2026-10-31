@@ -4817,10 +4817,18 @@ public final class CeHooks {
                     && MODE_VAL[e.getId() & MAMASK] != 0;
             // fresh-flag gates: anything the core cannot compute exactly runs
             // vanilla THIS tick (the flush re-evaluates the mode afterwards).
+            // L55: the onGround flag MUST ride every RESYNC-flavored batch
+            // entry — the phase-1 ingest commits entry.on_ground from the
+            // flags verbatim (itemcore F_ON_GROUND), so a flag-less
+            // FORCE_VANILLA collect clobbered the store's on_ground to FALSE
+            // for an on-ground item (the belt dust, addendum 14: the next
+            // wakeup's active body read !st.on_ground and ran a SPURIOUS
+            // move+friction vanilla's gate skipped — 53 items at t=413, one
+            // 0.588 vx/vz step each, 1214 by T639).
             if (e.isRemoved() || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
-                appendItem(e, IF_FORCE_VANILLA);
+                appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
                 return false;
             }
             appendItem(e, (nativeMode ? IF_NATIVE : IF_RESYNC)
@@ -4861,7 +4869,11 @@ public final class CeHooks {
             try {
                 int slot = e.getId() & MAMASK;
                 if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
-                    appendItem(e, IF_INACTIVE | IF_RESYNC);
+                    // L55: the onGround flag rides the RESYNC ingest too (the
+                    // vanilla body ran; its PRE-tick onGround is the freshest
+                    // store-side truth — an inactive body never moves).
+                    appendItem(e, IF_INACTIVE | IF_RESYNC
+                            | (e.onGround() ? IF_ON_GROUND : 0));
                 }
             } catch (Throwable t) {
                 lastError = System.nanoTime();
