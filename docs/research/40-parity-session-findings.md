@@ -736,3 +736,74 @@ for ids with (tc+id)%4==0 (id == 2 mod 4) the crossing tick tc=200 ALSO
 hits the merge cadence (200%40==0) — an active-tick merge scan running
 at the activation boundary; the 353 pair needs the PD window 348-360 to
 name the cohort's diverging ids and the changed field (count vs vy).
+
+## Session addendum 12 (2026-10-31): L53 — the items-353 wave NAMED and FIXED (the inactive tick's absolute on-ground bit)
+
+### The dispatch map reproduced (the e71dcc7 PD runs 41186373869 + 41188331063)
+Both dispatches (ph_dump=348-360/trace 1069, then 295-365/trace 324) land
+the SAME first-divergence map: mobs t=301, items t=353, mixed t=320,
+spread t=278 — bit-identical across runs (the determinism belt holds).
+The t=353 wave: the PD diff shows 533 items (items), 311 (mixed), 201
+(spread) diverging AT ONE TICK with no removals (missing=0); the T389
+snapshot deltas are vx/vz-only at 1e-15..1e-42. The L52 verdict's
+"id==2 mod 4" guess is WRONG — all four residues diverge.
+
+### The crossing semantics (the 26.3 decomp ground truth)
+- tickNonPassenger: commonTick (tickCount++) -> checkIfActive -> tick()
+  or inactiveTick(). The activation port's preIncrement=true phase is
+  CORRECT (L52).
+- The global wakeup: (cur - activatedTick - 1) % 20 == 0; for a
+  never-stamped entity (activatedTick = -2^31) that fires when
+  cur % 20 == 13 — t=353 is the FIRST such tick for the first cohort
+  (spawned t=153, the tc=200 crossing at the same tick).
+- The item move-skip rotation lives INSIDE tick(): gravity runs
+  unconditionally, but move()+friction+bounce only when
+  (tc+id)%4==0 || !onGround || horiz>1e-5. A skip tick leaves vy=-0.04
+  residue that the inactive ticks then PERSIST (inactiveTick has no
+  physics).
+
+### The wave mechanism (the FTICK store trace, CE_RTRACE_ID)
+tick_item's ON_GROUND outcome bit is ABSOLUTE (the final state) — the
+L8.2 commit applies it verbatim: entry.on_ground = bits & B_ON_GROUND.
+tick_item_inactive ran no physics and set NO bit, so EVERY inactive
+tick clobbered the store's on_ground to FALSE. Young items (tc<200)
+tick active every tick and always carry the absolute bit — the bug was
+invisible; at the tc=200 crossings 19/20 ticks go inactive and the next
+active tick's move gate (!st.on_ground) opened and ran a SPURIOUS move
+(gravity+collide+FRICTION, a x0.588 step on vx/vz) that vanilla's skip
+tick never does. The wave is density-coupled because the friction step
+is only visible on items with dx/dz != 0 (the merge-scattered pile).
+
+**L53 (e226a3a): tick_item_inactive sets the same absolute bit.** The
+local A/B at CI density (SCALE=12000, AREA=115): the T389 snapshot was
+801 diverging items before, bit-identical after.
+
+### The tooling that closed it (all default-off, riding main)
+- DTRACE (PARITY_TRACE_ID): the per-tick itemDispatch decision — the
+  path taken + the port's activation verdict + the tc/at the gate saw.
+  Proved the activation port EXACT tick-for-tick at the crossing.
+- FTICK (CE_RTRACE_ID): the flush store view (flags, st.tick_count,
+  st.on_ground) — named the clobber.
+- MSIB (CE_FQ_IBOX=1 + core EntityIndex::box_of): the marginExtra
+  reject sample's Rust side (the index box vs the live box).
+- The local parity loop: one scenario pair in ~8 min (SCALE 6000-12000,
+  MEASURE_TICKS=50), scripts/run-baseline.sh with MODULE=on + the
+  pre-staged paperboot jar/libraries.
+
+### The remaining families (the next layers)
+1. **mobs t=301 / spread t=278 / mixed t=320 — the inactivated-zombie
+   stale box.** The trace-823 root: the OFF zombie moved MORE at the
+   crossing tick (the young neighbors push it; vanilla reads the LIVE
+   box). The just-inactivated zombies stop running bodies, so their
+   probe batches stop; the kernel's push mirror keeps the LAST-ACTIVE
+   box — the pushes diverge exactly when a cohort crosses tc=200.
+   Fix surface: a freshness story for the inactivated entities' mirror
+   (probe at the walk level, or refuse the stale candidates).
+2. **The items belt dust: t=416+ (the L7 256-belt era), 2 items at
+   1e-21 vx/vz.** Post-fix local pair: T389 bit-identical, the belt
+   re-ingest era still splits a pair of items. Same hunt shape: the
+   FTICK/PD at 409-420.
+
+### The -90% grind (the b676709 baseline, e424b2a)
+items -54.6 / mobs -50.0 / mixed -54.7 / spread -31.4 (p50, run variance
++-4pp). The doc-41 ranked moves stand; the parity floors above gate them.
