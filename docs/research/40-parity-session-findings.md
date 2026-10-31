@@ -981,3 +981,12 @@ them all. Diag evidence MUST be read from the artifacts. The TL bind
 also died silently (Object[].class has no getId — fixed in 18ad9aa:
 bind on net.minecraft.world.entity.Entity); the TL stream's first
 clean data is expected from the post-L55 runs.
+
+### The L55 verification (the d9a84c8 gate run 41242317815, 2026-10-31)
+**items: T389 / T639 / final ALL PASS — bit-identical.** The belt dust
+is dead (T639 was 1214 drifted vx/vz before L55). Remaining red: mobs
+T382/T632/final, mixed T389/T639/final, spread T389/T639/final — the
+push-timing family (mobs t=301 / spread t=278 / mixed t=320, the
+inactivated-zombie stale box / the push integration timing). The next
+witness: the TL stream (fixed bind, 18ad9aa) at PD 270-325 — its data
+rides the run artifacts (read the full server.log, NOT the tail).
