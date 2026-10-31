@@ -1,7 +1,22 @@
 # 41. The -90% grind — fresh profiles and the ranked next moves
 
-Date: 2026-10-29. Status: PLAN (profiles measured on 443b8dc baseline +
-721c5de profile runs; the parity fix 5194968 rides in parallel).
+Date: 2026-10-31 (refresh). Status: PLAN (the ce5a471 baseline +
+profile runs 41236402326 / 41236766183; the parity families gate the
+grind — addendum 14's belt dust and the push-timing family).
+
+## Where the four scenarios stand (baseline ce5a471, p50 — 2026-10-31)
+
+| scenario | vanilla | mod | delta | target (-90%) |
+|---|---:|---:|---:|---:|
+| mobs-25k | 494.2 | 242.5 | -50.9% | 49.4 |
+| mixed-150k | 452.0 | 227.9 | -49.6% | 45.2 |
+| items-100k | 76.1 | 37.2 | -51.0% | 7.6 |
+| spread-100k | 581.2 | 260.8 | -55.1% | 58.1 |
+
+(older baseline 2e7986c: mobs -44.8 / mixed -60.1 / items -58.0 /
+spread -36.1 — the vanilla legs re-measured: mixed 732->452 and spread
+438->581 are RUN-VARIANCE-scale swings, the machine mix changed; the
+deltas move with them. The grind reads the fresh table only.)
 
 ## Where the four scenarios stand (baseline 2e7986c, p50 — the L49-L52 era)
 
@@ -68,13 +83,38 @@ carries a bigger view population than mixed)**, appendDispatch 3.11,
 Entity.level() 2.37. The merge/query lever is spent; the tracker and
 the flush are the next floors.
 
+### The FRESH mixed-150k profile (lean run 41236766183, ce5a471, 27778
+### samples, mod p50 227.9)
+1. **AABB.intersects(DDD) 8.09%** — the L37d exact re-check STILL owns
+   the #1 slot (the marginExtra tax: the index's margin superset
+   rejected by the LIVE-box compare). Move 1a (the exact f64 index
+   boxes) is the kill — gated on the freshness families (addendum 14).
+2. **CeHooks.isViewAfter 4.96%** — REGROWN to #2 (the L48 viewN==0 gate
+   does NOT hold on mixed: the view population there is real, the map
+   is hit in the steady state). NEW LEVER: the view-after map itself —
+   an int-array stamp per slot (id-based, cleared per query) instead of
+   the boxed HashMap, or a per-query epoch bit that skips the map read
+   entirely for ids whose entry is provably absent (a Bloom-ish
+   generation counter).
+3. ChunkEntitySlices$BasicEntityList.indexOf 2.04 (vanilla ticklist
+   reads — the L13 raw walk's counterpart), Unsafe.getObject 2.01 (the
+   mirror internals), ImmutableCollections$ListItr.next 1.99,
+   Entity.getBoundingBox 1.92, newTrackerTick$ 1.88, SynchedEntityData
+   1.25, HashMap.getNode 1.22, tickListForEach 1.15,
+   getMaxStackSize 1.02 (the L41 pre-resolution holds).
+
 ## Ranked next moves (updated 2026-10-31 after the fresh mixed-150k profile)
 0b. **DONE — L46 (move 2), f142684-pre c8747b6**: the merge-scan caller's
    shared scratch answer list (FQ_SCRATCH, depth-guarded, knob
    CE_FQ_SCRATCH=0). The general getEntities keeps allocating.
 0c. **DONE — L48**: the isViewAfter boxing HashMap.get hoisted behind a
    viewN==0 gate (0.91% self-time on the fresh profile; the steady state
-   never touches the map now).
+   never touches the map now). INVALIDATED 2026-10-31: mixed re-grows
+   the frame to 4.96% — the gate holds only for view-free scenarios.
+0d. **NEW — L57 (isViewAfter part 2)**: replace the per-id boxed map
+   with a primitive stamp array (slot -> last-view-query epoch); the
+   common "no view ever" path reads one int, the map only on a stamp
+   hit.
 ## Ranked next moves (updated 2026-10-29 after the L41 measurement)
 
 0. **DONE — the merge max-stack pre-resolution (L41, 98483d2)**:
