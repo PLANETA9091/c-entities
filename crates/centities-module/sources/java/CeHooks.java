@@ -362,16 +362,52 @@ public final class CeHooks {
     private static final double[] VIEW_BOX = new double[256 * 6];
     private static final int[] VIEW_KIDX = new int[256];
     private static int viewN = 0;
-    private static final java.util.HashMap<Integer, Integer> VIEW_MAP =
-            new java.util.HashMap<>();
+    // L57: the id -> view-index map as a tiny open-addressing int table
+    // (the view holds <= 256 entries, rebuilt every flush; the boxed
+    // HashMap.get was 4.96% self-time on the fresh mixed-150k profile —
+    // boxing + hashing per candidate x2 lookups). Empty slot = 0 (entity
+    // ids start at 1); the load factor never exceeds 256/2048.
+    private static final int VTAB_CAP = 2048;
+    private static final int VTAB_MASK = VTAB_CAP - 1;
+    private static final int[] VTAB_KEY = new int[VTAB_CAP];
+    private static final int[] VTAB_VAL = new int[VTAB_CAP];
+
+    private static int vtabHash(int id) {
+        return (id * 0x9E3779B9) >>> 11 & VTAB_MASK; // Fibonacci spread
+    }
+
+    private static void vtabPut(int id, int vi) {
+        int s = vtabHash(id);
+        while (VTAB_KEY[s] != 0 && VTAB_KEY[s] != id) {
+            s = s + 1 & VTAB_MASK;
+        }
+        VTAB_KEY[s] = id;
+        VTAB_VAL[s] = vi;
+    }
+
+    /** The view index for the id, or -1. Zero allocations, zero boxing. */
+    private static int vtabGet(int id) {
+        int s = vtabHash(id);
+        int k;
+        while ((k = VTAB_KEY[s]) != 0) {
+            if (k == id) return VTAB_VAL[s];
+            s = s + 1 & VTAB_MASK;
+        }
+        return -1;
+    }
+
+    private static void vtabClear() {
+        java.util.Arrays.fill(VTAB_KEY, 0);
+    }
+
     private static int MS_KIDX = 0; // the current scanner's batch index
 
     /** The merge-scan view box for a candidate: the PRE-body box when the
      *  candidate is a resync entry whose body runs AFTER the scanner in the
      *  entity order, else the live box (vanilla's per-body timing). */
     private static AABB viewBox(int cid, AABB live) {
-        Integer vi = VIEW_MAP.get(cid);
-        if (vi == null || VIEW_KIDX[vi] <= MS_KIDX) return live;
+        int vi = vtabGet(cid);
+        if (vi < 0 || VIEW_KIDX[vi] <= MS_KIDX) return live;
         return new AABB(VIEW_BOX[vi * 6], VIEW_BOX[vi * 6 + 1], VIEW_BOX[vi * 6 + 2],
                 VIEW_BOX[vi * 6 + 3], VIEW_BOX[vi * 6 + 4], VIEW_BOX[vi * 6 + 5]);
     }
@@ -380,14 +416,14 @@ public final class CeHooks {
      *  is one physics step past the vanilla view — the window must deref it
      *  and the home re-check must not drop it). */
     private static boolean isViewAfter(int cid) {
-        // L48: the map get boxes the id and hashes — per candidate x2 (the
-        // window-trust probe and the home-re-check probe) it was 0.91% of
-        // the mixed-150k profile. The view holds only the RARE resync /
-        // force-vanilla population: an empty view (the steady state) skips
-        // straight to false without touching the map.
+        // L48: the view holds only the RARE resync / force-vanilla
+        // population: an empty view (the steady state) skips straight to
+        // false without touching the table. L57: the lookup is a flat int
+        // probe (vtabGet) — the boxed HashMap.get boxed the id and hashed
+        // per candidate x2 (4.96% self-time, mixed-150k 41236766183).
         if (viewN == 0 || !IN_ITEM_APPLY) return false;
-        Integer vi = VIEW_MAP.get(cid);
-        return vi != null && VIEW_KIDX[vi] > MS_KIDX;
+        int vi = vtabGet(cid);
+        return vi >= 0 && VIEW_KIDX[vi] > MS_KIDX;
     }
 
     /** True when any AFTER-scanner view entry's PRE box intersects the query
@@ -4995,10 +5031,10 @@ public final class CeHooks {
             // L44: build the merge-scan view — the batch's RESYNC entries'
             // PRE-body boxes (their bodies ran during the phase; the live
             // boxes are already POST-move, one physics step past the vanilla
-            // per-body scan view). VIEW_MAP: id -> view slot; VIEW_KIDX: the
-            // entry's batch index (the vanilla body order).
+            // per-body scan view). VTAB: id -> view slot (L57 int table);
+            // VIEW_KIDX: the entry's batch index (the vanilla body order).
             viewN = 0;
-            VIEW_MAP.clear();
+            vtabClear();
             for (int i = 0; i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 // RESYNC and FORCE_VANILLA entries both ran their vanilla
@@ -5030,7 +5066,7 @@ public final class CeHooks {
                     VIEW_BOX[viewN * 6 + 5] = lb.maxZ;
                 }
                 VIEW_KIDX[viewN] = i;
-                VIEW_MAP.put(VIEW_IDS[viewN], viewN);
+                vtabPut(VIEW_IDS[viewN], viewN);
                 viewN++;
             }
 
