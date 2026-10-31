@@ -592,6 +592,44 @@ public final class CeHooks {
     private static final double[] msqRej = new double[192];
     private static final int[] msqRejIds = new int[32];
     private static int msqRejN = 0;
+    // L53: the INDEX boxes of the same rejects (the Rust side, CE_FQ_IBOX=1)
+    // — pairing idxMin vs liveMin names the stale side per reject id (the
+    // doc-41 exact-f64-query open question: 84% of the SIMD survivors fail
+    // the live re-check — a stale index or a margin-geometry tax?). NaN in
+    // slot 0 = the id was not indexed at sample time (a vanished candidate).
+    private static final boolean IBOX_ON =
+            "1".equals(System.getenv("CE_FQ_IBOX"));
+    private static final double[] msqRejIdx = new double[192];
+    private static final double[] iboxBuf = new double[6];
+    // L53-diag: the per-tick DISPATCH DECISION trace for PARITY_TRACE_ID —
+    // pairs the plugin's PTRACE (the entity's fields) with the ENGINE's own
+    // decision (the path taken inside itemDispatch + the port's activation
+    // verdict + the tc/at the gate saw). The OFF leg runs the module disarmed
+    // (no DTRACE lines) — the vanilla side's tc/activation are visible in
+    // the PTRACE's tc/at fields.
+    private static final int DTRACE_ID = dtraceId();
+
+    private static int dtraceId() {
+        try {
+            return (int) Long.parseLong(System.getenv("PARITY_TRACE_ID"));
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static void dtrace(ItemEntity e, String path, boolean active) {
+        if (DTRACE_ID >= 0 && e.getId() == DTRACE_ID) {
+            System.out.println("[ce-baseline] DTRACE t="
+                    + net.minecraft.server.MinecraftServer.currentTick
+                    + " path=" + path + " active=" + active
+                    + " tc=" + e.tickCount + " at=" + e.activatedTick
+                    + " mode=" + MODE_VAL[e.getId() & MAMASK]
+                    + " onG=" + e.onGround()
+                    + " dx=" + e.getDeltaMovement().x
+                    + " dy=" + e.getDeltaMovement().y
+                    + " age=" + e.age + " pd=" + e.pickupDelay);
+        }
+    }
     // L44b: the window-skipped and home-missed candidate ids at MSQ scans —
     // a merge partner that never reached the box test names itself here.
     private static final int[] msqSkipId = new int[32];
@@ -740,6 +778,23 @@ public final class CeHooks {
                     System.out.println("[ce-baseline] MSR t=" + CUR_TICK
                             + " self=" + e.getId() + " rej=" + msqRejN
                             + " liveMin=" + rb);
+                }
+                if (msqRejN > 0 && IBOX_ON) {
+                    StringBuilder rb2 = new StringBuilder(200);
+                    for (int k = 0; k < msqRejN; k++) {
+                        rb2.append(msqRejIds[k]).append(":[");
+                        if (Double.isNaN(msqRejIdx[k * 6])) {
+                            rb2.append('X'); // not indexed at sample time
+                        } else {
+                            rb2.append((float) msqRejIdx[k * 6]).append(',')
+                                    .append((float) msqRejIdx[k * 6 + 2]).append(',')
+                                    .append((float) msqRejIdx[k * 6 + 4]);
+                        }
+                        rb2.append(']');
+                    }
+                    System.out.println("[ce-baseline] MSIB t=" + CUR_TICK
+                            + " self=" + e.getId() + " rej=" + msqRejN
+                            + " idxMin=" + rb2);
                 }
 
                 if (msqHmN > 0) {
@@ -2190,6 +2245,11 @@ public final class CeHooks {
                     msqRej[msqRejN * 6 + 4] = eb.minZ;
                     msqRej[msqRejN * 6 + 5] = eb.maxZ;
                     msqRejIds[msqRejN] = cid;
+                    if (IBOX_ON) {
+                        java.util.Arrays.fill(iboxBuf, Double.NaN);
+                        nativeIndexBox(wid, cid, iboxBuf);
+                        System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
+                    }
                     msqRejN++;
                 }
                 continue;
@@ -2667,6 +2727,11 @@ public final class CeHooks {
                     msqRej[msqRejN * 6 + 4] = eb.minZ;
                     msqRej[msqRejN * 6 + 5] = eb.maxZ;
                     msqRejIds[msqRejN] = cid;
+                    if (IBOX_ON) {
+                        java.util.Arrays.fill(iboxBuf, Double.NaN);
+                        nativeIndexBox(wid, cid, iboxBuf);
+                        System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
+                    }
                     msqRejN++;
                 }
             }
@@ -3365,6 +3430,10 @@ public final class CeHooks {
      *  through a tiny native so the decline path can re-sync the field. */
     private static native int nativePushNcol(int id, int curTick);
 
+    /** L53-diag: the INDEX box of (world, id) into out[0..6] (x0,y0,z0,x1,y1,z1);
+     *  returns 1 when found, 0 when the id is not indexed. CE_FQ_IBOX=1 only. */
+    private static native int nativeIndexBox(int world, long id, double[] out);
+
     /** Drain any pending probe batches before a kernel call: the kernel
      *  reads the push mirror, so its view must be current. No-op when the
      *  batch is empty (the steady state — the DRAIN_CAP=64 policy keeps the
@@ -3482,6 +3551,7 @@ public final class CeHooks {
                     // skipped move path; MISC items take no immunity stamps)
                     boolean cadence = (e.tickCount + 1) % 40 == 0;
                     boolean active = cadence && itemCheckActive(e, true);
+                    dtrace(e, "rest", active);
                     // dispatcher prologue mirror (the suppressed
                     // tickNonPassenger: setOldPosAndRot is value-identical
                     // at a fixed point, the counters are not)
@@ -3566,6 +3636,7 @@ public final class CeHooks {
             // (tc<200) are unaffected: every clause returns active either
             // way.
             boolean active = itemCheckActive(e, true);
+            dtrace(e, "dispatch", active);
             appendDispatch(e, active);
             if (active) {
                 dispNative++;

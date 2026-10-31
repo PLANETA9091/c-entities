@@ -3222,6 +3222,17 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i32) -> i32
     );
     push!(
+        "nativeIndexBox",
+        "(JI[D)I",
+        n_index_box as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+            i64,
+            jni::jdoubleArray,
+        ) -> i32
+    );
+    push!(
         "nativeMobAiFloor",
         "([I[I)I",
         n_mob_ai_floor
@@ -4349,6 +4360,42 @@ pub extern "system" fn n_push_ncol(
         None => -1,
     })
     .unwrap_or(-1)
+}
+
+/// L53-diag: the INDEX box of (world, id) — the marginExtra sample's Rust
+/// side. Writes 6 doubles (x0,y0,z0,x1,y1,z1) into `out` and returns 1,
+/// or returns 0 when the id is not indexed (the Java sampler pairs this
+/// with the LIVE box it already captured; a 0 names a vanished candidate).
+/// Read-only: takes the INDEX lock briefly, never mutates, never creates
+/// the state (an unarmed module answers 0 — no side effects).
+pub extern "system" fn n_index_box(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    world: i32,
+    id: i64,
+    out: jni::jdoubleArray,
+) -> i32 {
+    let g = match INDEX.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let st = match g.as_ref() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let b = st.idx.box_of(world as u16, id);
+    drop(g);
+    if let Some(b6) = b {
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            let env = e.raw();
+            let vtable = *env;
+            ((*vtable).SetDoubleArrayRegion)(env, out, 0, 6, b6.as_ptr());
+        }
+        1
+    } else {
+        0
+    }
 }
 
 // bridge class bytes (compiled by build.rs against the paper jar)

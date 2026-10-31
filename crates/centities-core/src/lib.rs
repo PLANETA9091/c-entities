@@ -1136,6 +1136,41 @@ impl EntityIndex {
 
     // ---- 4b.2a Java-row publish helpers (module-side publisher) ----
 
+    /// The INDEX box of (world, id) — the L53 marginExtra sample's Rust
+    /// side (the Java side captures the LIVE boxes of the query rejects;
+    /// pairing the two names which side is stale for the doc-41 exact-f64
+    /// move). Returns the f32 cell-layout values widened to f64 (x/z
+    /// de-quantized back to world space with the same cell origins the
+    /// scan uses) — exactly what the SIMD filter compares against — or
+    /// the oversize entry's exact f64 box.
+    pub fn box_of(&self, world: u16, id: i64) -> Option<[f64; 6]> {
+        if let Some(slot) = self.idmap.find(id) {
+            let s = slot as usize;
+            if self.worlds[s] != world || self.homes[s] == 0 {
+                return None;
+            }
+            let home = self.homes[s] as usize;
+            let p = self.cpos[s] as usize;
+            let box_ = &self.cell_box[home];
+            let (cx, cz) = key_coords(self.cell_keys[home]);
+            let ox = cx as f64 * CELL as f64;
+            let oz = cz as f64 * CELL as f64;
+            let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            return Some([
+                box_[base] as f64 + ox,
+                box_[base + 8] as f64,
+                box_[base + 16] as f64 + oz,
+                box_[base + 24] as f64 + ox,
+                box_[base + 32] as f64,
+                box_[base + 40] as f64 + oz,
+            ]);
+        }
+        self.oversize
+            .iter()
+            .find(|o| o.id == id && o.world == world)
+            .map(|o| [o.b.x0, o.b.y0, o.b.z0, o.b.x1, o.b.y1, o.b.z1])
+    }
+
     /// The cell key of `cell`, or None if out of range.
     #[inline]
     pub fn cell_key_of(&self, cell: u32) -> Option<u64> {
