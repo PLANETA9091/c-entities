@@ -807,3 +807,78 @@ local A/B at CI density (SCALE=12000, AREA=115): the T389 snapshot was
 ### The -90% grind (the b676709 baseline, e424b2a)
 items -54.6 / mobs -50.0 / mixed -54.7 / spread -31.4 (p50, run variance
 +-4pp). The doc-41 ranked moves stand; the parity floors above gate them.
+
+## Session addendum 13 (2026-10-31): the stale-box family RE-ROOTED — the push integration timing, the 26.3 ground truth, the TL order stream
+
+### The PD windows reproduced the dispatch map bit-identically (runs 41214287627 / 41214289587, e226a3a+ed85916)
+ph_dump 270-325: mobs FIRST divergence t=301 (ONE entity: 823), spread t=278
+(4046), mixed t=320 (3461); items CLEAN 270-325. Same map as the e71dcc7
+dispatch — the determinism belt holds on the L53-era main.
+
+### The PTRACE verdict (run 41216108186, trace_id=823; run 41217812956, trace_id=556)
+mobs 823 (a STATIC isolated zombie, tc=93.., young => ALWAYS active via the
+tc<200 branch): t=300 bit-identical (x=15.75, vx=0). At t=301:
+- OFF: x UNMOVED (15.75), vx = -0.038078 PENDING — the push landed DURING
+  tick 301 AFTER 823's body (its travel never integrated it this tick).
+- ON: x MOVED (15.7043), vx = -0.020845 INTEGRATED (-0.038 x the on-ground
+  friction, exactly one travel) — the push landed BEFORE 823's body ran.
+The same force (-0.038073, the kernel pair 556->823 at CUR 900 = plugin
+301, KPH box center 16.0798 => dx_raw 0.58) landed and INTEGRATED in ON.
+556's own PTRACE (both legs bit-identical through t=301, x=16.079 at its
+turn-301 position) proves 556 was at the pusher position in BOTH legs at
+t=301. spread 4046 / mixed 3461: the same static-isolated-zombie profile.
+
+### The 26.3 ground truth (mapped jar javap, /tmp re-staged this session)
+- pushEntities has EXACTLY ONE call site: LivingEntity.aiStep offset 839.
+  INACTIVE entities never run aiStep => an inactivated zombie never ACTS
+  (it is a receiver only). The pushcore doc's "all of them run
+  pushEntities each tick" is wrong for inactivated entities (harmless:
+  the kernel's pushDispatch is woven INTO the vanilla body).
+- Entity.push(Entity) decoded: f = min(1, 1/sqrt(absMax(dx,dz))) — for
+  every box-overlapping pair (d<1) the force magnitude is EXACTLY 0.05 x
+  the normalized direction component; the self gets the opposite force
+  when pushable and not a vehicle. The kernel's pushcore math MATCHES
+  (the earlier -0.038 decode was the normalized component, not a bug).
+- LivingEntity.pushEntities decoded: the nextInt(4) cramming draw happens
+  ONLY when list.size() > cramming-1 (ServerLevel + cramming>0 gates);
+  an EMPTY list early-returns BEFORE the numCollisions reset. The
+  kernel's cramming flag gates the draw the same way — the draw count
+  matches iff the candidate count matches.
+- checkIfActive decoded: tc<200 => active (the crossings' mask);
+  otherwise the (currentTick - activatedTick - 1) % 20 == 0 wakeup runs
+  checkEntityImmunities; immunity = !onGround || horizontalDistanceSqr >
+  9.999999747378752e-6 => a 100-tick window (plus fire/water/climb/
+  target/... branches).
+- ServerLevel.tick: activateEntities(level) ONCE per tick before
+  entityTickList.forEach(guardEntityTick -> tickNonPassenger); the
+  stamp scan is one getEntities(null, maxBB) per player — routed through
+  the module's query paths in the ON leg (row path refuses wide boxes ->
+  the flush-merged native path — fresh by construction).
+- ItemEntity.tick: the merge scan runs AFTER the move (offset 481), the
+  cadence rate = 2 if the position changed else 40.
+- EntityTickList = IteratorSafeOrderedReferenceSet: insertion order;
+  remove() NULLS the slot (no swap) and defrags ONLY when no iterator is
+  active and frag>=0.2; defrag compacts IN ORDER — the iteration order is
+  INVARIANT to removal timing. The tick order cannot diverge from merge
+  removals (the earlier swap-remove theory is DEAD).
+
+### The open contradiction (what the TL stream must name)
+The tick order should be immutable, yet the OFF leg integrated the SAME
+push one turn later than ON. Either (a) the OFF-leg pusher is a different
+entity ticking after 823 while ON's pusher (556) ticks before it — i.e.
+the KERNEL pushed a pair vanilla's candidate list did NOT contain at
+556's turn (the vanilla list is built from the LIVE boxes — 556's box
+[15.779,16.379] vs 823's [15.2,15.8] overlaps by 0.021 — vanilla SHOULD
+have pushed too), or (b) the tick order really diverged. The TL dump
+(ce.tl.trace=1, run dispatched on e4227e3) names which: the first tick
+where the TL id sequences differ, and the entities whose relative order
+flipped. NOTE: the PD/PTRACE snapshots ride ServerTickEndEvent — the
+"t=301" sample is the END-of-tick state (the pending-vs-integrated
+delta at the same tick is the order proof).
+
+### The tooling added (all default-off)
+- TL (ce.tl.trace=1): the tick-list order dump at PD ticks, both legs
+  (BaselinePlugin, read-only reflection, 10 ids/line).
+- pd_window.py: the per-leg PD diff in a window (the first divergent
+  entity per scenario).
+- ptrace_win.py: the PTRACE diff per leg pair around a window.
