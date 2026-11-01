@@ -3125,6 +3125,27 @@ public final class CeHooks {
         return MS_WINDOW.length == 2
                 && CUR_TICK >= MS_WINDOW[0] && CUR_TICK <= MS_WINDOW[1];
     }
+
+    // ---- doc-40 addendum-17 instruments: TLO / TTR / KPD ----
+    // The push-timing family's surviving hypotheses were (a) the kernel
+    // delivering a pair one phase early and (b) the mob TRAVEL floor serving
+    // a first-walk tick differently than vanilla. The PTRACE at mobs t=275
+    // (id 1069, exact x0.5/0.5133872 + vx ratio 1/(0.6*0.91)) needs a
+    // per-tick witness INSIDE the ON-only paths: the walk order (TLO), the
+    // travel floor's serving decision (TTR), and the push kernel's decline
+    // reasons (KPD). All gated on phDumpTickNow() + the PARITY_TRACE_ID env;
+    // the OFF leg runs none of them (module off) — vanilla's order comes
+    // from the plugin's TL stream (the same raw array).
+    private static final int TR_ID = parseTraceId(System.getenv("PARITY_TRACE_ID"));
+
+    private static int parseTraceId(String s) {
+        if (s == null || s.isBlank()) return -1;
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException quiet) {
+            return -1;
+        }
+    }
     // L15b: PLAIN (per item-tick, 100k/tick) — see the mergeChecks note.
     public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
@@ -3340,6 +3361,15 @@ public final class CeHooks {
                 // vanilla pushes that follow (the mobs 377 trace: the ON
                 // leg's delta carried the un-capped push forces).
                 pushMirror++;
+                // KPD (addendum 17): the kernel's DECLINE verdict for the
+                // traced mob at PD ticks — density-gate refusals and mirror
+                // misses are the push-timing family's remaining suspects;
+                // the served path already prints KPH.
+                if (phDumpTickNow() && TR_ID >= 0 && le.getId() == TR_ID) {
+                    System.out.println("[ce-baseline] KPD t=" + CUR_TICK
+                            + " id=" + le.getId() + " decline=kernel"
+                            + " ncol=" + nativePushNcol(le.getId(), PUSH_CFG_TICK));
+                }
                 int ncolMirror = nativePushNcol(le.getId(), PUSH_CFG_TICK);
                 if (ncolMirror >= 0 && MH_NCOL != null) {
                     try {
@@ -4278,6 +4308,24 @@ public final class CeHooks {
             net.minecraft.world.phys.Vec3 input) {
         if (!ACTIVE || !MOB_TRAVEL_ON || O_STUCK < 0) return false;
         travelChecks++;
+        // TTR (addendum 17): the travel floor's per-tick decision witness for
+        // the traced mob. The t=275 PTRACE (exact x 0.5 vs 0.5133872, vx
+        // ratio 1/(0.6*0.91)) needs the SERVING verdict inside the ON-only
+        // path: which shape ran, with what entering delta/input. The OFF leg
+        // prints nothing (module off); decline = an enter line without an
+        // exit line (the traced id is unique).
+        final boolean ttr = phDumpTickNow() && TR_ID >= 0 && e != null
+                && e.getId() == TR_ID;
+        if (ttr) {
+            net.minecraft.world.phys.Vec3 dT = e.getDeltaMovement();
+            System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                    + " id=" + e.getId() + " tc=" + e.tickCount
+                    + " enter d=(" + dT.x + "," + dT.y + "," + dT.z + ")"
+                    + " in=(" + input.x + "," + input.y + "," + input.z + ")"
+                    + " onG=" + e.onGround()
+                    + " pos=(" + e.getX() + "," + e.getY() + "," + e.getZ() + ")"
+                    + " yaw=" + e.getYRot());
+        }
         try {
             if (e.level().isClientSide() || e.isRemoved()
                     || input.x != 0.0F || input.y != 0.0F || input.z != 0.0F
@@ -4307,6 +4355,10 @@ public final class CeHooks {
                     return false;
                 }
                 travelQuiet++;
+                if (ttr) {
+                    System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                            + " exit shape=A");
+                }
                 return true;
             }
             // SHAPE C — the moving grounded walk on proven-open ground (the
@@ -4529,6 +4581,13 @@ public final class CeHooks {
                         (0.0 - g) * (double) vf,
                         dmZ * (double) hC));
                 travelWalk++;
+                if (ttr) {
+                    System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                            + " exit shape=C dm=(" + dmX + "," + dmY + "," + dmZ + ")"
+                            + " post=(" + e.getX() + "," + e.getY() + "," + e.getZ() + ")"
+                            + " dv=(" + e.getDeltaMovement().x + ","
+                            + e.getDeltaMovement().y + "," + e.getDeltaMovement().z + ")");
+                }
                 return true;
             }
             // SHAPE B: the standing fixed point (0, -g * vf, 0)
@@ -4604,6 +4663,9 @@ public final class CeHooks {
                 return false;
             }
             travelQuiet++;
+            if (ttr) {
+                System.out.println("[ce-baseline] TTR t=" + CUR_TICK + " exit shape=B");
+            }
             return true;
         } catch (Throwable t) {
             travelFail++;
@@ -5867,15 +5929,37 @@ public final class CeHooks {
                 // itemDispatch chain (mode table + fresh-flag belt + activation),
                 // and a false keeps the vanilla accept path exactly as before.
                 boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
+                // TLO (addendum 17): the ACTUAL walk order at PD ticks — the
+                // plugin's TL stream reads the same raw array, so this line
+                // must be IDENTICAL to the OFF leg's TL at the mapped tick
+                // (module t = 3*plugin t ± pad). Any mismatch names the
+                // iteration-order divergence outright.
+                final boolean tloOn = phDumpTickNow();
+                StringBuilder tlo = tloOn ? new StringBuilder(512) : null;
+                long tloH = 0;
+                int tloN = 0;
                 for (int i = 0; i < maxIndex; i++) {
                     Object o = arr[i];
                     if (o instanceof Entity e) {
+                        if (tloOn) {
+                            tloH = tloH * 0x9E3779B97F4A7C15L + e.getId();
+                            tloH ^= Long.rotateLeft(tloH, 13);
+                            if (tloN < 48) {
+                                tlo.append(e.getId()).append(' ');
+                            }
+                            tloN++;
+                        }
                         if (collect && e instanceof ItemEntity
                                 && itemDispatch((ItemEntity) e)) {
                             continue; // native flush computes this tick
                         }
                         consumer.accept(e);
                     }
+                }
+                if (tloOn && tloN > 0) {
+                    System.out.println("[ce-baseline] TLO t=" + CUR_TICK
+                            + " n=" + tloN + " h=" + tloH
+                            + " ids=" + tlo.toString().trim());
                 }
             } finally {
                 set.finishRawIterator();        // iteratorCount-- + defrag check
