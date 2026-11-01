@@ -747,7 +747,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // L37 parity diagnostics: lazily-bound NMS accessors for tickCount /
     // activatedTick (parity mode only — perf irrelevant there).
     private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
-    private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED;
+    private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED,
+            PARITY_NCOL;
 
     // ------------------------------------------------------------------
     // PARITY PHASH: per-tick ORDER-INDEPENDENT checksum of the whole
@@ -1217,6 +1218,21 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                             Class<?> nms = PARITY_GET_HANDLE.getReturnType();
                             PARITY_TICK_COUNT = nms.getField("tickCount");
                             PARITY_ACTIVATED = nms.getField("activatedTick");
+                            // ADDENDUM-18: the crammed-cap counter — the push
+                            // seed family's verdict field. numCollisions is
+                            // PROTECTED on Entity (26.3) — getField() finds
+                            // publics only, so walk declared fields up the
+                            // hierarchy (observed: NoSuchFieldException would
+                            // kill the bind block and re-throw every tick).
+                            Class<?> ncClass = nms;
+                            while (ncClass != null && PARITY_NCOL == null) {
+                                try {
+                                    PARITY_NCOL = ncClass.getDeclaredField("numCollisions");
+                                    PARITY_NCOL.setAccessible(true);
+                                } catch (NoSuchFieldException ignored) {
+                                    ncClass = ncClass.getSuperclass();
+                                }
+                            }
                         }
                     }
                 }
@@ -1236,6 +1252,9 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     Object h = PARITY_GET_HANDLE.invoke(traced);
                     sb.append(" tc=").append(PARITY_TICK_COUNT.getInt(h))
                             .append(" at=").append(PARITY_ACTIVATED.getLong(h));
+                    if (PARITY_NCOL != null) {
+                        sb.append(" nc=").append(PARITY_NCOL.getInt(h));
+                    }
                 } catch (Throwable quiet) {
                     // diagnostics only
                 }

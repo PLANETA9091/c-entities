@@ -3101,29 +3101,41 @@ public final class CeHooks {
 
     private static int[] parseMsWindow(String s) {
         if (s == null || s.isBlank()) return new int[0];
-        try {
-            int dash = s.indexOf('-');
+        // ADDENDUM-18: ALL comma-separated ranges, not just the first — the
+        // mixed (t=353) and spread (t=259) seeds sit OUTSIDE the mobs window
+        // and the KPH/TLO/KPD instruments must cover them too.
+        java.util.ArrayList<int[]> out = new java.util.ArrayList<>();
+        for (String tok : s.split(",")) {
+            tok = tok.trim();
+            if (tok.isEmpty()) continue;
+            int dash = tok.indexOf('-');
             int lo, hi;
             if (dash > 0) {
-                lo = Integer.parseInt(s.substring(0, dash).trim());
-                hi = Integer.parseInt(s.substring(dash + 1).split(",")[0].trim());
+                lo = Integer.parseInt(tok.substring(0, dash).trim());
+                hi = Integer.parseInt(tok.substring(dash + 1).trim());
             } else {
-                lo = hi = Integer.parseInt(s.trim().split(",")[0]);
+                lo = hi = Integer.parseInt(tok);
             }
             // PH_DUMP is in PLUGIN-tick space; CUR_TICK counts flushes across
             // ALL loaded levels (3 at parity: overworld+nether+end — run
             // 40789269145: ct=423 at t=141) — scale and pad.
-            lo = lo * 3 - 15;
-            hi = hi * 3 + 15;
-            return new int[]{lo, hi};
-        } catch (NumberFormatException quiet) {
-            return new int[0];
+            out.add(new int[]{lo * 3 - 15, hi * 3 + 15});
         }
+        int[] r = new int[out.size() * 2];
+        for (int i = 0; i < out.size(); i++) {
+            r[i * 2] = out.get(i)[0];
+            r[i * 2 + 1] = out.get(i)[1];
+        }
+        return r;
     }
 
     private static boolean phDumpTickNow() {
-        return MS_WINDOW.length == 2
-                && CUR_TICK >= MS_WINDOW[0] && CUR_TICK <= MS_WINDOW[1];
+        for (int i = 0; i + 1 < MS_WINDOW.length; i += 2) {
+            if (CUR_TICK >= MS_WINDOW[i] && CUR_TICK <= MS_WINDOW[i + 1]) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- doc-40 addendum-17 instruments: TLO / TTR / KPD ----
@@ -3345,10 +3357,15 @@ public final class CeHooks {
             boolean selfVehicle = le.isVehicle();
             // the kernel reads the mirror: drain the pending probe batches first
             flushIfPending();
+            // ADDENDUM-18: the EXACT real numCollisions the kernel's cap
+            // replay starts from — printed on the KPH line so the OFF leg's
+            // vanilla pass verdict (the same field, same moment) can be
+            // compared without a re-run.
+            final int realNcol = O_NCOL >= 0 && U != null ? U.getInt(le, O_NCOL) : 0;
             long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
                     PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
                     PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK,
-                    O_NCOL >= 0 && U != null ? U.getInt(le, O_NCOL) : 0);
+                    realNcol);
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.
@@ -3469,6 +3486,8 @@ public final class CeHooks {
                 pb.append("[ce-baseline] KPH t=").append(CUR_TICK)
                         .append(" self=").append(le.getId())
                         .append(" tc=").append(le.tickCount)
+                        .append(" nc=").append(realNcol)
+                        .append(" maxec=").append(PUSH_CFG_MAXEC)
                         .append(" n=").append(pn)
                         .append(" box=[").append(sbx.minX).append(',').append(sbx.maxX)
                         .append(' ').append(sbx.minY).append(',').append(sbx.maxY)
