@@ -751,6 +751,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             PARITY_NCOL;
     private static volatile java.lang.reflect.Method PQ_METHOD;
     private static volatile Object PQ_LEVEL;
+    private static volatile java.lang.reflect.Method PQ_BB;
 
     // ------------------------------------------------------------------
     // PARITY PHASH: per-tick ORDER-INDEPENDENT checksum of the whole
@@ -1268,7 +1269,10 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     }
                     if (PQ_METHOD != null) {
                         Object h = PARITY_GET_HANDLE.invoke(traced);
-                        Object res = PQ_METHOD.invoke(PQ_LEVEL, h, h.getBoundingBox());
+                        if (PQ_BB == null) {
+                            PQ_BB = h.getClass().getMethod("getBoundingBox");
+                        }
+                        Object res = PQ_METHOD.invoke(PQ_LEVEL, h, PQ_BB.invoke(h));
                         java.util.List<?> list = (java.util.List<?>) res;
                         StringBuilder qb = new StringBuilder(64);
                         for (Object o2 : list) {
