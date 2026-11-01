@@ -1017,3 +1017,82 @@ rides the run artifacts (read the full server.log, NOT the tail).
   cohort id); run 41295183606 = CE_FQ_IBOX=1 + PD 270-330 (the MSIB
   idxMin-vs-liveMin pairing in the divergence window — the doc-41
   exact-f64 open question's sampler).
+
+## Addendum 17 (2026-11-01): the mobs t=275 family — the phase-law analysis and the TLO/TTR/KPD instruments
+
+### The replication (run 41327505893, production dispatch config, trace 1069, PD 270-277)
+The bisect-era fingerprint reproduces BIT-EXACTLY on the production
+config (mob_ai=0, aiFloor=false, all shipped knobs):
+
+- t=270..274: PD hash diff = 0 across ALL entities (the hash covers
+  x/y/z, vx/vy/vz, fire/alive/hp — a delta-only divergence would flip
+  it). TL tick-list order identical (61 ticks, 12759 lines/side).
+- **t=275: the FIRST and ONLY diverging entity is 1069** (diff_ids=[1069]);
+  t=276 adds 78, t=277 adds 916 (the downstream chaos wave).
+- The 1069 row: off (x=0.5, vx=+0.013387216874684499,
+  vz=-0.038050984457565336); on (x=0.5+0.013387216874684499 EXACTLY,
+  vx=0.013387216874684499 × (0.6·0.91) EXACTLY on BOTH components —
+  the ratio 1.8315016187680813 = 1/(0.6·0.91) to 16 digits).
+- **KPH lines: ZERO in the whole window** — the push kernel served NO
+  pair for ANY entity at the PD ticks; every pushDispatch declined.
+
+### The phase law (26.3 decompile, LivingEntity.aiStep)
+Per tick, per entity: `travel(input)` (line 3719) runs BEFORE
+`pushEntities()` (line 3752). A force entering an entity's
+deltaMovement therefore integrates into its POSITION on the first
+travel AFTER the write. The t=275 pair reads:
+
+- **OFF (vanilla)**: x unmoved, delta = the force RAW. The write
+  happened AFTER 1069's own tick-275 travel — the vanilla push/
+  reaction phase of a later-ticking body, or the frictioned walk
+  impulse of 1069's own travel with the move somehow not integrating.
+- **ON**: x moved by the force and the delta = force × 0.546 — the
+  force was IN the delta BEFORE 1069's tick-275 travel and got
+  integrated + frictioned by that travel.
+
+The magnitude |f| = 0.0403 is NOT a push force (any box-intersecting
+pair yields exactly 0.05 — the f=min(1,1/d) cap; |f|=0.05/1.2395
+implies a 1.24-block partner that cannot box-intersect). It IS a
+frictioned walk impulse I=(0.0245184, -0.06969), |I|=0.0739
+(= speed-class × input shape). So OFF's end-275 delta is the
+FRICTIONED WALK IMPULSE of 1069's own tick-275 travel — with x
+UNMOVED — the vanilla move not integrating a frictioned impulse,
+which is the part no code path read so far explains; and ON moved by
+I×0.546 (the FRICTIONED value, not I) — as if the ON path moved the
+entity by the post-friction delta. Both anomalies are inside the
+travel slice, which is exactly where the only ON-side writer lives.
+
+### The surviving hypotheses (post-exclusion)
+Excluded: the kernel pair delivery (KPH n=0 everywhere), the tick
+iteration order (TL identical; the plugin TL and the loop read the
+same moonrise raw array), the idle controls (all three bisect arms
+diverge identically), the RNG stream at 275 (the impulse VALUES are
+friction-shaped, not random-shaped), stale mirrors at end-274 (the PD
+hash covers deltas and shows 0 diffs).
+
+Surviving, to be separated by the addendum-17 instruments (a54bfdf):
+1. **The travel floor (mobTravelNative) served 1069's tick-275
+   travel** with a different writeback than vanilla's — the TTR line
+   names the shape, the entering delta/input, and the exact post
+   state. NOTE the floor's top gate declines nonzero INPUT travels;
+   SHAPE C serves a nonzero DELTA with zero input (the coasting
+   zombie) — if the OFF leg's own vanilla travel with the same
+   entering delta does NOT move the entity (the move()'s
+   `movementLength > 1.0E-7` gate or an unmodeled clip), the floor's
+   `setPos(x + dmX)` is the early integration.
+2. **A vanilla-vs-vanilla phase difference inside 1069's own body**
+   (the ON leg's weave changed WHEN within the tick the push phase
+   observes the travel's delta) — the TTR enter line's d at module
+   tick 275×3-15 is the arbiter: force present = the delivery came
+   earlier; force absent = the floor wrote it.
+
+### The instruments (a54bfdf, all gated on phDumpTickNow() + PARITY_TRACE_ID)
+- **TLO** (tickListForEach): the ACTUAL loop walk order at PD ticks —
+  first 48 ids + a rolling order-mix of every id; must equal the OFF
+  leg's plugin TL stream at the mapped tick (module t = 3·plugin t ±
+  pad).
+- **TTR** (mobTravelNative): enter line (d, input, onG, pos, yaw) +
+  exit lines at all three serve points (shape=A/B/C, with dm/post/dv
+  for C). Decline = an enter line without an exit line.
+- **KPD** (pushDispatch): the kernel decline verdict for the traced
+  id (the served path already prints KPH at PD ticks).
