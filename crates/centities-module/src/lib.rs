@@ -4231,7 +4231,18 @@ pub extern "system" fn n_push(
         drain_direct(st);
         let slot = match st.push.slot_of(self_id as i64) {
             Some(s) if st.push.flags[s] & pushcore::PF_PUSHABLE != 0 => s,
-            _ => return 0i64, // mirror: vanilla body runs
+            _ => {
+                // ADDENDUM-18: decline reason 4 (arena/flags miss) rides bits
+                // 54..56; the KPX line reads PUSH_RAW/PUSH_DROWS for the
+                // scan-stage witnesses.
+                PUSH_OUT.with(|o| {
+                    let mut o = o.borrow_mut();
+                    o.raw = 0;
+                    o.drows = 0;
+                    o.reason = 4;
+                });
+                return (4i64) << 54;
+            }
         };
         PUSH_OUT.with(|o| {
             let mut o = o.borrow_mut();
@@ -4258,11 +4269,32 @@ pub extern "system" fn n_push(
                     | (((o.non_passengers.max(0) as i64) & 0xF_FFFF) << 2)
                     | (((o.ncol.max(0) as i64) & 0xFFFF_FFFF) << 22)
             } else {
-                0i64
+                // ADDENDUM-18: the decline reason (1=density gate,
+                // 2=crammed route) rides bits 54..56 so the KPX line can
+                // name it without a second JNI crossing.
+                ((o.reason as i64) & 0x7) << 54
             }
         })
     })
     .unwrap_or(0i64);
+    // ADDENDUM-18: the scan-stage witnesses ride the statics for BOTH the
+    // served and the declined passes (the Java KPX/KPH lines read them).
+    PUSH_OUT.with(|o| {
+        let o = o.borrow();
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            let raw = e.raw();
+            let vt = *raw;
+            for (name, v) in [("PUSH_RAW", o.raw as i32), ("PUSH_DROWS", o.drows as i32)] {
+                if let Some(fid) = e.get_static_field_id(cls, name, "I") {
+                    ((*vt).SetStaticIntField)(raw, cls, fid, v);
+                }
+            }
+            if e.exception_check() {
+                e.exception_clear();
+            }
+        }
+    });
     if res & 1 == 1 {
         // write the delta statics OUTSIDE the state borrow (server-thread
         // confined statics, no race)

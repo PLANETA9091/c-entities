@@ -3229,6 +3229,13 @@ public final class CeHooks {
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
             pushCramming = 0, pushSelfDelta = 0, pushPairs = 0, pushPairMiss = 0;
+    /** ADDENDUM-18: the scan-stage witnesses (set by n_push for BOTH the
+     *  served and the declined passes). PUSH_RAW = the raw pre-filter
+     *  candidate count summed over the pass's cells; PUSH_DROWS = the
+     *  density-gate row population; the reason rides n_push's bits 54..56
+     *  (1=density gate, 2=crammed route, 4=arena/flags miss). */
+    public static int PUSH_RAW = 0, PUSH_DROWS = 0;
+
     /** L12 kill switch: -Dcentities.pushNative=false keeps every push vanilla. */
     public static final boolean PUSH_ON =
             !"false".equals(System.getProperty("centities.pushNative", "true"));
@@ -3396,6 +3403,21 @@ public final class CeHooks {
                     System.out.println("[ce-baseline] KPD t=" + CUR_TICK
                             + " id=" + le.getId() + " decline=kernel"
                             + " ncol=" + nativePushNcol(le.getId(), PUSH_CFG_TICK));
+                }
+                // ADDENDUM-18: the KPX line — EVERY declined pass at PD
+                // ticks, with the decline reason and the scan-stage
+                // witnesses. A hit can only be lost on a SERVED pass whose
+                // scan missed the candidate, so the declined lines bound
+                // the suspect set from below.
+                if (phDumpTickNow()) {
+                    int reason = (int) ((res >>> 54) & 0x7);
+                    System.out.println("[ce-baseline] KPX t=" + CUR_TICK
+                            + " self=" + le.getId()
+                            + " tc=" + le.tickCount
+                            + " reason=" + reason
+                            + " raw=" + PUSH_RAW
+                            + " rows=" + PUSH_DROWS
+                            + " nc=" + realNcol);
                 }
                 int ncolMirror = nativePushNcol(le.getId(), PUSH_CFG_TICK);
                 if (ncolMirror >= 0 && MH_NCOL != null) {

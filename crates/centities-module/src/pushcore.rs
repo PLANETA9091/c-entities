@@ -299,6 +299,9 @@ pub fn push_tick(
     out.ddz = 0.0;
     out.pairs.clear();
     out.hits.clear();
+    out.raw = 0;
+    out.drows = 0;
+    out.reason = 0;
 
     let sc = self_slot * 6;
     let sx0 = pc.box6[sc];
@@ -325,7 +328,12 @@ pub fn push_tick(
             rows += pidx.cell_population(world, cx, cz);
         }
     }
+    // ADDENDUM-18 witness: the raw query_cell candidate count (pre-filter)
+    // and the density-gate rows, packed back by n_push for the KPX lines.
+    out.raw = 0;
+    out.drows = rows as u32;
     if rows < gate_min {
+        out.reason = 1; // the density gate declined — the KPX line names it
         return; // out.ok stays false -> the caller routes vanilla
     }
 
@@ -421,6 +429,7 @@ pub fn push_tick(
             }
             cell_hits.clear();
             pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits);
+            out.raw += cell_hits.len() as u32;
             for &id in cell_hits.iter() {
                 if id == self_id {
                     continue;
@@ -494,9 +503,12 @@ pub fn push_tick(
                 let mut dz = opz - spz;
                 let d0 = abs_max(dx, dz);
                 if d0 < PUSH_EPS {
-                    // vanilla crammed branch: RNG-driven random offsets —
-                    // the kernel cannot draw; detect pass routes vanilla.
+                    // vanilla crammed branch: 26.3 push(Entity) applies NO
+                    // force here (the dd >= 0.01 gate has no else) — but the
+                    // counters already moved. Route vanilla to keep the
+                    // RNG/counter semantics byte-exact (the L37e contract).
                     if detect {
+                        out.reason = 2;
                         return; // ok stays false, mirrors untouched
                     }
                     continue;
@@ -605,6 +617,13 @@ pub struct PushOut {
     /// t=275 seed: vanilla's 78-pass broke at post-decay nc=10 >= 8,
     /// the kernel's nc=1 pass served the pair — the seed).
     pub hits: Vec<i64>,
+    /// ADDENDUM-18: the scan-stage witnesses (the raw pre-filter candidate
+    /// count summed over the pass's cells, and the density-gate rows).
+    pub raw: u32,
+    pub drows: u32,
+    /// ADDENDUM-18: the decline reason for the KPX line (1=density gate,
+    /// 2=crammed route; the arena miss is set by n_push itself).
+    pub reason: u8,
 }
 
 /// The emission cap — matches CeHooks.PUSH_PAIR_CAP (the Java statics are
