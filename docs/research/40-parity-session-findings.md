@@ -1139,3 +1139,53 @@ AFTER 1069's tick, while in ON it reached it BEFORE.** 78's end-274 and
 end-275 states are hash-identical across the legs, so the push itself
 fired in both. The pusher-trace run (41332029885, trace_id=78) was
 dispatched to witness 78's own walk/push phase in both legs.
+
+## Addendum 18 — the push seed SOLVED: the numCollisions cap parity (run 41332029885 + 41351170118 + the fix 178d287)
+
+**The instrument chain that closed it** (the delta-tail grep now streams
+TLO/TTR/KPD/TL — fe84513; KPH prints nc/maxec, PTRACE prints nc — b0e39b5):
+
+1. **Per-scenario first-divergence loci** (PD per-entity hash dumps, all
+   three seeds are ONE-Pair seeds, adds/removes all zero):
+   - mobs: t=275, exactly id **1069** (the victim's delta hash);
+   - mixed: t=353, exactly id **3047**; spread: t=259, ids **95+5932**.
+   - items: GREEN in every run since the R-B fix — no items dump at all.
+2. **The walk-order hypothesis DIED**: the plugin TL stream (CE_TL_TRACE=1,
+   run 41348958899) is hash-identical across the legs at every dumped tick
+   (t=275: h=32f1df3b9e590670, pos78=77, pos1069=1068 — 78 walks FIRST);
+   the moonrise BaseIterator provably visits the raw array forward, the
+   L13 mirror is exact.
+3. **The activation hypothesis DIED**: at=INT_MIN on both sides is never
+   consulted — tickCount < 200 short-circuits checkIfActive to ACTIVE;
+   tc increments every tick in both legs (no freeze, no inactiveTick).
+4. **The nc= witness (run 41351170118)**: `KPH t=822 self=78 tc=130
+   nc=1 maxec=8 n=1` — and the PTRACE nc columns:
+   - OFF nc(78): 1@244 then 2,2,3,3,4,4,5,5,6,7,7,7,8,8,9,10,...,**18@274**
+     → post-decay max(0,18−8)=**10 ≥ maxEC 8 → vanilla's 275 pass BREAKS
+     before the first candidate** — 78 pushed NOTHING at 275.
+   - ON nc(78): flat 0/1 the whole way (kernel writeback pattern).
+5. **The mechanism (the decomp, LivingEntity.pushEntities)**:
+   `entityx.numCollisions++` happens BEFORE doPush and BEFORE every push
+   gate; a gated candidate (same-vehicle/noPhysics/vehicle-receiver/
+   onlyPlayers) still consumes its hit. The kernel emitted only the pushed
+   pairs, so every gated/lost candidate never incremented its REAL counter
+   — the kernel's counters grew ~10x slower than vanilla's, the cap never
+   bound, and the kernel's pass served the 78→1069 pair vanilla's cap had
+   already excluded. OFF's force therefore landed from 1069's OWN pass
+   (post-travel → raw in the end-275 delta, x unmoved); ON's landed from
+   78's kernel pass (pre-travel → integrated, x=0.5133872). The 0.0208
+   z-overlap, the fingerprint force and the byte-exact trajectory data all
+   agree with this reading to the last bit.
+6. **The fix (178d287)**: pushcore emits `out.hits` — EVERY pre-break
+   candidate (superset of the pairs, ≤ maxEC−post-decay per pass); the
+   Java apply loop applies `U.putInt(ncol, +1)` per hit and `pe.push(...)`
+   per pair. `ncolNew` (post-decay + hits) now writes the same value
+   vanilla's field would carry. The same-vehicle test asserts the hit.
+
+**The surviving question** (the post-fix witness run 41353733450, window
+240-252): the FIRST nc divergence is t=245 (OFF Δ=+2, ON Δ=+1 hits). If
+that was a gated candidate, the hits fix closes it and the nc tables
+re-unify; if the kernel's SCAN itself missed one candidate (hn < vanilla's
+count), the next instrument is the per-pass raw candidate dump. The mobs
+275 / mixed 353 / spread 259 seeds all sit inside this one family —
+the cap parity is the single fix candidate for all three.
