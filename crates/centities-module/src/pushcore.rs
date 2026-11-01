@@ -298,6 +298,7 @@ pub fn push_tick(
     out.ddy = 0.0;
     out.ddz = 0.0;
     out.pairs.clear();
+    out.hits.clear();
 
     let sc = self_slot * 6;
     let sx0 = pc.box6[sc];
@@ -457,6 +458,20 @@ pub fn push_tick(
                 // noPhysics, eps) never undoes it (javap 295-319) ----
                 if !detect {
                     pc.ncol[hs] += 1;
+                    // ADDENDUM-18: the candidate's REAL counter hit rides
+                    // out.hits — the Java apply loop applies it (U.putInt)
+                    // for gated candidates too, exactly like vanilla's
+                    // pre-doPush `entityx.numCollisions++` (the increments
+                    // precede the push gates, so a gated candidate still
+                    // consumes its hit — the old emit-only loop lost every
+                    // gated hit and the entity's numCollisions grew ~10x
+                    // slower than vanilla: the OFF nc(78) trace 2..18 by
+                    // t=274 vs the kernel's flat 0-1, which let the
+                    // kernel's pass serve pairs vanilla's maxEntityCollisions
+                    // cap had already excluded — the mobs t=275 seed).
+                    if out.hits.len() < MAX_PUSH_PAIRS {
+                        out.hits.push(id);
+                    }
                 }
                 ncol_self += 1;
                 // Entity.push pair gates (all live INSIDE push, after ncol++)
@@ -579,6 +594,17 @@ pub struct PushOut {
     /// writes each candidate's delta at push time (the exact vanilla
     /// doPush order); the write's probe event re-syncs the mirror.
     pub pairs: Vec<(i64, f64, f64)>,
+    /// ADDENDUM-18: EVERY pre-break candidate — vanilla increments
+    /// `entityx.numCollisions++` BEFORE doPush, so the GATED candidates
+    /// (same-vehicle, noPhysics, onlyPlayers, vehicle-receiver) still
+    /// consume their counter hit. The kernel emitted only the pushed
+    /// pairs, so every gated candidate lost its increment and the
+    /// entity's numCollisions grew ~10x slower than vanilla — the
+    /// maxEntityCollisions cap never bound where vanilla's did (the OFF
+    /// nc(78) trace: 2..18 by t=274 vs the kernel's flat 0-1; the mobs
+    /// t=275 seed: vanilla's 78-pass broke at post-decay nc=10 >= 8,
+    /// the kernel's nc=1 pass served the pair — the seed).
+    pub hits: Vec<i64>,
 }
 
 /// The emission cap — matches CeHooks.PUSH_PAIR_CAP (the Java statics are
@@ -754,6 +780,13 @@ mod tests {
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
         assert_eq!(out.ddx, 0.0, "no force for same-vehicle pairs");
+        // ADDENDUM-18: the gated candidate still consumes its REAL counter
+        // hit — vanilla's entityx.numCollisions++ precedes the push gates.
+        assert_eq!(
+            out.hits,
+            vec![2i64],
+            "the same-vehicle candidate rides the hits emission"
+        );
     }
 
     /// Removed entities can never be pushed (the slot key check).

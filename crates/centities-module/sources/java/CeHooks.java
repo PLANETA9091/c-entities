@@ -3216,6 +3216,16 @@ public final class CeHooks {
     public static final long[] PUSH_PAIR_IDS = new long[PUSH_PAIR_CAP];
     public static final double[] PUSH_PAIR_D = new double[PUSH_PAIR_CAP * 2];
     public static int PUSH_PAIR_N = 0;
+    /** ADDENDUM-18: the pre-break candidate hits (superset of the pairs).
+     *  Vanilla increments entityx.numCollisions BEFORE doPush, so gated
+     *  candidates (same-vehicle/noPhysics/vehicle-receiver/onlyPlayers)
+     *  still consume their hit; the old emit-only loop lost those and the
+     *  entity's numCollisions grew ~10x slower than vanilla — the cap
+     *  never bound where vanilla's did (the mobs t=275 seed: vanilla's
+     *  78-pass broke at post-decay nc=10 >= maxec 8, the kernel's nc=1
+     *  pass served the pair). The apply loop now counts EVERY hit. */
+    public static final long[] PUSH_HIT_IDS = new long[PUSH_PAIR_CAP];
+    public static int PUSH_HIT_N = 0;
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
             pushCramming = 0, pushSelfDelta = 0, pushPairs = 0, pushPairMiss = 0;
@@ -3453,6 +3463,19 @@ public final class CeHooks {
                 return false; // cannot maintain the candidates' counters
             }
             int pn = PUSH_PAIR_N;
+            // ADDENDUM-18: the candidates' REAL numCollisions increments —
+            // for EVERY pre-break hit (the pairs are a subset), matching
+            // vanilla's pre-doPush entityx.numCollisions++.
+            int hn = PUSH_HIT_N;
+            for (int i = 0; i < hn; i++) {
+                long hid = PUSH_HIT_IDS[i];
+                Entity he = ARENA[(int) (hid & AMASK)];
+                if (he == null || he.getId() != (int) (hid & 0xFFFF_FFFFL)) {
+                    pushPairMiss++;
+                    continue;
+                }
+                U.putInt(he, O_NCOL, U.getInt(he, O_NCOL) + 1);
+            }
             for (int i = 0; i < pn; i++) {
                 long pid = PUSH_PAIR_IDS[i];
                 Entity pe = ARENA[(int) (pid & AMASK)];
@@ -3468,9 +3491,10 @@ public final class CeHooks {
                     pushPairMiss++;
                     continue;
                 }
-                U.putInt(pe, O_NCOL, U.getInt(pe, O_NCOL) + 1);
+                // the counter increment now rides the hits loop above
                 pe.push(PUSH_PAIR_D[i * 2], 0.0, PUSH_PAIR_D[i * 2 + 1]);
             }
+            PUSH_HIT_N = 0;
             pushPairs += pn;
             // L47 PUSH FORENSICS: the mixed t=233 PTRACE proved an EXTRA
             // push on a resting armor stand (ON gained vx/vz at tc=90,
@@ -3488,6 +3512,7 @@ public final class CeHooks {
                         .append(" tc=").append(le.tickCount)
                         .append(" nc=").append(realNcol)
                         .append(" maxec=").append(PUSH_CFG_MAXEC)
+                        .append(" hn=").append(hn)
                         .append(" n=").append(pn)
                         .append(" box=[").append(sbx.minX).append(',').append(sbx.maxX)
                         .append(' ').append(sbx.minY).append(',').append(sbx.maxY)

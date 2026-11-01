@@ -4266,7 +4266,7 @@ pub extern "system" fn n_push(
     if res & 1 == 1 {
         // write the delta statics OUTSIDE the state borrow (server-thread
         // confined statics, no race)
-        let (dx, dy, dz, npairs, ids, ds) = PUSH_OUT.with(|o| {
+        let (dx, dy, dz, npairs, ids, ds, nhits, hit_ids) = PUSH_OUT.with(|o| {
             let o = o.borrow();
             (
                 o.dx,
@@ -4275,6 +4275,8 @@ pub extern "system" fn n_push(
                 o.pairs.len(),
                 o.pairs.iter().map(|p| p.0).collect::<Vec<i64>>(),
                 o.pairs.iter().flat_map(|p| [p.1, p.2]).collect::<Vec<f64>>(),
+                o.hits.len(),
+                o.hits.iter().copied().collect::<Vec<i64>>(),
             )
         });
         unsafe {
@@ -4297,6 +4299,26 @@ pub extern "system" fn n_push(
             // because the loop read all-zero ids).
             if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_N", "I") {
                 ((*vt).SetStaticIntField)(raw, cls, fid, npairs as i32);
+            }
+            // ADDENDUM-18: the pre-break candidate hits (superset of the
+            // pairs) — the Java apply loop does the REAL numCollisions
+            // increment for EVERY hit, gated candidates included.
+            if let Some(fid) = e.get_static_field_id(cls, "PUSH_HIT_N", "I") {
+                ((*vt).SetStaticIntField)(raw, cls, fid, nhits as i32);
+            }
+            if nhits > 0 {
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_HIT_IDS", "[J") {
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetLongArrayRegion)(
+                            raw,
+                            arr as jni::jlongArray,
+                            0,
+                            nhits as i32,
+                            hit_ids.as_ptr(),
+                        );
+                    }
+                }
             }
             if npairs > 0 {
                 if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_IDS", "[J") {
