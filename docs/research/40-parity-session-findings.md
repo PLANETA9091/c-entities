@@ -1096,3 +1096,46 @@ Surviving, to be separated by the addendum-17 instruments (a54bfdf):
   for C). Decline = an enter line without an exit line.
 - **KPD** (pushDispatch): the kernel decline verdict for the traced
   id (the served path already prints KPH at PD ticks).
+
+### Addendum 17b (the instrumented run 41329446028, trace 1069 + PH_DUMP 272-276)
+
+**The TTR nailed the ON-side mechanics; the KPH named the force:**
+
+- TTR (module t=822, plugin t=275, tc=54): `enter d=(0.013387216874684499,
+  -0.0784, -0.038050984457565336) in=(0,0,0) onG=true pos=(0.5,-60,-18.5)
+  yaw=0.0` → `exit shape=C dm=(same) post=(0.5133872168746845,-60,
+  -18.538050984457566) dv=(0.007309421262586223,-0.0784,-0.020775839926999072)`.
+  The floor served the COAST (SHAPE C): the force was ALREADY in the
+  entering delta, the serve moved x by the force and frictioned it. Every
+  TTR in the window shows in=(0,0,0) — **the ON leg's 1069 never walks**.
+- **KPH t=822 self=78 tc=130 n=1
+  box=[-0.0037587,0.5962413 ... -18.220849,-17.620849]
+  1069:0.013387216874684499,-0.038050984457565336** — zombie 78 (an
+  EARLIER-ticking id, 76 ticks older) walked into 1069's box (the z
+  overlap is 0.0208 wide) and the kernel SERVED the pair with EXACTLY
+  the fingerprint force. The vanilla force math reproduces it exactly
+  (f = (Δ/√absMax)·min(1,1/√absMax)·0.05 — my addendum-17 note that
+  |f|<0.05 is impossible was WRONG: for absMax<1 pairs |f| = 0.05·|Δ|
+  /√absMax — 0.0403 is a legal push magnitude).
+- **The OFF leg's end-275 1069 delta carries the SAME force (raw, the
+  resting y untouched) with x UNMOVED — and its end-276 delta shows
+  the travel integrating the carried force PLUS a SECOND push from the
+  same bearing (I₂.z == the 275 force z to the last bit — the pair
+  re-fired while the boxes intersected).** So in OFF the 275 push
+  landed AFTER 1069's own tick, and the 276 push landed BEFORE it —
+  the delivery phase differs from ON, where both landed before.
+- The yaw sequences (0 → -10 → -20 → -28.6054) are IDENTICAL across
+  the legs at tick end; the TTR's yaw=0.0 at travel is the vanilla
+  BODY-yaw follow lag (the look writes yHeadRot/yRot via the body
+  rotation control after aiStep — getBukkitYaw == getYRot, the same
+  field) — **NOT an AI-phase shift** (addendum 17's hypothesis 2 dies).
+- The tick iteration order is settled identical (EntityTickList.forEach
+  → moonrise BaseIterator → the same raw array the module floor and the
+  plugin TL read).
+
+**The surviving question is now ONE tick-phase fact: in the OFF leg the
+275 push from 78 (an earlier-ticking id) reached 1069's delta only
+AFTER 1069's tick, while in ON it reached it BEFORE.** 78's end-274 and
+end-275 states are hash-identical across the legs, so the push itself
+fired in both. The pusher-trace run (41332029885, trace_id=78) was
+dispatched to witness 78's own walk/push phase in both legs.
