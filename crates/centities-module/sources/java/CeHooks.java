@@ -3534,6 +3534,8 @@ public final class CeHooks {
                         .append(" tc=").append(le.tickCount)
                         .append(" nc=").append(realNcol)
                         .append(" maxec=").append(PUSH_CFG_MAXEC)
+                        .append(" raw=").append(PUSH_RAW)
+                        .append(" rows=").append(PUSH_DROWS)
                         .append(" hn=").append(hn)
                         .append(" n=").append(pn)
                         .append(" box=[").append(sbx.minX).append(',').append(sbx.maxX)
