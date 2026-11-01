@@ -516,6 +516,23 @@ impl EntityIndex {
         let ncx = (b.center_x().floor() as i32) >> CELL_SHIFT;
         let ncz = (b.center_z().floor() as i32) >> CELL_SHIFT;
 
+        // (0,0) stamps = UNKNOWN (the off-thread nativeBoxDirect / DirEv
+        // paths and tests carry no order keys): substitute the entity's
+        // stored stamps so the unknown upsert neither clobbers them nor
+        // churns the cell order version. Two (0,0) stamps of a stored-never
+        // entity also stay (0,0) and never bump — the documented contract.
+        let (sy, seq) = if sy == 0 && seq == 0 {
+            match self.idmap.find(id) {
+                Some(slot) => (self.sy[slot as usize], self.seq[slot as usize]),
+                None => match self.oversize.iter().find(|o| o.id == id) {
+                    Some(o) => (o.sy, o.seq),
+                    None => (0, 0),
+                },
+            }
+        } else {
+            (sy, seq)
+        };
+
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
             let key = self.cell_keys[home as usize];
@@ -738,7 +755,7 @@ impl EntityIndex {
                     (ka, kb, id)
                 })
                 .collect();
-            keyed.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
             out.clear();
             out.extend(keyed.into_iter().map(|(_, _, id)| id));
         }
@@ -798,7 +815,7 @@ impl EntityIndex {
                     | (self.seq[slot] & 0xFFFF_FFFF);
                 rows.push((slot as u32, kb));
             }
-            rows.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
             let order: Vec<u32> = rows.into_iter().map(|(s, _)| s).collect();
             self.write_cell_layout(c, &order);
         }
@@ -964,7 +981,7 @@ impl EntityIndex {
                 kb,
             ));
         }
-        rows.sort_unstable_by(|a, b| {
+        rows.sort_by(|a, b| {
             (a.3, a.4).cmp(&(b.3, b.4))
         });
         let mut blocks: Vec<f32> = Vec::with_capacity(((n + 7) >> 3) * BLOCK_F32);
