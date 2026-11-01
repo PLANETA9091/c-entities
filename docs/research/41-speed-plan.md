@@ -111,10 +111,18 @@ the flush are the next floors.
    viewN==0 gate (0.91% self-time on the fresh profile; the steady state
    never touches the map now). INVALIDATED 2026-10-31: mixed re-grows
    the frame to 4.96% — the gate holds only for view-free scenarios.
-0d. **NEW — L57 (isViewAfter part 2)**: replace the per-id boxed map
-   with a primitive stamp array (slot -> last-view-query epoch); the
-   common "no view ever" path reads one int, the map only on a stamp
-   hit.
+0d. **DONE — L57 (isViewAfter part 2, 684231c)**: the view lookup is a
+   flat open-addressing int table (vtabGet/vtabPut, 2048 slots,
+   Fibonacci spread) — zero boxing, zero hashing allocations. Effect
+   reads from the post-L57 baseline profiles.
+0e. **DONE — L58/L58b (721c5de-era + de9cb75)**: the vanilla scan order
+   lives IN the index (upsert_ord stamps, per-cell versions, lazy
+   ensure_cell_order; (0,0)=unknown preserves stored stamps; stable
+   sorts). The per-query ordSortVanilla is dead work now.
+0f. **NEXT — move 1a (the exact f64 index boxes)**: still gated on the
+   freshness families; the MSIB dispatch (run 41295183606) pairs
+   idxMin vs liveMin per reject IN the divergence window (270-330) —
+   the stale side per reject id lands with that run.
 ## Ranked next moves (updated 2026-10-29 after the L41 measurement)
 
 0. **DONE — the merge max-stack pre-resolution (L41, 98483d2)**:
