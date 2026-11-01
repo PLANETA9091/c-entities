@@ -990,3 +990,30 @@ push-timing family (mobs t=301 / spread t=278 / mixed t=320, the
 inactivated-zombie stale box / the push integration timing). The next
 witness: the TL stream (fixed bind, 18ad9aa) at PD 270-325 — its data
 rides the run artifacts (read the full server.log, NOT the tail).
+
+### Addendum 16 — the L58b session (2026-11-01)
+- **L58 (index-side vanilla order)**: the per-query ordSortVanilla (L37)
+  moved INTO the index — upsert_ord stamps (moonrise sectionY, ORD_SEQ)
+  per slot, per-cell order versions, lazy ensure_cell_order re-sort
+  (721c5de-era machinery; the local working tree held a stale duplicate).
+- **L58b (de9cb75)**: (0,0) sy/seq = UNKNOWN — substitute the stored
+  stamps instead of clobbering them (the off-thread nativeBoxDirect /
+  DirEv upserts used to zero real stamps and churn the cell version);
+  the three order sorts are STABLE (ties keep the physical insertion
+  order). Local: core 43 + module 24 green (PAPER_JAR 26.3
+  mojang-mapped, temurin-25 javac — the local-build recipe mirrors CI).
+- **The L58b push-parity (run 41294269481)**: items ABSENT from the
+  dumps = bit-identical, no L58b regression. mobs T382 x/z/vx/vz,
+  T632/final yaw-only; spread T389 x/z + vx/vz; mixed T389 x/z — the
+  push-timing family intact (the late-snapshot yaw mass is the
+  downstream echo: pushed zombies path/look differently).
+- **Config archaeology**: push-triggered parity arms the experimental
+  AI engine by design (98483d2 — empty input != "0"); the PRODUCTION
+  config is the dispatch default (ai_floor=0 -> -Dcentities.aiFloor=
+  false). The production gate evidence therefore comes from dispatch
+  runs only (the d9a84c8 verdict framing holds).
+- **Evidence dispatches (de9cb75)**: run 41295158850 = TL stream
+  (CE_TL_TRACE=1) + PD window 270-330 + trace_id 202 (a mobs-T382
+  cohort id); run 41295183606 = CE_FQ_IBOX=1 + PD 270-330 (the MSIB
+  idxMin-vs-liveMin pairing in the divergence window — the doc-41
+  exact-f64 open question's sampler).
