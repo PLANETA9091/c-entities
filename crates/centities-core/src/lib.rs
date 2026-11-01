@@ -703,15 +703,28 @@ impl EntityIndex {
     /// across the chunkZ-major cell walk is bit-identical to vanilla's.
     pub fn query(&mut self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
         out.clear();
+        // L60 SCAN-BOUNDS SPLIT. `ex` expands ONLY the cell WALK (which
+        // cells host a box that can reach the query: a homed entity's box
+        // reaches <= max_half_span from its center cell). The per-cell SCAN
+        // bounds are the TRUE query box — scan_cells' internal EPSF (1e-2)
+        // already proves the f32 prefilter a superset of the exact f64
+        // check (the cell-relative rounding is <= 7.6e-6). Feeding the
+        // ex-expanded bounds into the scan made every merge scan pull the
+        // max_half_span-neighbourhood and hand the Java marginExtra trim
+        // ~80% false survivors (MSIB run 41295493035: reject 2067 at
+        // z-dist 20.6 from a 1.25-wide query — the world's max_half_span
+        // ratchet: one giant box poisons every query forever). The answer
+        // is UNCHANGED (the Java live-box trim already exactified it) —
+        // only the wasted scan/trim work dies.
         let ex = self.max_half_span + MARGIN as f64;
-        let qx0 = b.x0 - ex;
-        let qx1 = b.x1 + ex;
-        let qz0 = b.z0 - ex;
-        let qz1 = b.z1 + ex;
-        let cx0 = (qx0.floor() as i32) >> CELL_SHIFT;
-        let cx1 = (qx1.floor() as i32) >> CELL_SHIFT;
-        let cz0 = (qz0.floor() as i32) >> CELL_SHIFT;
-        let cz1 = (qz1.floor() as i32) >> CELL_SHIFT;
+        let wx0 = b.x0 - ex;
+        let wx1 = b.x1 + ex;
+        let wz0 = b.z0 - ex;
+        let wz1 = b.z1 + ex;
+        let cx0 = (wx0.floor() as i32) >> CELL_SHIFT;
+        let cx1 = (wx1.floor() as i32) >> CELL_SHIFT;
+        let cz0 = (wz0.floor() as i32) >> CELL_SHIFT;
+        let cz1 = (wz1.floor() as i32) >> CELL_SHIFT;
         let my0 = (b.y0 - MARGIN as f64) as f32;
         let my1 = (b.y1 + MARGIN as f64) as f32;
 
@@ -734,7 +747,7 @@ impl EntityIndex {
                 let ids = &self.cell_ids[cid];
                 let bx = &self.cell_box[cid];
                 let (ox, oz) = cell_origin(cx, cz);
-                simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+                simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out);
             }
         }
         let mut any_ov = false;

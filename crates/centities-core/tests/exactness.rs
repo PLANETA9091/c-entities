@@ -238,7 +238,16 @@ fn query_expansion_is_bounded_and_correct() {
     idx.query(0, &Aabb::new(70.0, 60.0, 70.0, 72.0, 70.0, 72.0), &mut out);
     assert!(out.is_empty());
 
+    // L60 exact-contract: the query returns ONLY entities whose box
+    // intersects the query box under vanilla's strict AABB.intersects
+    // (entity x1=65.0 < query x0=65.5 — a 0.5 gap — must NOT be pulled in
+    // by the max_half_span margin; the walk expansion only guarantees the
+    // CELL coverage, the scan bounds are the true box).
     idx.query(0, &Aabb::new(65.5, 60.0, 65.5, 70.0, 70.0, 70.0), &mut out);
+    assert!(!out.contains(&1), "margin leak: a 0.5-gap entity came back");
+    // a genuinely touching-face query (65.0 is the entity's x1, and
+    // vanilla's strict compare needs x1 > qx0) still finds it:
+    idx.query(0, &Aabb::new(64.99, 60.0, 64.99, 70.0, 70.0, 70.0), &mut out);
     assert!(out.contains(&1), "border-crossing entity missed");
     assert!(idx.max_half_span() <= MAX_HALF_SPAN);
 }
@@ -292,9 +301,20 @@ fn packed_window_is_conservative() {
         // read back the packed window for the entity's home cell
         let home = {
             let mut probe = Vec::new();
+            // L60 exact-contract: the probe must INTERSECT the entity's box
+            // under vanilla's strict compare — random w/h can be 0 (a
+            // degenerate box never intersects anything), so the probe pads
+            // 0.01 past the box's min corner on every axis.
             idx.query(
                 0,
-                &Aabb::new(x0, 64.0, z0, x0 + 0.01, 64.01, z0 + 0.01),
+                &Aabb::new(
+                    x0 - 0.01,
+                    63.99,
+                    z0 - 0.01,
+                    x0 + 0.01,
+                    64.01,
+                    z0 + 0.01,
+                ),
                 &mut probe,
             );
             assert!(probe.contains(&id0));
