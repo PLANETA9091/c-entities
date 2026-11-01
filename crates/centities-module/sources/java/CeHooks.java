@@ -3372,6 +3372,26 @@ public final class CeHooks {
             int wid = worldId(w);
             if (wid < 0) return false;
             boolean selfVehicle = le.isVehicle();
+            // ADDENDUM-18 (the mobs t=275 root cause): publish the SELF's
+            // LIVE box before the scan. The probeBox weave targets
+            // setBoundingBox — the single choke point of 1.21.8 — but the
+            // 26.3 move path no longer routes every reposition through it,
+            // so a mob's mirror box lagged one tick behind its live box.
+            // The scan then used the stale SELF box: an overlap the entity
+            // walked into THIS tick was invisible to the kernel (the 78
+            // pass at t=245: the live box overlaps 916 by 0.027, the PQ
+            // witness names 916 the only vanilla candidate, the scan saw
+            // hn=0) while stale overlaps kept being served (the L47 "extra
+            // push" family) — and the missing candidate hits starved the
+            // numCollisions cap (OFF 2..18 vs the kernel's flat 0-1), so
+            // vanilla's cap-blocked passes were served by the kernel. The
+            // self's own dispatch publishes its fresh box; the entities
+            // earlier in the walk did the same at their dispatches, and the
+            // not-yet-ticked ones are end-of-previous-tick = live. The scan
+            // becomes live-box exact, vanilla's semantics.
+            if (ACTIVE && INDEXING) {
+                batchUpsert(le.getId(), wid, le, le.getBoundingBox(), false);
+            }
             // the kernel reads the mirror: drain the pending probe batches first
             flushIfPending();
             // ADDENDUM-18: the EXACT real numCollisions the kernel's cap
