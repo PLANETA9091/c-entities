@@ -197,3 +197,45 @@ NOT our query paths — the vanilla query volume is the lever), the
 tracker floor ~2.8%, the attribute cluster ~2.2%, fastQuery 4.4%.
 The next profile run attributes the vanilla query roots (the
 74.85% bucket) with the full stacks.
+
+## The move-1a decision tree (pre-staged 2026-11-01, pending MSIB run 41295493035)
+
+The 84% Java-side rejection question (the index box vs the live box)
+resolves by pairing MSIB idxMin against MSR liveMin per reject id in the
+270-330 window. The outcomes and their pre-committed fixes:
+
+- **A. idxMin == liveMin, reject is pure margin geometry** (the candidate
+  sits inside the index's MARGIN superset but outside the exact box):
+  the f64 index (move 1a proper) shrinks the survivor set to exact —
+  the Java marginExtra loop dies, AABB.intersects (8.09% #1 mixed)
+  collapses with it. Implementation: widen the cell box store to f64
+  (100k × 48B = 4.8MB), the AVX2 f32 prefilter stays as the first pass
+  against a truncated copy, the Rust exact confirm promotes both sides
+  to f64, the MARGIN expansion drops to 0 — the query result becomes
+  set-exact, the Java re-check becomes an assert (knob-gated, then
+  deleted).
+- **B. idxMin stale (PRE-move) vs liveMin (POST-move)**: the probe
+  batch's box for the candidate predates its body's move this tick —
+  the R-B interleave (vanilla moves+merges per item in tick order; the
+  flush batches them). Fix surface: the L44 view already models PRE
+  boxes for RESYNC entries — extend the VIEW contract to every
+  move-gated entry the scanner can see BEFORE its body (the
+  freshness-story template: probe, version, or phase contract), or
+  serve those candidates from the row path with PRE boxes (the L49
+  pending-fresh mechanism already does this for covered rows).
+- **C. idxMin newer than liveMin (off-thread nativeBoxDirect wrote a
+  POST box the vanilla scan has not reached yet)**: the async-spawn
+  mirror ran ahead. Fix: gate nativeBoxDirect writes behind the same
+  IN_ITEM_APPLY phase discipline (serve stale-correct boxes during the
+  apply pass; commit the async truth at flush).
+- **D. idxMin = NaN (the id was not indexed at sample time)**: a
+  vanished candidate (merged/picked-up) the index still serves — the
+  ghost family. Fix: the remove-probe must ride the same batch as the
+  merge apply (probeDie-template: batch upsert + drain in the same
+  tick), or the row publisher must tombstone removed ids within the
+  flush cycle.
+
+The TL stream (run 41295158850, trace 202, window 270-330) independently
+witnesses the push-timing family's first-divergence tick order — its
+tick-list order stream names WHICH entity's list position moved first
+(the B/C class boundary).
