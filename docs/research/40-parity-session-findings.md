@@ -1189,3 +1189,45 @@ re-unify; if the kernel's SCAN itself missed one candidate (hn < vanilla's
 count), the next instrument is the per-pass raw candidate dump. The mobs
 275 / mixed 353 / spread 259 seeds all sit inside this one family —
 the cap parity is the single fix candidate for all three.
+
+### Addendum 18c — the PQ witness narrows the miss to an INTRA-tick scan event
+
+The PQ instrument (a6b9582: the plugin reflectively calls the vanilla
+`getPushableEntities(traced, box)` at the dump ticks, BOTH legs) shows the
+PLUGIN-PHASE candidate lists are IDENTICAL across the legs — at t=244-252
+both legs print `PQ n=1 [916]` on the odd ticks and `n=0 []` on the even
+ones. There is NO co-located spawn-mate; the OFF-side extra nc increment
+on 78 is an INTRA-TICK event the end-of-tick roster cannot see.
+
+The raw= witness (4ca569f) on the served passes: 78's own pass at t=245
+saw raw=2 pre-filter candidates and served hn=0 n=0, while vanilla's
+mid-tick 78-pass had at least one candidate (the OFF nc picked up a
+self-increment). The scan's candidate pipeline (query_cell → slot_of →
+flags → the exact f64 intersect on the mirror boxes) dropped a candidate
+that vanilla's live query kept. Two structural suspects remain:
+ 1. a mirror-box lag for the CANDIDATE (its probe event not yet applied
+    at the self's scan moment) — the probeBox weave targets
+    setBoundingBox, verified present in setPosRaw in 26.3, so the
+    coverage exists; the residual window is the batch FLUSH ORDER;
+ 2. the f64 intersect comparing MIRROR boxes whose staleness direction
+    differs per entity (the self's is flushed fresh at its dispatch, the
+    earlier-ticked candidates' are flushed at theirs — the not-yet-ticked
+    ones are end-of-previous-tick = live; the only stale pair member is
+    a candidate whose probe event is still pending).
+
+Landed this round:
+- the candidate-hit parity (178d287): every pre-break candidate consumes
+  its REAL numCollisions hit (vanilla counts before the gates);
+- the self live-box publish (1324533): every pushDispatch enqueues the
+  self's current box before flushIfPending;
+- the scan-stage witnesses (77aa264/4ca569f): KPH raw=/rows=, the KPX
+  decline lines (68,939 in the window — the declines are common and all
+  preserve hits by construction);
+- the PQ witness (a6b9582/06accea).
+
+**Next step**: trace the OFF nc(78) arithmetic tick-by-tick against the
+PQ/KPH data (the OFF table is exactly reproduced run-over-run: +1 every
+other tick from t=245, the 916 mutual-push ticks) and, in parallel, dump
+the kernel's per-candidate f64 intersect verdicts (the two dropped raw
+candidates with their mirror boxes) at the traced id's pass — the drop
+names itself.
