@@ -239,3 +239,27 @@ The TL stream (run 41295158850, trace 202, window 270-330) independently
 witnesses the push-timing family's first-divergence tick order — its
 tick-list order stream names WHICH entity's list position moved first
 (the B/C class boundary).
+
+## The MSIB verdict + L60 (2026-11-01, runs 41295493035 / 41295158850)
+
+**The exact-f64 open question is CLOSED — the index boxes are FRESH.**
+The MSIB x MSR pairing (376k pairs, items) shows idx x0/z0/y1 == live
+EXACTLY; the apparent 0.25 y-offset was a printer artifact
+(nativeIndexBox packs [x0,y0,z0,x1,y1,z1]; the sampler printed slots
+0/2/4 = (x0,z0,y1) vs the live sampler's (x0,y0,z0)).
+
+**The real root of the #1 buckets: the query expansion leaked into the
+SCAN bounds.** `EntityIndex::query` fed box ± (max_half_span + MARGIN)
+into scan_cells — every merge scan pulled the max_half_span
+neighbourhood (reject 2067 sat 20.6 blocks from a 1.25-wide query —
+the world's max_half_span ratchet: ONE giant box poisons every query
+forever), and the Java live-box trim rejected ~80% (marginExtra=70M).
+AABB.intersects 7.11% #1 (items) / fastQuery 13.29% #1 (mixed) were
+mostly this tax.
+
+**L60 (ba1b10e)**: the scan bounds are the TRUE box; the expansion
+covers only the cell WALK. Parity-neutral by construction (the Java
+trim already exactified the answer). The two exactness tests that
+pinned the margin-leak semantics moved to the vanilla-strict contract.
+The f64-box move 1a is NOT NEEDED for the margin tax; the freshness
+gate is resolved as class A (margin geometry) + the printer lesson.
