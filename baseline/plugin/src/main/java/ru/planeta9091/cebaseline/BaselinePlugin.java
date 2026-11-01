@@ -749,6 +749,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
     private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED,
             PARITY_NCOL;
+    private static volatile java.lang.reflect.Method PQ_METHOD;
+    private static volatile Object PQ_LEVEL;
 
     // ------------------------------------------------------------------
     // PARITY PHASH: per-tick ORDER-INDEPENDENT checksum of the whole
@@ -1241,6 +1243,44 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 traceOut.write("t=" + tickNo + " REMOVED\n");
                 traceOut.flush();
                 return;
+            }
+            // ADDENDUM-18: the vanilla LIVE candidate list for the traced id —
+            // a read-only getPushableEntities at the plugin phase, streamed in
+            // BOTH legs ("PQ t=.. id=.. n=.. [ids]"). The cross-leg PQ diff
+            // names the exact second pusher the ON-side kernel scan missed
+            // (the nc(78) gap: OFF counts a hit the ON leg never sees).
+            if (phDumpActive() && PARITY_GET_HANDLE != null) {
+                try {
+                    if (PQ_METHOD == null) {
+                        Object wh = Bukkit.getWorlds().get(0);
+                        Object sl = wh.getClass().getMethod("getHandle").invoke(wh);
+                        for (Class<?> c = sl.getClass(); c != null && PQ_METHOD == null; c = c.getSuperclass()) {
+                            try {
+                                java.lang.reflect.Method m = c.getDeclaredMethod(
+                                        "getPushableEntities",
+                                        Class.forName("net.minecraft.world.entity.Entity"),
+                                        Class.forName("net.minecraft.world.phys.AABB"));
+                                m.setAccessible(true);
+                                PQ_METHOD = m;
+                                PQ_LEVEL = sl;
+                            } catch (NoSuchMethodException ignored) { }
+                        }
+                    }
+                    if (PQ_METHOD != null) {
+                        Object h = PARITY_GET_HANDLE.invoke(traced);
+                        Object res = PQ_METHOD.invoke(PQ_LEVEL, h, h.getBoundingBox());
+                        java.util.List<?> list = (java.util.List<?>) res;
+                        StringBuilder qb = new StringBuilder(64);
+                        for (Object o2 : list) {
+                            qb.append(o2.getClass().getMethod("getId").invoke(o2)).append(' ');
+                        }
+                        getLogger().info("PQ t=" + tickNo + " id=" + traceId
+                                + " n=" + list.size() + " [" + qb.toString().trim() + "]");
+                    }
+                } catch (Throwable pqFail) {
+                    getLogger().warning("PQ failed: " + pqFail);
+                    PQ_METHOD = null;
+                }
             }
             Location l = traced.getLocation();
             org.bukkit.util.Vector v = traced.getVelocity();
