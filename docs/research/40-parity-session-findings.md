@@ -1231,3 +1231,29 @@ other tick from t=245, the 916 mutual-push ticks) and, in parallel, dump
 the kernel's per-candidate f64 intersect verdicts (the two dropped raw
 candidates with their mirror boxes) at the traced id's pass — the drop
 names itself.
+
+### Addendum 18d — the self-box publish verdict + the exact surviving locus
+
+The self live-box publish (1324533) did NOT move the seeds (the mobs
+dump keeps 78/125/194/407/623/916; mixed keeps 3047; spread keeps 95) —
+the SELF's box was never the stale member. Combined with the PQ verdict
+(identical plugin-phase rosters) and the raw=2-vs-hn=0 witness at 78's
+t=245 pass, the surviving locus is exact:
+
+**A SERVED pass's exact-f64 intersect compares mirror boxes, and the
+CANDIDATE's mirror box can be stale at the self's scan moment even
+though every flush applies every entry unconditionally.** The only way a
+candidate's mirror can lag its live box inside the same tick is an event
+that never entered the batch (a probe path that does not cover some 26.3
+reposition shape) or an ordering window between the candidate's
+batchUpsert and the flush the self triggers. The next instrument is a
+per-candidate intersect dump at the traced id's pass (the two raw
+candidates with BOTH their mirror boxes and live boxes — one run names
+which member was stale and by how much).
+
+State: main @ 6a6ea6d + 1324533. All instruments stream (PH/PD/PTRACE+nc/
+TLO/TL/KPH(nc,maxec,raw,rows,hn,n)/KPX(reason,raw,rows)/KPD/PQ). The
+items scenario is GREEN in every run since R-B. The mob/mixed/spread
+seeds are one family: the cap-parity fix (178d287) is correct and
+landed; the remaining candidate-box freshness gap is the single open
+question, with its decisive instrument specified above.
