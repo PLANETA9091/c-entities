@@ -210,7 +210,20 @@ jobs:
           [ "$GS_LIVE" = "1" ] || fail "goal pipeline dead (neither the gs bridge nor the AI floor requests moved)"
           echo "$LAST_HOOKS" | grep -Eq "froz=[0-9]+/[1-9]"      || fail "frozen gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "conv=[0-9]+/[1-9]"      || fail "conv gate never served a provable no-op"
-          echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        || fail "tracker-tick gate never served a provable no-op"
+          # L15c moonrise$tick per-TE gate: with the L30 loop fusing the
+          # no-tracking case at the LOOP level (ttlc=hits>0), the fused
+          # entities never reach moonrise$tick — the per-TE gate only sees
+          # the declines (the fuse's ttlDecl= sites) whose chunks are
+          # LOADED (chunk != null — the guard's own first condition), so
+          # the gate's no-op is a boot-window corner, not a steady-state
+          # proof. The no-op proof is EITHER the per-TE gate (tt=calls/
+          # gates>0) OR the L30/L63 loop cache (ttlc=hits/fills with
+          # hits>0) — the loop is the mechanism that actually serves the
+          # no-ops in a no-player world.
+          TT_LIVE=0
+          echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        && TT_LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "ttlc=[0-9]+/[1-9]"      && TT_LIVE=1
+          [ "$TT_LIVE" = "1" ] || fail "tracker-tick gate never served a provable no-op"
           # L36 liveness: at least ONE of the three idle-control guards
           # (nav/move/look) must have served a proven no-op for the soaked
           # zombies (fields: navCalls/navIdleHits/moveCalls/moveIdleHits/

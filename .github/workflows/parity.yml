@@ -109,6 +109,12 @@ jobs:
           if [ "$([ "${{ inputs.ai_floor }}" = "0" ] && echo 0 || echo 1)" = "0" ]; then
             BISECT_JVM="$BISECT_JVM -Dcentities.aiFloor=false"
           fi
+          # L64b: the ai_floor input was DEAD — run-baseline.sh (which the
+          # parity legs exec) passes -Dcentities.aiFloor=false on its OWN
+          # unless the CE_AI_FLOOR env is 1, so exporting only the JVM-flag
+          # absence never armed the L15 floor (run 41467393454: input=1,
+          # gs=0 everywhere, GoalChecks=0). Export the env the script reads.
+          echo "CE_AI_FLOOR=$([ "${{ inputs.ai_floor }}" = "0" ] && echo 0 || echo 1)" >> "$GITHUB_ENV"
           EJ="${{ inputs.extra_jvm || '' }}"
           echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5$BISECT_JVM $EJ" >> "$GITHUB_ENV"
           # env-knobs read natively (Rust precompute / CeHooks statics)
