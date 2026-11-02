@@ -348,3 +348,73 @@ bucket (caller 5.89 + callee 5.7 on items) must be removed by NOT
 calling it: the item tick floor's move writeback should land the delta
 straight into the mirror fields (the L44 view contract), with the
 vanilla call kept only on the declined/vanilla-routed population.
+
+## The L63 verdicts (2026-11-02, run 41466481613 on 08d3af8)
+
+**L63a + L63b are 12/12 PASS bit-identical.** The two items-module
+floors landed together:
+
+- **L63b — the TTL shape cache** (newTrackerTick$ 13.97% items): the
+  ttl fuse covered ~100% of the bench population (ttl=7374/85.38M/
+  85.38M) — the residual cost IS the per-entity probe chain re-verifying
+  verdicts that cannot change without a player. The cache stores the
+  TrackedEntity identity + the structural verdicts per mirror slot;
+  the per-pass `ChunkMap.level.players().isEmpty()` read (ONE per pass)
+  proves the seenBy/trackedPlayers/nearby-players lists cannot gain
+  entries, `hardColliding` is ctor-fixed, and the per-tick volatile
+  inputs (syncVelocity, syncPosition, trackedSteps emptiness for SIT)
+  stay per-entity reads. The telemetry: ttlc=9,423,970/20,000/0 —
+  20k fills, then ~100% hits, zero player-blocked passes.
+- **L63a — the flush delta direct write** (setDeltaMovement 3.93%
+  items): javap 26.3 — the whole vanilla body is the isFinite gate +
+  the posLock-guarded store (NO flag writes; markHurt owns syncVelocity).
+  The woven chain for a dispatch-owned item added three dead frames
+  (the deltaNoOp guard the ds=0 verdict says never fires, the probeDelta
+  capture dead for items, the virtual dispatch). putObjectVolatile is
+  stronger than the uncontended monitor-guarded store; the fresh Vec3
+  preserves the per-write identity.
+
+The L63b-era profile reading for the next items moves: the walk's
+floor is now (te read + identity compare + per-tick bytes + tickCount
+write) — the next structural cut is the tracker MIRROR (the tickCount
+in the mirror array, the se writeback only on the player-arrival
+epoch) and the itemTickFlush pass-2 loop remains the biggest single
+Java block.
+
+## L64a — the L29 direct-read layer was silently dead (2026-11-02)
+
+The 2c92b3a baseline telemetry: `froz=15.59M/15.58M/0 fd=0 cd=0` —
+the L25/L29 direct entityData walk caught ZERO across all three gates;
+the chain layer (getTicksFrozen() = a virtual call + the boxed get)
+served 100% of 15.6M calls/tick — the 2.01% setTicksFrozen$ self-time.
+
+**Root structure**: EDV_OK was a SHARED boolean requiring BOTH
+IDX_FROZEN (initFrozenHandles' timeline) and IDX_FLAGS (initFlagHandles'
+timeline — FLAGS_ID may not be captured yet) plus the O_ED trio; one
+missed precondition at either init moment killed the whole direct layer
+with NO telemetry (the edv probe writes lastErrorText, but the line
+prints it only when lastError > 0). L64a (764dcd0): per-layer indices,
+per-call validity in entityDataValueIdx, `edvskip:<reason>` telemetry on
+every capture skip, initFlagHandles runs the idempotent initDataOffsets
+itself, and the indices keep the L28d record verdict (the accessor id()
+METHOD — EntityDataAccessor is a record; Unsafe refuses its fields, so
+O_ACC_ID can never resolve).
+
+Reading rules: lastErr= empty or `edvskip:<reason>` names the layer
+state; fd/cd must move off zero with frozenGate unchanged; a red parity
+gate pins L64a (the frozenGate/convGate/flagGate knobs bisect in one
+run).
+
+## The L15 re-test (2026-11-02, run 41467393454, ai_floor=1 on 08d3af8)
+
+The R-A root (the L15 GoalSelector floor desyncing the RNG at t=143-145)
+predates the L25/L26 v2 floor — the bisect verdict (40773723794) was
+taken when the floor had the STAGED-request protocol. The v2 floor
+replaced staging with the shadow walk whose predicate call sequence
+matches the vanilla set walk structurally (cleanup over the running
+shadow in set order, update over the full set, the same short-circuit
+order) — but it was never re-bisected. This run re-arms it on the
+current tree (gs= must move off zero on the mobs leg; the gate must
+stay 12/12 PASS). GREEN → re-ship (-Dcentities.aiFloor=false stops
+being passed) and the GoalSelector cluster (~8% mobs) floors; RED →
+the PH_DUMP bisect with ai_floor=1 isolates the tick.
