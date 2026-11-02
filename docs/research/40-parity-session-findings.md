@@ -1257,3 +1257,45 @@ items scenario is GREEN in every run since R-B. The mob/mixed/spread
 seeds are one family: the cap-parity fix (178d287) is correct and
 landed; the remaining candidate-box freshness gap is the single open
 question, with its decisive instrument specified above.
+
+### Addendum 18e — the decisive instrument LANDED: the KPI per-candidate intersect dump
+
+The addendum-18d instrument is implemented (this commit):
+
+- **Rust (pushcore)**: `push_tick` takes a `diag: bool` (set ONLY for the
+  traced id's pass at a PD tick — the hot path is untouched). With diag on,
+  EVERY raw candidate across BOTH passes (detect=pass tag 0, apply=1) is
+  recorded into `out.diag` as `(pass<<4 | stage, id, mirror box6)`:
+  stage 1=flags-drop, 2=exact-f64 intersect-fail, 3=cap-break,
+  4=same-vehicle gate, 5=nophys gate, 6=players gate, 7=eps-crammed route,
+  8=served pair, 9=no-mirror-slot (index-only id). `out.diag_sb` = the
+  SELF's mirror box at scan time. Capped at 128 records/pass-set.
+- **JNI (n_push)**: the `diag` param rides the dispatch; the records are
+  region-written into `PUSH_DIAG_IDS`/[J, `PUSH_DIAG_STAGES`/[J,
+  `PUSH_DIAG_MB`/[D (6 per record), `PUSH_DIAG_SB`/[D and `PUSH_DIAG_N`/I
+  (in-place writes on the static finals — the JIT-fold contract).
+- **Java (CeHooks)**: `nativePush` gains the diag int (descriptor
+  `(IIIIIIIIII)J`, registered + natives_parity updated). `pushDispatch`
+  sets `diagPass = phDumpTickNow() && TR_ID >= 0 && id == TR_ID` and calls
+  `printKpi` right after the kernel pass — the ARENA entities' live boxes
+  ARE the exact scan-moment values (the pass mutates only deltas/counter
+  mirrors). `KPI` header: the self's mirror box (sboxm) vs live box
+  (sboxv) + `dsb` (max component diff — the self publish should keep it at
+  exactly 0). `KPIc` per record: the candidate's MIRROR box (m=) vs its
+  LIVE box (v=) + `dm` (max component diff); v=null = the id is not in the
+  ARENA. All boxes print x0,y0,z0,x1,y1,z1 (component-wise comparable).
+- **Test**: `diag_records_cover_the_scan_stages` pins the contract — a
+  served pair (8), a 4e-7-gap margin-superset miss (2), a spectator
+  flags-drop (1) and an index-only id (9) all appear with the exact mirror
+  boxes, in both passes; the diag=off path stays empty.
+
+**The reading rule** (one run names the stale member): a stage-2 record
+whose `v=` box DOES intersect the self's live box while `m=` does not = the
+candidate's mirror was stale at the self's scan moment (the batch missed
+its probe event / the flush order window). `dm` prints the staleness
+magnitude. If every record's m==v and the drop persists, the SELF's
+sboxm/sboxv (dsb) or the flags/filter pipeline is the suspect instead.
+
+Dispatched: mobs, trace_id=78 (the pusher whose t=245 kernel pass dropped
+the candidate vanilla kept: raw=2 hn=0 while PQ named 916), ph_dump
+window 240-252 — the nc-divergence onset, upstream of the t=275 PH seed.

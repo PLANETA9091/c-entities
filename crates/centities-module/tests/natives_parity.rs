@@ -23,7 +23,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // L37: + the vanilla-order keys (sy, seq int arrays per entry)
     s.insert(("nativeFlush", "(I[J[D[I[D[D[I[I[II[J[D)V"));
     // L50: + realNcol — the REAL numCollisions field the cap replay reads
-    s.insert(("nativePush", "(IIIIIIIII)J"));
+    // ADDENDUM-18e: + diag — the KPI per-candidate intersect dump flag
+    s.insert(("nativePush", "(IIIIIIIIII)J"));
     s.insert(("nativePushNcol", "(II)I"));
     // L53-diag: the marginExtra sample's Rust side — the INDEX box of
     // (world, id) into a double[6] (CE_FQ_IBOX=1; read-only, never creates

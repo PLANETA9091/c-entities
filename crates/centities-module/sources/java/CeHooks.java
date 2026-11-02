@@ -3018,7 +3018,8 @@ public final class CeHooks {
      *  and the cap replay under-counted — the extra-push family). */
     public static native long nativePush(
             int wid, int selfId, int selfVehicle, int selfPlayer,
-            int onlyPlayers, int maxEC, int cramming, int curTick, int realNcol);
+            int onlyPlayers, int maxEC, int cramming, int curTick, int realNcol,
+            int diag);
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
@@ -3226,6 +3227,22 @@ public final class CeHooks {
      *  pass served the pair). The apply loop now counts EVERY hit. */
     public static final long[] PUSH_HIT_IDS = new long[PUSH_PAIR_CAP];
     public static int PUSH_HIT_N = 0;
+    /** ADDENDUM-18e: the per-candidate intersect diag at the traced id's
+     *  pass (the KPI instrument — the decisive one per doc-40 addendum 18d).
+     *  For EVERY raw candidate the kernel saw, the KPI line pairs the MIRROR
+     *  box the exact-f64 intersect compared (PUSH_DIAG_MB) with the
+     *  candidate's LIVE box (the ARENA entity's getBoundingBox() at the
+     *  apply moment) — the diff names the stale member and the magnitude.
+     *  Stage codes (low nibble): 1=flags-drop, 2=intersect-fail, 3=cap-break,
+     *  4=same-vehicle gate, 5=nophys gate, 6=players gate, 7=eps-crammed
+     *  route, 8=served pair, 9=no-mirror-slot. Bit 4: 0=detect pass,
+     *  1=apply pass. PUSH_DIAG_SB = the SELF's mirror box at scan time. */
+    public static final int PUSH_DIAG_CAP = 128;
+    public static final long[] PUSH_DIAG_IDS = new long[PUSH_DIAG_CAP];
+    public static final long[] PUSH_DIAG_STAGES = new long[PUSH_DIAG_CAP];
+    public static final double[] PUSH_DIAG_MB = new double[PUSH_DIAG_CAP * 6];
+    public static final double[] PUSH_DIAG_SB = new double[6];
+    public static int PUSH_DIAG_N = 0;
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
             pushCramming = 0, pushSelfDelta = 0, pushPairs = 0, pushPairMiss = 0;
@@ -3399,10 +3416,17 @@ public final class CeHooks {
             // vanilla pass verdict (the same field, same moment) can be
             // compared without a re-run.
             final int realNcol = O_NCOL >= 0 && U != null ? U.getInt(le, O_NCOL) : 0;
+            // ADDENDUM-18e: the KPI diag rides ONLY the traced id's pass at
+            // a PD tick (one branch off the hot path otherwise).
+            final boolean diagPass =
+                    phDumpTickNow() && TR_ID >= 0 && le.getId() == TR_ID;
             long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
                     PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
                     PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK,
-                    realNcol);
+                    realNcol, diagPass ? 1 : 0);
+            if (diagPass) {
+                printKpi(le);
+            }
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.
@@ -3577,6 +3601,90 @@ public final class CeHooks {
             t.printStackTrace();
             ACTIVE = false;
             return false;
+        }
+    }
+
+    /** ADDENDUM-18e: the KPI instrument — the decisive one per doc-40
+     *  addendum 18d. Printed right after the traced id's kernel pass (the
+     *  ARENA entities' live boxes ARE the exact scan-moment values: the
+     *  walk is sequential on the server thread and the pass mutates only
+     *  deltas/counter mirrors, not boxes). Each record pairs the
+     *  candidate's MIRROR box (what the exact-f64 intersect compared) with
+     *  its LIVE box — the diff names the stale member and the magnitude; a
+     *  stage-2 (intersect-fail) record whose live box DOES overlap the
+     *  self's live box is the missed candidate. dsb = the self's
+     *  mirror-vs-live max component diff (the self publish should keep it
+     *  at exactly 0). All boxes print as x0,y0,z0,x1,y1,z1 (the mirror
+     *  layout, component-wise comparable). */
+    private static void printKpi(Entity le) {
+        AABB sv = le.getBoundingBox();
+        StringBuilder pb = new StringBuilder(160);
+        pb.append("[ce-baseline] KPI t=").append(CUR_TICK)
+                .append(" self=").append(le.getId())
+                .append(" tc=").append(le.tickCount)
+                .append(" sboxm=[").append(box6Str(PUSH_DIAG_SB))
+                .append("] sboxv=[").append(box6Str(sv)).append(']');
+        double dsb = 0.0;
+        for (int k = 0; k < 6; k++) {
+            double d = Math.abs(PUSH_DIAG_SB[k] - aabbComp(sv, k));
+            if (d > dsb) dsb = d;
+        }
+        pb.append(" dsb=").append(dsb)
+                .append(" n=").append(PUSH_DIAG_N);
+        System.out.println(pb);
+        for (int i = 0; i < PUSH_DIAG_N; i++) {
+            long cid = PUSH_DIAG_IDS[i];
+            int stg = (int) PUSH_DIAG_STAGES[i];
+            Entity ce = ARENA[(int) (cid & AMASK)];
+            boolean live = ce != null && ce.getId() == (int) (cid & 0xFFFF_FFFFL);
+            StringBuilder rb = new StringBuilder(256);
+            rb.append("[ce-baseline] KPIc t=").append(CUR_TICK)
+                    .append(" self=").append(le.getId())
+                    .append(" cand=").append(cid)
+                    .append(" p=").append(stg >> 4)
+                    .append(" st=").append(stg & 0xF)
+                    .append(" m=[");
+            for (int k = 0; k < 6; k++) {
+                if (k > 0) rb.append(',');
+                rb.append(PUSH_DIAG_MB[i * 6 + k]);
+            }
+            rb.append(']');
+            if (live) {
+                AABB lv = ce.getBoundingBox();
+                rb.append(" v=[").append(box6Str(lv)).append(']');
+                double dm = 0.0;
+                for (int k = 0; k < 6; k++) {
+                    double d = Math.abs(PUSH_DIAG_MB[i * 6 + k] - aabbComp(lv, k));
+                    if (d > dm) dm = d;
+                }
+                rb.append(" dm=").append(dm);
+            } else {
+                rb.append(" v=null");
+            }
+            System.out.println(rb);
+        }
+    }
+
+    /** The box6 order (x0,y0,z0,x1,y1,z1) of an AABB — component-wise
+     *  comparable with the mirror arrays. */
+    private static String box6Str(AABB b) {
+        return b.minX + "," + b.minY + "," + b.minZ + ","
+                + b.maxX + "," + b.maxY + "," + b.maxZ;
+    }
+
+    private static String box6Str(double[] b6) {
+        return b6[0] + "," + b6[1] + "," + b6[2] + ","
+                + b6[3] + "," + b6[4] + "," + b6[5];
+    }
+
+    private static double aabbComp(AABB b, int k) {
+        switch (k) {
+            case 0: return b.minX;
+            case 1: return b.minY;
+            case 2: return b.minZ;
+            case 3: return b.maxX;
+            case 4: return b.maxY;
+            default: return b.maxZ;
         }
     }
 

@@ -3200,11 +3200,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativePush",
-        "(IIIIIIIII)J",
+        "(IIIIIIIIII)J",
         n_push
             as extern "system" fn(
                 *mut jni::JNIEnv,
                 jni::jclass,
+                i32,
                 i32,
                 i32,
                 i32,
@@ -4226,6 +4227,7 @@ pub extern "system" fn n_push(
     cramming: i32,
     cur_tick: i32,
     real_ncol: i32,
+    diag: i32,
 ) -> i64 {
     let res = with_state(|st| {
         drain_direct(st);
@@ -4240,6 +4242,7 @@ pub extern "system" fn n_push(
                     o.raw = 0;
                     o.drows = 0;
                     o.reason = 4;
+                    o.diag.clear(); // the KPI reader must see no stale records
                 });
                 return (4i64) << 54;
             }
@@ -4261,6 +4264,7 @@ pub extern "system" fn n_push(
                 pushcore::GATE_MIN,
                 cur_tick as u64,
                 real_ncol,
+                diag != 0,
                 &mut o,
             );
             if o.ok {
@@ -4281,13 +4285,92 @@ pub extern "system" fn n_push(
     // served and the declined passes (the Java KPX/KPH lines read them).
     PUSH_OUT.with(|o| {
         let o = o.borrow();
+        let (raw, drows, n_diag, sb, diag_ids, diag_stages, diag_boxes) = (
+            o.raw as i32,
+            o.drows as i32,
+            if diag != 0 { o.diag.len() as i32 } else { 0 },
+            o.diag_sb,
+            if diag != 0 {
+                o.diag.iter().map(|d| d.1).collect::<Vec<i64>>()
+            } else {
+                Vec::new()
+            },
+            if diag != 0 {
+                o.diag.iter().map(|d| d.0 as i64).collect::<Vec<i64>>()
+            } else {
+                Vec::new()
+            },
+            if diag != 0 {
+                o.diag
+                    .iter()
+                    .flat_map(|d| d.2.iter().copied())
+                    .collect::<Vec<f64>>()
+            } else {
+                Vec::new()
+            },
+        );
         unsafe {
             let e = JniEnv::from_raw(env);
-            let raw = e.raw();
-            let vt = *raw;
-            for (name, v) in [("PUSH_RAW", o.raw as i32), ("PUSH_DROWS", o.drows as i32)] {
+            let raw_env = e.raw();
+            let vt = *raw_env;
+            for (name, v) in [("PUSH_RAW", raw), ("PUSH_DROWS", drows), ("PUSH_DIAG_N", n_diag)] {
                 if let Some(fid) = e.get_static_field_id(cls, name, "I") {
-                    ((*vt).SetStaticIntField)(raw, cls, fid, v);
+                    ((*vt).SetStaticIntField)(raw_env, cls, fid, v);
+                }
+            }
+            if diag != 0 {
+                // ADDENDUM-18e: the per-candidate intersect diag — the self's
+                // mirror box + (id, stage, mirror box6) per raw candidate.
+                // In-place region writes (the static-final JIT-fold pattern).
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_SB", "[D") {
+                    let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw_env,
+                            arr as jni::jdoubleArray,
+                            0,
+                            6,
+                            sb.as_ptr(),
+                        );
+                    }
+                }
+                if n_diag > 0 {
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_IDS", "[J") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetLongArrayRegion)(
+                                raw_env,
+                                arr as jni::jlongArray,
+                                0,
+                                n_diag,
+                                diag_ids.as_ptr(),
+                            );
+                        }
+                    }
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_STAGES", "[J") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetLongArrayRegion)(
+                                raw_env,
+                                arr as jni::jlongArray,
+                                0,
+                                n_diag,
+                                diag_stages.as_ptr(),
+                            );
+                        }
+                    }
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_MB", "[D") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetDoubleArrayRegion)(
+                                raw_env,
+                                arr as jni::jdoubleArray,
+                                0,
+                                diag_boxes.len() as i32,
+                                diag_boxes.as_ptr(),
+                            );
+                        }
+                    }
                 }
             }
             if e.exception_check() {

@@ -288,12 +288,15 @@ pub fn push_tick(
     gate_min: usize,
     tick: u64,
     real_ncol: i32,
+    diag: bool,
     out: &mut PushOut,
 ) {
     out.ok = false;
     out.cramming = false;
     out.non_passengers = 0;
     out.ncol = 0;
+    out.diag.clear();
+    out.diag_sb = [0.0; 6];
     out.ddx = 0.0;
     out.ddy = 0.0;
     out.ddz = 0.0;
@@ -314,6 +317,10 @@ pub fn push_tick(
     let spz = pc.pz[self_slot];
     let self_pushable = pc.flags[self_slot] & PF_PUSHABLE != 0;
     let self_nophys = pc.flags[self_slot] & PF_NOPHYSICS != 0;
+    if diag {
+        out.diag_sb
+            .copy_from_slice(&pc.box6[sc..sc + 6]);
+    }
 
     // Density gate FIRST (before any scanning work): sum the covered
     // cells' pushable-row populations; sparse worlds route vanilla.
@@ -394,6 +401,9 @@ pub fn push_tick(
     let mut base_dz = pc.dz[self_slot];
 
     for detect in [true, false] {
+    // ADDENDUM-18e: the diag pass tag (0=detect, 1=apply) rides bit 4 of
+    // every stage code this pass emits.
+    let dtag: u8 = if detect { 0 } else { 16 };
     // per-pass reset: the detection pass's replay must not leak into the
     // apply pass (pc.dx[self] stays unmutated until the tail write, so it
     // is the correct base for both passes)
@@ -435,10 +445,19 @@ pub fn push_tick(
                     continue;
                 }
                 let Some(hs) = pc.slot_of(id) else {
+                    if diag && out.diag.len() < 128 {
+                        out.diag.push((dtag | 9, id, [0.0; 6]));
+                    }
                     continue;
                 };
                 let fl = pc.flags[hs];
                 if fl & PF_PUSHABLE == 0 || fl & PF_SPECTATOR != 0 || fl & PF_NOPHYSICS != 0 {
+                    if diag && out.diag.len() < 128 {
+                        let o = hs * 6;
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 1, id, mb));
+                    }
                     continue;
                 }
                 let o = hs * 6;
@@ -450,6 +469,11 @@ pub fn push_tick(
                     && pc.box6[o + 2] < sz1
                     && pc.box6[o + 5] > sz0)
                 {
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 2, id, mb));
+                    }
                     continue;
                 }
                 hits_count += 1;
@@ -460,6 +484,11 @@ pub fn push_tick(
                 // numCollisions cap (vanilla `return`s the whole body)
                 if ncol_self >= max_ec {
                     // keep counting hits for the cramming audit, skip the rest
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 3, id, mb));
+                    }
                     continue;
                 }
                 // ---- vanilla loop body: numCollisions bookkeeping happens
@@ -485,15 +514,35 @@ pub fn push_tick(
                 ncol_self += 1;
                 // Entity.push pair gates (all live INSIDE push, after ncol++)
                 if is_pass && pc.vid[hs] == self_id {
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 4, id, mb));
+                    }
                     continue; // isPassengerOfSameVehicle
                 }
                 if self_nophys || fl & PF_NOPHYSICS != 0 {
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 5, id, mb));
+                    }
                     continue;
                 }
                 if only_players_collide && !self_player && fl & PF_PLAYER == 0 {
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 6, id, mb));
+                    }
                     continue;
                 }
                 if fl & PF_PLAYER != 0 && !player_collisions {
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 6, id, mb));
+                    }
                     continue;
                 }
                 // ---- Entity.push force math (exact constants) ----
@@ -510,6 +559,11 @@ pub fn push_tick(
                     if detect {
                         out.reason = 2;
                         return; // ok stays false, mirrors untouched
+                    }
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 7, id, mb));
                     }
                     continue;
                 }
@@ -542,6 +596,11 @@ pub fn push_tick(
                 // declined (the first-move divergence, doc 40 addendum 5).
                 if !detect && fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
                     out.pairs.push((id, dx, dz));
+                }
+                if diag && out.diag.len() < 128 {
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[o..o + 6]);
+                    out.diag.push((dtag | 8, id, mb));
                 }
             }
         }
@@ -594,6 +653,19 @@ pub struct PushOut {
     pub cramming: bool,
     pub non_passengers: i32,
     pub ncol: i32,
+    /// ADDENDUM-18e: per-candidate intersect diag — (pass, stage, id, mirror
+    /// box6) for EVERY raw candidate at the traced id's pass (filled only
+    /// when the `diag` param is set; the Java KPI line pairs each mirror box
+    /// with the candidate's LIVE box to name the stale member and the
+    /// magnitude). Stage codes: 1=flags-drop, 2=intersect-fail, 3=cap-break,
+    /// 4=same-vehicle gate, 5=nophys gate, 6=players gate, 7=eps-crammed
+    /// route, 8=served pair, 9=no-mirror-slot. Pass: 0=detect, 1=apply
+    /// (the low nibble carries the stage, bit 4 the pass tag).
+    pub diag: Vec<(u8, i64, [f64; 6])>,
+    /// ADDENDUM-18e: the SELF's mirror box at scan time (the KPI header
+    /// pairs it with the self's live box — the self publish (1324533)
+    /// should keep them equal; verifying costs nothing).
+    pub diag_sb: [f64; 6],
     /// full post-tick delta (for the Java writeback)
     pub dx: f64,
     pub dy: f64,
@@ -672,7 +744,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert!(out.ok);
         let want = sq * 0.05000000074505806;
@@ -711,7 +783,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert!(!out.ok, "a crammed pair routes the whole tick vanilla");
         assert_eq!(out.ncol, 0, "no kernel bookkeeping on the routed tick");
@@ -738,7 +810,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.non_passengers, 5, "all hits audited despite the cap");
         assert_eq!(out.ncol, 2, "the cap stops pair processing at maxEC");
@@ -764,7 +836,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.non_passengers, 30);
         assert!(out.cramming);
@@ -794,7 +866,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
@@ -819,7 +891,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.non_passengers, 0);
         assert_eq!(out.ncol, 0);
@@ -845,7 +917,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
@@ -871,7 +943,7 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(out.pairs.len(), 1, "one emitted pair");
@@ -899,7 +971,7 @@ mod tests {
         // gate_min=96 with 2 rows -> decline, NO state changes
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, rn, false, &mut out,
         );
         assert!(!out.ok, "sparse world must route vanilla");
         assert_eq!(out.ncol, 0);
@@ -908,7 +980,7 @@ mod tests {
         // gate_min=0 -> the tick runs
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert!(out.ok);
         assert_eq!(out.ncol, 1);
@@ -939,10 +1011,76 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
         );
         assert_eq!(out.ddy, 0.0);
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(pc.dy[s2], -0.08);
+    }
+
+    /// ADDENDUM-18e: the KPI instrument's Rust contract — with `diag` set,
+    /// the pass emits a record per raw candidate across BOTH passes, each
+    /// tagged with the stage and the exact mirror box the intersect
+    /// compared; diag_sb carries the self's mirror box; with `diag` off the
+    /// records stay empty (the hot path is untouched).
+    #[test]
+    fn diag_records_cover_the_scan_stages() {
+        let mut pidx = idx_with(2, 0.5, 0.0);
+        let mut pc = core_with(1, 0.0, 0.0);
+        // 2 = served pair (boxes overlap, dx=0.5 >= eps)
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        // 3 = intersect-fail: its x0 sits 4e-7 beyond the exact self box
+        // (gap 4e-7) but inside the 1e-3 query margin (the f32 superset)
+        let b3 = zbox(0.6 + 4e-7, 0.0);
+        pidx.upsert(3, 0, &b3);
+        pc.upsert(3, 0, &b3, 0.6 + 4e-7, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        // 4 = flags-drop (spectator)
+        let b4 = zbox(0.5, 0.0);
+        pidx.upsert(4, 0, &b4);
+        pc.upsert(4, 0, &b4, 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE | PF_SPECTATOR, 0, 0, 0);
+        // 9 = index-only id (never upserted into the push mirror)
+        pidx.upsert(9, 0, &zbox(0.5, 0.0));
+        let mut out = PushOut::default();
+        let s1 = pc.slot_of(1).unwrap();
+        let rn = pc.ncol[s1];
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, true,
+            &mut out,
+        );
+        assert!(out.ok);
+        let sc = s1 * 6;
+        assert_eq!(out.diag_sb, pc.box6[sc..sc + 6], "diag_sb = the self's mirror box6");
+        let (mut served, mut ifail, mut fdrop, mut noslot) = (false, false, false, false);
+        for &(stage, id, ref mb) in out.diag.iter() {
+            assert!(stage >> 4 <= 1, "pass tag only");
+            let st = stage & 0xF;
+            match (id, st) {
+                (2, 8) => {
+                    served = true;
+                    let o = pc.slot_of(2).unwrap() * 6;
+                    assert_eq!(*mb, pc.box6[o..o + 6], "the recorded mirror box is exact");
+                }
+                (3, 2) => ifail = true,
+                (4, 1) => fdrop = true,
+                (9, 9) => noslot = true,
+                _ => {}
+            }
+        }
+        assert!(served, "the served pair must be recorded (stage 8)");
+        assert!(
+            ifail,
+            "the margin-superset miss must be recorded (stage 2); diag={:?}",
+            out.diag
+        );
+        assert!(fdrop, "the spectator must be recorded (stage 1)");
+        assert!(noslot, "the index-only id must be recorded (stage 9)");
+        // the diag=off path stays empty
+        let mut out2 = PushOut::default();
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out2,
+        );
+        assert!(out2.diag.is_empty());
+        assert_eq!(out2.diag_sb, [0.0; 6]);
     }
 }
