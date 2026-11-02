@@ -1540,3 +1540,42 @@ census names the DELTA_SAME miss rate — dwrite ~ item count per tick
 means the resting fixed point misses widely and the L16 gate needs
 re-derivation; (c) ench=/equip= gate rates ~100% on the bench legs;
 a red parity gate pins L62 first (the knobs bisect in one run).
+
+## Addendum 22 — the L62a lesson: a replay into the woven static recurses (2026-11-02)
+
+The first cut of the ench floor ReplaceBody'd `EnchantmentHelper.tickEffects`
+and replayed vanilla from the bridge via a direct
+`EnchantmentHelper.tickEffects(level, e)` call — **which IS the woven
+body**. The bridge re-entered itself and recursed until
+StackOverflowError on every gate miss.
+
+The parity fill makes the trap deterministic: every bench zombie wears
+an UNBREAKING-255 iron helmet (never an all-empty gate), so the first
+post-arming tick SOE'd the whole population and Paper's per-entity
+tick handler removed every thrower. The mobs-ON leg emptied in ONE
+tick (PH n=562 at t=183 -> n=0 at t=184, rm=2505 == add=2505), the
+mixed/spread legs lost their zombies and shifted every downstream id
+(1884 type mismatches, only-off 2284), and the items legs stayed
+bit-identical 3/3 — no LivingEntity, no tickEffects call.
+
+**The invariant**: a ReplaceBody bridge must NEVER reach vanilla by
+calling the woven method. The decline path is one of:
+  1. an EARLY-RETURN PREFIX — the vanilla body stays intact behind the
+     check in the same method (the L14/L15/L33 shape; the L62a fix
+     weaves `enchGate$(ServerLevel,LivingEntity)Z` as op-5 guard2 —
+     static locals 0+1 are its two parameters), or
+  2. a replay through methods that are NOT woven (the equip floor's
+     protected reflection trio — collectEquipmentChanges/
+     handleHandSwap/handleEquipmentChanges are untouched bodies).
+
+**The fix run (41449061017, 46e2f3a)**: 12/12 PASS bit-identical;
+mobs-ON n=2509 stable; the counters behave — mobs leg
+`ench=575500/2745/1` (helmeted zombies correctly bypass the gate),
+items/mixed `ench=908780/633741/1` (69.7% of the walk skipped),
+`equip=931358/633741/297617/1` — the reflection-trio replay survived
+297,617 bit-exact rounds. The e2e and module workflows are green on
+the same commit; the L59-L62 era stands.
+
+Rule for every future floor: the exact-vanilla decline path must be
+able to run the ORIGINAL bytecode. If the only vanilla entry point is
+the method you replaced, the floor design is wrong before it ships.
