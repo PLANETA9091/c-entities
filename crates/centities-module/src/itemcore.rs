@@ -431,6 +431,13 @@ const B_DELTA_SAME: i32 = 1 << 14;
 /// (probes, section changes, the 256-tick belt) clear the rest mode; the
 /// next full native tick re-proves it.
 const B_REST_CAND: i32 = 1 << 15;
+/// L78 TAIL_NONE: the Java applier's ENTIRE post-counter tail is a provable
+/// no-op for this entry (DELTA_SAME + no event bits + the out-fd/pd/onGround
+/// equal their pre-states; for inactive entries — no DESPAWN/VOID/LAND + the
+/// out-pd equals the pre-pd). The applier skips straight to the next entry
+/// after the counters — the skipped compares are exactly the ones the tails
+/// would skip themselves.
+const B_TAIL_NONE: i32 = 1 << 16;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -1052,6 +1059,15 @@ unsafe fn n_item_tick_impl(
                                     entry.age = oi[k * 4];
                                     entry.pickup_delay = oi[k * 4 + 1];
                                     entry.tick_count = oi[k * 4 + 3];
+                                    // L78 TAIL_NONE: the pre-fd/ong must be read
+                                    // BEFORE the overwrite below — they are the
+                                    // same pre-states the Java tails compare
+                                    // against (the store mirrors the entity at
+                                    // batch time; mid-batch mutation rides the
+                                    // removed/merge paths which never reach this
+                                    // commit).
+                                    let l78_pre_fd = entry.fall_dist;
+                                    let l78_pre_ong = entry.on_ground;
                                     entry.fall_dist = od[k * 8 + 6] as f32;
                                     // L55-diag: the commit-side witness for the
                                     // traced id — the outcome bit AND the entry's
@@ -1076,6 +1092,29 @@ unsafe fn n_item_tick_impl(
                                     if (f & F_NATIVE) == 0 {
                                         // collector-carried entries refresh despawnRate
                                         entry.despawn_rate = iv[k * 4 + 3];
+                                    }
+                                    // L78 TAIL_NONE — see the B_TAIL_NONE doc.
+                                    // The pre-fd/ong were captured above BEFORE
+                                    // the store overwrite (l78_pre_fd/ong).
+                                    let bits_now = oi[k * 4 + 2];
+                                    let inactive_k = (fv[k] & F_INACTIVE) != 0;
+                                    let out_pd = oi[k * 4 + 1];
+                                    let pre_pd = iv[k * 4 + 2];
+                                    let tail_none = if inactive_k {
+                                        (bits_now & (B_DESPAWN | B_VOID | B_LAND)) == 0
+                                            && out_pd == pre_pd
+                                    } else {
+                                        (bits_now & B_DELTA_SAME) != 0
+                                            && (bits_now
+                                                & (B_MOVED | B_IMPULSE | B_MERGE
+                                                    | B_DESPAWN | B_VOID | B_LAND))
+                                                == 0
+                                            && (od[k * 8 + 6] as f32) == l78_pre_fd
+                                            && out_pd == pre_pd
+                                            && ((bits_now & B_ON_GROUND) != 0) == l78_pre_ong
+                                    };
+                                    if tail_none {
+                                        oi[k * 4 + 2] = bits_now | B_TAIL_NONE;
                                     }
                                 }
                                 // state extremes (garbage-detector diagnostics)

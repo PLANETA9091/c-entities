@@ -977,7 +977,7 @@ public final class CeHooks {
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
-                + " item=" + itemChecks + "/" + itemNative + "/" + itemResync
+                + " item=" + itemChecks + "/" + itemNative + "/" + itemResync + "/tn" + itemTailNone
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
                 + " ds=" + dsame + "/" + dwrite
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
@@ -3211,7 +3211,7 @@ public final class CeHooks {
     public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
             itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0,
-            dsame = 0, dwrite = 0;
+            dsame = 0, dwrite = 0, itemTailNone = 0;
     // L60: the DELTA_SAME verdict census — dsame = the core said the post-tick
     // delta is identical to pre (the write skipped), dwrite = the flush wrote
     // a fresh Vec3. The items profile burns ~10% (caller 5.89 + callee 5.7)
@@ -5546,12 +5546,27 @@ public final class CeHooks {
                 if (e == null || e.isRemoved()) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
-                // skipped for dispatch-owned entries).
+                // skipped for dispatch-owned entries). L78: the age write
+                // joins the counters — it is unconditional in BOTH the
+                // inactive and the active tail, and it must precede the
+                // despawn check (e.age >= rate) — the tails' relative order
+                // is preserved (age before pd/fd/delta/pos/merge/despawn).
                 e.tickCount = outI[i * 4 + 3];
                 e.totalEntityAge = e.totalEntityAge + 1;
+                e.age = outI[i * 4];
+                // L78 TAIL_NONE: the core set bit 16 when the ENTIRE
+                // post-counter tail is a provable no-op for this entry —
+                // DELTA_SAME + not MOVED/IMPULSE/MERGE/DESPAWN-fireable/
+                // VOID/LAND + the out-fd/out-pd/out-onGround equal their
+                // pre-states (the store/batch carries them). The skipped
+                // compares are exactly the ones the tails would skip; the
+                // gate runs the full 12/12 over every scenario.
+                if ((bits & (1 << 16)) != 0) {
+                    itemTailNone++;
+                    continue;
+                }
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
-                    e.age = outI[i * 4];
                     int pd = outI[i * 4 + 1];
                     if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                         e.pickupDelay = pd;
@@ -5613,7 +5628,6 @@ public final class CeHooks {
                 } else {
                     dsame++;
                 }
-                e.age = outI[i * 4];
                 int pd = outI[i * 4 + 1];
                 if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                     e.pickupDelay = pd;
