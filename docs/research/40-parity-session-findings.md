@@ -1299,3 +1299,50 @@ sboxm/sboxv (dsb) or the flags/filter pipeline is the suspect instead.
 Dispatched: mobs, trace_id=78 (the pusher whose t=245 kernel pass dropped
 the candidate vanilla kept: raw=2 hn=0 while PQ named 916), ph_dump
 window 240-252 — the nc-divergence onset, upstream of the t=275 PH seed.
+
+### Addendum 18f — the KPI 18e run read: raw ACCUMULATES over both passes; the nc(78) family refined
+
+The first KPI run (41412729787, trace 78, window 240-252) — the reading
+rules and one retraction:
+
+- **RETRACTED: the "duplicated self"**. `out.raw += cell_hits.len()`
+  sits INSIDE the detect/apply pass loop — raw ACCUMULATES over BOTH
+  passes. A lone zombie's raw=2 = its own row × 2 passes, NOT a
+  duplicate row. The addendum-18c reading ("raw=2 pre-filter
+  candidates") was the same artifact. The pidx property test (this
+  commit, `pidx_no_duplicate_rows_and_no_false_negatives`: 4000-op
+  upsert/remove/sort/query storms × 4 seeds) confirms the index cannot
+  duplicate or lose rows under the kernel's op mix.
+- **dsb=0.0 on every traced pass** — the SELF's mirror box is always
+  fresh (the 1324533 self publish works; the self-box family stays
+  dead).
+- **The OFF nc(78) table in THIS run**: 0 flat to t=243, then +1 every
+  ODD tick (1@244, 2@245, 2@246, 3@247, ...). The ON leg's nc(78):
+  flat 1 through the window (module 705-771). The kernel NEVER emits a
+  hit for 78 in the window — 78 never appears as a raw row of ANY
+  kernel pass (its own passes: raw=2 = [78]×2; zero stage records).
+- **The phase geometry is now settled** (the 26.3 decomp):
+  LivingEntity.tick runs travel() FIRST, pushEntities() AFTER (the
+  "push" profiler section follows travel). So at 916's pushEntities
+  phase, 916's box is post-travel and 78's box is post-78-tick — the
+  SAME geometry the plugin-phase PQ witness prints (PQ n=1 [916] at
+  t=244-245, identical in both legs). Vanilla's 916-pass at that phase
+  hits 78 (nc(78)++ — the OFF table). The kernel's 916-pass at the
+  same phase returns raw=[916] only — **the kernel's scan misses the
+  candidate vanilla's identical-geometry pass keeps.**
+- The 78-pass itself seeing nothing at its own phase is CORRECT
+  (916 pre-travel does not overlap 78 yet at those ticks) — the
+  78-side KPI was never going to show the drop; the pair hit is born
+  in 916's pass.
+
+**The surviving locus (narrowed again)**: inside 916's kernel pass,
+candidate 78 either (a) never enters the raw rows — 78's pidx row sits
+in a cell the walk does not query (a stale HOME cell: 78 crossed the
+x=0 cell boundary mid-window, center −0.5 → +0.011) or its stored f32
+box is stale beyond QEPS — or (b) enters and dies at the exact-f64
+intersect with a mirror-vs-live divergence. The KPI-18f run (self rows
+recorded as stage 10, the walk range cx/cz/ex/world on the header)
+traces **916** — one run separates (a) from (b): a stage-2 record with
+m vs v names the stale member and the magnitude; 78's total absence
+from the raw rows while the walk covers its home cell names the index
+side.
