@@ -3193,6 +3193,12 @@ public final class CeHooks {
     // from the plugin's TL stream (the same raw array).
     private static final int TR_ID = parseTraceId(System.getenv("PARITY_TRACE_ID"));
 
+    // L76: the AI-engine protocol trace — armed with TR_ID (a per-tick
+    // staged-request witness for the traced mob, ON leg only; the OFF leg
+    // runs no engine). Streams AITR lines via the run-baseline whitelist
+    // (add the pattern there in the same commit).
+    private static final boolean AITR = TR_ID >= 0;
+
     private static int parseTraceId(String s) {
         if (s == null || s.isBlank()) return -1;
         try {
@@ -8643,6 +8649,17 @@ public final class CeHooks {
             int req = AI_OUT[1];
             lastReqOp = req;
             int gi = AI_OUT[2];
+            // L76 hunt: the per-round protocol witness for the traced mob —
+            // the (round, req-op, goal, cursor) sequence names the EXACT
+            // staged request at the first RNG-divergent tick (SR/LR first
+            // diverge at mobs t=143/145 with the engine armed; the PH hash
+            // covers only x/y/z+v so the state was still "identical")
+            if (AITR) {
+                System.out.println("[ce-baseline] AITR t=" + CUR_TICK
+                        + " id=" + entId(mob) + " r=" + round
+                        + " op=" + req + " gi=" + gi + " cur=" + cursor
+                        + " seed=" + Long.toHexString(seed));
+            }
             res = 1;
             rx = ry = rz = 0;
             boolean targetSel = ((cursor >> 9) & 1) == 0;
