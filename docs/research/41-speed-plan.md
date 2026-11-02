@@ -535,3 +535,48 @@ exact across join/leave.
    needed (removals between dispatch and flush ride probeRemove —
    verify batchRemove's IB handling first).
 4. The per-leg long tails — unchanged.
+
+## The L70 verdict + L71/L72 (2026-11-03)
+
+**L70 is parity-proven**: run 41509676180 (be17c27) — 12/12 PASS
+bit-identical with the mirror armed. The fresh baseline's items-100k-mod
+artifacts read: Unsafe.putInt GONE from the top-15 (was 9.79% #1);
+items-100k paired legs 69.18 vanilla vs 28.98 mod = **-58.1%** (was
+-55.4%). The cost MOVED, it did not vanish: the JFR parent analysis on
+the run's own rec.jfr (artifact, JDK jfr print + a 2-line attribution —
+no CI round-trip needed) pins 71% of the new #1 (Unsafe.getObject
+11.45%) to the per-tick te read in newTrackerTick$.
+
+- **L71 (5b56ed8) — the travel floor's input gate widens to
+  vertical-only.** mobTravelNative declined ANY nonzero travel input,
+  which made SHAPE C unreachable for every actively-steering mob (the
+  dominant walking population) and pinned the quiet-travel catch at 18%.
+  The steering math (getInputVector: the 1e-7 gate, the >1 normalize,
+  the f64 speed scale, the f32 Mth sin/cos yaw rotation) was ALREADY
+  coded in the SHAPE C delta step and pinned by mobtravel.rs; the hull
+  proof is swept-volume-generic. input.y stays declined (a positive dmY
+  extends the swept hull's TOP — the proof's box covers the falling
+  dmY only). SHAPE B now REQUIRES zero horizontal input: a mob steering
+  into a wall leaves the steering residue in the vanilla delta after
+  the collision, which the (0, -g*vf, 0) writeback would erase.
+- **L72 (f5156eb) — the tracker cache's identity key is TT_E[m] == ent.**
+  One array read replaces the per-tick te Unsafe hop on the ~100%-hit
+  cached path (probeRemove clears TT_E in the same unconditional block
+  as the other TT_ arrays; the te is 1:1 with (entity, world)). The te
+  read and the chunk read both move behind the cached-path check.
+
+### The frontier (2026-11-03, after L70/L71/L72)
+
+0. **The gate runs on f5156eb** (parity + baseline in flight) — the
+   verdicts quantify the steering widening (expect travelWalk to jump:
+   the walking population finally routes) and the identity swap.
+1. **The itemTickFlush pass-2 apply** (10.78% items at 5473 + the
+   field-write cluster) — the structural cut is the flush writeback
+   into Rust (the engine already computes everything; the Java loop is
+   a handful of field writes per entry). The L8.2 compact-batch shape
+   needs the writeback contract re-read first.
+2. **The guardEntityTick + appendDispatch chain** (~11% items) — the
+   L7 dispatcher's next step.
+3. **The AI engine RNG protocol** (~-19% mobs, doc 30 item 4) — the
+   big one, unchanged.
+4. The per-leg long tails — unchanged.
