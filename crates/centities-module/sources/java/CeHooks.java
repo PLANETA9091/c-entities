@@ -6959,31 +6959,39 @@ public final class CeHooks {
             if (VH_ENT_DATA.off >= 0) {
                 O_ED = VH_ENT_DATA.off;
             }
-            // L29: freeze the static accessor indices once the offsets are
-            // in. The reads below are the SAME capture pattern the flag
-            // gate uses for DATA_SHARED_FLAGS_ID (static-field Unsafe read
-            // — identity preserved), and each accessor is instanceof'd
-            // before its record component is read.
-            if (U != null && O_ED >= 0 && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0) {
+            // L64a: the static accessor indices resolve via the accessor's
+            // public id() METHOD (the L28d verdict: EntityDataAccessor is a
+            // RECORD — Unsafe refuses its fields, so O_ACC_ID can never
+            // resolve; id() is the exact read, JIT-inlined). Each layer now
+            // gates on ITS OWN index — the old shared EDV_OK needed BOTH
+            // indices (IDX_FLAGS lives in initFlagHandles' timeline), so one
+            // missed precondition silently killed every L29 direct read (the
+            // run telemetry: froz gate 15.5M, fd=0 — the chain served 100%).
+            // Every skip now records its reason into lastErrorText.
+            if (U == null) {
+                lastError = System.nanoTime();
+                lastErrorText = "edvskip: U==null";
+            } else if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
+                lastError = System.nanoTime();
+                lastErrorText = "edvskip: O_ED=" + O_ED + " ITEMS=" + O_ED_ITEMS
+                        + " DI=" + O_DI_VALUE;
+            } else {
                 try {
                     java.lang.reflect.Field ff = Entity.class
                             .getDeclaredField("DATA_TICKS_FROZEN");
                     ff.setAccessible(true);
                     Object fa = U.getObject(U.staticFieldBase(ff),
                             U.staticFieldOffset(ff));
-                    if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
-                        IDX_FROZEN = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
+                    if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor acc) {
+                        IDX_FROZEN = acc.id();
+                    } else {
+                        lastError = System.nanoTime();
+                        lastErrorText = "edvskip: frozen acc=" + fa;
                     }
                 } catch (Throwable frozenIdx) {
                     IDX_FROZEN = -1;
-                }
-                if (FLAGS_ID instanceof net.minecraft.network.syncher.EntityDataAccessor) {
-                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>) FLAGS_ID).id();
-                }
-                // FLAGS_ID is captured by initFlagHandles which may run
-                // after us; EDV_OK then flips in initFlagHandles too.
-                if (IDX_FROZEN >= 0 && IDX_FLAGS >= 0) {
-                    EDV_OK = true;
+                    lastError = System.nanoTime();
+                    lastErrorText = "edvskip: frozen idx " + frozenIdx;
                 }
             }
             FROZEN_HANDLES_OK = true;
@@ -7091,7 +7099,11 @@ public final class CeHooks {
      *  the value hop. Returns null on any structural doubt — the caller
      *  routes the vanilla chain exactly as with entityDataValue. */
     private static Object entityDataValueIdx(Entity e, int idx) {
-        if (!EDV_OK) {
+        // L64a: per-call validity — the caller's own index plus the three
+        // data-array offsets. The shared EDV_OK (which also required the
+        // FLAGS timeline) is no longer a precondition; a negative idx or
+        // offset routes the vanilla chain below.
+        if (idx < 0 || O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
             return null;
         }
         try {
@@ -7137,6 +7149,10 @@ public final class CeHooks {
             if (VH_ENT_DATA == null) {
                 VH_ENT_DATA = new RefField(Entity.class, "entityData");
             }
+            // L64a: the accessor-id offset must exist before the index read
+            // below — initFlagHandles may run before any other initDataOffsets
+            // caller (idempotent, the L27-proven shape).
+            initDataOffsets();
             if (U != null) {
                 java.lang.reflect.Field f =
                         Entity.class.getDeclaredField("DATA_SHARED_FLAGS_ID");
@@ -7145,17 +7161,14 @@ public final class CeHooks {
             }
             if (FLAGS_ID != null) {
                 FLAGG_HANDLES_OK = true;
-                // L29: the flags index may freeze here when initFlagHandles
-                // runs before initFrozenHandles (or re-freeze after).
-                if (U != null && IDX_FROZEN >= 0 && O_ED >= 0
-                        && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0
-                        && FLAGS_ID instanceof
-                                net.minecraft.network.syncher.EntityDataAccessor) {
-                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
-                            FLAGS_ID).id();
-                    if (IDX_FLAGS >= 0) {
-                        EDV_OK = true;
-                    }
+                // L64a: the flags index resolves independently (the id()
+                // method per the L28d record verdict) and gates ONLY the
+                // flags layer (entityDataValueIdx checks per-call validity)
+                // — the frozen timeline no longer gates the flags direct
+                // read, and the flags capture never gated the frozen one.
+                if (FLAGS_ID instanceof
+                        net.minecraft.network.syncher.EntityDataAccessor acc) {
+                    IDX_FLAGS = acc.id();
                 }
             }
         } catch (Throwable t) {
