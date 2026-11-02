@@ -9235,6 +9235,19 @@ public final class CeHooks {
     private static volatile net.minecraft.server.level.ServerEntity[] TT_SE;
     private static volatile Object[] TT_SITOBJ;
     private static volatile Object[] TT_STEPS;
+    // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
+    // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
+    // increment — the counter is unobservable while nobody tracks the
+    // entity (its ONLY reader is sendChanges' interval gate). Transitions
+    // reconcile exactly: armed->disarmed hands the mirror back into the
+    // real field, disarmed->armed re-captures the real field, and every
+    // decline tick (real sendChanges ran) re-captures per entity, so the
+    // mirror can never fork from the real counter. Any reconcile failure
+    // disables the mirror (TT_TC=null) — the real RMW stays the fallback.
+    private static volatile int[] TT_TC;
+    // the per-ChunkMap armed memo (tiny direct map; #dims entries)
+    private static final Object[] TT_ARM_CM = new Object[8];
+    private static final boolean[] TT_ARM_VAL = new boolean[8];
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
 
     public static void initTrackerLoopHandles() {
@@ -9268,6 +9281,7 @@ public final class CeHooks {
                 TT_TE = new Object[ARENA.length];
                 TT_SHAPE = new long[ARENA.length];
                 TT_SE = new net.minecraft.server.level.ServerEntity[ARENA.length];
+                TT_TC = new int[ARENA.length];
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
@@ -9501,13 +9515,31 @@ public final class CeHooks {
                 ent.syncVelocity = false;
             }
             ent.updateDataBeforeSync();
-            U.putInt(serverEntity, O_SE_TICKCOUNT,
-                    U.getInt(serverEntity, O_SE_TICKCOUNT) + 1);
+            // L70: the cached path runs ONLY while the cm is ARMED — the
+            // increment rides the mirror (the real field is handed back on
+            // the armed->disarmed transition; the L70 tail below);
+            // the real RMW stays the fallback.
+            int[] tc = TT_TC;
+            if (tc != null) {
+                tc[m]++;
+            } else {
+                U.putInt(serverEntity, O_SE_TICKCOUNT,
+                        U.getInt(serverEntity, O_SE_TICKCOUNT) + 1);
+            }
             ttlCache++;
             return true;
         } catch (Throwable cacheFail) {
             return false; // route the exact vanilla pair — never break tracking
         }
+    }
+
+    /** L70 helper: the tracked entity read the main loop performs (the
+     *  direct offset when resolved, the interface call otherwise). */
+    private static Object trackedEntityOf(Entity ent) {
+        return (O_ENT_TRACKED >= 0 && U != null)
+                ? U.getObject(ent, O_ENT_TRACKED)
+                : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
+                        .moonrise$getTrackedEntity();
     }
 
     /** Replacement body of ChunkMap.newTrackerTick() — the byte-exact
@@ -9554,6 +9586,53 @@ public final class CeHooks {
                     }
                 }
                 if (!cacheArm) ttlPopBlock++;
+                // L70: the tickCount mirror reconcile on the armed-state
+                // transition (and on first sight of this ChunkMap). One list
+                // walk per transition; the steady state walks nothing. Any
+                // failure disables the mirror globally (TT_TC=null) — the
+                // cached path falls back to the real RMW, which is exact
+                // once the mirror is off (the real field is authoritative
+                // again from the next tick).
+                if (TT_TC != null) {
+                    int cmi = -1;
+                    boolean lastArm = false;
+                    boolean known = false;
+                    for (int t = 0; t < TT_ARM_CM.length; t++) {
+                        if (TT_ARM_CM[t] == cmObj) {
+                            cmi = t;
+                            lastArm = TT_ARM_VAL[t];
+                            known = true;
+                            break;
+                        }
+                    }
+                    if (!known) {
+                        cmi = (int) (ttlCalls & (TT_ARM_CM.length - 1));
+                        TT_ARM_CM[cmi] = cmObj;
+                        lastArm = !cacheArm; // force the reconcile below
+                    }
+                    if (cacheArm != lastArm) {
+                        try {
+                            for (int i = 0; i < size; i++) {
+                                Entity ent = raw[i];
+                                int m = ent.getId() & AMASK;
+                                Object te2 = trackedEntityOf(ent);
+                                if (te2 == null || TT_TE[m] != te2) continue;
+                                Object se2 = U.getObject(te2, O_TE_SE);
+                                if (!(se2 instanceof net.minecraft.server.level.ServerEntity)) continue;
+                                if (cacheArm) { // re-capture: the real field is the truth
+                                    TT_TC[m] = U.getInt(se2, O_SE_TICKCOUNT);
+                                } else {        // hand the mirror back
+                                    U.putInt(se2, O_SE_TICKCOUNT, TT_TC[m]);
+                                }
+                            }
+                            TT_ARM_VAL[cmi] = cacheArm;
+                        } catch (Throwable reconcileFail) {
+                            TT_TC = null; // mirror off; real RMW everywhere
+                        }
+                    } else if (!known) {
+                        TT_ARM_VAL[cmi] = cacheArm;
+                    }
+                }
             }
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
@@ -9585,6 +9664,10 @@ public final class CeHooks {
                                     ? U.getObject(se0, O_SE_INTERP) : null;
                             TT_TE[m] = te;
                             TT_SE[m] = se0;
+                            // L70: stamp the mirror from the real field
+                            // (the fast path just did its real RMW — the
+                            // stamp captures the post-increment truth)
+                            TT_TC[m] = U.getInt(se0, O_SE_TICKCOUNT);
                             TT_SHAPE[m] = TT_OK;
                             if (interp instanceof
                                             net.minecraft.world.entity
@@ -9620,6 +9703,19 @@ public final class CeHooks {
                                     .isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
                         ((net.minecraft.server.level.ServerEntity) VH_TE_SERVERENT.getObj(te))
                                 .sendChanges();
+                    }
+                    // L70: the decline tick ran the REAL sendChanges (its own
+                    // tickCount++ inside — the L26 fast exit or the vanilla
+                    // body) — re-capture so the mirror never forks from the
+                    // real counter while armed. Skipped when disarmed (the
+                    // real field is the truth there; the re-arm transition
+                    // walk re-captures everything).
+                    int[] tcd = TT_TC;
+                    if (tcd != null && TT_TE[m] == te) {
+                        Object se2 = U.getObject(te, O_TE_SE);
+                        if (se2 instanceof net.minecraft.server.level.ServerEntity) {
+                            tcd[m] = U.getInt(se2, O_SE_TICKCOUNT);
+                        }
                     }
                     continue;
                 }
