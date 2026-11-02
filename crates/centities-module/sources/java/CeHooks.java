@@ -9288,10 +9288,17 @@ public final class CeHooks {
     //      EMPTY over EMPTY, and the caller's handleHandSwap/
     //      handleEquipmentChanges never run — the whole body is a no-op.
     // Any present item, an unprimed map (the first tick) or any shape doubt
-    // routes the exact vanilla body. The tickEffects decline is a direct
-    // public-static call; the detectEquipmentUpdates decline replays the
-    // vanilla body through cached reflection Methods (the protected trio —
-    // the CHANGED path is rare by definition).
+    // routes the exact vanilla body. The tickEffects guard is an EARLY-
+    // RETURN PREFIX (op-5 guard2, static locals 0+1) — the vanilla body
+    // stays intact behind the check. L62a lesson (2026-11-02, parity
+    // mobs-ON leg): the first cut ReplaceBody'd tickEffects and replayed
+    // vanilla via a direct EnchantmentHelper.tickEffects call — which IS
+    // the woven body — so every helmeted mob (the fill's UNBREAKING-255
+    // iron helmets) recursed into its own guard until StackOverflowError,
+    // and Paper's per-entity tick handler removed every thrower: the
+    // world emptied at the arming tick. A replay into the woven static
+    // can NEVER be the decline path; the equip floor replays through the
+    // UNWOVEN protected trio and is immune by construction.
     // ==================================================================
 
     public static volatile boolean ENCH_ON = false;
@@ -9313,26 +9320,30 @@ public final class CeHooks {
         EQUIP_ON = on;
     }
 
-    /** Replacement body of EnchantmentHelper.tickEffects(ServerLevel, LivingEntity). */
-    public static void enchTickEffects$(net.minecraft.server.level.ServerLevel level,
+/** tickEffects(ServerLevel,LivingEntity) guard: TRUE = the all-empty
+ *  equipment early-out ran (the vanilla body is skipped — a provable
+ *  no-op); FALSE = the vanilla body follows IN THE SAME METHOD (the
+ *  guard is an early-return prefix woven ahead of the untouched body).
+ *  NEVER replay vanilla by calling the woven static from here — that
+ *  re-enters this guard and recurses (the L62a lesson). */
+    public static boolean enchGate$(net.minecraft.server.level.ServerLevel level,
             net.minecraft.world.entity.LivingEntity e) {
         enchCalls++;
-        if (ENCH_ON) {
-            try {
-                if (e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND).isEmpty()
-                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND).isEmpty()
-                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty()
-                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty()
-                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty()
-                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty()) {
-                    enchGate++;
-                    return;
-                }
-            } catch (Throwable gateFail) {
-                // route the exact vanilla body
+        if (!ENCH_ON) return false;
+        try {
+            if (e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty()) {
+                enchGate++;
+                return true;
             }
+        } catch (Throwable gateFail) {
+            // route the exact vanilla body
         }
-        net.minecraft.world.item.enchantment.EnchantmentHelper.tickEffects(level, e);
+        return false;
     }
 
     // The protected trio behind the detectEquipmentUpdates decline path,

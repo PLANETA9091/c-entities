@@ -44,8 +44,10 @@ const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNav
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
 const LOOK_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/LookControl";
 /// L62a: the empty-equipment floor target — EnchantmentHelper.tickEffects
-/// replace_body (the baseTick enchantment walk; 47.5% of the mobs leg's
-/// ImmutableList$ListItr leaves).
+/// early-return prefix (op-5 guard2 on the static; the baseTick
+/// enchantment walk; 47.5% of the mobs leg's ImmutableList$ListItr
+/// leaves). NOT a ReplaceBody: a replay into the woven static recurses
+/// (the L62a parity lesson, 2026-11-02).
 const ENCH_HELPER_CLASS: &str = "net/minecraft/world/item/enchantment/EnchantmentHelper";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 /// L38f: LivingEntity.die(DamageSource) — the cramming-audit freshness feed
@@ -1793,8 +1795,13 @@ fn patch_ench_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// L62a: the deferred weave — the empty-equipment ReplaceBody on
-/// EnchantmentHelper.tickEffects. No Unsafe handles are needed (the gate is
+/// L62a: the deferred weave — the empty-equipment early-return PREFIX on
+/// EnchantmentHelper.tickEffects (op-5 guard2: a STATIC method, so locals
+/// 0+1 are its two parameters — ServerLevel, LivingEntity). The vanilla
+/// body stays intact behind the check; the L62a lesson (2026-11-02, parity
+/// mobs-ON mass removal) outlaws the ReplaceBody+replay shape here: a
+/// replay into the woven static re-enters the guard and recurses until
+/// StackOverflowError. No Unsafe handles are needed (the gate is
 /// public-API only), so the weave applies right after the knob check; the
 /// GATE arming stays verifier-gated on the enchCalls liveness.
 fn precompute_ench(loader: jni::jobject) {
@@ -1814,19 +1821,15 @@ fn precompute_ench(loader: jni::jobject) {
         cplug_sdk::log::info("[c-entities] enchTick floor declined (centities.enchTick) — vanilla kept");
         return;
     }
-    let spec = cplug_sdk::asm::ReplaceBody {
+    let spec = cplug_sdk::asm::EarlyReturnGuard2 {
         method_name: "tickEffects",
         method_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
-        bridge_owner: HOOKS_CLASS,
-        bridge_name: "enchTickEffects$",
-        bridge_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
-        args: &[
-            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
-            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
-        ],
+        check_class: HOOKS_CLASS,
+        check_name: "enchGate$",
+        check_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)Z",
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::replace_body(env, loader, &bytes, &spec)
+        cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &spec)
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
@@ -1834,7 +1837,7 @@ fn precompute_ench(loader: jni::jobject) {
                 pc.insert(ENCH_HELPER_CLASS, b.clone());
             }
             ENCH_WOVEN.store(true, Ordering::Release);
-            cplug_sdk::log::info("[c-entities] precomputed EnchantmentHelper tickEffects floor");
+            cplug_sdk::log::info("[c-entities] precomputed EnchantmentHelper tickEffects floor (op-5 prefix)");
         }
         _ => {
             ENCH_DECLINED.store(true, Ordering::Release);
