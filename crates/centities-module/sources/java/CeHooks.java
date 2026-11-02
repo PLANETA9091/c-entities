@@ -5447,8 +5447,8 @@ public final class CeHooks {
                     ItemEntity r0 = IB_ITEM[i];
                     if (false
                             && (bits & (1 << 15)) != 0
-                            && r0 instanceof ItemEntity ie0
-                            && !restSectionTouched(ie0)) {
+                            && r0 != null
+                            && !restSectionTouched(r0)) {
                         MODE_VAL[mSlot] = 2;
                         REST_ID[mSlot] = IB_IDS[i];
                         MODE_REV[mSlot] = WORLD_REV;
