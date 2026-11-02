@@ -979,6 +979,7 @@ public final class CeHooks {
                 + "/" + dbgExpSlot + "/" + dbgMisses
                 + " item=" + itemChecks + "/" + itemNative + "/" + itemResync
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
+                + " ds=" + dsame + "/" + dwrite
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
@@ -3165,7 +3166,14 @@ public final class CeHooks {
     // L15b: PLAIN (per item-tick, 100k/tick) — see the mergeChecks note.
     public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
-            itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0;
+            itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0,
+            dsame = 0, dwrite = 0;
+    // L60: the DELTA_SAME verdict census — dsame = the core said the post-tick
+    // delta is identical to pre (the write skipped), dwrite = the flush wrote
+    // a fresh Vec3. The items profile burns ~10% (caller 5.89 + callee 5.7)
+    // in Entity.setDeltaMovement — this pair names whether the resting fixed
+    // point misses widely (dwrite ~ item count per tick) or the cost is a
+    // small moving subpopulation.
 
     // ---- batch (server-thread confined; one world per tick segment) ----
     private static final int IB_CAP = 1 << 17;
@@ -5450,7 +5458,10 @@ public final class CeHooks {
                 // ~100k Vec3 allocations + virtual writes per tick on
                 // items-100k (setDeltaMovement self was 3.5% of the leg).
                 if ((bits & (1 << 14)) == 0) { // not DELTA_SAME
+                    dwrite++;
                     e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                } else {
+                    dsame++;
                 }
                 e.age = outI[i * 4];
                 int pd = outI[i * 4 + 1];
