@@ -1390,3 +1390,37 @@ negatives under the kernel's op mix — 4000 ops × 4 seeds), the KPI 18f
 extension (stage 10 = the self row; the walk range on the header), and
 the raw-accumulates retraction (addendum 18f — raw=2 was [self]×2
 passes, not a duplicate row).
+
+## Addendum 19 — THE PARITY GATE IS GREEN (12/12 PASS, runs 41422201497 + 41422148762, main @ 2ed4aba)
+
+The 18g fix (gate the numCollisions reset on a non-empty roster) closed
+the last family. Both parity runs on the fix commit — the dispatched
+one (trace 916, window 240-252) and the push-triggered one — report
+**12 × `PARITY-GATE: PASS (bit-identical state)`**: all four scenarios
+(items / mobs / mixed / spread), all three snapshots each (final +
+mid-window), bit-identical across the OFF/ON legs.
+
+The fix's fingerprint in the green run's KPI stream:
+- the serve pattern is UNCHANGED (st=8 at module {729,732,738,744,750,
+  756,...}, st=2 at {735,741,747,753}) — the scan, the walk, the
+  intersect and the serve logic were never touched; only the counter
+  writeback changed;
+- nc(916) sits at its post-fix equilibrium (4 flat — the candidate-hit
+  increments from the pile's other passes balanced against 916's own
+  gated resets) instead of the pre-fix reset-to-zero oscillation;
+- the OFF/ON nc(78) ratchet now evolves identically, the cap binds at
+  the same ticks, and the t=275 trajectory seed is gone (the snapshots
+  are bit-identical THROUGH t=275 and to the end).
+
+The hunt's ledger (doc 40, addenda 1-19): 19 root causes found and
+fixed — corpse-blindness (5194968), the L21 rest dispatch (d35a309),
+the R-B merge interleave (8fbad05), the L37 scan-order family, the
+L41c mirror-authority gate, the 178d287 candidate-hit parity, the
+1324533 self live-box publish, and the final 2ed4aba empty-roster
+reset gate. The instrumentation built on the way (PH/PD/PTRACE/TLO/
+TTR/KPD/KPX/KPH/KVM/PQ/KPI) stays in the tree, knob-gated, zero hot-
+path cost when off.
+
+**State: parity COMPLETE. The remaining frontier is the −90% perf
+target (doc 41): items −54%, mobs −39%, mixed −56%, spread −41% vs the
+latest vanilla legs.**
