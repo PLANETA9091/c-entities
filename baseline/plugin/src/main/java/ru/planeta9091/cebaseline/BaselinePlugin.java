@@ -470,6 +470,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
         if (parity) {
             logParityHash();
+            // L77-hunt: the per-tick Level.random call count + the caller
+            // frames inside the window (LRC_WINDOW="lo-hi", default 138-150)
+            if (LR_WRAP != null) {
+                getLogger().info("LRC t=" + tickNo + " calls=" + LR_WRAP.calls());
+                if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
+                    LR_WRAP.dump(tickNo);
+                }
+                LR_WRAP.tickReset();
+            }
         }
         if (parity && traceId >= 0) {
             traceStep();
@@ -1068,6 +1077,161 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------
     private static volatile java.lang.invoke.MethodHandle SR_SEED, LR_XLO;
     private static volatile Object SR_OBJ, LR_OBJ;
+    // L77-hunt: the counting Level.random wrapper (parity legs only). The
+    // mob_ai=1 SR/LR step-count diff named t=143 as EXACTLY ONE extra
+    // Level.random draw on the ON leg (SR still identical) — but NO
+    // AI-path class references Level.random and the module's own code
+    // never touches it (javap scans). The wrapper keeps the stream EXACT
+    // (it delegates every call to the original RandomSource) and records
+    // the CALLER of every draw; at the tick end the harness prints the
+    // count and, inside the LRC_LO..LRC_HI window, the per-draw caller
+    // frames. The OFF leg wraps too (same harness) — the first tick with
+    // a different count diff names the extra caller by diffing LRF lines.
+    private static volatile CountingRandom LR_WRAP;
+    private static volatile long LR_CALLS;
+    private static final int LRC_LO = parseLrcBound(0), LRC_HI = parseLrcBound(1);
+
+    private static int parseLrcBound(int idx) {
+        try {
+            String s = System.getenv("LRC_WINDOW");
+            if (s == null || s.isBlank()) s = "138-150";
+            String[] parts = s.split("-");
+            return Integer.parseInt(parts[idx].trim());
+        } catch (Throwable quiet) {
+            return idx == 0 ? 138 : 150;
+        }
+    }
+
+    static final class CountingRandom implements net.minecraft.util.RandomSource {
+        private final net.minecraft.util.RandomSource d;
+        private final java.util.List<char[]> frames = new java.util.ArrayList<>();
+        private static final int FRAMES_MAX = 512;
+
+        CountingRandom(net.minecraft.util.RandomSource delegate) {
+            this.d = delegate;
+        }
+
+        private void rec() {
+            LR_CALLS++;
+            if (frames.size() < FRAMES_MAX) {
+                StackTraceElement[] st = new Throwable().getStackTrace();
+                StringBuilder sb = new StringBuilder(96);
+                // skip rec() + the wrapper method + Throwable.getStackTrace
+                for (int i = 2; i < Math.min(st.length, 6); i++) {
+                    sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
+                            .append('.').append(st[i].getMethodName()).append(' ');
+                }
+                frames.add(sb.toString().toCharArray());
+            }
+        }
+
+        void tickReset() {
+            LR_CALLS = 0;
+            frames.clear();
+        }
+
+        long calls() {
+            return LR_CALLS;
+        }
+
+        void dump(long tick) {
+            StringBuilder sb = new StringBuilder(128)
+                    .append("LRF t=").append(tick).append(" n=").append(frames.size());
+            for (char[] f : frames) {
+                sb.append('\n').append(f);
+            }
+            System.out.println(sb);
+        }
+
+        @Override
+        public net.minecraft.util.RandomSource fork() {
+            rec();
+            return d.fork();
+        }
+
+        @Override
+        public net.minecraft.world.level.levelgen.PositionalRandomFactory forkPositional() {
+            rec();
+            return d.forkPositional();
+        }
+
+        @Override
+        public void setSeed(long seed) {
+            d.setSeed(seed);
+        }
+
+        @Override
+        public int nextInt() {
+            rec();
+            return d.nextInt();
+        }
+
+        @Override
+        public int nextInt(int bound) {
+            rec();
+            return d.nextInt(bound);
+        }
+
+        @Override
+        public int nextInt(int origin, int bound) {
+            rec();
+            return d.nextInt(origin, bound);
+        }
+
+        @Override
+        public int nextIntBetweenInclusive(int min, int max) {
+            rec();
+            return d.nextIntBetweenInclusive(min, max);
+        }
+
+        @Override
+        public long nextLong() {
+            rec();
+            return d.nextLong();
+        }
+
+        @Override
+        public boolean nextBoolean() {
+            rec();
+            return d.nextBoolean();
+        }
+
+        @Override
+        public float nextFloat() {
+            rec();
+            return d.nextFloat();
+        }
+
+        @Override
+        public double nextDouble() {
+            rec();
+            return d.nextDouble();
+        }
+
+        @Override
+        public double nextGaussian() {
+            rec();
+            return d.nextGaussian();
+        }
+
+        @Override
+        public double triangle(double min, double max) {
+            rec();
+            return d.triangle(min, max);
+        }
+
+        @Override
+        public float triangle(float min, float max) {
+            rec();
+            return d.triangle(min, max);
+        }
+
+        @Override
+        public void consumeCount(int count) {
+            rec();
+            d.consumeCount(count);
+        }
+    }
 
     /** Walk the class hierarchy for a declared long field and bind a
      *  primitive getter — both SHARED_RANDOM (Entity$RandomRandomSource) and
@@ -1122,6 +1286,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 rf.setAccessible(true);
                 LR_OBJ = rf.get(handle);
                 LR_XLO = bindValue(LR_OBJ);
+                // L77-hunt: wrap ONCE — the field now holds the delegating
+                // wrapper (the stream is untouched: every call forwards to
+                // the original object the probe reads); the count + the
+                // caller frames localize the extra Level.random draw
+                if (LR_WRAP == null) {
+                    LR_WRAP = new CountingRandom(
+                            (net.minecraft.util.RandomSource) LR_OBJ);
+                    rf.set(handle, LR_WRAP);
+                }
             }
             if (LR_XLO != null && LR_OBJ != null) {
                 long a = (long) LR_XLO.invokeExact(LR_OBJ);
