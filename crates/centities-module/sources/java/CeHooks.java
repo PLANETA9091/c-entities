@@ -1310,6 +1310,8 @@ public final class CeHooks {
                 if (st != null) st[sm] = null;
                 Entity[] fe = FROZ_E;
                 if (fe != null) fe[sm] = null;
+                Entity[] tes = TT_E;
+                if (tes != null) tes[sm] = null;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -9264,6 +9266,13 @@ public final class CeHooks {
     // mirror can never fork from the real counter. Any reconcile failure
     // disables the mirror (TT_TC=null) — the real RMW stays the fallback.
     private static volatile int[] TT_TC;
+    // L72: the per-slot entity identity — the cached path's identity key.
+    // The te read (an Unsafe hop into the entity's moonrise field per
+    // entity per tick) existed ONLY to prove the slot; TT_E[m] == ent
+    // proves the same thing with one array read. probeRemove clears the
+    // slot unconditionally (same block as TT_TE/TT_SE) so a removal can
+    // never pass the check; a fresh te for a re-added entity re-fills.
+    private static volatile Entity[] TT_E;
     // the per-ChunkMap armed memo (tiny direct map; #dims entries)
     private static final Object[] TT_ARM_CM = new Object[8];
     private static final boolean[] TT_ARM_VAL = new boolean[8];
@@ -9301,6 +9310,7 @@ public final class CeHooks {
                 TT_SHAPE = new long[ARENA.length];
                 TT_SE = new net.minecraft.server.level.ServerEntity[ARENA.length];
                 TT_TC = new int[ARENA.length];
+                TT_E = new Entity[ARENA.length];
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
@@ -9484,9 +9494,13 @@ public final class CeHooks {
      *  trackedSteps emptiness (addStep is NOT player-gated: the L62b
      *  decline must re-fire on any live step). The replicated effects are
      *  byte-identical to the fill path's fused tail. */
-    private static boolean ttlCachedPath(Entity ent, Object te, int m) {
-        Object[] te0 = TT_TE;
-        if (te0 == null || te0[m] != te) return false;
+    private static boolean ttlCachedPath(Entity ent, int m) {
+        // L72: the identity key is TT_E[m] == ent (one array read — the te
+        // Unsafe hop existed only to prove the slot). probeRemove clears
+        // TT_E unconditionally, so a removed entity can never pass; a
+        // re-tracked entity (fresh te for a fresh add) re-fills.
+        Entity[] es = TT_E;
+        if (es == null || es[m] != ent) return false;
         long[] sh0 = TT_SHAPE;
         if (sh0 == null) return false;
         long sh = sh0[m];
@@ -9657,21 +9671,24 @@ public final class CeHooks {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
                 // direct offset when resolved, the interface call otherwise.
+                // L63b/L72: the cached path first (ONE array-read identity
+                // compare for the bulk of the population) — the te read and
+                // the chunk read are both deferred behind the cache check,
+                // the fill probe on any doubt.
+                if (cacheArm) {
+                    int m0 = ent.getId() & AMASK;
+                    if (ttlCachedPath(ent, m0)) {
+                        ttlFuse++;
+                        continue;
+                    }
+                }
                 Object te = (O_ENT_TRACKED >= 0 && U != null)
                         ? U.getObject(ent, O_ENT_TRACKED)
                         : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
-                // L63b: the cached path first (one identity compare for the
-                // bulk of the population) — the chunk read (two calls) is
-                // deferred behind the cache check, the fill probe on any
-                // doubt.
                 if (cacheArm) {
                     int m = ent.getId() & AMASK;
-                    if (ttlCachedPath(ent, te, m)) {
-                        ttlFuse++;
-                        continue;
-                    }
                     Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                             .moonrise$getChunkData().nearbyPlayers;
                     if (ttlFastPath(ent, te, chunk)) {
@@ -9683,6 +9700,7 @@ public final class CeHooks {
                                     ? U.getObject(se0, O_SE_INTERP) : null;
                             TT_TE[m] = te;
                             TT_SE[m] = se0;
+                            TT_E[m] = ent;
                             // L70: stamp the mirror from the real field
                             // (the fast path just did its real RMW — the
                             // stamp captures the post-increment truth)
