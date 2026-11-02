@@ -263,3 +263,56 @@ trim already exactified the answer). The two exactness tests that
 pinned the margin-leak semantics moved to the vanilla-strict contract.
 The f64-box move 1a is NOT NEEDED for the margin tax; the freshness
 gate is resolved as class A (margin geometry) + the printer lesson.
+
+## The 2ed4aba refresh (2026-11-02): the L59-L62 era + the ranked frontier
+
+Baseline 2ed4aba (run 41422148952, p50): items 34.8 (-45.5% vs the
+fresh 63.9 vanilla leg), mobs 239.5 (-23.8% vs 314.4), mixed 248.7
+(-54.2% vs 542.5), spread 332.0 (-38.5% vs 539.7). The vanilla legs
+swung hard between runs again (mobs 490 -> 314, spread 632 -> 540) —
+the deltas read against the PAIRED legs only.
+
+The landed floors this era (parity-gated, all 12/12 green):
+- L59a/L61: the tracker fuse extends — the per-pass chunk memo + the
+  syncVelocity consumption (addendum 20/21; javap bc 1116-1246).
+- L60: the ds/dwrite DELTA_SAME census rides the tree.
+- L62: the empty-equipment floors (enchTickEffects$ +
+  equipUpdates$) — the mobs profile's #1 leaf family decoded via the
+  JFR parent analysis: ImmutableList$ListItr.next 6.32% (mobs) =
+  87.7% inside tickEffects (47.5%) + collectEquipmentChanges (39.3%).
+
+### The ranked next moves (2026-11-02, after L62)
+
+0. **The AI engine RNG protocol (THE mobs lever)** — the L22a native
+   AI engine measured mobs-25k 193.2 vs the shipped 239.5 (e774d00)
+   but diverges level.random at t=143 (the staged-request protocol
+   consumes the RNG in a different order; SR/LR probes, run
+   40771017055). Parity is now green and the freshness discipline is
+   proven — the engine's pre-resolved-predicate redesign (doc 30 item
+   4) must make the Rust goal engine consume random values in the
+   EXACT vanilla call order. ~-19% on mobs, the single biggest
+   module-owned move left. The vanilla-goal long tail (GoalSelector
+   4.05 + tickRunningGoals 2.11 + WrappedGoal 1.11 + flags/goal
+   predicates ~3%) is what it replaces; the shipped aiFloor stays off
+   until the engine is exact (the L15 gate mirror has the same
+   freshness problem at smaller scale).
+1. **The native travel/collide port (doc 28)** — LivingEntity.travel
+   cluster (travel 2.07 + getBlockState 1.84 + fluid interaction ~2.5
+   + collide internals ~3) ≈ 10% of the mobs leg; the quiet-travel
+   gate catches only 18% (2.85M/15.6M on mobs-25k) — moving mobs pay
+   full vanilla travel. tick_item's move/collide machinery is the
+   template; the port must be byte-exact on friction variants
+   (block-below slipperiness), water/lava branches and the collision
+   epsilon.
+2. **The tracker share on mobs** — the ttlDecl counters (this era)
+   name the fuse decline site; if seen/se, the TrackedEntity-shape
+   probe is the next floor; if syncVelocity, the L61 fuse already
+   covers the bench mobs and the sendChanges family (tryEncode 2.35
+   on spread, sendChanges internals) collapses with it.
+3. **The ds census verdict (L60)** — dwrite ~ item count per tick
+   means the resting fixed point misses widely and the L16 gate needs
+   re-derivation (the setDeltaMovement caller 5.89 + callee 5.7 on
+   items is the largest items bucket left after the tracker).
+4. **The per-leg long tails** (each 1-3%, no single move):
+   AttributeMap cluster (2.10+1.56+1.21 — attrCache covers part),
+   NaturalSpawner.createState (1.63 mixed), setOldPos, applyEffectsFromBlocks.
