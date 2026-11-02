@@ -1000,6 +1000,9 @@ public final class CeHooks {
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
+                + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
+                + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
+                + "/" + ttlDeclSync
                 + " eff=" + effCalls + "/" + effGate + "/" + (EFF_ON ? 1 : 0)
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
@@ -8992,7 +8995,13 @@ public final class CeHooks {
     // try/finally protocol, the same hasPlayers/chunk-status gate) with
     // ONE fused fast path: no chunk players AND seenBy empty AND
     // trackedPlayers empty AND interp NO_OP AND !hardColliding AND
-    // !syncVelocity -> updateDataBeforeSync + tickCount++, skip the rest.
+    // (L61) syncVelocity either clear or consumable -> updateDataBeforeSync
+    // + tickCount++ (+ the syncVelocity consumption for non-ServerPlayers,
+    // javap bc 1218-1246: the branch's only state effect is the flag write;
+    // the motion-packet send rides the provably-empty tracked set), skip
+    // the rest. L59a: the chunk-player read is memoized per distinct chunk
+    // per pass (the lists are stable inside the tracker loop — mutations
+    // ride the player-move/chunk phases), reset at every pass entry.
     // TTL_ON gates ONLY the fast path; the mirror is always the body.
     // ==================================================================
 
@@ -9001,6 +9010,12 @@ public final class CeHooks {
     public static final boolean TTL_FLAG_ON =
             !"false".equals(System.getProperty("centities.trackerLoop", "true"));
     public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
+    // L59a/L61 decline-site counters (the fuse verdict, per site) + the
+    // per-pass chunk memo (reset at every newTrackerTick$ entry).
+    public static long ttlDeclChunk = 0, ttlDeclSeen = 0, ttlDeclSe = 0,
+            ttlDeclTrk = 0, ttlDeclInterp = 0, ttlDeclHard = 0, ttlDeclSync = 0;
+    private static Object ttlMemoChunk = null;
+    private static boolean ttlMemoEmpty = false;
 
     private static volatile RefField VH_CM_TRACKERS;  // ChunkMap.trackerEntities
     private static volatile RefField VH_CM_ITERATING; // ChunkMap.iteratingTrackerEntities
@@ -9047,9 +9062,12 @@ public final class CeHooks {
         }
     }
 
-    /** The L30 fused fast path. All reads are pure (the L15b REORDER rule —
+    /** The L30 fused fast path. All READS are pure (the L15b REORDER rule —
      *  running the probes BEFORE vanilla's moonrise$tick order is free);
-     *  a decline routes the exact vanilla pair. */
+     *  a decline routes the exact vanilla pair. The ONE effect beyond the
+     *  classic two-effect tail is the L61 syncVelocity consumption (below)
+     *  — it runs only after every read has proven the empty-tracking shape,
+     *  so the reads' relative order is still free. */
     private static boolean ttlFastPath(Entity ent, Object te, Object chunk) {
         ttlFuseChecks++;
         if (!TTL_ON || !TTL_HANDLES_OK || U == null) return false;
@@ -9060,31 +9078,78 @@ public final class CeHooks {
         try {
             // 1. the chunk side: the VIEW_DISTANCE player list. null chunk
             //    or null/empty list = the clearPlayers-or-nothing case.
-            if (chunk != null) {
-                ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk tc =
-                        (ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk;
-                ca.spottedleaf.moonrise.common.list.ReferenceList<?> players =
-                        tc.getPlayers(ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.VIEW_DISTANCE);
-                if (players != null && players.size() != 0) return false;
+            //    L59a memo: the player lists cannot change DURING the pass
+            //    (mutations ride the player-move/chunk phases, never the
+            //    tracker loop — moonrise$tick/sendChanges only read them),
+            //    so one read per distinct chunk per pass is exact; the memo
+            //    is reset at every pass entry. On a getPlayers throw the
+            //    memo stays unwritten and the catch declines this entity —
+            //    the next entity of the same chunk re-reads.
+            if (chunk != ttlMemoChunk) {
+                if (chunk == null) {
+                    ttlMemoChunk = null;
+                    ttlMemoEmpty = true;
+                } else {
+                    ca.spottedleaf.moonrise.common.list.ReferenceList<?> players =
+                            ((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk)
+                                    .getPlayers(ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.VIEW_DISTANCE);
+                    ttlMemoChunk = chunk;
+                    ttlMemoEmpty = players == null || players.size() == 0;
+                }
+            }
+            if (!ttlMemoEmpty) {
+                ttlDeclChunk++;
+                return false;
             }
             // 2. seenBy empty — no removals could fire, updatePlayer loop
             //    provably empty.
             Object seen = U.getObject(te, O_TE_SEEN);
-            if (!(seen instanceof java.util.Set<?> ss) || !ss.isEmpty()) return false;
+            if (!(seen instanceof java.util.Set<?> ss) || !ss.isEmpty()) {
+                ttlDeclSeen++;
+                return false;
+            }
             // 3. the ServerEntity side: the sendChanges fast-exit shape
             //    (the L24a conditions — same equivalence, now from the loop).
             Object se = U.getObject(te, O_TE_SE);
             if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+                ttlDeclSe++;
                 return false;
             }
             Object trk = U.getObject(serverEntity, O_SE_TRACKED_PLAYERS);
-            if (!(trk instanceof java.util.Set<?> ts) || !ts.isEmpty()) return false;
+            if (!(trk instanceof java.util.Set<?> ts) || !ts.isEmpty()) {
+                ttlDeclTrk++;
+                return false;
+            }
             if (U.getObject(serverEntity, O_SE_INTERP)
-                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) return false;
-            if (ent.moonrise$isHardColliding() || ent.syncVelocity) return false;
+                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                ttlDeclInterp++;
+                return false;
+            }
+            if (ent.moonrise$isHardColliding()) {
+                ttlDeclHard++;
+                return false;
+            }
+            if (ent.syncVelocity) {
+                // L61 (javap 26.3 sendChanges bc 1116-1246): for a
+                // non-ServerPlayer the velocity branch is
+                // `entity.syncVelocity = false` + the motion packet emitted
+                // through sendToTrackingPlayersAndSelf over the tracked set
+                // — HERE provably empty (checked 2 and 3 above), so the send
+                // is a no-op and the packet allocation is not state. The
+                // consumption is the branch's only observable effect and is
+                // replicated here, which extends the fuse to hurt-marked
+                // entities. ServerPlayers keep the Bukkit event path (the
+                // PlayerVelocityEvent branch can cancel the consumption via
+                // the z-return) and route vanilla.
+                if (ent instanceof net.minecraft.server.level.ServerPlayer) {
+                    ttlDeclSync++;
+                    return false;
+                }
+                ent.syncVelocity = false;
+            }
             // ALL conditions passed: this entity's tracker tick emits
-            // nothing. Reproduce the two unconditional effects:
-            ent.updateDataBeforeSync();                       // sendChanges bc 19-23
+            // nothing. Reproduce the unconditional effects:
+            ent.updateDataBeforeSync();                       // sendChanges bc 19-23 (javap: an EMPTY stub — the call itself is the whole effect)
             U.putInt(serverEntity, O_SE_TICKCOUNT,
                     U.getInt(serverEntity, O_SE_TICKCOUNT) + 1); // bc 1106-1113
             return true;
@@ -9097,6 +9162,8 @@ public final class CeHooks {
      *  vanilla loop (javap-anchored) with the L30 fused fast path. */
     public static void newTrackerTick$(Object cmObj) {
         ttlCalls++;
+        ttlMemoChunk = null; // L59a: fresh chunk reads every pass
+        ttlMemoEmpty = true;
         setIterating(cmObj, true);
         try {
             Object listObj = VH_CM_TRACKERS.getObj(cmObj);

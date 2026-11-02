@@ -1424,3 +1424,61 @@ path cost when off.
 **State: parity COMPLETE. The remaining frontier is the −90% perf
 target (doc 41): items −54%, mobs −39%, mixed −56%, spread −41% vs the
 latest vanilla legs.**
+
+### Addendum 20 — L59a/L61: the tracker fuse extends (chunk memo + the syncVelocity consumption), the decline sites get counters
+
+The parity gate is green (addendum 19), the frontier is doc 41. The
+fresh 2ed4aba baseline (run 41422148952) reads the tracker family as
+the biggest cross-scenario module-owned bucket: items ttlFastPath 9.89
++ newTrackerTick$ 5.87 (+ itemTickFlush 8.32), mixed 2.09 + 3.84,
+spread 1.72 + 3.26, mobs 1.44 + 1.71. The counters decoded the legs:
+
+- **items: fuse 100.0000%** (ttl=7974 passes / 97,938,597 fuses /
+  97,938,598 checks) — the 15.8% IS the fused per-entity floor: the
+  check chain + the two-effect tail for ~12.3k entities per pass.
+- **mobs: fuse 0.0000%** (6174 / 0 / 23,113,290) — every check
+  declines. Not syncVelocity (markHurt is the only setter — javap,
+  and the bench never hurts), not hardColliding (uncached shape =
+  Boat/Minecart/Shulker/... — javap). The decline site was UNKNOWN —
+  this commit adds per-site counters (ttlDecl= chunk/seen/se/trk/
+  interp/hard/sync in the counter line) and the next run names it.
+
+**L59a — the per-pass chunk memo.** ttlFastPath re-read
+TrackedChunk.getPlayers(VIEW_DISTANCE) per entity; the pile legs walk
+~12k entities over a few dozen chunks. The player lists cannot change
+DURING the pass (mutations ride the player-move/chunk phases —
+moonrise$tick and sendChanges only read them; the loop is
+single-threaded with no re-entrancy), so the memo is exact within a
+pass; it is reset at every newTrackerTick$ entry, so across passes it
+is always fresh. On a getPlayers throw the memo stays unwritten (the
+write is ordered AFTER the read) and the catch declines — the next
+entity of the same chunk re-reads.
+
+**L61 — the syncVelocity consumption (javap 26.3
+ServerEntity.sendChanges bc 1116-1246, verified in the patched
+26.3-237 jar).** The velocity branch for a NON-ServerPlayer is exactly
+`entity.syncVelocity = false` + `synchronizer.sendToTrackingPlayersAndSelf(
+new ClientboundSetEntityMotionPacket(entity))`. With the tracked set
+provably EMPTY (the fuse's checks 2 and 3) the send is a no-op over an
+empty set and the packet allocation is not state — the consumption is
+the branch's ONLY observable effect. The fuse now consumes the flag
+instead of declining: hurt-marked entities (markHurt's only reader is
+this branch) fuse on the next tracker tick exactly as vanilla's tail
+would. ServerPlayers keep the Bukkit event path (the
+PlayerVelocityEvent dance can cancel the consumption via the z-return
+at bc 1213-1217) and route vanilla. Also javap-verified this session:
+`updateDataBeforeSync()` is an EMPTY stub (bc 0: return) — the classic
+fuse's "effect 1" is the virtual call itself.
+
+The vanilla tail for a syncVelocity non-Player entity with empty
+tracking therefore decomposes exactly as the L24a model said —
+updateDataBeforeSync (no-op) + the latch class (self-healing) +
+tickCount++ + the flag consumption — and the fuse now replays all
+three state effects. The parity gate is the verdict.
+
+Dispatched: parity + baseline on this commit. Reading rules for the
+next run: (a) mobs' ttlDecl= names the decline site — if it is seen/se
+(the TrackedEntity shape), that is the next floor's target; (b) items'
+fuse stays ~100% with the memo shaving the getPlayers virtual per
+entity; (c) a red parity gate pins the L61 consumption first (the
+CE/trackerLoop knob bisects in one run).
