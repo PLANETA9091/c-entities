@@ -9036,6 +9036,17 @@ public final class CeHooks {
     private static volatile RefField VH_TE_SERVERENT; // TrackedEntity.serverEntity (public final)
     private static long O_TE_SE = -1;                 // the same field's direct offset
     private static long O_ENT_TRACKED = -1;           // Entity.trackedEntity (private final)
+    // L62b (run 41449046210 verdict): the interp gate — 26.3 gives EVERY
+    // LivingEntity a real SteppedInterpolationTracker (create() server
+    // side), so `!= InterpolationTracker.NO_OP` declined every mob
+    // (ttlDeclInterp=8,075,257 on mobs-25k) and the fuse covered nothing
+    // with a LivingEntity in it. The exact consumption needs the tracker's
+    // own three fields plus the entity's syncPosition flag.
+    private static volatile RefField VH_SIT_STEPS;    // SteppedInterpolationTracker.trackedSteps
+    private static volatile RefField VH_SIT_DELTA;    // SteppedInterpolationTracker.predictedDelta
+    private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
+    private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
+    private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
 
     public static void initTrackerLoopHandles() {
         try {
@@ -9046,6 +9057,20 @@ public final class CeHooks {
             VH_TE_SERVERENT = new RefField(te, "serverEntity");
             O_TE_SE = VH_TE_SERVERENT.off;
             O_ENT_TRACKED = offOf(Entity.class, "trackedEntity");
+            // L62b: the SteppedInterpolationTracker shape (server-side
+            // LivingEntity handlers) + the syncPosition flag read.
+            Class<?> sit = Class.forName(
+                    "net.minecraft.world.entity.SteppedInterpolationTracker");
+            VH_SIT_STEPS = new RefField(sit, "trackedSteps");
+            VH_SIT_DELTA = new RefField(sit, "predictedDelta");
+            VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
+            O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
+            if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
+                    && VH_SIT_TICKS.off >= 0) {
+                O_SIT_STEPS = VH_SIT_STEPS.off;
+                O_SIT_DELTA = VH_SIT_DELTA.off;
+                O_SIT_TICKS = VH_SIT_TICKS.off;
+            }
             TTL_HANDLES_OK = VH_CM_TRACKERS.off >= 0 && VH_CM_ITERATING.off >= 0
                     && O_TE_SE >= 0;
         } catch (Throwable t) {
@@ -9134,10 +9159,47 @@ public final class CeHooks {
                 ttlDeclTrk++;
                 return false;
             }
-            if (U.getObject(serverEntity, O_SE_INTERP)
-                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
-                ttlDeclInterp++;
-                return false;
+            if (O_SE_INTERP > 0
+                    && U.getObject(serverEntity, O_SE_INTERP)
+                            != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                // L62b: 26.3 hands every LivingEntity a REAL
+                // SteppedInterpolationTracker (SteppedInterpolationHandler
+                // .create routes server-side to the tracker), so the old
+                // !=NO_OP test declined every mob (ttlDeclInterp=8.07M,
+                // run 41449046210). The exact per-tick sendChanges effect
+                // (javap bc 298-307) is ONE updateTracking(trackingPosition())
+                // whose full observable shape, on an EMPTY trackedSteps list
+                // with syncPosition FALSE, is exactly
+                //   { predictedDelta = Vec3.ZERO; ticksSinceLastStep++ }
+                // — the replaceAll gate reads predictedDelta but mutates
+                // only non-empty steps, and the position argument is read
+                // solely by addStep (dead under !syncPosition). Both writes
+                // are replicated here; any other shape routes vanilla. The
+                // ticksSinceLastStep++ is NOT skippable: addStep packs it
+                // into PositionStep(vec, ticksSinceLastStep) on a later
+                // teleport (an observable packet payload).
+                if (O_SIT_STEPS < 0 || O_SIT_DELTA < 0 || O_SIT_TICKS < 0
+                        || O_ENT_SYNC_POS < 0
+                        || !(U.getObject(serverEntity, O_SE_INTERP)
+                                instanceof net.minecraft.world.entity
+                                        .SteppedInterpolationTracker)) {
+                    ttlDeclInterp++;
+                    return false;
+                }
+                Object sitObj = U.getObject(serverEntity, O_SE_INTERP);
+                Object steps = U.getObject(sitObj, O_SIT_STEPS);
+                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                    ttlDeclInterp++; // a later replaceAll/addStep would mutate
+                    return false;
+                }
+                if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
+                    ttlDeclInterp++; // the syncPosition branch is live: addStep
+                    return false;
+                }
+                U.putObject(sitObj, O_SIT_DELTA,
+                        net.minecraft.world.phys.Vec3.ZERO);
+                U.putInt(sitObj, O_SIT_TICKS,
+                        U.getInt(sitObj, O_SIT_TICKS) + 1);
             }
             if (ent.moonrise$isHardColliding()) {
                 ttlDeclHard++;
