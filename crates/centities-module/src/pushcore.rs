@@ -627,7 +627,26 @@ pub fn push_tick(
         }
     }
 
-    pc.ncol[self_slot] = ncol_self;
+    // ADDENDUM-18g — THE R-C ROOT. Vanilla gates the ENTIRE counter body
+    // on a non-empty roster: `if (!pushableEntities.isEmpty()) { ...;
+    // numCollisions = max(0, nc - maxEC); loop; }` — an EMPTY roster
+    // leaves numCollisions UNTOUCHED (no reset). The kernel replayed the
+    // reset unconditionally, wiping the ratchet that vanilla's
+    // empty-roster ticks preserve: the OFF nc(78) table ratchets
+    // 1,2,3,...,18 by t=274 (empty rosters on even ticks, 916's pass ++ on
+    // odd ones) while the ON leg oscillated 0->1 (the kernel's own
+    // empty 78-pass reset to 0 every tick, 916's serve +1) — flat 1 on
+    // the PTRACE. The cap then never bound where vanilla's did and the
+    // kernel's t=275 pass served a pair vanilla's cap had excluded (the
+    // mobs/mixed/spread seed family). The KPI-18f/18g instrument chain
+    // proved the serve set itself is parity-exact (module 3p-3 mapping:
+    // the kernel serves at exactly vanilla's overlap ticks {244,245,247,
+    // 249,251} and stage-2-drops at {246,248,250}); only the counter
+    // writeback diverged. With zero candidates the writeback carries the
+    // UNCHANGED real field (a no-op store — vanilla's outcome).
+    let ncol_out = if hits_count > 0 { ncol_self } else { real_ncol };
+
+    pc.ncol[self_slot] = ncol_out;
     pc.ncol_tick[self_slot] = tick as u32;
     pc.dx[self_slot] = base_dx;
     pc.dy[self_slot] = base_dy;
@@ -641,7 +660,7 @@ pub fn push_tick(
     out.ok = true;
     out.cramming = cramming > 0 && hits_count > cramming - 1;
     out.non_passengers = non_pass;
-    out.ncol = ncol_self;
+    out.ncol = ncol_out;
     out.ddx = ddx;
     out.ddy = 0.0;
     out.ddz = ddz;
@@ -1103,5 +1122,42 @@ mod tests {
         );
         assert!(out2.diag.is_empty());
         assert_eq!(out2.diag_sb, [0.0; 6]);
+    }
+
+    /// ADDENDUM-18g — THE R-C ROOT REGRESSION: vanilla gates the
+    /// numCollisions reset on a NON-EMPTY roster (`if (!list.isEmpty())
+    /// { reset; loop; }`). An empty-roster pass must carry the UNCHANGED
+    /// real field in the writeback — the old unconditional reset wiped
+    /// the ratchet vanilla's empty-roster ticks preserve (the OFF nc(78)
+    /// 1..18 table vs the ON flat 1; the t=275 cap seed).
+    #[test]
+    fn empty_roster_pass_never_resets_numcollisions() {
+        let mut pidx = idx_with(1, 0.0, 0.0);
+        let mut pc = core_with(1, 0.0, 0.0);
+        let mut out = PushOut::default();
+        let s1 = pc.slot_of(1).unwrap();
+        // no candidates anywhere near: the roster is empty. The entity's
+        // REAL numCollisions (ratcheted by earlier candidate hits) = 5.
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, 5, false,
+            &mut out,
+        );
+        assert!(out.ok, "the kernel serves the pass (density gate passes)");
+        assert_eq!(out.ncol, 5, "empty roster: the field rides back UNCHANGED");
+        assert_eq!(out.hits.len(), 0);
+        assert_eq!(out.pairs.len(), 0);
+        // the mirror follows the real field (no reset to 0)
+        assert_eq!(pc.ncol[s1], 5);
+        // WITH a candidate the reset + cap replay applies as before:
+        // real=5, maxEC=8 -> post-decay 0, one candidate -> ncol=1.
+        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pidx.upsert(2, 0, &zbox(0.5, 0.0));
+        let mut out2 = PushOut::default();
+        push_tick(
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, 5, false,
+            &mut out2,
+        );
+        assert!(out2.ok);
+        assert_eq!(out2.ncol, 1, "non-empty roster: reset-then-increment as vanilla");
     }
 }

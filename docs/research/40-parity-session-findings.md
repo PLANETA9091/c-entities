@@ -1346,3 +1346,47 @@ traces **916** — one run separates (a) from (b): a stage-2 record with
 m vs v names the stale member and the magnitude; 78's total absence
 from the raw rows while the walk covers its home cell names the index
 side.
+
+### Addendum 18g — R-C SOLVED: the unconditional numCollisions reset (the fix this commit)
+
+The KPI-18f run (41418072760, trace 916) closed the family. The chain:
+
+1. **The tick mapping settled**: CUR_TICK++ rides itemTickFlush = once per
+   LEVEL per world tick (three loaded levels) — module t = 3×world t,
+   with the traced dispatch reading 3(T−1) (pad −3 in the correlations).
+2. **The serve set is parity-exact.** With the mapping applied, the
+   kernel's 916-pass serves the 78 pair at exactly vanilla's overlap
+   ticks {244, 245, 247, 249, 251} (PQ n=1 [78] in BOTH legs on those
+   ticks) and stage-2-drops at {246, 248, 250} (PQ n=0). dm=0.0 on every
+   record — the mirror boxes ARE the live boxes at the dispatch moment.
+   The scan, the walk, the intersect and the serve are NOT the bug.
+3. **The OFF nc tables decode the vanilla semantics**: nc(916) = 1 flat
+   (its own pass resets 1→0 then +1 self every odd tick; empty roster on
+   even ticks SKIPS the reset — the value stays) and nc(78) ratchets
+   1,2,2,3,3,4,4,... (78's own pass NEVER fires — its roster is empty at
+   its pre-916-travel phase — so its counter is never reset; 916's pass
+   ++ rides every odd tick). The 26.3 decomp:
+   `if (!pushableEntities.isEmpty()) { cramming audit; numCollisions =
+   max(0, nc − maxEC); loop; }` — **the reset lives INSIDE the
+   non-empty-roster gate.**
+4. **The kernel replayed the reset UNCONDITIONALLY**: push_tick always
+   computed ncol_self = max(0, real − maxEC) and the Java writeback
+   always stored it. The ON leg's empty 78-pass reset the ratchet to 0
+   every tick (916's serve +1 → the PTRACE's flat 1), the cap never
+   bound where vanilla's did, and the kernel's t=275 pass served the
+   pair vanilla's post-decay 10 ≥ maxEC 8 cap had excluded — the mobs
+   t=275 seed, and the same mechanism for mixed 353 / spread 259.
+5. **The fix (this commit)**: with zero intersect-passing candidates
+   (hits_count == 0 == vanilla's empty roster) the writeback carries the
+   UNCHANGED real field — `out.ncol = real_ncol`, `pc.ncol[self] =
+   real_ncol` — a no-op store, exactly vanilla's outcome. Non-empty
+   rosters replay reset + cap + increments exactly as before.
+6. **The regression test** `empty_roster_pass_never_resets_numcollisions`
+   pins it: real=5 in, empty roster → 5 out (mirror too); with a
+   candidate → the reset-then-increment math (5 → post-decay 0 → 1).
+
+Also this commit: the pidx property test (no duplicate rows, no false
+negatives under the kernel's op mix — 4000 ops × 4 seeds), the KPI 18f
+extension (stage 10 = the self row; the walk range on the header), and
+the raw-accumulates retraction (addendum 18f — raw=2 was [self]×2
+passes, not a duplicate row).
