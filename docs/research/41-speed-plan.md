@@ -418,3 +418,46 @@ current tree (gs= must move off zero on the mobs leg; the gate must
 stay 12/12 PASS). GREEN → re-ship (-Dcentities.aiFloor=false stops
 being passed) and the GoalSelector cluster (~8% mobs) floors; RED →
 the PH_DUMP bisect with ai_floor=1 isolates the tick.
+
+## The L63 baseline verdict (2026-11-02, run 41466473668 on 08d3af8, paired legs)
+
+| scenario | vanilla | mod | delta | prev delta |
+|---|---:|---:|---:|---:|
+| items-100k | 76.9 | 34.7 | **-54.9%** | -43.2% |
+| mobs-25k | 520.0 | 291.3 | **-44.0%** | -43.2% |
+| mixed-150k | 539.6 | 224.8 | **-58.3%** | -49.0% |
+| spread-100k | 418.0 | 231.1 | **-44.7%** | -39.4% |
+
+L63a+L63b delivered +11.7pp items, +9.3pp mixed, +5.3pp spread,
++0.8pp mobs (no item flush there — the tracker cache alone). The
+items profile post-L63: newTrackerTick$ GONE from the top (13.97% ->
+ttlCachedPath 3.68%), the #1 leaf is Unsafe.getObject 17.35% and the
+JFR parent analysis pins 78.9% of it INSIDE ttlCachedPath's own hops —
+L65 (51c0be2) caches the final-field refs (serverEntity /
+interpolationTracker / trackedSteps — the te identity pins the chain)
+to cut exactly those. itemTickFlush 9.97% next (L64c's scan skip
+shaves the two full-batch loops), guardEntityTick 4.26% (the vanilla
+tick-loop frame — the L7 dispatcher's deeper redesign), the merge
+cadence.
+
+### The refreshed frontier (2026-11-02, after L63-L65)
+
+0. **The L15 re-test** — the ai_floor=1 parity with the FIXED input
+   wiring (CE_AI_FLOOR export, a69fd58; the first attempt 41467393454
+   never armed the floor — run-baseline.sh passed aiFloor=false on its
+   own). GREEN → re-ship (run-baseline.sh stops passing aiFloor=false;
+   the parity input default flips) → the GoalSelector cluster ~8% mobs
+   floors. RED → the PH_DUMP bisect with ai_floor=1.
+1. **The tracker mirror (L66, the items endgame)** — the cached walk's
+   floor is (te read + identity + per-tick bytes + tickCount RMW +
+   updateDataBeforeSync) per entity per tick ≈ 4-5% items. Moving the
+   tickCount mirror-side (the se writeback rides the players-arrival
+   epoch; the per-pass gate hands the state back) collapses the walk
+   into a Rust array pass. The freshness story: se.tickCount is read
+   ONLY by sendChanges (players present → the gate is off → the mirror
+   hands the state back on the transition).
+2. **The travel/collide port (doc 28)** — unchanged, ~10% mobs.
+3. **The L7 dispatcher batch-tick** — guardEntityTick + the per-entity
+   lambda + the itemSkip chain ≈ 7-8% items; one weave at the
+   EntityTickList level replaces the per-entity frames for owned items.
+4. The per-leg long tails — unchanged.
