@@ -4446,6 +4446,11 @@ public final class CeHooks {
     // exact-equality test fails and those mobs route vanilla.
     public static final boolean MOB_TRAVEL_ON =
             !"0".equals(System.getenv("CE_MOB_TRAVEL"));
+    // L71b: the steering widening's own knob (a -D system property so the
+    // parity dispatch's extra_jvm can flip it per run). Default OFF — the
+    // shipped gate keeps the proven input==0 contract.
+    public static final boolean TRAVEL_STEER_ON =
+            "true".equals(System.getProperty("centities.travelSteer", "false"));
     // plain longs (the L15b lesson: a volatile add per entity per tick was
     // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
     // visibility)
@@ -4540,20 +4545,18 @@ public final class CeHooks {
                     + " yaw=" + e.getYRot());
         }
         try {
-            // L71: the input gate widens to vertical-only. The steering
-            // (input.x/z != 0) rides the SAME SHAPE C port — the
-            // getInputVector math (normalize, the f64 speed scale, the f32
-            // Mth sin/cos yaw rotation) is already coded at the delta step
-            // below and pinned by centities-core/src/mobtravel.rs
-            // (input_vector_yaw_rotation_is_exact + the travel tests); the
-            // hull proof is swept-volume-generic (the union footprint with
-            // the steering delta). input.y stays declined: a POSITIVE dmY
-            // would extend the swept hull's TOP, which the proof's swept
-            // box does not cover (it was built for the falling dmY), and
-            // the jump-adjacent paths (jumpFromGround in aiStep) are out of
-            // the travel slice's contract.
+            // L71b: the steering widening (input.x/z != 0 riding SHAPE C)
+            // is KNOB-GATED (centities.travelSteer, default OFF) — the
+            // f5156eb parity run failed the mobs-bearing scenes with the
+            // widening active (small drifts: yaw 9.4deg, x 0.07 — a tiny
+            // per-tick steering-math divergence compounding through the
+            // AI), while the coasting shapes and L72's identity swap stay
+            // bit-identical. The shipped gate keeps the proven
+            // input==0 contract; the traced bisect run flips the knob.
+            final boolean steer = TRAVEL_STEER_ON;
             if (e.level().isClientSide() || e.isRemoved()
                     || input.y != 0.0F
+                    || (!steer && (input.x != 0.0F || input.z != 0.0F))
                     || !e.getPassengers().isEmpty()
                     || e.isFallFlying()
                     || e.isTemporarilyActive
