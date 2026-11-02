@@ -757,3 +757,35 @@ of the proven 18% quiet catch.
 L76 arms the AITR per-round protocol trace (the (round, req-op, goalIdx,
 cursor, seed) sequence for the traced mob); the follow-up dispatch is
 mob_ai=1 + trace_id=<a t=143-alive mob> + PH_DUMP 138-160.
+
+## The hunt deepens (runs 41525558896 + the step-count unwind): t=143 = ONE extra LR draw
+
+The L76 AITR run (mob_ai=1 + trace_id=1 + PH_DUMP 138-160) landed while
+in flight — the partial log gave everything:
+
+- **The PD diff named the spawn batch**: at t=147 the OFF leg spawned ids
+  83-92 (10 entities), the ON leg 83-91 + one at t=148, at DIFFERENT
+  positions — the spawn ROLLS had already shifted.
+- **The LCG step unwind** (the ThreadUnsafeRandom recurrence inverted
+  between the per-tick end-of-tick probe values): t=143 is the FIRST
+  divergence and it is EXACTLY ONE extra Level.random step on the ON
+  leg (LR 132→133; SR 426/426 — the SHARED stream still identical!).
+  The LR shift stays +1..+3 through t=146 and explodes at t=147
+  (799/760 — the extra spawn).
+- The AITR per-round protocol trace shows the engine busy with op=6
+  (REQ_FIND_TARGET) staged requests around the window — NONE of which
+  consume RNG (findTarget over 0 players).
+- javap scans across 21+ classes (Zombie, LivingEntity, Monster,
+  PathfinderMob, Entity base, every classified goal, the navigation, the
+  controls, PathFinder): ZERO Level.random references; the only
+  level().getRandom() in Mob is finalizeSpawn (spawn-time). The module's
+  own code never touches it either.
+
+The +1 draw at t=143 comes from a state-conditional Level.random call
+whose STATE is outside the PH hash (yaw/goal-state/blocks). The L77
+instrument (this commit): the harness (both legs) replaces
+ServerLevel.random with a delegating CountingRandom — the stream is
+untouched, every draw is counted and its caller frames captured; the
+tick end prints LRC (the count) always and the LRF frame dump inside
+LRC_WINDOW (default 138-150). The OFF/ON LRF diff names the extra
+caller class.method directly.
