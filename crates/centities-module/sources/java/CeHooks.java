@@ -1312,6 +1312,20 @@ public final class CeHooks {
                 if (fe != null) fe[sm] = null;
                 Entity[] tes = TT_E;
                 if (tes != null) tes[sm] = null;
+                AT_E[sm & (AT_CAP - 1)] = null;
+                // L73: the AI floor's shadow keys are STRONG — the removed
+                // mob's selector must be dropped explicitly (its goalSelector
+                // rides O_MOB_GOALSEL). A missed drop leaks one bounded
+                // entry; the drop never fires for non-mobs.
+                if (e instanceof net.minecraft.world.entity.Mob
+                        && O_MOB_GOALSEL >= 0 && U != null) {
+                    try {
+                        Object gsD = U.getObject(e, O_MOB_GOALSEL);
+                        if (gsD != null) aiDrop(gsD);
+                    } catch (Throwable dropFail) {
+                        // bounded leak, never a crash
+                    }
+                }
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -4464,100 +4478,43 @@ public final class CeHooks {
         }
     }
 
-    // L27: the per-mob AttributeInstance cache. AttributeMap builds its
-    // instances once in the constructor and never replaces them, so caching
-    // the instance references is the same read as AttributeMap.getValue
-    // (which is attributes.get(holder) -> instance.getValue()) without the
-    // HashMap.get per call (the 2.18% AttributeMap.getInstance bucket in
-    // the mixed-150k profile; the SHAPE C path pays it 3x per covered mob
-    // per tick). Slots: [0]=AIR_DRAG_MODIFIER, [1]=FRICTION_MODIFIER,
-    // [2]=MOVEMENT_SPEED. A null slot means the supplier lacks the
-    // attribute — vanilla's getAttributeValue base-default path routes for
-    // those. Weak-keyed identity table (the AIKey pattern): an entry dies
-    // with its mob, dead slots are claimed in place, server-thread confined
-    // (mobTravelNative runs inside the tick phase).
-    private static final int AT_CAP_INIT = 1 << 13;   // 8192 slots
-    private static AIKey[] AT_KEYS = new AIKey[AT_CAP_INIT];
-    private static net.minecraft.world.entity.ai.attributes.AttributeInstance[][] AT_VALS =
-            new net.minecraft.world.entity.ai.attributes.AttributeInstance[AT_CAP_INIT][];
-    private static int AT_SIZE = 0, AT_DEAD = 0;
+    // L73: the per-mob AttributeInstance cache, DIRECT-MAPPED by entity id.
+    // The L27 weak identity table paid a WeakReference.get + an
+    // identity-hash probe per covered mob per travel tick (30% of the
+    // mobs leg's Reference.get bucket); the id-slot stamp (AT_E[m] == e)
+    // proves the same thing with one array read. AttributeMap builds its
+    // instances once in the constructor and never replaces them, so the
+    // cached refs are the same reads without the HashMap.get per call.
+    // Slots: [0]=AIR_DRAG_MODIFIER, [1]=FRICTION_MODIFIER,
+    // [2]=MOVEMENT_SPEED. A null instance slot means the supplier lacks
+    // the attribute — vanilla's getAttributeValue base-default path routes
+    // for those. probeRemove clears the stamp; id-slot collisions evict
+    // (the identity check rejects, the next travel re-fills) — a
+    // two-colliding-mobs-same-tick thrash is rare and only re-reads three
+    // fields. Server-thread confined (mobTravelNative runs in the tick).
+    private static final int AT_CAP = 1 << 15;   // 32768 direct slots
+    private static final net.minecraft.world.entity.LivingEntity[] AT_E =
+            new net.minecraft.world.entity.LivingEntity[AT_CAP];
+    private static final net.minecraft.world.entity.ai.attributes.AttributeInstance[][] AT_V =
+            new net.minecraft.world.entity.ai.attributes.AttributeInstance[AT_CAP][];
 
     private static net.minecraft.world.entity.ai.attributes.AttributeInstance[] attrCache(
             net.minecraft.world.entity.LivingEntity e) {
-        AIKey[] keys = AT_KEYS;
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] vals = AT_VALS;
-        int mask = keys.length - 1;
-        int i = System.identityHashCode(e) & mask;
-        while (true) {
-            AIKey k = keys[i];
-            if (k == null) {
-                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
-                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
-                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.AIR_DRAG_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.FRICTION_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.MOVEMENT_SPEED),
-                        };
-                keys[i] = new AIKey(e);
-                vals[i] = v;
-                AT_SIZE++;
-                if (AT_SIZE + (AT_SIZE >> 1) >= keys.length) {
-                    attrRebuild(keys.length << 1);
-                }
-                return v;
-            }
-            Object cur = k.get();
-            if (cur == e) return vals[i];
-            if (cur == null) {
-                // dead slot: claim in place (same linear-probe law as the
-                // AI table — the incoming key's probe path starts here)
-                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
-                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
-                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.AIR_DRAG_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.FRICTION_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.MOVEMENT_SPEED),
-                        };
-                AT_DEAD++;
-                keys[i] = new AIKey(e);
-                vals[i] = v;
-                if (AT_DEAD > 2048 && AT_DEAD * 2 > AT_SIZE) {
-                    attrRebuild(keys.length); // sweep dead, same capacity
-                }
-                return v;
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    private static void attrRebuild(int newCap) {
-        AIKey[] oldKeys = AT_KEYS;
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] oldVals = AT_VALS;
-        AIKey[] nk = new AIKey[newCap];
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] nv =
-                new net.minecraft.world.entity.ai.attributes.AttributeInstance[newCap][];
-        int mask = newCap - 1;
-        int live = 0;
-        for (int j = 0; j < oldKeys.length; j++) {
-            AIKey k = oldKeys[j];
-            if (k == null) continue;
-            if (k.get() == null) continue; // dead — dropped
-            int i = k.hash & mask;
-            while (nk[i] != null) i = (i + 1) & mask;
-            nk[i] = k;
-            nv[i] = oldVals[j];
-            live++;
-        }
-        AT_KEYS = nk;
-        AT_VALS = nv;
-        AT_SIZE = live;
-        AT_DEAD = 0;
+        int m = e.getId() & (AT_CAP - 1);
+        if (AT_E[m] == e) return AT_V[m];
+        net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
+        net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
+                new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.AIR_DRAG_MODIFIER),
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.FRICTION_MODIFIER),
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.MOVEMENT_SPEED),
+                };
+        AT_E[m] = e;
+        AT_V[m] = v;
+        return v;
     }
 
     public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e,
@@ -6414,56 +6371,33 @@ public final class CeHooks {
     // the 26.3 mobs-25k-mod profile billed its segment chain
     // (Segment.getFirst 1.46% + getEntry 0.57%) per tick per selector
     // (25k mobs). This table is a flat open-addressed identity probe with
-    // WEAK keys: one identityHashCode, one slot, one WeakReference.get()
-    // — ~5-10ns. Dead entries (GC-cleared selectors) are reused in place
-    // on the next probe that touches them; a periodic sweep rebuilds the
-    // table when dead slots pile up (mob churn). Server-thread confined
-    // (every caller runs inside the goal tick phase) — plain arrays, no
-    // fences.
-    private static final class AIKey extends java.lang.ref.WeakReference<Object> {
-        final int hash;
-        AIKey(Object k) {
-            super(k);
-            hash = System.identityHashCode(k);
-        }
-    }
-
+    // L73: STRONG keys with explicit removal (probeRemove drops the removed
+    // mob's selector via its goalSelector field). The weak-key table paid a
+    // WeakReference.get() per probe per mob per tick (48% of the mobs leg's
+    // Reference.get bucket) plus the dead-slot sweep bookkeeping — with
+    // probeRemove as the proven universal removal choke point the strong
+    // keys need no GC coupling: one identityHashCode + one array compare
+    // per probe, and aiDrop's backward-shift deletion keeps the probe
+    // chains intact. Server-thread confined (every caller runs inside the
+    // goal tick phase) — plain arrays, no fences.
     private static final int AI_CAP_INIT = 1 << 13;   // 8192 slots
-    private static AIKey[] AI_KEYS = new AIKey[AI_CAP_INIT];
+    private static Object[] AI_KEYS = new Object[AI_CAP_INIT];
     private static AIShadow[] AI_VALS = new AIShadow[AI_CAP_INIT];
-    private static int AI_SIZE = 0;      // live + dead entries
-    private static int AI_DEAD = 0;      // GC-cleared entries seen while probing
+    private static int AI_SIZE = 0;      // live entries
 
     private static AIShadow shadowOf(Object gs) {
         int mask = AI_KEYS.length - 1;
-        int h = System.identityHashCode(gs);
-        int i = h & mask;
+        int i = System.identityHashCode(gs) & mask;
         while (true) {
-            AIKey k = AI_KEYS[i];
-            if (k == null) {
+            Object cur = AI_KEYS[i];
+            if (cur == gs) return AI_VALS[i];
+            if (cur == null) {
                 AIShadow sh = new AIShadow();
-                AI_KEYS[i] = new AIKey(gs);
+                AI_KEYS[i] = gs;
                 AI_VALS[i] = sh;
                 AI_SIZE++;
                 if (AI_SIZE + (AI_SIZE >> 1) >= AI_KEYS.length) {
                     aiRebuild(AI_KEYS.length << 1);
-                }
-                return sh;
-            }
-            Object cur = k.get();
-            if (cur == gs) return AI_VALS[i];
-            if (cur == null) {
-                // dead slot: claim in place. Safe under linear probing —
-                // the incoming key's probe path starts here, so the new
-                // pair is found first; the dead key is unreachable by
-                // definition; every other chain still terminates at a
-                // null or its own live key.
-                AI_DEAD++;
-                AIShadow sh = new AIShadow();
-                AI_KEYS[i] = new AIKey(gs);
-                AI_VALS[i] = sh;
-                if (AI_DEAD > 2048 && AI_DEAD * 2 > AI_SIZE) {
-                    aiRebuild(AI_KEYS.length); // sweep dead, same capacity
                 }
                 return sh;
             }
@@ -6477,44 +6411,72 @@ public final class CeHooks {
      *  the probe must WALK PAST them (a live entry later in the chain is
      *  still reachable), terminating at the first true null. */
     private static AIShadow aiShadowPeek(Object gs) {
-        AIKey[] keys = AI_KEYS;
+        Object[] keys = AI_KEYS;
         AIShadow[] vals = AI_VALS;
         int mask = keys.length - 1;
         int i = System.identityHashCode(gs) & mask;
         while (true) {
-            AIKey k = keys[i];
-            if (k == null) return null;
-            Object cur = k.get();
+            Object cur = keys[i];
+            if (cur == null) return null;
             if (cur == gs) return vals[i];
             i = (i + 1) & mask;
         }
     }
 
-    /** Rehash (capacity 0 = same capacity, dead sweep only). Keeps the
-     *  live pairs, drops the dead ones. Called from the server thread —
-     *  no racing readers. */
+    /** L73: drop a removed mob's selector entry (probeRemove). Open
+     *  addressing with backward-shift deletion: after clearing the slot,
+     *  the following cluster entries whose home does NOT lie cyclically
+     *  between the hole and their own slot shift back, so every probe
+     *  chain stays intact (Knuth 6.4R). A missed drop (a removal path
+     *  that skips probeRemove — none known) leaks one bounded entry. */
+    private static void aiDrop(Object gs) {
+        int mask = AI_KEYS.length - 1;
+        int i = System.identityHashCode(gs) & mask;
+        while (true) {
+            Object cur = AI_KEYS[i];
+            if (cur == null) return;               // not present
+            if (cur == gs) break;
+            i = (i + 1) & mask;
+        }
+        int j = i;
+        while (true) {
+            j = (j + 1) & mask;
+            Object k = AI_KEYS[j];
+            if (k == null) break;
+            int h = System.identityHashCode(k) & mask;
+            boolean between = (i < j) ? (h > i && h <= j)
+                                      : (h > i || h <= j);
+            if (!between) {
+                AI_KEYS[i] = k;
+                AI_VALS[i] = AI_VALS[j];
+                AI_KEYS[j] = null;
+                AI_VALS[j] = null;
+                i = j;
+            }
+        }
+        AI_KEYS[i] = null;
+        AI_VALS[i] = null;
+        AI_SIZE--;
+    }
+
+    /** Rehash (growth only — strong keys have no dead slots). Called from
+     *  the server thread — no racing readers. */
     private static void aiRebuild(int newCap) {
-        AIKey[] oldKeys = AI_KEYS;
+        Object[] oldKeys = AI_KEYS;
         AIShadow[] oldVals = AI_VALS;
-        AIKey[] nk = new AIKey[newCap];
+        Object[] nk = new Object[newCap];
         AIShadow[] nv = new AIShadow[newCap];
         int mask = newCap - 1;
-        int live = 0;
         for (int j = 0; j < oldKeys.length; j++) {
-            AIKey k = oldKeys[j];
+            Object k = oldKeys[j];
             if (k == null) continue;
-            Object cur = k.get();
-            if (cur == null) continue; // dead — dropped
-            int i = k.hash & mask;
+            int i = System.identityHashCode(k) & mask;
             while (nk[i] != null) i = (i + 1) & mask;
             nk[i] = k;
             nv[i] = oldVals[j];
-            live++;
         }
         AI_KEYS = nk;
         AI_VALS = nv;
-        AI_SIZE = live;
-        AI_DEAD = 0;
     }
 
     private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_LOCK_TABLE =
