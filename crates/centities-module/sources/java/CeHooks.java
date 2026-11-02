@@ -3204,7 +3204,7 @@ public final class CeHooks {
     // items-100k-mod leg). The batch is per-tick state, so no id-match
     // staleness check is needed: a mid-tick removal is caught by
     // isRemoved() (a plain field read).
-    private static final Entity[] IB_REF = new Entity[IB_CAP];
+    private static final ItemEntity[] IB_ITEM = new ItemEntity[IB_CAP];
     // L8.2 COMPACT BATCH: only collector-data entries (resync /
     // force-vanilla — the rare population) carry the 14-double state stride;
     // they are side-packed contiguously into IB_CD. The 1-based slot number
@@ -4046,7 +4046,7 @@ public final class CeHooks {
         ibN = i + 1;
         IB_IDS[i] = e.getId();
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
-        IB_REF[i] = e;
+        IB_ITEM[i] = e;
         IB_I[i * 4] = 0;
         IB_I[i * 4 + 1] = 0;
         IB_I[i * 4 + 2] = e.pickupDelay;
@@ -5208,7 +5208,7 @@ public final class CeHooks {
         if ((flags & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
             ibResyncN++;
         }
-        IB_REF[i] = e;
+        IB_ITEM[i] = e;
         // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
         int ci = ibCDN;
         int o = ci * 14;
@@ -5287,9 +5287,8 @@ public final class CeHooks {
             for (int i = 0; rsN != 0 && i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
-                    Entity ref = IB_REF[i];
-                    if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
-                    ItemEntity e = (ItemEntity) ref;
+                    ItemEntity e = IB_ITEM[i];
+                    if (e == null || e.isRemoved()) continue;
                     int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
                     IB_CD[o] = e.getX();
                     IB_CD[o + 1] = e.getY();
@@ -5382,8 +5381,8 @@ public final class CeHooks {
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) == 0
                         || (f & IF_INACTIVE) != 0) continue;
                 if (viewN >= VIEW_IDS.length) break;
-                Entity ref = IB_REF[i];
-                if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
+                ItemEntity ei = IB_ITEM[i];
+                if (ei == null || ei.isRemoved()) continue;
                 int cdSlot = (IB_FLAGS[i] >>> IF_CDSHIFT) - 1;
                 if (cdSlot < 0) continue;
                 VIEW_IDS[viewN] = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
@@ -5396,7 +5395,7 @@ public final class CeHooks {
                     VIEW_BOX[viewN * 6 + 4] = IB_PRE[p6 + 4];
                     VIEW_BOX[viewN * 6 + 5] = IB_PRE[p6 + 5];
                 } else {
-                    AABB lb = ref.getBoundingBox();
+                    AABB lb = ei.getBoundingBox();
                     VIEW_BOX[viewN * 6] = lb.minX;
                     VIEW_BOX[viewN * 6 + 1] = lb.minY;
                     VIEW_BOX[viewN * 6 + 2] = lb.minZ;
@@ -5445,7 +5444,7 @@ public final class CeHooks {
                     // full-ticking forever). Until the inline path mirrors
                     // the full per-tick semantics, rest stays off: items
                     // stay in the native batch where tick_item is exact.
-                    Entity r0 = IB_REF[i];
+                    ItemEntity r0 = IB_ITEM[i];
                     if (false
                             && (bits & (1 << 15)) != 0
                             && r0 instanceof ItemEntity ie0
@@ -5468,9 +5467,8 @@ public final class CeHooks {
                     if ((bits & (1 << 13)) != 0) itemAbort++;
                     continue;
                 }
-                Entity ref = IB_REF[i];
-                if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
-                ItemEntity e = (ItemEntity) ref;
+                ItemEntity e = IB_ITEM[i];
+                if (e == null || e.isRemoved()) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
                 // skipped for dispatch-owned entries).
@@ -9163,7 +9161,7 @@ public final class CeHooks {
     // check, so the cached path skips the three Unsafe hops per entity
     // per tick and reads the live objects directly. The SIT pair is
     // allocated lazily (items-only populations never need it).
-    private static volatile Object[] TT_SE;
+    private static volatile net.minecraft.server.level.ServerEntity[] TT_SE;
     private static volatile Object[] TT_SITOBJ;
     private static volatile Object[] TT_STEPS;
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
@@ -9198,7 +9196,7 @@ public final class CeHooks {
             if (TT_TE == null) {
                 TT_TE = new Object[ARENA.length];
                 TT_SHAPE = new long[ARENA.length];
-                TT_SE = new Object[ARENA.length];
+                TT_SE = new net.minecraft.server.level.ServerEntity[ARENA.length];
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
@@ -9389,10 +9387,11 @@ public final class CeHooks {
         if (sh0 == null) return false;
         long sh = sh0[m];
         if ((sh & TT_OK) == 0) return false;
-        Object[] ses = TT_SE;
-        if (ses == null) return false;
-        Object se = ses[m];
-        if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+        // L67: typed read — the TT_TE[m] == te identity above pins this
+        // slot to the fill that validated the type (the fill probe's
+        // instanceof is the check; per-tick it is a proven tautology).
+        net.minecraft.server.level.ServerEntity serverEntity = TT_SE[m];
+        if (serverEntity == null) {
             return false;
         }
         ttlFuseChecks++;
@@ -9408,9 +9407,8 @@ public final class CeHooks {
                     return false;
                 }
                 Object sitObj = so[m];
-                if (!(sitObj instanceof net.minecraft.world.entity
-                                .SteppedInterpolationTracker)) {
-                    return false;
+                if (sitObj == null) {
+                    return false; // L67: the type was fill-proven
                 }
                 Object steps = st[m];
                 if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
@@ -9510,7 +9508,8 @@ public final class CeHooks {
                     if (ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
                         try { // fill: cache the structural verdicts + refs
-                            Object se0 = U.getObject(te, O_TE_SE);
+                            net.minecraft.server.level.ServerEntity se0 =
+                                    (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
                             Object interp = O_SE_INTERP > 0
                                     ? U.getObject(se0, O_SE_INTERP) : null;
                             TT_TE[m] = te;
