@@ -42,8 +42,8 @@ on:
         description: 'CE_PUSH (1=shipped, 0=vanilla pushes via -Dcentities.pushNative=false)'
         default: '1'
       ai_floor:
-        description: 'CE_AI_FLOOR (1=experimental engine, 0=shipped vanilla GoalSelector)'
-        default: '0'
+        description: 'CE_AI_FLOOR (1=shipped L15 floor, L69-exact; 0=vanilla GoalSelector bisect)'
+        default: '1'
       collide:
         description: 'CE_COLLIDE (1=shipped, 0=vanilla canCollideWithBukkit body in ON leg)'
         default: '1'
