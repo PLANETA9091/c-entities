@@ -984,6 +984,7 @@ public final class CeHooks {
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
+                + "/w" + travelWalk + "/n" + travelWalkNoMove
                 + " idle=" + navCalls + "/" + navIdleHits + "/" + moveCalls + "/" + moveIdleHits
                 + "/" + lookCalls + "/" + lookIdleHits
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
@@ -4454,11 +4455,13 @@ public final class CeHooks {
     // plain longs (the L15b lesson: a volatile add per entity per tick was
     // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
     // visibility)
-    public static long travelChecks = 0, travelQuiet = 0, travelWalk = 0, travelFail = 0;
+    public static long travelChecks = 0, travelQuiet = 0, travelWalk = 0,
+            travelWalkNoMove = 0, travelFail = 0;
     // L24b: the two protected members the SHAPE C writeback needs —
     // resolved once with setAccessible (unreflect honors the flag), the
     // virtual dispatch stays exact through the MethodHandle
-    private static volatile MethodHandle MH_BACK_OFF_EDGE, MH_BOUNCINESS;
+    private static volatile MethodHandle MH_BACK_OFF_EDGE, MH_BOUNCINESS,
+            MH_BLOCK_SPEED;
     private static volatile boolean TRAVEL_MH_READY = false;
 
     private static synchronized boolean initTravelMh() {
@@ -4474,7 +4477,16 @@ public final class CeHooks {
                     .getDeclaredMethod("getEntityBounciness");
             bn.setAccessible(true);
             MH_BOUNCINESS = MethodHandles.lookup().unreflect(bn);
-            TRAVEL_MH_READY = MH_BACK_OFF_EDGE != null && MH_BOUNCINESS != null;
+            // L74: Entity.getBlockSpeedFactor() — the move() tail multiplies
+            // the delta by it (getBlockSpeedFactor: honey/soul sand 0.4,
+            // cobweb 0.05...); the gate declines anything != 1.0F so the
+            // writeback's scale stays exact on every feet block
+            java.lang.reflect.Method bs = net.minecraft.world.entity.Entity.class
+                    .getDeclaredMethod("getBlockSpeedFactor");
+            bs.setAccessible(true);
+            MH_BLOCK_SPEED = MethodHandles.lookup().unreflect(bs);
+            TRAVEL_MH_READY = MH_BACK_OFF_EDGE != null && MH_BOUNCINESS != null
+                    && MH_BLOCK_SPEED != null;
             return TRAVEL_MH_READY;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -4617,7 +4629,14 @@ public final class CeHooks {
                         || e.horizontalCollision || e.minorHorizontalCollision
                         || e.onClimbable() || e.isPassenger()
                         || e.getVehicle() != null
-                        || e.isInWater() || e.isInLava()) {
+                        || e.isInWater() || e.isInLava()
+                        || e.fallDistance != 0.0) {
+                    // L74: fallDistance joins the gate — the move()'s
+                    // fall-damage RESET clip (fallDistance != 0.0 &&
+                    // movementLength >= 1.0 → level.clip + resetFallDistance)
+                    // must be provably dead; a grounded mob's fallDistance
+                    // is 0 (checkFallDamage resets it every grounded tick),
+                    // so this declines nothing in practice
                     return false;
                 }
                 net.minecraft.world.level.Level lvl = e.level();
@@ -4713,6 +4732,12 @@ public final class CeHooks {
                 // maybeBackOffFromEdge must be the identity (non-sneaking
                 // mobs) — compare by reference like the no-op returns
                 if (!initTravelMh()) return false;
+                // L74: the move() tail multiplies the delta by
+                // getBlockSpeedFactor() (the FEET block: honey/soul sand
+                // 0.4, cobweb 0.05) — the writeback scales by frictC*hdC
+                // only, so the factor must be proven 1.0 or the mob routes
+                // vanilla (the bench's plain terrain always is)
+                if (((float) MH_BLOCK_SPEED.invoke(e)) != 1.0F) return false;
                 net.minecraft.world.phys.Vec3 wantedC =
                         new net.minecraft.world.phys.Vec3(dmX, dmY, dmZ);
                 if (MH_BACK_OFF_EDGE.invoke(e, wantedC,
@@ -4795,10 +4820,35 @@ public final class CeHooks {
                 // applyEffectsFromBlocks, which the block-fx gate no-ops
                 // on the SAME all-air hull — the record is unobservable,
                 // and skipping it keeps that gate armed.
-                e.setPos(e.getX() + dmX, y, e.getZ() + dmZ);
+                // L74 — the move()'s setPos condition (26.3 Entity.move):
+                //   movement = collide(delta);
+                //   if (movement.lengthSqr() > 1.0E-7
+                //       || delta.lengthSqr() - movement.lengthSqr() < 1.0E-7) {
+                //     addMovementThisTick; setPos(pos + movement); recordMovement; }
+                // The y-clip makes movement == (dmX, 0.0, dmZ), so the
+                // guard's second term is (dmX*dmX + dmY*dmY) + dmZ*dmZ
+                // minus ((dmX*dmX + 0.0) + dmZ*dmZ) — for the gated mob
+                // dmY = -g*vf (|dmY| ~ 0.078) the difference is ~6.1e-3 ≥
+                // 1e-7 regardless of the sum roundings, and the condition
+                // reduces to movement.lengthSqr() > 1.0E-7. A NEAR-
+                // STATIONARY mob (dm_horiz² ≤ 1e-7, |dm_horiz| ≤ 3.16e-4)
+                // does NOT setPos in vanilla — the old writeback moved it
+                // every tick: a per-tick drift of up to ~3.2e-4 exactly in
+                // the decelerating-coaster / wall-residue population the
+                // L71 widening newly routes here (the f5156eb T382/T389
+                // tiny drifts, mixed yaw 9.4deg). The flags, the
+                // setOnGroundWithMovement rescan and the delta tail run
+                // OUTSIDE the condition in vanilla — reproduced identically
+                // in both branches below.
                 net.minecraft.world.phys.Vec3 clippedC =
                         new net.minecraft.world.phys.Vec3(dmX, 0.0, dmZ);
-                e.recordMovement(net.minecraft.world.entity.MoverType.SELF, clippedC);
+                double mlC = (dmX * dmX + 0.0) + dmZ * dmZ;
+                double dlC = (dmX * dmX + dmY * dmY) + dmZ * dmZ;
+                boolean moveC = mlC > 1.0E-7 || dlC - mlC < 1.0E-7;
+                if (moveC) {
+                    e.setPos(e.getX() + dmX, y, e.getZ() + dmZ);
+                    e.recordMovement(net.minecraft.world.entity.MoverType.SELF, clippedC);
+                }
                 e.setOnGroundWithMovement(true, false, clippedC);
                 float hdC = 1.0F - (1.0F - 0.91F) * dragMod; // the horizontal drag
                 if (hdC < 0.0F) hdC = 0.0F;
@@ -4808,10 +4858,11 @@ public final class CeHooks {
                         dmX * (double) hC,
                         (0.0 - g) * (double) vf,
                         dmZ * (double) hC));
-                travelWalk++;
+                if (moveC) travelWalk++; else travelWalkNoMove++;
                 if (ttr) {
                     System.out.println("[ce-baseline] TTR t=" + CUR_TICK
-                            + " exit shape=C dm=(" + dmX + "," + dmY + "," + dmZ + ")"
+                            + " exit shape=C" + (moveC ? "" : " noMove")
+                            + " dm=(" + dmX + "," + dmY + "," + dmZ + ")"
                             + " post=(" + e.getX() + "," + e.getY() + "," + e.getZ() + ")"
                             + " dv=(" + e.getDeltaMovement().x + ","
                             + e.getDeltaMovement().y + "," + e.getDeltaMovement().z + ")");
