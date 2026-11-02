@@ -1296,10 +1296,18 @@ public final class CeHooks {
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
             // the entity — the identity check tolerates stale slots, but a
-            // removed entity's TrackedEntity must be collectable).
+            // removed entity's TrackedEntity must be collectable). L65: the
+            // se/sit/steps refs ride the same slot lifecycle.
             if (e != null) {
+                int sm = e.getId() & AMASK;
                 Object[] te0 = TT_TE;
-                if (te0 != null) te0[e.getId() & AMASK] = null;
+                if (te0 != null) te0[sm] = null;
+                Object[] ses = TT_SE;
+                if (ses != null) ses[sm] = null;
+                Object[] so = TT_SITOBJ;
+                if (so != null) so[sm] = null;
+                Object[] st = TT_STEPS;
+                if (st != null) st[sm] = null;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -9131,6 +9139,16 @@ public final class CeHooks {
     private static volatile Object[] TT_TE;   // slot -> TrackedEntity (identity key)
     private static volatile long[] TT_SHAPE;  // slot -> (TT_OK|TT_SIT)
     private static final long TT_OK = 1L, TT_SIT = 2L;
+    // L65: the fill-time REF caches — serverEntity (TrackedEntity, public
+    // final), interpolationTracker (ServerEntity, private final) and
+    // trackedSteps (SteppedInterpolationTracker, private final List) are
+    // ALL final fields whose owner chain is pinned by the te identity
+    // check, so the cached path skips the three Unsafe hops per entity
+    // per tick and reads the live objects directly. The SIT pair is
+    // allocated lazily (items-only populations never need it).
+    private static volatile Object[] TT_SE;
+    private static volatile Object[] TT_SITOBJ;
+    private static volatile Object[] TT_STEPS;
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
 
     public static void initTrackerLoopHandles() {
@@ -9159,6 +9177,7 @@ public final class CeHooks {
             if (TT_TE == null) {
                 TT_TE = new Object[ARENA.length];
                 TT_SHAPE = new long[ARENA.length];
+                TT_SE = new Object[ARENA.length];
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
@@ -9344,27 +9363,35 @@ public final class CeHooks {
      *  byte-identical to the fill path's fused tail. */
     private static boolean ttlCachedPath(Entity ent, Object te, int m) {
         Object[] te0 = TT_TE;
+        if (te0 == null || te0[m] != te) return false;
         long[] sh0 = TT_SHAPE;
-        if (te0 == null || sh0 == null || te0[m] != te) return false;
+        if (sh0 == null) return false;
         long sh = sh0[m];
         if ((sh & TT_OK) == 0) return false;
+        Object[] ses = TT_SE;
+        if (ses == null) return false;
+        Object se = ses[m];
+        if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+            return false;
+        }
         ttlFuseChecks++;
         try {
-            Object se = U.getObject(te, O_TE_SE);
-            if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
-                return false;
-            }
             if ((sh & TT_SIT) != 0) {
-                if (O_SE_INTERP <= 0 || O_SIT_STEPS < 0 || O_SIT_DELTA < 0
+                // L65: the interp handler and the steps LIST are fill-cached
+                // (both final; the te identity pins the chain) — the per-tick
+                // reads are the cached refs' live state.
+                Object[] so = TT_SITOBJ;
+                Object[] st = TT_STEPS;
+                if (so == null || st == null || O_SIT_DELTA < 0
                         || O_SIT_TICKS < 0 || O_ENT_SYNC_POS < 0) {
                     return false;
                 }
-                Object sitObj = U.getObject(serverEntity, O_SE_INTERP);
+                Object sitObj = so[m];
                 if (!(sitObj instanceof net.minecraft.world.entity
                                 .SteppedInterpolationTracker)) {
                     return false;
                 }
-                Object steps = U.getObject(sitObj, O_SIT_STEPS);
+                Object steps = st[m];
                 if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
                     return false; // a live step: addStep would mutate — vanilla
                 }
@@ -9461,15 +9488,27 @@ public final class CeHooks {
                             .moonrise$getChunkData().nearbyPlayers;
                     if (ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
-                        try { // fill: cache the structural verdicts
+                        try { // fill: cache the structural verdicts + refs
                             Object se0 = U.getObject(te, O_TE_SE);
                             Object interp = O_SE_INTERP > 0
                                     ? U.getObject(se0, O_SE_INTERP) : null;
                             TT_TE[m] = te;
-                            TT_SHAPE[m] = TT_OK | ((interp instanceof
+                            TT_SE[m] = se0;
+                            TT_SHAPE[m] = TT_OK;
+                            if (interp instanceof
                                             net.minecraft.world.entity
-                                                    .SteppedInterpolationTracker)
-                                    ? TT_SIT : 0L);
+                                                    .SteppedInterpolationTracker
+                                    && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
+                                    && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
+                                // L65: lazy SIT arrays (mobs populations only)
+                                if (TT_SITOBJ == null) {
+                                    TT_SITOBJ = new Object[ARENA.length];
+                                    TT_STEPS = new Object[ARENA.length];
+                                }
+                                TT_SITOBJ[m] = interp;
+                                TT_STEPS[m] = U.getObject(interp, O_SIT_STEPS);
+                                TT_SHAPE[m] |= TT_SIT;
+                            }
                             ttlFill++;
                         } catch (Throwable fillFail) {
                             TT_TE[m] = null;
