@@ -316,3 +316,35 @@ The landed floors this era (parity-gated, all 12/12 green):
 4. **The per-leg long tails** (each 1-3%, no single move):
    AttributeMap cluster (2.10+1.56+1.21 — attrCache covers part),
    NaturalSpawner.createState (1.63 mixed), setOldPos, applyEffectsFromBlocks.
+
+### The L62 era verdicts (2026-11-02, runs 41449046210 / 41449061017 / 41453326369)
+
+The 46e2f3a baseline (L62a armed, paired legs): items 34.5 vs 76.1
+(-54.6%), mobs 309.9 vs 537.4 (-42.3%), mixed 275.8 vs 681.7 (-59.6%),
+spread 340.9 vs 561.8 (-39.3%). The mobs leg moved -23.8% -> -42.3%
+with the ench/equip floors actually armed (the L62a ReplaceBody bug
+kept them SOE-ing the whole mobs population in the red run before it).
+
+**Frontier item 2 (the tracker share on mobs) is RESOLVED — L62b.**
+The ttlDecl verdict named site 5 (interp) = 8,075,257 on mobs-25k,
+every other site 0. Root cause, a 26.3 shape change:
+LivingEntity.createInterpolationHandler() routes SERVER-side to
+SteppedInterpolationTracker (create() picks the handler client-side,
+the tracker server-side), so ServerEntity.interpolationTracker is
+NEVER InterpolationTracker.NO_OP for a mob and the fuse's gate 5
+declined every living entity. L62b (2c92b3a) consumes the tracker
+exactly: on EMPTY trackedSteps with syncPosition FALSE the per-tick
+sendChanges effect is exactly {predictedDelta=ZERO; ticksSinceLastStep++}
+(addStep packs the counter into PositionStep(vec, ticks) on a later
+teleport, so the ++ is replicated, never skipped). Both parity runs on
+2c92b3a are 12/12 bit-identical with ttlDecl ALL ZERO — the fuse now
+covers the full bench population. The 2c92b3a baseline quantifies the
+mobs share this freed.
+
+**Frontier item 3 (the ds census) has its verdict: ds=0/34.5M on
+items.** The DELTA_SAME gate NEVER hits — every setDeltaMovement call
+changes the value; a same-value skip is worthless. The setDeltaMovement
+bucket (caller 5.89 + callee 5.7 on items) must be removed by NOT
+calling it: the item tick floor's move writeback should land the delta
+straight into the mirror fields (the L44 view contract), with the
+vanilla call kept only on the declined/vanilla-routed population.
