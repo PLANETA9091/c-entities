@@ -631,3 +631,92 @@ or the delta.y gate interacting with a steering tick's gravity write).
 
 The rule stands: a widening ships ONLY after the traced divergence is
 pinned to a single float op and the mobtravel.rs mirror pins it.
+
+## L74 (f22fb53): the move() setPos condition — the near-stationary band
+
+The traced travelSteer bisect (run 41514292000 on 385a32d, trace_id=78,
+PH_DUMP 240-400) failed the gate exactly as the L71 verdict predicted:
+mobs T382 / mixed T389 / spread T389 — same counts, no type mismatches,
+worst deltas TINY (mobs T382: x 1.67e-4, z 4.90e-4 across entities 652 /
+975 / 2336 — the drift magnitudes sit inside a ~3.2e-4 envelope). The
+TTR lines (id=78, spawned t≈672 — NOT a T382 witness) showed the shape-C
+routing itself works: input=(0,0,0) coasters enter with dm_horiz
+0.025-0.07 and exit dv=dm×0.546 as designed.
+
+The pin came from the DECOMPILED Entity.move (26.3, line 1173+):
+
+```java
+Vec3 movement = this.collide(delta);
+double movementLength = movement.lengthSqr();
+if (movementLength > 1.0E-7 || delta.lengthSqr() - movementLength < 1.0E-7) {
+   addMovementThisTick(...); this.setPos(pos.add(movement)); recordMovement(...); }
+```
+
+The y-clip makes movement == (dmX, 0.0, dmZ); with the gated
+dmY = -g*vf (~ -0.078) the second term is (dmX²+dmY²)+dmZ² minus
+(dmX²+0.0)+dmZ² ≈ 6.1e-3 ≥ 1e-7 regardless of the sum roundings — the
+condition reduces to movementLength > 1e-7. A NEAR-STATIONARY mob
+(dm_horiz² ≤ 1e-7, |dm_horiz| ≤ 3.16e-4) does NOT setPos in vanilla.
+The SHAPE C writeback moved it every tick: a per-tick drift of up to
+~3.2e-4 exactly in the decelerating-coaster / wall-residue population —
+the drift envelope matches the T382 dump to the digit. The rest of the
+move() body (the collision flags, setOnGroundWithMovement, the delta
+tail with the getBlockSpeedFactor multiply) runs OUTSIDE the condition —
+the writeback now reproduces the condition bit-exactly (both branches),
+declines the fall-damage clip (fallDistance != 0) and declines
+getBlockSpeedFactor() != 1.0F (honey/soul sand feet blocks). mobtravel.rs
+pins the condition (move_sets_position + the band-edge test — note the
+threshold compares the COMPUTED lengthSqr: sqrt(1e-7)² re-rounds ABOVE
+1e-7, so the exact-threshold pin uses representable squares).
+
+The same-body read also VERIFIED op-exactness of everything else the
+widening touches: travelInAir's blockFriction is the MODIFIER-adjusted
+computeModifiedFriction (26.3 — matches frictC), the final scale is
+blockFriction × computeModifiedFriction(0.91, dragMod) (== hC), the
+vertical is movementY × computeModifiedFriction(0.98, dragMod) (== vf;
+omnidirectionalAirMover() = false in the Entity base), the restitution
+is provably 0.0 for the gated dmY (|dmY| ≤ g always → the max() branch
+never taken), getInputVector normalizes by DIVISION (Vec3.normalize
+bytecode: x/d, y/d, z/d — same as the engine; the 1e-5 guard is
+unreachable at lsC > 1.0), Mth.sin/cos are the SAME table through a
+DOUBLE parameter in 26.3 (sin(double) — the module's call is identical),
+getFrictionInfluencedSpeed HAS the 0.6 special-case (matches fisC), and
+Vec3.scale widens the float speed — all bit-equal.
+
+## L75 (6fcded7): the direct id read — getId()'s throw edge
+
+javap 26.3: Entity.getId() reads the id field TWICE around a defensive
+"Tried to access entity ID before ID assignment" IllegalStateException,
+and the method is not final. The probes/dispatch/mode tables read the id
+~9x per item per tick → 4.52% self on the items-100k leg (the #4 leaf,
+ABOVE the whole Unsafe cluster). entId() = one Unsafe field load
+(O_ENT_ID resolved idempotently in initDataOffsets, the virtual-call
+fallback when unresolved); 88 call sites replaced, the 9 println/append
+diagnostics keep the virtual call. The 0-id entity previously threw
+(disarming through the probe guards); it now indexes slot 0 and declines
+by mismatch — dead on live populations.
+
+### The frontier (2026-11-03, after L74/L75)
+
+0. The L74 gate runs (in flight): the shipped-config parity + baseline on
+   f22fb53/6fcded7, the traced travelSteer re-bisect (trace_id=652 — a
+   T382 drifted entity, not the t≈672-spawned 78), the mob_ai=1 SR/LR
+   hunt for the AI engine's RNG protocol (the −19% mobs lever).
+1. **The itemTickFlush compact pass-2** (15.4% items across the flush
+   lines; the loop head `null + isRemoved` is 11.03% alone) — the batch
+   bits already classify every entry; the structural cut is the
+   two-loop split: a TIGHT counter loop (MODE stamps + tickCount/
+   totalEntityAge/age writes, ~6 ops/entry) over all n, and the FULL
+   tail loop over Rust's compact index list (entries with bits beyond
+   the counters). Contract: outI grows to n*4 + 1 + n (outI[n*4] = cn,
+   then the compact indices); include an entry when the delta write /
+   MOVED / MERGE / DESPAWN / VOID / LAND / needsSync bits fire OR the
+   out-fd/out-pd differ from the batch pre-state (the Java compares
+   stay in Loop B — over-inclusion costs one branch). natives_parity
+   pins the new descriptor.
+2. The guardEntityTick + appendDispatch chain (~11% items) — the L7
+   dispatcher's batch-tick step.
+3. The AI engine RNG protocol (~-19% mobs) — the mob_ai=1 hunt is armed;
+   scripts/srlr_first_div.py pairs the OFF/ON legs' SR/LR/PH streams and
+   names the first divergence tick + stream.
+4. The per-leg long tails — unchanged.
