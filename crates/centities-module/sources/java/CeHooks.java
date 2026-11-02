@@ -4581,8 +4581,20 @@ public final class CeHooks {
                     + " yaw=" + e.getYRot());
         }
         try {
+            // L71: the input gate widens to vertical-only. The steering
+            // (input.x/z != 0) rides the SAME SHAPE C port — the
+            // getInputVector math (normalize, the f64 speed scale, the f32
+            // Mth sin/cos yaw rotation) is already coded at the delta step
+            // below and pinned by centities-core/src/mobtravel.rs
+            // (input_vector_yaw_rotation_is_exact + the travel tests); the
+            // hull proof is swept-volume-generic (the union footprint with
+            // the steering delta). input.y stays declined: a POSITIVE dmY
+            // would extend the swept hull's TOP, which the proof's swept
+            // box does not cover (it was built for the falling dmY), and
+            // the jump-adjacent paths (jumpFromGround in aiStep) are out of
+            // the travel slice's contract.
             if (e.level().isClientSide() || e.isRemoved()
-                    || input.x != 0.0F || input.y != 0.0F || input.z != 0.0F
+                    || input.y != 0.0F
                     || !e.getPassengers().isEmpty()
                     || e.isFallFlying()
                     || e.isTemporarilyActive
@@ -4844,8 +4856,15 @@ public final class CeHooks {
                 }
                 return true;
             }
-            // SHAPE B: the standing fixed point (0, -g * vf, 0)
-            if (d.x != 0.0 || d.z != 0.0 || !e.onGround()
+            // SHAPE B: the standing fixed point (0, -g * vf, 0).
+            // L71: zero horizontal INPUT is part of the contract — a mob
+            // steering into a wall has vanilla-observed delta.x/z AFTER the
+            // tick (the steering's moveRelative + the wall's collision
+            // restitution leave the input's residue in the horizontal
+            // delta), which this shape does not reproduce; it routes
+            // vanilla (the writeback would have erased the residue).
+            if (input.x != 0.0F || input.z != 0.0F
+                    || d.x != 0.0 || d.z != 0.0 || !e.onGround()
                     || e.fallDistance != 0.0
                     || e.horizontalCollision
                     || !e.verticalCollision
