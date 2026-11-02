@@ -1001,6 +1001,7 @@ public final class CeHooks {
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
+                + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -1292,6 +1293,13 @@ public final class CeHooks {
                 ARENA[e.getId() & AMASK] = null;
                 REST_GEN[e.getId() & AMASK] = 0; // gone: drop the rest state
                 batchRemove(e.getId());
+            }
+            // L63b: release the shape-cache slot (the te ref must not outlive
+            // the entity — the identity check tolerates stale slots, but a
+            // removed entity's TrackedEntity must be collectable).
+            if (e != null) {
+                Object[] te0 = TT_TE;
+                if (te0 != null) te0[e.getId() & AMASK] = null;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -5462,7 +5470,36 @@ public final class CeHooks {
                 // items-100k (setDeltaMovement self was 3.5% of the leg).
                 if ((bits & (1 << 14)) == 0) { // not DELTA_SAME
                     dwrite++;
-                    e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                    // L63a: the direct delta write. javap 26.3 — the whole
+                    // vanilla body of setDeltaMovement(Vec3) is the isFinite
+                    // gate + the posLock-guarded field store (NO flag
+                    // writes: markHurt owns syncVelocity). The woven call
+                    // chain for a dispatch-owned item inside the apply
+                    // window adds three dead frames: the deltaNoOp guard
+                    // (a value compare the ds=0/34.5M verdict says NEVER
+                    // fires on live populations), the probeDelta capture
+                    // (l7ExternalMutation no-ops under IN_ITEM_APPLY; the
+                    // LivingEntity push batch is dead for items; the REST
+                    // wake only matters when REST_GEN is set — routed
+                    // below), and the virtual dispatch. The volatile store
+                    // is STRONGER than the monitor-guarded plain store
+                    // (uncontended on the single server thread); the fresh
+                    // Vec3 matches vanilla's per-write identity exactly
+                    // (Entity.move's identity term reads it the same way).
+                    // Non-finite: vanilla SKIPS the write — replicated (the
+                    // field keeps the old value; no probe fires on the
+                    // guard path either — the deltaNoOp !isFinite early
+                    // return precedes the capture).
+                    if (O_ENT_DELTA > 0 && U != null
+                            && REST_GEN[idSlot & AMASK] == 0) {
+                        if (Double.isFinite(outD[o]) && Double.isFinite(outD[o + 1])
+                                && Double.isFinite(outD[o + 2])) {
+                            U.putObjectVolatile(e, O_ENT_DELTA,
+                                    new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                        }
+                    } else {
+                        e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                    }
                 } else {
                     dsame++;
                 }
@@ -9047,6 +9084,22 @@ public final class CeHooks {
     private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
     private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
     private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
+    // L63a: Entity.deltaMovement (private Vec3) — the flush apply loop's
+    // direct delta write (javap 26.3: setDeltaMovement's whole body is the
+    // isFinite gate + the posLock-guarded field store; no flag writes).
+    private static volatile long O_ENT_DELTA = -1;
+    // L63b: the TTL shape cache — per mirror slot, the te identity + the
+    // structural verdicts the fill probe established. With NO ServerPlayers
+    // in the level (the per-pass players().isEmpty() gate) seenBy /
+    // trackedPlayers / nearby-players lists cannot GAIN entries (only
+    // tracking writes them; removals only shrink), so a fill-time empty
+    // verdict holds until the te identity changes. Per-tick volatile
+    // inputs (syncVelocity, syncPosition, steps-emptiness for SIT) stay
+    // per-entity reads in the cached path.
+    private static volatile Object[] TT_TE;   // slot -> TrackedEntity (identity key)
+    private static volatile long[] TT_SHAPE;  // slot -> (TT_OK|TT_SIT)
+    private static final long TT_OK = 1L, TT_SIT = 2L;
+    public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
 
     public static void initTrackerLoopHandles() {
         try {
@@ -9065,6 +9118,16 @@ public final class CeHooks {
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
+            // L63a: the delta field offset (the flush apply loop's direct
+            // write; a miss keeps every writeback on the woven call).
+            O_ENT_DELTA = offOf(Entity.class, "deltaMovement");
+            // L63b: the shape-cache arrays (slot-indexed like the ARENA;
+            // allocated once — the identity check tolerates stale entries,
+            // probeRemove clears the slot to release the te ref).
+            if (TT_TE == null) {
+                TT_TE = new Object[ARENA.length];
+                TT_SHAPE = new long[ARENA.length];
+            }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
                 O_SIT_STEPS = VH_SIT_STEPS.off;
@@ -9234,8 +9297,73 @@ public final class CeHooks {
         }
     }
 
+    /** L63b — the cached fast path. The fill probe (ttlFastPath) proved,
+     *  under the SAME per-pass conditions this pass re-proves (players()
+     *  empty), the STRUCTURAL verdicts: chunk-players list empty, seenBy
+     *  empty, trackedPlayers empty, !hardColliding (a ctor-fixed field),
+     *  and the interp shape (NO_OP or a SteppedInterpolationTracker). None
+     *  of those can change without a player or a new TrackedEntity — the
+     *  identity check (TT_TE[m] == te) covers the latter, the per-pass
+     *  players gate covers the former. What CAN change every tick stays a
+     *  per-entity read here: syncVelocity (markHurt), syncPosition (the
+     *  bounce/ServerEntity writers), and — for SIT entities — the
+     *  trackedSteps emptiness (addStep is NOT player-gated: the L62b
+     *  decline must re-fire on any live step). The replicated effects are
+     *  byte-identical to the fill path's fused tail. */
+    private static boolean ttlCachedPath(Entity ent, Object te, int m) {
+        Object[] te0 = TT_TE;
+        long[] sh0 = TT_SHAPE;
+        if (te0 == null || sh0 == null || te0[m] != te) return false;
+        long sh = sh0[m];
+        if ((sh & TT_OK) == 0) return false;
+        ttlFuseChecks++;
+        try {
+            Object se = U.getObject(te, O_TE_SE);
+            if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+                return false;
+            }
+            if ((sh & TT_SIT) != 0) {
+                if (O_SE_INTERP <= 0 || O_SIT_STEPS < 0 || O_SIT_DELTA < 0
+                        || O_SIT_TICKS < 0 || O_ENT_SYNC_POS < 0) {
+                    return false;
+                }
+                Object sitObj = U.getObject(serverEntity, O_SE_INTERP);
+                if (!(sitObj instanceof net.minecraft.world.entity
+                                .SteppedInterpolationTracker)) {
+                    return false;
+                }
+                Object steps = U.getObject(sitObj, O_SIT_STEPS);
+                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                    return false; // a live step: addStep would mutate — vanilla
+                }
+                if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
+                    return false; // the syncPosition branch is live: addStep
+                }
+                U.putObject(sitObj, O_SIT_DELTA,
+                        net.minecraft.world.phys.Vec3.ZERO);
+                U.putInt(sitObj, O_SIT_TICKS,
+                        U.getInt(sitObj, O_SIT_TICKS) + 1);
+            }
+            if (ent.syncVelocity) {
+                // the L61 consumption (same shape as the fill path)
+                if (ent instanceof net.minecraft.server.level.ServerPlayer) {
+                    return false;
+                }
+                ent.syncVelocity = false;
+            }
+            ent.updateDataBeforeSync();
+            U.putInt(serverEntity, O_SE_TICKCOUNT,
+                    U.getInt(serverEntity, O_SE_TICKCOUNT) + 1);
+            ttlCache++;
+            return true;
+        } catch (Throwable cacheFail) {
+            return false; // route the exact vanilla pair — never break tracking
+        }
+    }
+
     /** Replacement body of ChunkMap.newTrackerTick() — the byte-exact
-     *  vanilla loop (javap-anchored) with the L30 fused fast path. */
+     *  vanilla loop (javap-anchored) with the L30 fused fast path and the
+     *  L63b cached fast path (fill = the L30 probe; hit = the cache). */
     public static void newTrackerTick$(Object cmObj) {
         ttlCalls++;
         ttlMemoChunk = null; // L59a: fresh chunk reads every pass
@@ -9249,6 +9377,35 @@ public final class CeHooks {
             // same cast here; a CCE is the honest vanilla-shaped failure.
             Entity[] raw = (Entity[]) list.getRawDataUnchecked();
             int size = list.size();
+            // L63b per-pass hoists: the ON/handles checks ran PER ENTITY
+            // inside ttlFastPath before this (a volatile read + three
+            // offset compares per entity per tick). All of them are
+            // pass-stable — hoisted. The players() gate is ONE read per
+            // pass: any ServerPlayer in the level disables the cache (the
+            // fill probe still runs and the vanilla decline path is
+            // untouched; with players present the L30 probe alone is the
+            // exact behavior).
+            boolean on = TTL_ON && TTL_HANDLES_OK && U != null
+                    && O_TE_SE > 0 && O_ENT_TRACKED >= 0
+                    // the ttlFastPath per-entity guard, hoisted: with any of
+                    // these negative the L30 probe declined EVERY entity —
+                    // the whole loop routed vanilla; replicate exactly.
+                    && O_TE_SEEN > 0 && O_SE_TRACKED_PLAYERS > 0
+                    && O_SE_INTERP > 0 && O_SE_TICKCOUNT > 0;
+            boolean cacheArm = false;
+            if (on) {
+                cacheArm = TT_TE != null && TT_SHAPE != null
+                        && O_ENT_SYNC_POS >= 0;
+                if (cacheArm) {
+                    try {
+                        cacheArm = ((net.minecraft.server.level.ChunkMap) cmObj)
+                                .level.players().isEmpty();
+                    } catch (Throwable popFail) {
+                        cacheArm = false;
+                    }
+                }
+                if (!cacheArm) ttlPopBlock++;
+            }
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
@@ -9258,10 +9415,54 @@ public final class CeHooks {
                         : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
+                // L63b: the cached path first (one identity compare for the
+                // bulk of the population) — the chunk read (two calls) is
+                // deferred behind the cache check, the fill probe on any
+                // doubt.
+                if (cacheArm) {
+                    int m = ent.getId() & AMASK;
+                    if (ttlCachedPath(ent, te, m)) {
+                        ttlFuse++;
+                        continue;
+                    }
+                    Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                            .moonrise$getChunkData().nearbyPlayers;
+                    if (ttlFastPath(ent, te, chunk)) {
+                        ttlFuse++;
+                        try { // fill: cache the structural verdicts
+                            Object se0 = U.getObject(te, O_TE_SE);
+                            Object interp = O_SE_INTERP > 0
+                                    ? U.getObject(se0, O_SE_INTERP) : null;
+                            TT_TE[m] = te;
+                            TT_SHAPE[m] = TT_OK | ((interp instanceof
+                                            net.minecraft.world.entity
+                                                    .SteppedInterpolationTracker)
+                                    ? TT_SIT : 0L);
+                            ttlFill++;
+                        } catch (Throwable fillFail) {
+                            TT_TE[m] = null;
+                        }
+                        continue;
+                    }
+                    ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$tick((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk);
+                    // vanilla bc 71-94: sendChanges iff hasPlayers() OR the
+                    // entity's chunk is entity-ticking — NO negation (the
+                    // first weave shipped with an inverted !hasPlayers();
+                    // players tracking an entity in a non-entity-ticking
+                    // chunk would have missed every update).
+                    if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$hasPlayers()
+                            || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                                    .moonrise$getChunkStatus()
+                                    .isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
+                        ((net.minecraft.server.level.ServerEntity) VH_TE_SERVERENT.getObj(te))
+                                .sendChanges();
+                    }
+                    continue;
+                }
                 Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                         .moonrise$getChunkData().nearbyPlayers;
-                // L30: the fused no-tracking fast path (declines to the
-                // exact vanilla pair on any doubt).
                 if (ttlFastPath(ent, te, chunk)) {
                     ttlFuse++;
                     continue;
