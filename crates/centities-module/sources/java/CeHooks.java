@@ -1308,6 +1308,8 @@ public final class CeHooks {
                 if (so != null) so[sm] = null;
                 Object[] st = TT_STEPS;
                 if (st != null) st[sm] = null;
+                Entity[] fe = FROZ_E;
+                if (fe != null) fe[sm] = null;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -6970,6 +6972,14 @@ public final class CeHooks {
     // proven get-chain layer counts into the same frozenGate/convGate).
     public static long frozenCalls = 0, convCalls = 0;
     public static long frozenGate = 0, frozenWrites = 0, frozenDirect = 0;
+    // L68: the frozen memo — FROZ_E[m] == e pins the slot to its fill; the
+    // jar-wide scan proves setTicksFrozen is DATA_TICKS_FROZEN's ONLY writer
+    // (Entity + PowderSnowBlock reference the accessor; the block only
+    // resends), so a slot memo filled on any access is exact until the
+    // setter writes, and the setter refreshes the slot on every real write.
+    private static volatile Entity[] FROZ_E;
+    private static volatile int[] FROZ_V;
+    public static volatile boolean FROZ_MEMO_OK = false;
     public static long convGate = 0, convWrites = 0, convDirect = 0;
     // system-property kill switches, folded to static finals at class init.
     // NOTE the idiom: Boolean.getBoolean(name) returns FALSE when the
@@ -7029,6 +7039,15 @@ public final class CeHooks {
                     lastError = System.nanoTime();
                     lastErrorText = "edvskip: frozen idx " + frozenIdx;
                 }
+            }
+            // L68: the memo slots (ARENA-indexed like TT_*/MODE_*; the
+            // identity check tolerates a stale slot, probeRemove releases
+            // the ref). A failed allocation keeps FROZ_MEMO_OK false — the
+            // weaves route the proven walks/vanilla chain unchanged.
+            if (FROZ_E == null) {
+                FROZ_E = new Entity[ARENA.length];
+                FROZ_V = new int[ARENA.length];
+                FROZ_MEMO_OK = true;
             }
             FROZEN_HANDLES_OK = true;
         } catch (Throwable t) {
@@ -9863,6 +9882,29 @@ public final class CeHooks {
     public static void setTicksFrozen$(Entity e, int i) {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
+            // L68: memo-first — a slot hit replaces the whole direct walk.
+            // The setter is the accessor's only writer (jar-scan proof), so
+            // FROZ_V[m] IS the live value whenever FROZ_E[m] == e; every
+            // real write below refreshes the slot on its way out.
+            if (FROZ_MEMO_OK) {
+                int m = e.getId() & AMASK;
+                if (FROZ_E[m] == e) {
+                    if (FROZ_V[m] == i) {
+                        frozenDirect++;
+                        frozenGate++;
+                        return;
+                    }
+                    // memo says the value differs: the write is real
+                    frozenWrites++;
+                    ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA
+                            .getObj(e)).set(Entity.DATA_TICKS_FROZEN, Integer.valueOf(i));
+                    FROZ_V[m] = i;
+                    return;
+                }
+                // slot miss: fall through to the proven direct walk — both
+                // of its exits fill the memo (the walk that proves the
+                // value also stamps it).
+            }
             // L25: the direct-read gate — one typed Unsafe walk instead of
             // the getTicksFrozen() boxed chain. LAYERED after the e2e
             // forensics (a77b3ea: the direct walk served zero catches while
@@ -9878,6 +9920,11 @@ public final class CeHooks {
                 if (cur instanceof Integer iv && iv.intValue() == i) {
                     frozenDirect++;
                     frozenGate++;
+                    if (FROZ_MEMO_OK) {
+                        int m = e.getId() & AMASK;
+                        FROZ_E[m] = e;
+                        FROZ_V[m] = i;
+                    }
                     return;
                 }
             } catch (Throwable directFail) {
@@ -9892,9 +9939,40 @@ public final class CeHooks {
                 // never swallow the write — fall through to the vanilla body
             }
             frozenWrites++;
+            if (FROZ_MEMO_OK) {
+                int m = e.getId() & AMASK;
+                FROZ_E[m] = e;
+                FROZ_V[m] = i;
+            }
         }
         ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e))
                 .set(Entity.DATA_TICKS_FROZEN, Integer.valueOf(i));
+    }
+
+    /** Replacement body of Entity.getTicksFrozen() — the L68 memo read.
+     *  javap 26.3: the vanilla body is the boxed entityData.get chain. The
+     *  jar-wide scan proves the setter is the accessor's only writer, so a
+     *  slot hit IS the live value; a miss reads the exact value via the
+     *  L64a direct walk (the boxed chain on any doubt) and fills. */
+    public static int getTicksFrozen$(Entity e) {
+        if (FROZ_MEMO_OK) {
+            int m = e.getId() & AMASK;
+            if (FROZ_E[m] == e) {
+                return FROZ_V[m];
+            }
+            if (IDX_FROZEN >= 0) {
+                Object cur = entityDataValueIdx(e, IDX_FROZEN);
+                if (cur instanceof Integer iv) {
+                    int v = iv.intValue();
+                    FROZ_E[m] = e;
+                    FROZ_V[m] = v;
+                    return v;
+                }
+            }
+            // direct-walk doubt: the exact vanilla chain, memo unfilled
+        }
+        return ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e))
+                .get(Entity.DATA_TICKS_FROZEN);
     }
 
     /** Replacement body of ConversionTracker.setConverting(boolean). */

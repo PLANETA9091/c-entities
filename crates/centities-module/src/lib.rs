@@ -2406,6 +2406,20 @@ fn frozen_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     }
 }
 
+/// L68: the Entity.getTicksFrozen memo read — the body becomes
+/// `CeHooks.getTicksFrozen$`; the jar-wide scan proves the setter is the
+/// accessor's only writer, so the slot memo is an exact read.
+fn frozen_get_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getTicksFrozen",
+        method_desc: "()I",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getTicksFrozen$",
+        bridge_desc: "(Lnet/minecraft/world/entity/Entity;)I",
+        args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+    }
+}
+
 fn conv_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     cplug_sdk::asm::ReplaceBody {
         method_name: "setConverting",
@@ -2626,6 +2640,29 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
             "[c-entities] frozen gate disabled/refused (centities.frozenGate) — vanilla write kept",
         );
         bytes.to_vec()
+    };
+    // L68: the getTicksFrozen memo read chains onto the same Entity bytes,
+    // gated by the SAME frozen knob — the memo protocol is atomic (the
+    // setter's only-writer proof), so one knob bisects the whole layer.
+    let gated = if read_java_flag("FROZEN_FLAG_ON") == Some(true)
+        && prove_handles("initFrozenHandles", "FROZEN_HANDLES_OK") == Some(true)
+    {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::replace_body(env, loader, &gated, &frozen_get_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                cplug_sdk::log::info("[c-entities] precomputed getTicksFrozen memo read");
+                b
+            }
+            _ => {
+                cplug_sdk::log::info(
+                    "[c-entities] getTicksFrozen replace refused — vanilla read kept",
+                );
+                gated
+            }
+        }
+    } else {
+        gated
     };
     // L18: the shared-flags gate chains onto the same Entity bytes. The
     // flag gate is OPTIONAL like the frozen one — a refusal keeps vanilla
