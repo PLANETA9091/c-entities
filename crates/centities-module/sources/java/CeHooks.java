@@ -3813,7 +3813,18 @@ public final class CeHooks {
         if (!(ent instanceof ItemEntity e)) return false;
         if (ibN >= IB_CAP) return false;
         try {
-            if (e.level().isClientSide()) return false;
+            // L66: the direct client check — javap 26.3: e.level() reads the
+            // private `level` field, isClientSide() the private final
+            // `isClientSide` boolean; two typed Unsafe reads replace the
+            // virtual call pair. A null level (never for a ticking entity)
+            // or an unresolved offset routes the exact vanilla pair.
+            Object lv = O_ENT_LEVEL >= 0 ? U != null
+                    ? U.getObject(e, O_ENT_LEVEL) : null : null;
+            if (lv == null || O_LEVEL_CLIENT < 0) {
+                if (e.level().isClientSide()) return false;
+            } else if (U.getBoolean(lv, O_LEVEL_CLIENT)) {
+                return false;
+            }
             int slot = e.getId() & MAMASK;
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
                 if (REST_ID[slot] != e.getId()) {
@@ -9128,6 +9139,12 @@ public final class CeHooks {
     // direct delta write (javap 26.3: setDeltaMovement's whole body is the
     // isFinite gate + the posLock-guarded field store; no flag writes).
     private static volatile long O_ENT_DELTA = -1;
+    // L66: Entity.level (private Level) + Level.isClientSide (private final
+    // boolean) — itemDispatch's per-item client check (the 3.2% Entity.level
+    // frame on items: 98.9% of it is the dispatch walk's own
+    // e.level().isClientSide()) becomes two typed Unsafe reads; any
+    // unresolved offset routes the exact vanilla pair of calls.
+    private static volatile long O_ENT_LEVEL = -1, O_LEVEL_CLIENT = -1;
     // L63b: the TTL shape cache — per mirror slot, the te identity + the
     // structural verdicts the fill probe established. With NO ServerPlayers
     // in the level (the per-pass players().isEmpty() gate) seenBy /
@@ -9171,6 +9188,10 @@ public final class CeHooks {
             // L63a: the delta field offset (the flush apply loop's direct
             // write; a miss keeps every writeback on the woven call).
             O_ENT_DELTA = offOf(Entity.class, "deltaMovement");
+            // L66: the dispatch walk's client check offsets.
+            O_ENT_LEVEL = offOf(Entity.class, "level");
+            O_LEVEL_CLIENT = offOf(net.minecraft.world.level.Level.class,
+                    "isClientSide");
             // L63b: the shape-cache arrays (slot-indexed like the ARENA;
             // allocated once — the identity check tolerates stale entries,
             // probeRemove clears the slot to release the te ref).
