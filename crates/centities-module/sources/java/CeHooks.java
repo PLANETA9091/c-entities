@@ -6500,6 +6500,14 @@ public final class CeHooks {
             ThreadLocal.withInitial(
                 () -> new net.minecraft.world.entity.ai.goal.WrappedGoal[32]);
 
+    // L69: the set-ordered running-array scratch. The update merge-walk
+    // rebuilds the shadow in availableGoals INSERTION order — the order
+    // vanilla's cleanup walk and tickRunningGoals(true) tail use — instead
+    // of the old start-order appends (the T382 parity divergence).
+    private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_RUN_TABLE =
+            ThreadLocal.withInitial(
+                () -> new net.minecraft.world.entity.ai.goal.WrappedGoal[8]);
+
     /** Precompute-time proof: the private-handle set must resolve BEFORE
      *  the GoalSelector bodies are replaced (doc-25 rule — the mirror has
      *  no vanilla escape, so a lazy handle failure would crash the first
@@ -6665,6 +6673,21 @@ public final class CeHooks {
             profiler.pop();
             // vanilla tick() ends with tickRunningGoals(true) — full-set walk
             tickRunningImpl(gs, true);
+            // L69: rebuild the running shadow in SET order — the update pass
+            // above starts goals into the lock table only; the pre-update
+            // rebuild predates them, so the shadow missed every fresh starter
+            // and the next fast-path tick would have skipped their cleanup
+            // and tail (the stale-shadow fullPass loop). One extra set walk
+            // per FULL pass — full passes are rare by design.
+            sh.n = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (g.isRunning()) {
+                    if (sh.n == sh.goals.length) {
+                        sh.goals = java.util.Arrays.copyOf(sh.goals, sh.n * 2);
+                    }
+                    sh.goals[sh.n++] = g;
+                }
+            }
             // record the shadow shape for the L25 flat path
             sh.allSize = goals.size();
             sh.first = firstOf(goals);
@@ -6771,13 +6794,29 @@ public final class CeHooks {
             // set element must be the next expected survivor (both walk the
             // same insertion order); anything else (external start, direct
             // set surgery) falls to the exact 4-pass rebuild.
+            // L69: the running array is rebuilt in SET ORDER. Vanilla's
+            // cleanup and its tickRunningGoals(true) tail walk availableGoals
+            // itself — the order two live goals of one mob tick/stop in IS
+            // the set's insertion order. The old append-at-tail built START
+            // order: once goal X (set pos 0) started after goal Y (set pos
+            // 1) was already running, the shadow was [Y, X] while vanilla
+            // walked [X, Y] — navigation/lookControl writes interleave in
+            // the wrong sequence and the mob diverges (the T382 gate).
+            // The merge below places survivors and fresh starters at their
+            // set positions by construction (the walk IS the set order).
             profiler.push("goalUpdate");
-            int n = w;
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] out = AI_RUN_TABLE.get();
+            int rn = 0;
             int j = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
                 if (g.isRunning()) {
                     if (j < w && sh.goals[j] == g) {
                         j++;
+                        if (rn == out.length) {
+                            out = java.util.Arrays.copyOf(out, rn * 2);
+                            AI_RUN_TABLE.set(out);
+                        }
+                        out[rn++] = g;
                         continue;
                     }
                     profiler.pop();
@@ -6800,10 +6839,11 @@ public final class CeHooks {
                     }
                     g.start();
                     gsFloorStarts++;
-                    if (n == sh.goals.length) {
-                        sh.goals = java.util.Arrays.copyOf(sh.goals, n * 2);
+                    if (rn == out.length) {
+                        out = java.util.Arrays.copyOf(out, rn * 2);
+                        AI_RUN_TABLE.set(out);
                     }
-                    sh.goals[n++] = g;
+                    out[rn++] = g;
                 }
             }
             profiler.pop();
@@ -6813,11 +6853,23 @@ public final class CeHooks {
                 fullPassTick(gs, goals, sh);
                 return;
             }
-            sh.n = n;
+            // L69: compact entries a same-pass stop dropped (a candidate
+            // replaced a survivor the walk had already placed) — set order kept
+            int m = 0;
+            for (int i = 0; i < rn; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = out[i];
+                if (g.isRunning()) out[m++] = g;
+            }
+            if (sh.goals.length < m) {
+                sh.goals = java.util.Arrays.copyOf(
+                        sh.goals, Math.max(m, sh.goals.length * 2));
+            }
+            System.arraycopy(out, 0, sh.goals, 0, m);
+            sh.n = m;
             // vanilla tail — tickRunningGoals(true): the running array IS the
             // set's running subset in the same order; every entry re-checked
             profiler.push("goalTick");
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < m; i++) {
                 net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
                 if (g.isRunning()) g.tick();
             }
