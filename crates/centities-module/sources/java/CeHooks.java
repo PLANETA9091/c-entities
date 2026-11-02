@@ -1005,6 +1005,9 @@ public final class CeHooks {
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
                 + " eff=" + effCalls + "/" + effGate + "/" + (EFF_ON ? 1 : 0)
+                + " ench=" + enchCalls + "/" + enchGate + "/" + (ENCH_ON ? 1 : 0)
+                + " equip=" + equipCalls + "/" + equipGate + "/" + equipVanilla
+                + "/" + (EQUIP_ON ? 1 : 0)
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
                 + " oddJ=" + mobAiOddJava
@@ -9265,6 +9268,190 @@ public final class CeHooks {
 
     public static void setTickEffectsGateOn(boolean on) {
         EFF_ON = on;
+    }
+
+    // ==================================================================
+    // L62 — the empty-equipment floors. The fresh mobs profile (2ed4aba)
+    // pins two per-mob-per-tick walks on EMPTY equipment:
+    //   1. EnchantmentHelper.tickEffects (javap: the lambda visitor + ONE
+    //      runIterationOnEquipment call, bc 0-11) — 47.5% of the
+    //      ImmutableList$ListItr leaves (6.32% of the leg) ride it from
+    //      LivingEntity.baseTick. With every equipment slot EMPTY the walk
+    //      reads six EMPTY stacks' ENCHANTMENTS components and the visitor
+    //      never fires — a provable no-op.
+    //   2. LivingEntity.detectEquipmentUpdates -> collectEquipmentChanges
+    //      (javap bc 4-208) — 39.3% of the same leaves from
+    //      LivingEntity.tick. With every slot EMPTY and the
+    //      lastEquipmentItems map already primed with the EMPTY singletons,
+    //      equipmentHasChanged (= !ItemStack.matches) is false per slot,
+    //      the changes maps stay null (return null), the refresh puts write
+    //      EMPTY over EMPTY, and the caller's handleHandSwap/
+    //      handleEquipmentChanges never run — the whole body is a no-op.
+    // Any present item, an unprimed map (the first tick) or any shape doubt
+    // routes the exact vanilla body. The tickEffects decline is a direct
+    // public-static call; the detectEquipmentUpdates decline replays the
+    // vanilla body through cached reflection Methods (the protected trio —
+    // the CHANGED path is rare by definition).
+    // ==================================================================
+
+    public static volatile boolean ENCH_ON = false;
+    public static final boolean ENCH_FLAG_ON =
+            !"false".equals(System.getProperty("centities.enchTick", "true"));
+    public static volatile boolean EQUIP_ON = false;
+    public static final boolean EQUIP_FLAG_ON =
+            !"false".equals(System.getProperty("centities.equipUpdates", "true"));
+    // liveness counters for the verifier (PLAIN longs — same reasoning as
+    // frozenCalls: bumped on every bridge entry, proven before arming).
+    public static long enchCalls = 0, enchGate = 0;
+    public static long equipCalls = 0, equipGate = 0, equipVanilla = 0;
+
+    public static void setEnchTickGateOn(boolean on) {
+        ENCH_ON = on;
+    }
+
+    public static void setEquipGateOn(boolean on) {
+        EQUIP_ON = on;
+    }
+
+    /** Replacement body of EnchantmentHelper.tickEffects(ServerLevel, LivingEntity). */
+    public static void enchTickEffects$(net.minecraft.server.level.ServerLevel level,
+            net.minecraft.world.entity.LivingEntity e) {
+        enchCalls++;
+        if (ENCH_ON) {
+            try {
+                if (e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND).isEmpty()
+                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND).isEmpty()
+                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty()
+                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty()
+                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty()
+                        && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty()) {
+                    enchGate++;
+                    return;
+                }
+            } catch (Throwable gateFail) {
+                // route the exact vanilla body
+            }
+        }
+        net.minecraft.world.item.enchantment.EnchantmentHelper.tickEffects(level, e);
+    }
+
+    // The protected trio behind the detectEquipmentUpdates decline path,
+    // resolved once against the live LivingEntity class.
+    private static volatile boolean EQUIP_HANDLES_OK = false;
+    private static java.lang.reflect.Method M_COLLECT_EQUIP;
+    private static java.lang.reflect.Method M_HANDLE_HAND_SWAP;
+    private static java.lang.reflect.Method M_HANDLE_EQUIP_CHANGES;
+    private static volatile RefField VH_LE_LAST_EQUIP; // LivingEntity.lastEquipmentItems
+
+    public static void initEquipHandles() {
+        try {
+            Class<?> le = net.minecraft.world.entity.LivingEntity.class;
+            M_COLLECT_EQUIP = le.getDeclaredMethod("collectEquipmentChanges", java.util.Map.class);
+            M_COLLECT_EQUIP.setAccessible(true);
+            M_HANDLE_HAND_SWAP = le.getDeclaredMethod("handleHandSwap", java.util.Map.class);
+            M_HANDLE_HAND_SWAP.setAccessible(true);
+            M_HANDLE_EQUIP_CHANGES = le.getDeclaredMethod("handleEquipmentChanges", java.util.Map.class);
+            M_HANDLE_EQUIP_CHANGES.setAccessible(true);
+            VH_LE_LAST_EQUIP = new RefField(le, "lastEquipmentItems");
+            EQUIP_HANDLES_OK = M_COLLECT_EQUIP != null && M_HANDLE_HAND_SWAP != null
+                    && M_HANDLE_EQUIP_CHANGES != null && VH_LE_LAST_EQUIP.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initEquipHandles: " + t;
+            EQUIP_HANDLES_OK = false;
+        }
+    }
+
+    /** Replacement body of LivingEntity.detectEquipmentUpdates(). */
+    @SuppressWarnings("unchecked")
+    public static void equipUpdates$(net.minecraft.world.entity.LivingEntity e) {
+        equipCalls++;
+        if (EQUIP_ON && EQUIP_HANDLES_OK) {
+            try {
+                java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> last =
+                        (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                                VH_LE_LAST_EQUIP.getObj(e);
+                if (last != null) {
+                    // The no-change gate: every slot EMPTY now and the cache
+                    // primed with the same EMPTY singleton — matches() true
+                    // per slot, the refresh puts idempotent, the result null,
+                    // the handles never called. Value-exact skip.
+                    if (last.get(net.minecraft.world.entity.EquipmentSlot.MAINHAND)
+                            == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.HEAD)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.CHEST)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.LEGS)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.FEET)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET)
+                                    == net.minecraft.world.item.ItemStack.EMPTY) {
+                        equipGate++;
+                        return;
+                    }
+                }
+            } catch (Throwable gateFail) {
+                // route the exact vanilla body
+            }
+        }
+        // The vanilla body, replayed: collectEquipmentChanges on the live
+        // lastEquipmentItems, then the null/isEmpty guard around the two
+        // handlers. The reflection cost rides the CHANGED path only.
+        if (!EQUIP_HANDLES_OK) {
+            // Unreachable when the weave is applied (the Rust side proves the
+            // handles BEFORE replace_body) — the degraded last resort is a
+            // logged skip, never a re-entry into this replaced body.
+            lastError = System.nanoTime();
+            lastErrorText = "equipUpdates$: handles broken, body skipped";
+            return;
+        }
+        try {
+            java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> last =
+                    (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                            VH_LE_LAST_EQUIP.getObj(e);
+            java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> changes =
+                    (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                            M_COLLECT_EQUIP.invoke(e, last);
+            if (changes != null) {
+                M_HANDLE_HAND_SWAP.invoke(e, changes);
+                if (!changes.isEmpty()) {
+                    M_HANDLE_EQUIP_CHANGES.invoke(e, changes);
+                }
+            }
+            equipVanilla++;
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            // The vanilla body threw — propagate EXACTLY as vanilla would
+            // (its caller is LivingEntity.tick, which declares nothing).
+            Throwable t = ite.getCause();
+            if (t instanceof RuntimeException re) {
+                throw re;
+            }
+            if (t instanceof Error err) {
+                throw err;
+            }
+            throw new RuntimeException(t);
+        } catch (IllegalAccessException iae) {
+            // Only realistic on a class reload; the equipment handling for
+            // this entity-tick is lost, the floor self-disarms (the verifier
+            // re-arms after a fresh prove). Never re-enter the replaced body.
+            EQUIP_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "equipUpdates$ replay: " + iae;
+        }
     }
 
     private static void setTickingFlag(net.minecraft.world.entity.LivingEntity e, boolean v) {

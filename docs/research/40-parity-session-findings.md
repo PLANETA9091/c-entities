@@ -1482,3 +1482,61 @@ next run: (a) mobs' ttlDecl= names the decline site — if it is seen/se
 fuse stays ~100% with the memo shaving the getPlayers virtual per
 entity; (c) a red parity gate pins the L61 consumption first (the
 CE/trackerLoop knob bisects in one run).
+
+### Addendum 21 — L59a/L61 verdict GREEN; L60 counters in; L62 the empty-equipment floors (the ListItr family)
+
+**L59a/L61 verdict (runs 41429691087 + 41430358528, both parity
+SUCCESS)**: the per-pass chunk memo + the syncVelocity consumption are
+bit-identical on the gate — the fuse now covers hurt-marked entities
+(markHurt's only reader is the branch we replay), ServerPlayers keep
+the event path. The L60 ds/dwrite counters ride the tree for the next
+run (the setDeltaMovement census).
+
+**The fresh 2ed4aba mobs profile's #1 leaf decoded**: ImmutableList$
+ListItr.next 6.32% = 87.7% inside the equipment walks (JFR parent
+analysis on the run's rec.jfr): 47.5% EnchantmentHelper.tickEffects
+<- LivingEntity.baseTick, 39.3% collectEquipmentChanges <-
+detectEquipmentUpdates <- LivingEntity.tick, 11.9% VecDelta.tryEncode
+<- sendChanges (the tracker family — the L61 fuse now applies to the
+bench mobs IF the ttlDecl counters name syncVelocity as the decline
+site). javap 26.3-237:
+
+- tickEffects = the visitor lambda + ONE runIterationOnEquipment call
+  (bc 0-11); with every slot EMPTY the walk reads six EMPTY stacks'
+  ENCHANTMENTS components and the visitor never fires — a provable
+  no-op.
+- collectEquipmentChanges (bc 4-208): per slot
+  lastEquipmentItems.get + getItemBySlot + equipmentHasChanged (=
+  !ItemStack.matches); with every slot EMPTY and the cache primed with
+  the EMPTY singletons, nothing changed, the result is null, the
+  refresh puts write EMPTY over EMPTY, and the caller's
+  handleHandSwap/handleEquipmentChanges never run.
+
+**L62 (this commit) — two floors**:
+1. `enchTickEffects$` — ReplaceBody on EnchantmentHelper.tickEffects
+   (its own class, the deferred-weave verifier pattern): the all-empty
+   gate returns, any present item routes the exact vanilla body (a
+   direct public-static call — no reflection).
+2. `equipUpdates$` — ReplaceBody on LivingEntity.detectEquipmentUpdates
+   (chained onto the LivingEntity bytes after the collide chain): the
+   all-empty + cache-primed gate (identity compares against the EMPTY
+   singleton) returns; the decline replays the protected trio
+   (collectEquipmentChanges/handleHandSwap/handleEquipmentChanges)
+   through cached reflection Methods, propagating the vanilla body's
+   own exceptions unwrapped (InvocationTargetException -> cause), and
+   NEVER re-entering the replaced body.
+
+Both arm through the standard verifier protocol (enchCalls/equipCalls
+liveness, then setEnchTickGateOn/setEquipGateOn); knobs
+centities.enchTick / centities.equipUpdates; counters in the line as
+`ench=` and `equip=`. Expected: the ListItr family (~6.3% mobs,
+~4.8% mixed, ~4.3% spread) minus the VecDelta share, plus the walks'
+non-ListItr internals (getItemBySlot/component reads).
+
+Reading rules for the next run: (a) mobs' ttlDecl= names the fuse
+decline site — if it is NOT syncVelocity (the L61 extension made that
+consumable), the seen/interp sites are the next floor; (b) the ds=
+census names the DELTA_SAME miss rate — dwrite ~ item count per tick
+means the resting fixed point misses widely and the L16 gate needs
+re-derivation; (c) ench=/equip= gate rates ~100% on the bench legs;
+a red parity gate pins L62 first (the knobs bisect in one run).

@@ -43,6 +43,10 @@ const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
 const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNavigation";
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
 const LOOK_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/LookControl";
+/// L62a: the empty-equipment floor target — EnchantmentHelper.tickEffects
+/// replace_body (the baseTick enchantment walk; 47.5% of the mobs leg's
+/// ImmutableList$ListItr leaves).
+const ENCH_HELPER_CLASS: &str = "net/minecraft/world/item/enchantment/EnchantmentHelper";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
 /// L38f: LivingEntity.die(DamageSource) — the cramming-audit freshness feed
 /// (javap-verified 26.3 descriptor).
@@ -440,6 +444,10 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
     cplug_sdk::hooks::register_bytes(LOOK_CONTROL_CLASS, |_n, b| patch_lookcontrol(b));
+    cplug_sdk::hooks::register_bytes(
+        ENCH_HELPER_CLASS,
+        |_n, b| patch_ench(b),
+    );
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -801,6 +809,23 @@ fn arm_module() {
                         ));
                     }
                 }
+                // L62a deferred weave: EnchantmentHelper loads with the first
+                // mob baseTick (post-arm on most boots).
+                if !ENCH_WOVEN.load(Ordering::Acquire)
+                    && !ENCH_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(ENCH_HELPER_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_ench(loader as jni::jobject);
+                    if ENCH_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(ENCH_HELPER_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred EnchantmentHelper floor applied, rc={rc}"
+                        ));
+                    }
+                }
                 if !FROZEN_WOVEN.load(Ordering::Acquire)
                     && !FROZEN_DECLINED.load(Ordering::Acquire)
                     && STASH
@@ -928,6 +953,27 @@ fn arm_module() {
                 if set_java_bool("setConvGateOn", true) {
                     CONV_ARMED.store(true, Ordering::Release);
                     cplug_sdk::log::info("[c-entities] conv gate ARMED (verified live)");
+                }
+            }
+            // L62 arming: the equipment floors flip ON only when their bridges
+            // are proven live (enchCalls/equipCalls move — the bridges bump
+            // them on every entry even disarmed; the gates move after).
+            if ENCH_WOVEN.load(Ordering::Acquire)
+                && !ENCH_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::EnchChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setEnchTickGateOn", true) {
+                    ENCH_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] enchTick floor ARMED (verified live)");
+                }
+            }
+            if EQUIP_WOVEN.load(Ordering::Acquire)
+                && !EQUIP_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::EquipChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setEquipGateOn", true) {
+                    EQUIP_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] equip floor ARMED (verified live)");
                 }
             }
             if TT_WOVEN.load(Ordering::Acquire)
@@ -1209,6 +1255,14 @@ static SENSING_ARMED: AtomicBool = AtomicBool::new(false);
 static FLAGR_WOVEN: AtomicBool = AtomicBool::new(false);
 static FLAGR_DECLINED: AtomicBool = AtomicBool::new(false);
 static FLAGR_ARMED: AtomicBool = AtomicBool::new(false);
+/// L62: the empty-equipment floors (EnchantmentHelper.tickEffects +
+/// LivingEntity.detectEquipmentUpdates) weave state.
+static ENCH_WOVEN: AtomicBool = AtomicBool::new(false);
+static ENCH_DECLINED: AtomicBool = AtomicBool::new(false);
+static ENCH_ARMED: AtomicBool = AtomicBool::new(false);
+static EQUIP_WOVEN: AtomicBool = AtomicBool::new(false);
+static EQUIP_DECLINED: AtomicBool = AtomicBool::new(false);
+static EQUIP_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     // L39: resolve the merge-mirror offsets (despawnRate/count/DATA_ITEM) —
@@ -1575,6 +1629,51 @@ fn precompute_livingentity(loader: jni::jobject) {
                 _ => None,
             },
         };
+        // L62b chain: the detectEquipmentUpdates empty-equipment ReplaceBody
+        // (the per-mob equipment-change scan — 39.3% of the mobs leg's
+        // ImmutableList$ListItr leaves). OPTIONAL: a refusal keeps every
+        // guard above. The bridge's decline path replays the protected trio
+        // via the handles proven here; arming stays verifier-gated.
+        let equip_ok = read_java_flag("EQUIP_FLAG_ON") == Some(true)
+            && prove_handles("initEquipHandles", "EQUIP_HANDLES_OK") == Some(true);
+        if !equip_ok {
+            EQUIP_DECLINED.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] equipUpdates floor declined (flag/handles) — vanilla kept",
+            );
+        }
+        let equip_spec = cplug_sdk::asm::ReplaceBody {
+            method_name: "detectEquipmentUpdates",
+            method_desc: "()V",
+            bridge_owner: HOOKS_CLASS,
+            bridge_name: "equipUpdates$",
+            bridge_desc: "(Lnet/minecraft/world/entity/LivingEntity;)V",
+            args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+        };
+        let guarded = if equip_ok {
+            match guarded {
+                Some(b) => {
+                    match cplug_sdk::asm::replace_body(env, loader, &b, &equip_spec) {
+                        Some(b2) if !b2.is_empty() => {
+                            EQUIP_WOVEN.store(true, Ordering::Release);
+                            Some(b2)
+                        }
+                        _ => Some(b),
+                    }
+                }
+                None => {
+                    match cplug_sdk::asm::replace_body(env, loader, &bytes, &equip_spec) {
+                        Some(b2) if !b2.is_empty() => {
+                            EQUIP_WOVEN.store(true, Ordering::Release);
+                            Some(b2)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        } else {
+            guarded
+        };
         // L38f chain: the die-probe feed for the push view (doc 40). The
         // cramming audit reads hits/nonPass from the mirror; a dying mob's
         // flags are stale for its whole ~20-tick deathTime animation (no
@@ -1656,6 +1755,95 @@ fn patch_livingentity(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_livingentity_inner(bytes))
         .ok()
         .flatten()
+}
+
+/// L62a: EnchantmentHelper byte hook — the stash/serve pattern.
+fn patch_ench(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_ench_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_ench_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The floor is
+        // woven by the verifier (precompute_ench).
+        let mut st = STASH.lock().ok()?;
+        st.entry(ENCH_HELPER_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(ENCH_HELPER_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched EnchantmentHelper tickEffects floor");
+            Some(b)
+        }
+        _ if !ENCH_WOVEN.load(Ordering::Acquire)
+            && !ENCH_DECLINED.load(Ordering::Acquire) =>
+        {
+            let mut st = STASH.lock().ok()?;
+            st.entry(ENCH_HELPER_CLASS).or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] EnchantmentHelper bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// L62a: the deferred weave — the empty-equipment ReplaceBody on
+/// EnchantmentHelper.tickEffects. No Unsafe handles are needed (the gate is
+/// public-API only), so the weave applies right after the knob check; the
+/// GATE arming stays verifier-gated on the enchCalls liveness.
+fn precompute_ench(loader: jni::jobject) {
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(ENCH_HELPER_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info(
+            "[c-entities] precompute Ench floor: original bytes not seen at boot",
+        );
+        return;
+    };
+    if read_java_flag("ENCH_FLAG_ON") != Some(true) {
+        ENCH_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info("[c-entities] enchTick floor declined (centities.enchTick) — vanilla kept");
+        return;
+    }
+    let spec = cplug_sdk::asm::ReplaceBody {
+        method_name: "tickEffects",
+        method_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "enchTickEffects$",
+        bridge_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+        ],
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(ENCH_HELPER_CLASS, b.clone());
+            }
+            ENCH_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed EnchantmentHelper tickEffects floor");
+        }
+        _ => {
+            ENCH_DECLINED.store(true, Ordering::Release);
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute EnchantmentHelper floor — vanilla kept",
+            );
+        }
+    }
 }
 
 /// L14 tracker fast gate: boot-time hook stashes the original bytes; the
@@ -2908,6 +3096,8 @@ enum Counter {
     DeltaChecks,
     SenseChecks,
     FlagRChecks,
+    EnchChecks,
+    EquipChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -2947,6 +3137,9 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::DeltaChecks, ("deltaCalls", "J")),
             (Counter::SenseChecks, ("senseCalls", "J")),
             (Counter::FlagRChecks, ("flagrCalls", "J")),
+            // L62 liveness counters (every bridge entry — proven before arming).
+            (Counter::EnchChecks, ("enchCalls", "J")),
+            (Counter::EquipChecks, ("equipCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
