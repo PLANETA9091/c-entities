@@ -608,3 +608,26 @@ AttributeMap.getValue 2.97% (the instance cache is landed; the value
 walk needs a freshness story), setTicksFrozen$ 2.27% (the L68 memo —
 its residual is the getter+setter counter arithmetic), SynchedEntityData
 .getValue 2.16% (the L15/L29 direct-read layer's residual).
+
+## The L71 verdict (run 41511972780 on f5156eb): the steering widening diverges — knob-gated (L71b)
+
+The widening FAILED the gate: mobs/mixed/spread all red while items went
+12/12 bit-identical (L72's TT_E identity swap is CLEAN). The failure
+shape is NOT structural: same counts, no type mismatches, the worst
+deltas are SMALL drifts (mixed T389: yaw 9.4deg, x 0.070, z -0.115,
+vx -0.0136) — a tiny per-tick difference in the steering math compounding
+through the AI's look/navigation feedback loop. The coasting shapes
+(input==0, the pre-L71 proven 12/12) are untouched.
+
+L71b (385a32d) puts the widening behind centities.travelSteer (default
+OFF — the shipped gate keeps the proven input==0 contract) and re-arms
+the hunt: the shipped-config parity run must go back to 12/12; the
+traced bisect run (travelSteer=true + trace_id + PH_DUMP 240-400)
+captures the TTR enter/exit lines for the traced mob — the exact shape,
+inputs and computed delta at the first divergent tick, which names the
+broken float op (candidates: the fis normalize/scale f32-vs-f64 seams,
+the Mth table vs the JIT's intrinsic, the input-rotation operand order,
+or the delta.y gate interacting with a steering tick's gravity write).
+
+The rule stands: a widening ships ONLY after the traced divergence is
+pinned to a single float op and the mobtravel.rs mirror pins it.
