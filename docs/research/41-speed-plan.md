@@ -461,3 +461,77 @@ cadence.
    lambda + the itemSkip chain ≈ 7-8% items; one weave at the
    EntityTickList level replaces the per-entity frames for owned items.
 4. The per-leg long tails — unchanged.
+
+## The L69 verdict (2026-11-02, run 41507709894 on d02b03c): the L15 re-test is GREEN — the floor re-ships
+
+**Frontier item 0 is CLOSED — but not the way the bisects implied.** The
+"parity window" L67..L68 was FALSE: run 41489839532 (79632c2) passed
+12/12 bit-identical BETWEEN the 15:xx reds and the L67 reds, with the
+same code. The runs differed by DISPATCH INPUTS, not code: the reds were
+curl-dispatched with an EMPTY ai_floor input (workflow_dispatch yaml
+defaults do NOT apply to curl dispatches — `${{ inputs.x }}` is the empty
+string, and parity.yml's `[ '' = '0' ] || echo 1` computed CE_AI_FLOOR=1),
+so every "L67+ regression" run had the L15 AI floor ARMED while every
+green run to date had it dead or '0'. The floor was never gate-proven.
+
+The floor bug (javap 26.3 GoalSelector.tick + tickRunningGoals(true)):
+
+- vanilla's cleanup walk and its tickRunningGoals tail iterate
+  availableGoals — ObjectLinkedOpenHashSet, INSERTION order; two live
+  goals of one mob tick/stop in the set's order;
+- the floor's flat path kept the running shadow in START order: the
+  update pass appended fresh starters (sh.goals[n++]); once goal X
+  (set pos 0) started after goal Y (set pos 1) was already running the
+  shadow was [Y, X] while vanilla walked [X, Y] — navigation/
+  lookControl/pathfinding writes interleave in the wrong sequence and
+  the mob diverges. 2500 mobs x 382 ticks = the T382 yaw=718 chaos and
+  the type-mismatch storms in every mobs-bearing scene (items never
+  diverged — no GoalSelector);
+- fullPassTick additionally never appended its own update's starters to
+  the shadow — a stale shadow that re-triggered fullPass forever.
+
+L69 (d02b03c): the update merge-walk rebuilds the running array in SET
+order (AI_RUN_TABLE scratch; survivors and fresh starters placed as the
+walk reaches them = the walk IS the set order; same-pass stops compacted
+afterwards), and fullPassTick rebuilds the shadow after its tail. Run
+41507709894: 12/12 PASS bit-identical, gs=999514/472780/7429/6709 (the
+floor ran at full scale). The re-ship (3c7e345): run-baseline.sh's
+CE_AI_FLOOR defaults to 1, parity.yml's ai_floor default flips to '1'.
+
+**Lesson for the ledger: a bisect run's KNOBS are part of the evidence —
+an empty-string dispatch input is not a yaml default. The gate config
+must be echoed into the job log (it is: the `CE_AI_FLOOR=$([ ... ]...)`
+line names the arm state of every run).**
+
+## L70 (be17c27): the tickCount mirror — frontier item 1 landed
+
+The items-100k #1 leaf (Unsafe.putInt 9.79%) was the L63b cached path's
+per-tick ServerEntity.tickCount RMW (~100k/tick; the counter's ONLY
+reader is sendChanges' interval gate, unobservable while nobody tracks
+the entity). The mirror: TT_TC[m] on the ARENA slot (identity-pinned by
+TT_TE[m] == te). While the ChunkMap is ARMED the cached path increments
+the mirror; the fill stamps it from the real field right after
+ttlFastPath's real RMW; every decline tick re-captures post-sendChanges;
+the armed->disarmed transition hands the mirror back into the real field
+and disarmed->armed re-captures (one list walk per transition, a tiny
+per-ChunkMap armed memo). Any reconcile failure sets TT_TC=null and the
+real RMW fallback resumes (exact from the next tick). The bench has no
+players — no transitions, no readers; prod keeps the interval counter
+exact across join/leave.
+
+### The frontier after L69/L70 (2026-11-03)
+
+0. **The fresh baseline read** — the running baseline on be17c27 is the
+   first one with the floor shipped + L70; its REPORT re-ranks this list
+   (expect: GoalSelector.tick 1.92 + tickRunningGoals 1.70 collapse into
+   gsFloorTicks; putInt 9.79 collapses on items; the ttlCachedPath walk
+   floor stays).
+1. **The travel/collide port (doc 28)** — ~10% mobs; the biggest
+   module-owned move left.
+2. **The L7 dispatcher batch-tick** — guardEntityTick 6.85% + the
+   per-entity lambda ≈ 7-8% items.
+3. **The itemTickFlush 5473 guard** — `e.isRemoved()` 9.28% self on the
+   flush's per-entry removal check; a mirror-bit freshness story is
+   needed (removals between dispatch and flush ride probeRemove —
+   verify batchRemove's IB handling first).
+4. The per-leg long tails — unchanged.
