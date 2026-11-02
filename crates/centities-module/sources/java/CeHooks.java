@@ -3209,6 +3209,11 @@ public final class CeHooks {
     private static final int IF_CDMASK = 0x3F; // the IF_* bit namespace
     private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
     private static int ibN = 0;
+    // L64c: the batch's RESYNC|FORCE_VANILLA population — the flush's pass-1
+    // re-read loop and the L44 view-build loop both scan ALL n entries to
+    // find these; on the bench steady state the count is ZERO and both
+    // full-batch scans skip on one compare.
+    private static int ibResyncN = 0;
 
     // flag bits (must match itemcore.rs)
     public static final int IF_INACTIVE = 1;        // entry came from inactiveTick
@@ -5179,6 +5184,11 @@ public final class CeHooks {
         int id = e.getId();
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
+        // L64c: the flush's two full-batch scans (pass-1 re-read + the L44
+        // view build) skip entirely when this count is zero.
+        if ((flags & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
+            ibResyncN++;
+        }
         IB_REF[i] = e;
         // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
         int ci = ibCDN;
@@ -5238,6 +5248,10 @@ public final class CeHooks {
         ibN = 0;
         int cdN = ibCDN;
         ibCDN = 0;
+        // L64c: captured before the reset — the two resync-scans below skip
+        // on this being zero (the bench steady state).
+        int rsN = ibResyncN;
+        ibResyncN = 0;
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || !(level instanceof ServerLevel)) {
             return;
         }
@@ -5250,7 +5264,8 @@ public final class CeHooks {
             boolean isNether = level.dimension() == Level.NETHER;
 
             // pass 1: resync entries re-read state POST vanilla tick
-            for (int i = 0; i < n; i++) {
+            // (L64c: skipped wholesale when the batch carried none)
+            for (int i = 0; rsN != 0 && i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
                     Entity ref = IB_REF[i];
@@ -5337,7 +5352,10 @@ public final class CeHooks {
             // VIEW_KIDX: the entry's batch index (the vanilla body order).
             viewN = 0;
             vtabClear();
-            for (int i = 0; i < n; i++) {
+            // L64c: the scan skips wholesale when the batch carried no
+            // RESYNC|FORCE_VANILLA entries (viewN stays 0 — the consumers
+            // see an empty view exactly as the full scan would produce).
+            for (int i = 0; rsN != 0 && i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 // RESYNC and FORCE_VANILLA entries both ran their vanilla
                 // bodies DURING the phase (their live boxes are POST-move);
@@ -5574,6 +5592,7 @@ public final class CeHooks {
             }
         } catch (Throwable t) {
             ibN = 0;
+            ibResyncN = 0; // L64c: the batch is dropped wholesale
             IN_ITEM_APPLY = false;
             lastError = System.nanoTime();
             lastErrorText = "itemTickFlush: " + t;
