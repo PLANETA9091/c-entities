@@ -580,3 +580,31 @@ no CI round-trip needed) pins 71% of the new #1 (Unsafe.getObject
 3. **The AI engine RNG protocol** (~-19% mobs, doc 30 item 4) — the
    big one, unchanged.
 4. The per-leg long tails — unchanged.
+
+## L73 (c663d5c): the per-mob floor maps drop their weak references
+
+The fresh mobs-25k-mod profile (be17c27 artifacts, JFR attributed
+locally) bills Reference.get 3.90% (#1) across the two weak-keyed
+identity tables the per-mob floors probe per mob per tick:
+
+- shadowOf/aiShadowPeek (48%+22% of the bucket) — the AI floor's shadow
+  map (AIKey extends WeakReference). L73: STRONG keys + explicit removal
+  — probeRemove drops the removed mob's selector through its
+  goalSelector field (O_MOB_GOALSEL) via aiDrop's backward-shift
+  deletion (Knuth 6.4R: the following cluster entries whose home does
+  not lie cyclically between the hole and their own slot shift back, so
+  the probe chains stay intact). probeRemove is the proven universal
+  removal choke point; a missed drop leaks one bounded entry.
+- attrCache (30%) — the travel floor's per-mob AttributeInstance[] cache
+  is now DIRECT-MAPPED by entity id (AT_E[m] == e, 32k slots,
+  probeRemove clears). One array read replaces the weak probe + the
+  hash walk; id-slot collisions evict (the identity check rejects, the
+  next travel re-fills).
+
+The mobs legs' next floors (the fresh mobs-mod top, post-L70/floor):
+WrappedGoal.getFlags 2.59% (the AI floor's own per-goal flag reads —
+the flags CAN change, so a stamp needs the collide-check story),
+AttributeMap.getValue 2.97% (the instance cache is landed; the value
+walk needs a freshness story), setTicksFrozen$ 2.27% (the L68 memo —
+its residual is the getter+setter counter arithmetic), SynchedEntityData
+.getValue 2.16% (the L15/L29 direct-read layer's residual).
