@@ -4285,11 +4285,12 @@ pub extern "system" fn n_push(
     // served and the declined passes (the Java KPX/KPH lines read them).
     PUSH_OUT.with(|o| {
         let o = o.borrow();
-        let (raw, drows, n_diag, sb, diag_ids, diag_stages, diag_boxes) = (
+        let (raw, drows, n_diag, sb, walk, diag_ids, diag_stages, diag_boxes) = (
             o.raw as i32,
             o.drows as i32,
             if diag != 0 { o.diag.len() as i32 } else { 0 },
             o.diag_sb,
+            o.diag_walk,
             if diag != 0 {
                 o.diag.iter().map(|d| d.1).collect::<Vec<i64>>()
             } else {
@@ -4331,6 +4332,18 @@ pub extern "system" fn n_push(
                             0,
                             6,
                             sb.as_ptr(),
+                        );
+                    }
+                }
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_WALK", "[D") {
+                    let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw_env,
+                            arr as jni::jdoubleArray,
+                            0,
+                            6,
+                            walk.as_ptr(),
                         );
                     }
                 }

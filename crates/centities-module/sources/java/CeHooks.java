@@ -3242,6 +3242,8 @@ public final class CeHooks {
     public static final long[] PUSH_DIAG_STAGES = new long[PUSH_DIAG_CAP];
     public static final double[] PUSH_DIAG_MB = new double[PUSH_DIAG_CAP * 6];
     public static final double[] PUSH_DIAG_SB = new double[6];
+    /** ADDENDUM-18f: the scan walk range — (cx0, cx1, cz0, cz1, ex, world). */
+    public static final double[] PUSH_DIAG_WALK = new double[6];
     public static int PUSH_DIAG_N = 0;
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
@@ -3615,10 +3617,12 @@ public final class CeHooks {
      *  self's live box is the missed candidate. dsb = the self's
      *  mirror-vs-live max component diff (the self publish should keep it
      *  at exactly 0). All boxes print as x0,y0,z0,x1,y1,z1 (the mirror
-     *  layout, component-wise comparable). */
+     *  layout, component-wise comparable). Stage 10 = the SELF's own row
+     *  (the duplicated-self witness); the header carries the walk range
+     *  (w=cx0:cx1/cz0:cz1 ex= world=). */
     private static void printKpi(Entity le) {
         AABB sv = le.getBoundingBox();
-        StringBuilder pb = new StringBuilder(160);
+        StringBuilder pb = new StringBuilder(220);
         pb.append("[ce-baseline] KPI t=").append(CUR_TICK)
                 .append(" self=").append(le.getId())
                 .append(" tc=").append(le.tickCount)
@@ -3630,6 +3634,12 @@ public final class CeHooks {
             if (d > dsb) dsb = d;
         }
         pb.append(" dsb=").append(dsb)
+                .append(" w=").append((int) PUSH_DIAG_WALK[0]).append(':')
+                .append((int) PUSH_DIAG_WALK[1]).append('/')
+                .append((int) PUSH_DIAG_WALK[2]).append(':')
+                .append((int) PUSH_DIAG_WALK[3])
+                .append(" ex=").append(PUSH_DIAG_WALK[4])
+                .append(" wld=").append((int) PUSH_DIAG_WALK[5])
                 .append(" n=").append(PUSH_DIAG_N);
         System.out.println(pb);
         for (int i = 0; i < PUSH_DIAG_N; i++) {

@@ -297,6 +297,7 @@ pub fn push_tick(
     out.ncol = 0;
     out.diag.clear();
     out.diag_sb = [0.0; 6];
+    out.diag_walk = [0.0; 6];
     out.ddx = 0.0;
     out.ddy = 0.0;
     out.ddz = 0.0;
@@ -320,6 +321,7 @@ pub fn push_tick(
     if diag {
         out.diag_sb
             .copy_from_slice(&pc.box6[sc..sc + 6]);
+        out.diag_walk[5] = world as f64;
     }
 
     // Density gate FIRST (before any scanning work): sum the covered
@@ -380,6 +382,13 @@ pub fn push_tick(
     let cx1 = ((sx1 + ex).floor() as i32) >> centities_core::CELL_SHIFT;
     let cz0 = ((sz0 - ex).floor() as i32) >> centities_core::CELL_SHIFT;
     let cz1 = ((sz1 + ex).floor() as i32) >> centities_core::CELL_SHIFT;
+    if diag {
+        out.diag_walk[0] = cx0 as f64;
+        out.diag_walk[1] = cx1 as f64;
+        out.diag_walk[2] = cz0 as f64;
+        out.diag_walk[3] = cz1 as f64;
+        out.diag_walk[4] = ex;
+    }
 
     // L37e CRAMMED-PUSH ROUTING. Vanilla Entity.push for d0 < 0.01 takes
     // the CRAMMED branch: random-direction 0.05 offsets drawn from the
@@ -442,6 +451,14 @@ pub fn push_tick(
             out.raw += cell_hits.len() as u32;
             for &id in cell_hits.iter() {
                 if id == self_id {
+                    // ADDENDUM-18f: self rows are RECORDED (stage 10) — the
+                    // duplicated-self family (raw=2 with zero records) was
+                    // invisible to the KPI because the self skip was silent.
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[sc..sc + 6]);
+                        out.diag.push((dtag | 10, id, mb));
+                    }
                     continue;
                 }
                 let Some(hs) = pc.slot_of(id) else {
@@ -666,6 +683,10 @@ pub struct PushOut {
     /// pairs it with the self's live box — the self publish (1324533)
     /// should keep them equal; verifying costs nothing).
     pub diag_sb: [f64; 6],
+    /// ADDENDUM-18f: the scan WALK range — (cx0, cx1, cz0, cz1, ex) with
+    /// ex = max_half_span + MARGIN, world packed by the caller (the KPI
+    /// header prints it; a world/cell-key mismatch names itself here).
+    pub diag_walk: [f64; 6],
     /// full post-tick delta (for the Java writeback)
     pub dx: f64,
     pub dy: f64,
