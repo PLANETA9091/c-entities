@@ -319,7 +319,7 @@ public final class CeHooks {
             // world and skipped the merge vanilla made.
             if (phDumpTickNow()) {
                 System.out.println("[ce-baseline] KVM t=" + CUR_TICK
-                        + " self=" + e.getId()
+                        + " self=" + entId(e)
                         + " removed=" + (e.isRemoved() ? 1 : 0));
             }
             return true;
@@ -654,12 +654,12 @@ public final class CeHooks {
     }
 
     private static void dtrace(ItemEntity e, String path, boolean active) {
-        if (DTRACE_ID >= 0 && e.getId() == DTRACE_ID) {
+        if (DTRACE_ID >= 0 && entId(e) == DTRACE_ID) {
             System.out.println("[ce-baseline] DTRACE t="
                     + net.minecraft.server.MinecraftServer.currentTick
                     + " path=" + path + " active=" + active
                     + " tc=" + e.tickCount + " at=" + e.activatedTick
-                    + " mode=" + MODE_VAL[e.getId() & MAMASK]
+                    + " mode=" + MODE_VAL[entId(e) & MAMASK]
                     + " onG=" + e.onGround()
                     + " dx=" + e.getDeltaMovement().x
                     + " dy=" + e.getDeltaMovement().y
@@ -731,7 +731,7 @@ public final class CeHooks {
                           .append(B_IDS[k] < 0 ? "!" : (B_IDS[k] & ROW_NEUTRAL) != 0 ? "~" : "+");
                     }
                     System.out.println("[ce-baseline] MSP t=" + CUR_TICK
-                            + " self=" + e.getId() + " bN=" + bN
+                            + " self=" + entId(e) + " bN=" + bN
                             + " ids=" + pb + (bN > lim ? ",..." : ""));
                 }
                 msqWin0 = rowWinSkip;
@@ -753,7 +753,7 @@ public final class CeHooks {
                 try {
                     if (msq) {
                         System.out.println("[ce-baseline] QB t=" + CUR_TICK
-                                + " self=" + e.getId()
+                                + " self=" + entId(e)
                                 + " q=[" + box.minX + "," + box.maxX
                                 + " " + box.minY + "," + box.maxY
                                 + " " + box.minZ + "," + box.maxZ + "]"
@@ -769,7 +769,7 @@ public final class CeHooks {
                     if (msq) {
                         msqPath = msqPath == null ? "mirror" : msqPath;
                         System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
-                                + " self=" + e.getId() + " path=mirror"
+                                + " self=" + entId(e) + " path=mirror"
                                 + " rawN=" + msqN + " ids=" + msqIds()
                                 + " refuse=" + fastRefuse);
                     }
@@ -797,7 +797,7 @@ public final class CeHooks {
                 }
                 System.out.println("[ce-baseline] " + msb);
                 System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
-                        + " self=" + e.getId()
+                        + " self=" + entId(e)
                         + " path=" + (msqPath == null ? "row" : msqPath)
                         + " rawN=" + msqN + " ids=" + msqIds()
                         + " win=" + (rowWinSkip - msqWin0)
@@ -812,7 +812,7 @@ public final class CeHooks {
                                 .append((float) msqRej[k * 6 + 4]).append(']');
                     }
                     System.out.println("[ce-baseline] MSR t=" + CUR_TICK
-                            + " self=" + e.getId() + " rej=" + msqRejN
+                            + " self=" + entId(e) + " rej=" + msqRejN
                             + " liveMin=" + rb);
                 }
                 if (msqRejN > 0 && IBOX_ON) {
@@ -829,7 +829,7 @@ public final class CeHooks {
                         rb2.append(']');
                     }
                     System.out.println("[ce-baseline] MSIB t=" + CUR_TICK
-                            + " self=" + e.getId() + " rej=" + msqRejN
+                            + " self=" + entId(e) + " rej=" + msqRejN
                             + " idxMin=" + rb2);
                 }
 
@@ -839,7 +839,7 @@ public final class CeHooks {
                         sb4.append(k == 0 ? "" : ",").append(msqHmId[k]);
                     }
                     System.out.println("[ce-baseline] MSH t=" + CUR_TICK
-                            + " self=" + e.getId() + " homeMiss=" + msqHmN
+                            + " self=" + entId(e) + " homeMiss=" + msqHmN
                             + " ids=" + sb4);
                 }
                 if (msqRowsN > 0) {
@@ -936,7 +936,7 @@ public final class CeHooks {
         try {
             hurtProbes++; // TEMP L2a apply-check counter (also fires from tick)
             if (REST_ON && ACTIVE && e != null) {
-                REST_GEN[e.getId() & AMASK] = 0;
+                REST_GEN[entId(e) & AMASK] = 0;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -1190,7 +1190,7 @@ public final class CeHooks {
             // IN_ITEM_APPLY and do not trip this).
             l7ExternalMutation(e);
             if (e != null) {
-                int m = e.getId() & AMASK;
+                int m = entId(e) & AMASK;
                 // L12 push mirror: keep the native delta fresh. Only living
                 // entities are push-kernel state; the delta events of items
                 // are the item core's business. Off-thread callers skip (the
@@ -1210,7 +1210,7 @@ public final class CeHooks {
                             flush();
                         }
                         DB_IDS[dbN] = ((pw & 0xFFFFL) << 32)
-                                | (e.getId() & 0xFFFF_FFFFL);
+                                | (entId(e) & 0xFFFF_FFFFL);
                         DB_DV[dbN * 3] = x;
                         DB_DV[dbN * 3 + 1] = y;
                         DB_DV[dbN * 3 + 2] = z;
@@ -1248,7 +1248,7 @@ public final class CeHooks {
         try {
             l7ExternalMutation(e);
             if (e != null) {
-                int m = e.getId() & AMASK;
+                int m = entId(e) & AMASK;
                 if (REST_GEN[m] != 0) { // resting: decide whether the impulse
                     // is self-physics (this item's own marking tick) or an
                     // external push; only the latter may break the rest.
@@ -1274,9 +1274,9 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
-                ARENA[e.getId() & AMASK] = e;
+                ARENA[entId(e) & AMASK] = e;
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
-                batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), false);
+                batchUpsert(entId(e), worldId(e.level()), e, e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -1291,16 +1291,16 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
-                ARENA[e.getId() & AMASK] = null;
-                REST_GEN[e.getId() & AMASK] = 0; // gone: drop the rest state
-                batchRemove(e.getId());
+                ARENA[entId(e) & AMASK] = null;
+                REST_GEN[entId(e) & AMASK] = 0; // gone: drop the rest state
+                batchRemove(entId(e));
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
             // the entity — the identity check tolerates stale slots, but a
             // removed entity's TrackedEntity must be collectable). L65: the
             // se/sit/steps refs ride the same slot lifecycle.
             if (e != null) {
-                int sm = e.getId() & AMASK;
+                int sm = entId(e) & AMASK;
                 Object[] te0 = TT_TE;
                 if (te0 != null) te0[sm] = null;
                 Object[] ses = TT_SE;
@@ -1359,8 +1359,8 @@ public final class CeHooks {
                     && e instanceof net.minecraft.world.entity.LivingEntity
                     && SERVER_THREAD.get()
                     && e.level() != null && !e.level().isClientSide()) {
-                ARENA[e.getId() & AMASK] = e;
-                batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), true);
+                ARENA[entId(e) & AMASK] = e;
+                batchUpsert(entId(e), worldId(e.level()), e, e.getBoundingBox(), true);
             }
         } catch (Throwable t) {
             // uncertain -> the mirror stays as-is. The failure mode is the
@@ -1386,9 +1386,9 @@ public final class CeHooks {
             l7ExternalMutation(e);
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide()) {
                 probesBox++;
-                ARENA[e.getId() & AMASK] = e;
-                if (REST_GEN[e.getId() & AMASK] != 0) {
-                    REST_GEN[e.getId() & AMASK] = 0; // a box change is a disturbance
+                ARENA[entId(e) & AMASK] = e;
+                if (REST_GEN[entId(e) & AMASK] != 0) {
+                    REST_GEN[entId(e) & AMASK] = 0; // a box change is a disturbance
                     wakesBox++;
                 }
                 // Row-neutral classification (4b.2a): a box change WITHIN one
@@ -1404,11 +1404,11 @@ public final class CeHooks {
                 // its old order until the next dirty republish).
                 AABB oldBox = e.getBoundingBox();
                 int curSy = e.moonrise$getSectionY();
-                boolean syMoved = LAST_SY[e.getId() & AMASK] != curSy;
-                LAST_SY[e.getId() & AMASK] = curSy;
+                boolean syMoved = LAST_SY[entId(e) & AMASK] != curSy;
+                LAST_SY[entId(e) & AMASK] = curSy;
                 boolean rowNeutral = !syMoved && oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
-                batchUpsert(e.getId(), worldId(e.level()), e, newBox, rowNeutral);
+                batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -1482,7 +1482,7 @@ public final class CeHooks {
         // chunkZ, chunkX, sectionY, seq). moonrise$getSectionY and the
         // ORD_SEQ stamp live on plain Entity, not just LivingEntity.
         B_SY[bN] = e.moonrise$getSectionY();
-        B_SEQ[bN] = ORD_SEQ[e.getId() & AMASK];
+        B_SEQ[bN] = ORD_SEQ[entId(e) & AMASK];
         if (e instanceof net.minecraft.world.entity.LivingEntity le) {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
@@ -1490,7 +1490,7 @@ public final class CeHooks {
             Vec3 dv = le.getDeltaMovement();
             B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
             Entity veh = le.isPassenger() ? le.getVehicle() : null;
-            B_VID[bN] = veh != null ? veh.getId() : 0;
+            B_VID[bN] = veh != null ? entId(veh) : 0;
         } else {
             B_PF[bN] = 0;
             B_PXZ[bN * 2] = 0.0;
@@ -1782,7 +1782,7 @@ public final class CeHooks {
             new java.util.concurrent.atomic.AtomicInteger(1);
 
     private static void ordStamp(Entity e) {
-        ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+        ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
     }
 
     /** Prefix of EntityLookup.moveEntity(Entity): the vanilla RE-APPEND
@@ -1807,7 +1807,7 @@ public final class CeHooks {
             int ny = nyr < lvl.getMinSectionY() ? lvl.getMinSectionY()
                     : nyr > lvl.getMaxSectionY() ? lvl.getMaxSectionY() : nyr;
             if (nx != ox || nz != oz || ny != oy) {
-                ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+                ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
             }
         } catch (Throwable t) {
             // never break movement: a missed stamp costs order fidelity on
@@ -1862,14 +1862,14 @@ public final class CeHooks {
             e.moonrise$setSectionX(nx);
             e.moonrise$setSectionY(sy);
             e.moonrise$setSectionZ(nz);
-            ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
-            LAST_SY[e.getId() & AMASK] = sy;
+            ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
+            LAST_SY[entId(e) & AMASK] = sy;
             if (lvl instanceof net.minecraft.server.level.ServerLevel) {
                 AABB b = e.getBoundingBox();
                 if (b != null) {
                     int wid = worldId(lvl);
                     if (wid >= 0) {
-                        batchUpsert(e.getId(), wid, e, b, false);
+                        batchUpsert(entId(e), wid, e, b, false);
                     }
                 }
             }
@@ -1910,7 +1910,7 @@ public final class CeHooks {
         int cz = e.moonrise$getSectionZ();
         int cx = e.moonrise$getSectionX();
         int sy = e.moonrise$getSectionY();
-        int seq = ORD_SEQ[e.getId() & AMASK];
+        int seq = ORD_SEQ[entId(e) & AMASK];
         ORD_KA[i] = ((((long) cz + 2097152L) & 0x3FFFFFL) << 22)
                 | (((long) cx + 2097152L) & 0x3FFFFFL);
         ORD_KB[i] = ((((long) sy + 2097152L) & 0x3FFFFFL) << 40)
@@ -1990,7 +1990,7 @@ public final class CeHooks {
                     getEnts.invoke(lookup, null, box, all, null);
                     for (int i = 0; i < all.size(); i++) {
                         Entity en = all.get(i);
-                        ARENA[en.getId() & AMASK] = en;
+                        ARENA[entId(en) & AMASK] = en;
                         ordStamp(en);
                     }
                 }
@@ -2046,7 +2046,7 @@ public final class CeHooks {
                 long sya = a.moonrise$getSectionY();
                 long syb = b.moonrise$getSectionY();
                 if (sya != syb) return Long.compare(sya, syb);
-                return Integer.compare(ORD_SEQ[a.getId() & AMASK], ORD_SEQ[b.getId() & AMASK]);
+                return Integer.compare(ORD_SEQ[entId(a) & AMASK], ORD_SEQ[entId(b) & AMASK]);
             });
             for (int i = 0; i < n; i++) out.set(i, arr[i]);
         }
@@ -2256,7 +2256,7 @@ public final class CeHooks {
         int srcSkip = 0;
         candidatesSeen += n;
         long t2 = prof ? System.nanoTime() : 0L;
-        int srcId = source == null ? -1 : source.getId();
+        int srcId = source == null ? -1 : entId(source);
         for (int k = 0; k < n; k++) {
             int cid = (int) ids[k];
             if (cid == srcId) {
@@ -2275,7 +2275,7 @@ public final class CeHooks {
             // id-match rejects stale/wrapped slots, the getter is only a
             // fallback (e.g. right after a resync window).
             Entity e = ARENA[cid & AMASK];
-            if (e == null || e.getId() != cid) {
+            if (e == null || entId(e) != cid) {
                 arenaMiss++;
                 e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                 if (e == null) {
@@ -2617,7 +2617,7 @@ public final class CeHooks {
                     if (pqAdded) break;              // one row match is enough
                     int pid = (int) (l & 0xFFFF_FFFFL);
                     Entity pe = ARENA[pid & AMASK];
-                    if (pe == null || pe.getId() != pid) {
+                    if (pe == null || entId(pe) != pid) {
                         rowPending++;
                         fastRefuse = "pending";
                         return null;
@@ -2680,7 +2680,7 @@ public final class CeHooks {
                 ? FQ_SCRATCH
                 : new ArrayList<>(Math.min(total, totalCap));
         out.clear();
-        int srcId = source == null ? -1 : source.getId();
+        int srcId = source == null ? -1 : entId(source);
         int stale = 0, homeMiss = 0;
         for (int r = 0; r < nr; r++) {
             long[] row = MQ_ROWS[r];
@@ -2749,7 +2749,7 @@ public final class CeHooks {
                     continue;
                 }
                 Entity e = ARENA[cid & AMASK];
-                if (e == null || e.getId() != cid) {
+                if (e == null || entId(e) != cid) {
                     e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                     if (e == null) { stale++; continue; }
                 }
@@ -2839,7 +2839,7 @@ public final class CeHooks {
         // and a fresh add's PRE registration is the covered cell itself.
         for (int q = 0; q < pqN; q++) {
             Entity pe = ARENA[PQ_ID[q] & AMASK];
-            if (pe == null || pe.getId() != PQ_ID[q]) continue;
+            if (pe == null || entId(pe) != PQ_ID[q]) continue;
             boolean dup = false;
             for (int k = 0; k < out.size(); k++) {
                 if (out.get(k).getId() == PQ_ID[q]) { dup = true; break; }
@@ -3219,7 +3219,7 @@ public final class CeHooks {
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
     // this (one array read) instead of arenaRef(id) (an ARENA read + the
-    // megamorphic cand.getId() staleness call: measured 15.6% of the
+    // megamorphic entId(cand) staleness call: measured 15.6% of the
     // items-100k-mod leg). The batch is per-tick state, so no id-match
     // staleness check is needed: a mid-tick removal is caught by
     // isRemoved() (a plain field read).
@@ -3463,7 +3463,7 @@ public final class CeHooks {
             // not-yet-ticked ones are end-of-previous-tick = live. The scan
             // becomes live-box exact, vanilla's semantics.
             if (ACTIVE && INDEXING) {
-                batchUpsert(le.getId(), wid, le, le.getBoundingBox(), false);
+                batchUpsert(entId(le), wid, le, le.getBoundingBox(), false);
             }
             // the kernel reads the mirror: drain the pending probe batches first
             flushIfPending();
@@ -3475,8 +3475,8 @@ public final class CeHooks {
             // ADDENDUM-18e: the KPI diag rides ONLY the traced id's pass at
             // a PD tick (one branch off the hot path otherwise).
             final boolean diagPass =
-                    phDumpTickNow() && TR_ID >= 0 && le.getId() == TR_ID;
-            long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
+                    phDumpTickNow() && TR_ID >= 0 && entId(le) == TR_ID;
+            long res = nativePush(wid, entId(le), selfVehicle ? 1 : 0,
                     PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
                     PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK,
                     realNcol, diagPass ? 1 : 0);
@@ -3499,10 +3499,10 @@ public final class CeHooks {
                 // traced mob at PD ticks — density-gate refusals and mirror
                 // misses are the push-timing family's remaining suspects;
                 // the served path already prints KPH.
-                if (phDumpTickNow() && TR_ID >= 0 && le.getId() == TR_ID) {
+                if (phDumpTickNow() && TR_ID >= 0 && entId(le) == TR_ID) {
                     System.out.println("[ce-baseline] KPD t=" + CUR_TICK
-                            + " id=" + le.getId() + " decline=kernel"
-                            + " ncol=" + nativePushNcol(le.getId(), PUSH_CFG_TICK));
+                            + " id=" + entId(le) + " decline=kernel"
+                            + " ncol=" + nativePushNcol(entId(le), PUSH_CFG_TICK));
                 }
                 // ADDENDUM-18: the KPX line — EVERY declined pass at PD
                 // ticks, with the decline reason and the scan-stage
@@ -3512,14 +3512,14 @@ public final class CeHooks {
                 if (phDumpTickNow()) {
                     int reason = (int) ((res >>> 54) & 0x7);
                     System.out.println("[ce-baseline] KPX t=" + CUR_TICK
-                            + " self=" + le.getId()
+                            + " self=" + entId(le)
                             + " tc=" + le.tickCount
                             + " reason=" + reason
                             + " raw=" + PUSH_RAW
                             + " rows=" + PUSH_DROWS
                             + " nc=" + realNcol);
                 }
-                int ncolMirror = nativePushNcol(le.getId(), PUSH_CFG_TICK);
+                int ncolMirror = nativePushNcol(entId(le), PUSH_CFG_TICK);
                 if (ncolMirror >= 0 && MH_NCOL != null) {
                     try {
                         MH_NCOL.invokeExact((Entity) le, ncolMirror);
@@ -3592,7 +3592,7 @@ public final class CeHooks {
             for (int i = 0; i < hn; i++) {
                 long hid = PUSH_HIT_IDS[i];
                 Entity he = ARENA[(int) (hid & AMASK)];
-                if (he == null || he.getId() != (int) (hid & 0xFFFF_FFFFL)) {
+                if (he == null || entId(he) != (int) (hid & 0xFFFF_FFFFL)) {
                     pushPairMiss++;
                     continue;
                 }
@@ -3601,7 +3601,7 @@ public final class CeHooks {
             for (int i = 0; i < pn; i++) {
                 long pid = PUSH_PAIR_IDS[i];
                 Entity pe = ARENA[(int) (pid & AMASK)];
-                if (pe == null || pe.getId() != (int) (pid & 0xFFFF_FFFFL)) {
+                if (pe == null || entId(pe) != (int) (pid & 0xFFFF_FFFFL)) {
                     // unreachable once the JNI side writes the arrays IN
                     // PLACE: the pair ids come from the mirror the ARENA
                     // feeds, no Java code runs between n_push and this loop.
@@ -3700,7 +3700,7 @@ public final class CeHooks {
             long cid = PUSH_DIAG_IDS[i];
             int stg = (int) PUSH_DIAG_STAGES[i];
             Entity ce = ARENA[(int) (cid & AMASK)];
-            boolean live = ce != null && ce.getId() == (int) (cid & 0xFFFF_FFFFL);
+            boolean live = ce != null && entId(ce) == (int) (cid & 0xFFFF_FFFFL);
             StringBuilder rb = new StringBuilder(256);
             rb.append("[ce-baseline] KPIc t=").append(CUR_TICK)
                     .append(" self=").append(le.getId())
@@ -3844,9 +3844,9 @@ public final class CeHooks {
             } else if (U.getBoolean(lv, O_LEVEL_CLIENT)) {
                 return false;
             }
-            int slot = e.getId() & MAMASK;
+            int slot = entId(e) & MAMASK;
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
-                if (REST_ID[slot] != e.getId()) {
+                if (REST_ID[slot] != entId(e)) {
                     // slot turnover: entity ids are monotonic per run, so a
                     // mismatched stamp belongs to a dead predecessor
                     MODE_VAL[slot] = 0;
@@ -3858,7 +3858,7 @@ public final class CeHooks {
                             || e.portalProcess != null || e.isOnPortalCooldown()
                             || stackEmptyDispatch(e)
                             || !e.getPassengers().isEmpty()
-                            || ARENA[e.getId() & AMASK] != e) {
+                            || ARENA[entId(e) & AMASK] != e) {
                         MODE_VAL[slot] = 0;
                         restExits++;
                         dispPass++;
@@ -4017,7 +4017,7 @@ public final class CeHooks {
         // items-340 family was born (PTRACE item 2: vy -0.04 -> -0.08 at
         // t=340; the settle 343 vs vanilla 342; tc bit-identical). L52.
         int tc = e.tickCount + (preIncrement ? 1 : 0);
-        if ((tc + e.getId()) % 4 == 0) return true;
+        if ((tc + entId(e)) % 4 == 0) return true;
         if (e.defaultActivationState) return true;
         if (tc < 200) return true; // isAlive(): isRemoved gated above
         long cur = net.minecraft.server.MinecraftServer.currentTick;
@@ -4063,7 +4063,7 @@ public final class CeHooks {
     private static void appendDispatch(ItemEntity e, boolean active) {
         int i = ibN;
         ibN = i + 1;
-        IB_IDS[i] = e.getId();
+        IB_IDS[i] = entId(e);
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
         IB_ITEM[i] = e;
         IB_I[i * 4] = 0;
@@ -4079,7 +4079,7 @@ public final class CeHooks {
      *  gates (it must fire even when the query index is suspended). */
     private static void l7ExternalMutation(Entity e) {
         if (ITEM_TICK_ON && !IN_ITEM_APPLY && e instanceof ItemEntity) {
-            int slot = e.getId() & MAMASK;
+            int slot = entId(e) & MAMASK;
             if (MODE_GEN[slot] == MODE_EPOCH) {
                 MODE_VAL[slot] = 0;
             }
@@ -4194,7 +4194,7 @@ public final class CeHooks {
     public static void probeSetItem(net.minecraft.world.entity.item.ItemEntity e,
             net.minecraft.world.item.ItemStack st) {
         try {
-            STACK_EMPTY[e.getId() & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
+            STACK_EMPTY[entId(e) & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
         } catch (Throwable ignored) {
             // cache is an optimization only; the dispatch falls back to the
             // synched read for unseen slots
@@ -4204,7 +4204,7 @@ public final class CeHooks {
     /** Empty-stack parity check for the dispatch guard: cached bit when the
      *  item has been seen by the setItem probe, synched read otherwise. */
     private static boolean stackEmptyDispatch(net.minecraft.world.entity.item.ItemEntity e) {
-        byte v = STACK_EMPTY[e.getId() & MAMASK];
+        byte v = STACK_EMPTY[entId(e) & MAMASK];
         return v == 0 ? e.getItem().isEmpty() : v == (byte) 2;
     }
 
@@ -4277,6 +4277,21 @@ public final class CeHooks {
     private static int intAt(Object o, long off) { return U.getInt(o, off); }
     private static void putIntAt(Object o, long off, int v) { U.putInt(o, off, v); }
 
+    /** L75: the direct entity-id read. 26.3 entId(Entity) (javap) reads
+     *  the id field TWICE around a defensive
+     *  "Tried to access entity ID before ID assignment" throw and the
+     *  method is not final — 4.52% self on the items-100k leg across the
+     *  ~9 probe/dispatch reads per item per tick. One Unsafe field load,
+     *  no virtual dispatch, no throw edge. The 0-id (unassigned) entity
+     *  previously threw and disarmed through the probe guards; it now
+     *  indexes slot 0 and declines by mismatch — dead on live populations
+     *  (id assignment precedes the first probe by construction). The
+     *  fallback covers an unresolved offset (initDataOffsets order). */
+    static int entId(net.minecraft.world.entity.Entity e) {
+        long off = O_ENT_ID;
+        return off >= 0 ? U.getInt(e, off) : entId(e);
+    }
+
     // L19: the DataItem fast read. SynchedEntityData.getItem (javap, 26.3)
     // is exactly `itemsById[accessor.id()]` and get() adds only the value
     // load — with the two field offsets captured once, a gate reads the
@@ -4292,6 +4307,11 @@ public final class CeHooks {
     private static long O_DESPAWN_RATE = -1;
     // L22b: the inside-block-effect scratch lists (ArrayDeque / List)
     private static long O_MOVEMENT_TICK = -1, O_FINAL_MOVEMENTS = -1;
+    // L75: the Entity.id offset — the direct read replaces 26.3
+    // entId(Entity) (which reads the field TWICE around a defensive
+    // throw — 4.5% self on the items leg across the ~9 probe/dispatch
+    // reads per item per tick)
+    private static long O_ENT_ID = -1;
 
     // ---- L22b: the inside-block-effect no-op floor ----
     // Woven EarlyReturnGuard on Entity.applyEffectsFromBlocks(). Vanilla
@@ -4517,7 +4537,7 @@ public final class CeHooks {
 
     private static net.minecraft.world.entity.ai.attributes.AttributeInstance[] attrCache(
             net.minecraft.world.entity.LivingEntity e) {
-        int m = e.getId() & (AT_CAP - 1);
+        int m = entId(e) & (AT_CAP - 1);
         if (AT_E[m] == e) return AT_V[m];
         net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
         net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
@@ -4545,11 +4565,11 @@ public final class CeHooks {
         // prints nothing (module off); decline = an enter line without an
         // exit line (the traced id is unique).
         final boolean ttr = phDumpTickNow() && TR_ID >= 0 && e != null
-                && e.getId() == TR_ID;
+                && entId(e) == TR_ID;
         if (ttr) {
             net.minecraft.world.phys.Vec3 dT = e.getDeltaMovement();
             System.out.println("[ce-baseline] TTR t=" + CUR_TICK
-                    + " id=" + e.getId() + " tc=" + e.tickCount
+                    + " id=" + entId(e) + " tc=" + e.tickCount
                     + " enter d=(" + dT.x + "," + dT.y + "," + dT.z + ")"
                     + " in=(" + input.x + "," + input.y + "," + input.z + ")"
                     + " onG=" + e.onGround()
@@ -4979,6 +4999,18 @@ public final class CeHooks {
                 O_ACC_ID = -1; // the typed gates fall back to the get() chain
             }
         }
+        // L75: the entity id offset — resolved idempotently with the rest
+        // (initDataOffsets first ran at the L15 frozen-gate init, before
+        // every O_ existed; the same idempotent pattern applies)
+        if (O_ENT_ID < 0 && U != null) {
+            try {
+                O_ENT_ID = U.objectFieldOffset(
+                        net.minecraft.world.entity.Entity.class
+                                .getDeclaredField("id"));
+            } catch (Throwable t) {
+                O_ENT_ID = -1; // entId falls back to the virtual getId()
+            }
+        }
         if (O_ED_ITEMS >= 0 || U == null) return;
         try {
             O_ED_ITEMS = U.objectFieldOffset(
@@ -5161,8 +5193,8 @@ public final class CeHooks {
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) return false;
         if (e.level().isClientSide()) return false; // client-side ticks stay vanilla
         try {
-            boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
-                    && MODE_VAL[e.getId() & MAMASK] != 0;
+            boolean nativeMode = MODE_GEN[entId(e) & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[entId(e) & MAMASK] != 0;
             // fresh-flag gates: anything the core cannot compute exactly runs
             // vanilla THIS tick (the flush re-evaluates the mode afterwards).
             // L55: the onGround flag MUST ride every RESYNC-flavored batch
@@ -5215,7 +5247,7 @@ public final class CeHooks {
         if (ACTIVE && ITEM_TICK_ON && cplugReady && ibN < IB_CAP
                 && !e.level().isClientSide()) {
             try {
-                int slot = e.getId() & MAMASK;
+                int slot = entId(e) & MAMASK;
                 if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
                     // L55: the onGround flag rides the RESYNC ingest too (the
                     // vanilla body ran; its PRE-tick onGround is the freshest
@@ -5234,7 +5266,7 @@ public final class CeHooks {
 
     private static void appendItem(ItemEntity e, int flags) {
         int i = ibN;
-        int id = e.getId();
+        int id = entId(e);
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
         // L64c: the flush's two full-batch scans (pass-1 re-read + the L44
@@ -5655,7 +5687,7 @@ public final class CeHooks {
     /** ARENA resolve with the id-match staleness check (same as queries). */
     private static Entity arenaRef(long id) {
         Entity cand = ARENA[(int) (id & 0xFFFF_FFFFL) & AMASK];
-        return (cand != null && cand.getId() == id) ? cand : null;
+        return (cand != null && entId(cand) == id) ? cand : null;
     }
 
     /** The exact vanilla despawn tail (ItemEntity.tick/inactiveTick):
@@ -6272,7 +6304,7 @@ public final class CeHooks {
                     Object o = arr[i];
                     if (o instanceof Entity e) {
                         if (tloOn) {
-                            tloH = tloH * 0x9E3779B97F4A7C15L + e.getId();
+                            tloH = tloH * 0x9E3779B97F4A7C15L + entId(e);
                             tloH ^= Long.rotateLeft(tloH, 13);
                             if (tloN < 48) {
                                 tlo.append(e.getId()).append(' ');
@@ -8245,7 +8277,7 @@ public final class CeHooks {
         if (U.getObject(mob, O_MOB_LASTHURTBY) != null) mf |= 16; // MF_LAST_HURT_BY=16
         in[1] = mf;
         in[2] = mob.tickCount;
-        in[3] = mob.getId();
+        in[3] = entId(mob);
         // noActionTime already incremented by the floor (vanilla order)
         in[4] = U.getInt(mob, O_MOB_NOACTION);
         in[5] = ctx.tGoals.length;
@@ -8335,7 +8367,7 @@ public final class CeHooks {
                 if (pl.isDiscrete()) fl |= AIPF_DISCRETE;
                 if (pl.isPassenger()) fl |= AIPF_RIDING;
                 in2[b + PFLAGS] = fl;
-                in2[b + PID] = pl.getId();
+                in2[b + PID] = entId(pl);
             }
         }
         int base = IN_HEADER;
@@ -8521,7 +8553,7 @@ public final class CeHooks {
             // walk: lookTime-- + setLookAt, no RNG, no engine round-trip —
             // run it in pure Java and skip the JNI entirely (half the ticks
             // of a peaceful zombie).
-            boolean odd = ((mob.tickCount + mob.getId()) & 1) != 0 && mob.tickCount > 1;
+            boolean odd = ((mob.tickCount + entId(mob)) & 1) != 0 && mob.tickCount > 1;
             if (odd && !aiMeleeRunning(ctx)) {
                 for (int i = 0; i < ctx.gGoals.length; i++) {
                     if (ctx.gKind[i] == GK_LOOKAROUND && ctx.gGoals[i].isRunning()) {
@@ -8933,7 +8965,7 @@ public final class CeHooks {
                 (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_TARGETSEL);
         net.minecraft.world.entity.ai.goal.GoalSelector gs =
                 (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_GOALSEL);
-        int idBasedTickCount = mob.tickCount + mob.getId();
+        int idBasedTickCount = mob.tickCount + entId(mob);
         if (idBasedTickCount % 2 != 0 && mob.tickCount > 1) {
             ts.tickRunningGoals(false);
             gs.tickRunningGoals(false);
@@ -9663,7 +9695,7 @@ public final class CeHooks {
                         try {
                             for (int i = 0; i < size; i++) {
                                 Entity ent = raw[i];
-                                int m = ent.getId() & AMASK;
+                                int m = entId(ent) & AMASK;
                                 Object te2 = trackedEntityOf(ent);
                                 if (te2 == null || TT_TE[m] != te2) continue;
                                 Object se2 = U.getObject(te2, O_TE_SE);
@@ -9692,7 +9724,7 @@ public final class CeHooks {
                 // the chunk read are both deferred behind the cache check,
                 // the fill probe on any doubt.
                 if (cacheArm) {
-                    int m0 = ent.getId() & AMASK;
+                    int m0 = entId(ent) & AMASK;
                     if (ttlCachedPath(ent, m0)) {
                         ttlFuse++;
                         continue;
@@ -9704,7 +9736,7 @@ public final class CeHooks {
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
                 if (cacheArm) {
-                    int m = ent.getId() & AMASK;
+                    int m = entId(ent) & AMASK;
                     Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                             .moonrise$getChunkData().nearbyPlayers;
                     if (ttlFastPath(ent, te, chunk)) {
@@ -10088,7 +10120,7 @@ public final class CeHooks {
             // FROZ_V[m] IS the live value whenever FROZ_E[m] == e; every
             // real write below refreshes the slot on its way out.
             if (FROZ_MEMO_OK) {
-                int m = e.getId() & AMASK;
+                int m = entId(e) & AMASK;
                 if (FROZ_E[m] == e) {
                     if (FROZ_V[m] == i) {
                         frozenDirect++;
@@ -10122,7 +10154,7 @@ public final class CeHooks {
                     frozenDirect++;
                     frozenGate++;
                     if (FROZ_MEMO_OK) {
-                        int m = e.getId() & AMASK;
+                        int m = entId(e) & AMASK;
                         FROZ_E[m] = e;
                         FROZ_V[m] = i;
                     }
@@ -10141,7 +10173,7 @@ public final class CeHooks {
             }
             frozenWrites++;
             if (FROZ_MEMO_OK) {
-                int m = e.getId() & AMASK;
+                int m = entId(e) & AMASK;
                 FROZ_E[m] = e;
                 FROZ_V[m] = i;
             }
@@ -10157,7 +10189,7 @@ public final class CeHooks {
      *  L64a direct walk (the boxed chain on any doubt) and fills. */
     public static int getTicksFrozen$(Entity e) {
         if (FROZ_MEMO_OK) {
-            int m = e.getId() & AMASK;
+            int m = entId(e) & AMASK;
             if (FROZ_E[m] == e) {
                 return FROZ_V[m];
             }
