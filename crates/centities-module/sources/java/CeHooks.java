@@ -4474,10 +4474,13 @@ public final class CeHooks {
     public static final boolean MOB_TRAVEL_ON =
             !"0".equals(System.getenv("CE_MOB_TRAVEL"));
     // L71b: the steering widening's own knob (a -D system property so the
-    // parity dispatch's extra_jvm can flip it per run). Default OFF — the
-    // shipped gate keeps the proven input==0 contract.
+    // parity dispatch's extra_jvm can flip it per run). L77: default ON —
+    // the L74 move()-setPos fix resolved the f5156eb divergence and the
+    // traced re-bisect (41521042020, trace 652, travelSteer=true) passed
+    // the gate 12/12; the widening's hull + delta math is the proven
+    // SHAPE C port (run-baseline.sh can still ship it off per run).
     public static final boolean TRAVEL_STEER_ON =
-            "true".equals(System.getProperty("centities.travelSteer", "false"));
+            !"false".equals(System.getProperty("centities.travelSteer", "true"));
     // plain longs (the L15b lesson: a volatile add per entity per tick was
     // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
     // visibility)

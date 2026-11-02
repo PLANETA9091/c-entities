@@ -720,3 +720,40 @@ by mismatch — dead on live populations.
    scripts/srlr_first_div.py pairs the OFF/ON legs' SR/LR/PH streams and
    names the first divergence tick + stream.
 4. The per-leg long tails — unchanged.
+
+## L77 (this commit): the steering widening ships ON
+
+The L74 move()-setPos fix RESOLVED the f5156eb divergence: the traced
+re-bisect (run 41521042020 on f22fb53, travelSteer=true, trace_id=652 —
+a T382 drifted entity) passed the gate 12/12 (the earlier 41514292000
+run traced id 78 — spawned t≈672, NOT a T382 witness; the TTR data was
+routing-correct but predates the divergence). The shipped-config parity
+(41521019643) and the L75 parity (41522268657) are GREEN too — the
+no-move band branch and the direct id read are parity-clean.
+
+TRAVEL_STEER_ON defaults ON now (run-baseline can still ship it off per
+run via -Dcentities.travelSteer=false). The quiet-travel catch should
+jump: the actively-steering population (the dominant walking share,
+pathing zombies with xxa/zza != 0) rides SHAPE C instead of paying full
+vanilla travel — the L71-era projection was ~10% of the mobs leg on top
+of the proven 18% quiet catch.
+
+## The AI-engine hunt (mob_ai=1, run 41521523478): the first REAL engine data
+
+- parity-items: SR/LR/PH identical through t=272 (the engine touches no
+  item).
+- parity-mobs: **LR (Level.random) diverges FIRST at t=143**, SR at
+  t=145, PH at t=147.
+- The PH hash covers ONLY x/y/z + velocity (8 invokes — the harness
+  comment; NO yaw/hp/tc/type) — the state was "still identical" while
+  the streams split.
+- NO AI-path class reads Level.random (javap Fieldref scan: zero across
+  21 goal/entity/navigation classes; the only level().getRandom() in
+  Mob is finalizeSpawn — spawn-time).
+- The doc-40 (ai_floor=0, mobAi=1) bisect was INERT: the mobAiFloor
+  guard requires VH_GS_DISABLED (the L15 init), so the engine never ran;
+  41521523478 is the first run with the engine actually engaged.
+
+L76 arms the AITR per-round protocol trace (the (round, req-op, goalIdx,
+cursor, seed) sequence for the traced mob); the follow-up dispatch is
+mob_ai=1 + trace_id=<a t=143-alive mob> + PH_DUMP 138-160.
