@@ -6,31 +6,31 @@ Server: `26.3-238-df120fd (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 62954 -> 62954) |
+| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 63011 -> 63011) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 75.669 / 88.776 / 174.306 / 265.837 |
-| MSPT mean, ms | 82.315 |
-| TPS estimate (1000/p50) | 13.2 |
-| heap used / max, MB | 1071.9 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 65.390 / 90.153 / 151.767 / 191.654 |
+| MSPT mean, ms | 72.485 |
+| TPS estimate (1000/p50) | 15.3 |
+| heap used / max, MB | 1390.4 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 8.55% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
-| 2 | 4.19% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 3 | 4.18% | `net.minecraft.world.entity.Entity.setOldPos(Vec3) line: 2409` |
-| 4 | 3.65% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 5 | 3.05% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 118` |
-| 6 | 2.81% | `net.minecraft.server.level.ServerLevel.tick(BooleanSupplier) line: 892` |
-| 7 | 2.39% | `net.minecraft.server.level.ChunkMap$TrackedEntity.moonrise$clearPlayers() line: 1336` |
-| 8 | 2.01% | `net.minecraft.world.entity.Entity.setSharedFlag(int, boolean) line: 3874` |
-| 9 | 1.82% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 10 | 1.70% | `java.util.Arrays.copyOf(Object[], int) line: 3478` |
-| 11 | 1.57% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
-| 12 | 1.38% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 13 | 1.37% | `net.minecraft.core.Vec3i.getY() line: 67` |
-| 14 | 1.22% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
-| 15 | 1.22% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 157` |
+| 1 | 9.55% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
+| 2 | 5.38% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 3 | 4.98% | `net.minecraft.world.entity.Entity.setOldPos(Vec3) line: 2409` |
+| 4 | 3.40% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 5 | 3.07% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 157` |
+| 6 | 2.96% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 7 | 2.78% | `net.minecraft.server.level.ServerEntity.sendChanges() line: 118` |
+| 8 | 2.37% | `net.minecraft.server.level.ServerLevel.tick(BooleanSupplier) line: 892` |
+| 9 | 2.23% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 10 | 1.93% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
+| 11 | 1.86% | `net.minecraft.world.phys.Vec3.add(double, double, double) line: 123` |
+| 12 | 1.85% | `net.minecraft.server.level.ChunkMap$TrackedEntity.moonrise$clearPlayers() line: 1336` |
+| 13 | 1.84% | `java.util.EnumMap.get(Object) line: 248` |
+| 14 | 1.67% | `net.minecraft.world.entity.Entity.setSharedFlag(int, boolean) line: 3874` |
+| 15 | 1.41% | `it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap$ValuesCollection.forEach(Consumer) line: 698` |
 
