@@ -1383,6 +1383,40 @@ mod tests {
     }
 
     #[test]
+    fn even_tick_never_ticks_running_goals() {
+        // L82 regression pin: 26.3's EVEN serverAiStep branch calls ONLY
+        // GoalSelector.tick() (cleanup + removeIf + update) — a RUNNING
+        // goal's tick body must NOT run and must not draw. The old even
+        // path force-ticked every running goal (a phase 26.3 never runs)
+        // and reordered the SHARED_RANDOM serving (the t=141 root).
+        let seed0 = 999u64;
+        let mut inb = build_in(seed0, 100, 2, 42); // 100+2 even, tickCount>1
+        let off = IN_HEADER + 10 * GOAL_STRIDE; // the lookaround, running
+        inb[off + 4] = 1;
+        inb[off + 5] = 7; // lookTime 7
+        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let st = ai_floor(&inb, &mut out);
+        assert_eq!(st, ST_DONE);
+        assert_eq!(out[5], 0, "NO tick actions on an even tick");
+        // the seed advances ONLY by the update phase's canUse pulls of the
+        // NON-running goals: 3 nearest gates + stroll + lookat — the running
+        // lookaround's 0.02 canUse roll does NOT happen (vanilla's update
+        // loop skips running goals), which is exactly why the old even-path
+        // force-tick was a serving-order bug: it both ticked the body AND
+        // let the tick's effects change what the update phase would draw.
+        let mut r = Lcg { value: seed0 };
+        for _ in 0..3 {
+            r.next_int_bound(10);
+        }
+        r.next_int_bound(60);
+        r.next_f32();
+        let seed1 = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+        assert_eq!(seed1, r.value, "the even tick must not draw anything extra");
+        // the lookaround's lookTime state is untouched (no tick body ran)
+        assert_eq!(inb[off + 5], 7, "lookTime unchanged — no tick body ran");
+    }
+
+    #[test]
     fn odd_tick_runs_running_goals_only() {
         // (tickCount + id) odd → both selectors run tickRunningGoals(false)
         // → the running lookaround ticks (lookTime--), nothing else
