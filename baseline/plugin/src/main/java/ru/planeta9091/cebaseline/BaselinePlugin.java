@@ -1225,8 +1225,23 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         Class<?>[] ifaces = isSr
                 ? new Class<?>[]{iface, SrUnwrap.class}
                 : new Class<?>[]{iface};
+        // L86: the DEFINING LOADER must SEE every interface — the JDK
+        // ProxyClassFactory runs Class.forName(name, false, loader) per
+        // interface and IllegalArgumentExceptions otherwise. The L85b
+        // install passed the delegate's (NMS) loader: RandomSource is
+        // visible, SrUnwrap (THIS plugin's class, a child loader) is NOT
+        // — every install died "SrUnwrap is not visible from class
+        // loader", SR_WRAP stayed null and the streamed log showed SRC=0
+        // again (the diagnostic line itself fell under the whitelist gap).
+        // The harness loader sees BOTH (SrUnwrap its own class,
+        // RandomSource up the parent chain). Vanilla keeps calling the
+        // proxy through the RandomSource TYPE — the defining loader of
+        // the proxy CLASS is invisible to callers. The LR path keeps the
+        // proven delegate loader (single NMS interface, L77-green).
         return java.lang.reflect.Proxy.newProxyInstance(
-                random.getClass().getClassLoader(),
+                isSr
+                        ? BaselinePlugin.class.getClassLoader()
+                        : random.getClass().getClassLoader(),
                 ifaces,
                 (proxy, method, args) -> {
                     String n = method.getName();
