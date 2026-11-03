@@ -1135,6 +1135,25 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /** The DEEPEST frames first: the console/log handler truncates long
+     *  records (observed in run 41670844291 — the depth-30 RemoveBinomial
+     *  line cut at ~430 chars, exactly the frame window where the caller
+     *  that NAMES the path — burnUndead vs finalizeSpawn vs the cramming
+     *  hurt — would appear). Reversing puts the caller chain first; the
+     *  leaf machinery (RemoveBinomial/Enchantment) tail is the least
+     *  informative part and is the part that gets lost. The k= index
+     *  keeps the draws orderable; the frame order within one k is a
+     *  display convention only — both legs print the same shape. */
+    private static String lrfFramesReversed(char[] f) {
+        String[] parts = new String(f).trim().split(" ");
+        StringBuilder sb = new StringBuilder(f.length + 8);
+        for (int i = parts.length - 1; i >= 0; i--) {
+            sb.append(parts[i]);
+            if (i > 0) sb.append(' ');
+        }
+        return sb.toString();
+    }
+
     /** Wrap the level's RandomSource in a counting, delegating Proxy. The
      *  interface type is resolved BY NAME from the delegate's loader —
      *  Paper 26.3's Level.random is a ThreadUnsafeRandom whose DIRECT
@@ -1188,7 +1207,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             int k = 0;
             for (char[] f : LR_FRAMES) {
                 getLogger().info("LRF t=" + tickNo + " k=" + (k++) + ' '
-                        + new String(f));
+                        + lrfFramesReversed(f));
             }
         }
         LR_CALLS = 0;

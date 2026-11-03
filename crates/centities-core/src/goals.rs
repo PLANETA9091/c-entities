@@ -781,13 +781,39 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     }
                     gi += 1;
                 }
-                phase = PH_TICK_RUNNING;
-                gi = 0;
+                // L82 (the parity fix): the EVEN branch of 26.3
+                // serverAiStep (javap bc 148-191) calls ONLY
+                // GoalSelector.tick() per selector — the cleanup loop +
+                // the lockedFlags removeIf + the update loop. There is NO
+                // running-goal tick phase on even ticks: the tick bodies
+                // live in the ODD branch's tickRunningGoals(false)
+                // (bc 91-145, requiresUpdateEveryTick goals only — the
+                // classified zombie set's single override is
+                // RandomLookAroundGoal, exactly every_tick() here). The
+                // old even-path hop into PH_TICK_RUNNING with force=true
+                // executed a phase 26.3 never runs: every running goal's
+                // tick body (state writes AND any RNG draws) landed
+                // between the update and the next selector, reordering
+                // the SHARED_RANDOM serving within the tick. The re-
+                // ordered values are what the L81b hunt caught: the
+                // burnUndead armor-wear gate (nextInt(2)) read a shifted
+                // LCG position at mobs t=143 (+1 RemoveBinomial draw),
+                // the spawn rolls shifted next tick, the jockey rolls
+                // flipped at t=146 and the entity-id streams exploded.
+                if sel == SEL_TARGET {
+                    sel = SEL_GOAL;
+                    phase = PH_CLEANUP;
+                    gi = 0;
+                    continue;
+                }
+                return done(&mut ctx, &mut out);
             }
             PH_TICK_RUNNING => {
-                let force = !odd_branch;
+                // ODD branch only: tickRunningGoals(false) — the running
+                // goals with requiresUpdateEveryTick() (LOOKAROUND in the
+                // classified set) tick.
                 while gi < count {
-                    if ctx.running[sel][gi] && (force || every_tick(ctx.kind(sel, gi))) {
+                    if ctx.running[sel][gi] && every_tick(ctx.kind(sel, gi)) {
                         if !tick_ported(&mut ctx, &mut out, sel, gi) {
                             out.push(ACT_GOAL_TICK_V, ctx.global(sel, gi), 0, 0, 0);
                         }
@@ -796,11 +822,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 }
                 if sel == SEL_TARGET {
                     sel = SEL_GOAL;
-                    phase = if odd_branch {
-                        PH_TICK_RUNNING
-                    } else {
-                        PH_CLEANUP
-                    };
+                    phase = PH_TICK_RUNNING;
                     gi = 0;
                     continue;
                 }
