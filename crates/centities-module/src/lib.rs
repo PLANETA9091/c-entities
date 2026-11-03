@@ -1128,13 +1128,18 @@ fn precompute_level(loader: jni::jobject) {
         return;
     };
     // Two bodies, chained (the goal_tick chain pattern): getEntities first,
-    // then getEntitiesOfClass on its output. A refusal of the SECOND keeps
-    // the first (partial weave — the typed path falls back to vanilla).
+    // then getEntitiesOfClass on its output. A refusal of the SECOND must
+    // keep the FIRST (degrade to the entity-typed weave only — the typed
+    // path routes vanilla); dropping both on a second-spec failure would
+    // silently disable the whole Level fast path.
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         let one = cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec());
         match one {
             Some(b) if !b.is_empty() => {
-                cplug_sdk::asm::replace_body(env, loader, &b, &level_class_spec())
+                match cplug_sdk::asm::replace_body(env, loader, &b, &level_class_spec()) {
+                    Some(b2) if !b2.is_empty() => Some(b2),
+                    _ => Some(b), // second refused — keep the first weave
+                }
             }
             other => other,
         }
