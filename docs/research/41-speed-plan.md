@@ -1186,3 +1186,46 @@ tracker cluster 11.3% (ttlCachedPath ×4 lines), `Entity.isRemoved` 4.51%,
 to re-prove per-entity quietness; a Rust-side batched quiet-scan
 (parallel id array → candidate bitset) or an epoch-dirty skip list is
 the next items lever.
+
+## L88 (bdb9f4f): the SRF instrument finally names the t=141 divergence — the BURN probe drew entity-randoms
+
+The L85b instrument chain is now fully live (enable-time install +
+the defining-loader fix + the whitelist): the L86 hunt (d7fc699) streamed
+real SRC counts — 600/tick in the items window, ~208 (OFF) vs ~133
+(ON-visible) in the mobs window — and the SRF frames at t=141 named the
+divergence directly.
+
+**The smoking gun**: `x13 Monster.aiStep → Mob.aiStep → Mob.burnUndead →
+CeHooks.probeBurn → Mob.isSunBurnTick → Proxy.nextFloat` — ON-leg-only
+frames at the EXACT divergence tick. javap 26.3: **Mob.isSunBurnTick
+draws `random.nextFloat()` whenever getLightLevelDependentMagicValue() >
+0.5** (bc 92-96: getfield random; invokeinterface RandomSource.nextFloat)
+— the doc-41 "the BURN probe's extra isSunBurnTick() call is
+entropy-neutral (javap: zero random calls in the body)" audit was WRONG
+for this version. The window-gated probe drew +1 entity-random per lit
+mob per window tick, ON leg only (the OFF leg's Mob class is never woven
+— precompute_mob declines). The f^17 solve (ON = OFF + 17 at t=141)
+decomposes as: +13 the probe's extra isSunBurnTick draws, +~2 the
+engine's first-serving goal-start rolls (RandomLookAroundGoal.start
+nextDouble+nextInt where vanilla started none at t=141), +~1-2 the
+engine's Rust-side canUse gate draws vs vanilla's (the OFF-only SRF
+groups name the exact vanilla rolls the engine replaces:
+x52 NearestAttackableTargetGoal.canUse nextInt, x13 LookAtPlayerGoal
+canUse nextFloat, x13 RandomLookAroundGoal canUse nextFloat, x13
+RandomStrollGoal canUse nextInt at t=141 — 91 rolls the engine serves
+Rust-side as 92).
+
+**Fix**: the BURN line keeps fire/hp/type (entropy-free) and drops the
+burn field. The probe only weaves into the mob_ai=1 legs, so the
+shipped-config parity was never affected — but every hunt so far carried
+this bias inside its own dump window.
+
+**The road to the engine gate**: with the probe neutral, the next hunt's
+SRC/SRF diff at t=141 isolates the engine's RESIDUAL delta — the
+Rust-side canUse gate draw counts vs vanilla's 91-roll sequence and the
+goal-start ordering. The SRF frames give both legs' full per-draw caller
+multisets, so the reconciliation is mechanical: for each vanilla roll
+group the engine must consume the same count in the same per-mob order.
+Once the hunt gate goes GREEN the AI engine becomes shippable — doc-30
+frontier 0 (mobs −61% per e774d00, the single biggest module-owned move
+toward −90%).
