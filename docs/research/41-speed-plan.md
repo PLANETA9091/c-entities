@@ -1084,3 +1084,47 @@ verdict of the corrected engine) and the definitive hunt on b30936d
 frontier is the engine's remaining staged rounds (the stroll getPosition
 park — REQ_STROLL_POS fires only when the 1/interval gate passes, ~1/60
 per mob — negligible) and the travel/collide port (frontier 1).
+
+## The t=141 root narrows to the engine — the LCG solve + the push=0 bisect
+
+The L82 fix (the even-path phase order) did NOT move the divergence: the
+L82 hunt (41674048550, 7f1f72f) still shows SR t=141 / LRC t=142, the PH
+state holding to t=147, the same jockey shape. Two new facts close the
+net:
+
+1. **The LCG forward-solve.** The SHARED_RANDOM LCG (value*25214903917+11
+   mod 2^48) is a permutation: iterating the ON leg's t=141-end state
+   forward reaches the OFF leg's state in EXACTLY 17 steps, in BOTH hunt
+   runs (41670844291 and 41674048550). The ON leg advanced the
+   ENTITY-random stream 17 draws more by t=141 — not a single missed
+   roll, a PER-MOB serving delta (~13 mobs ticking their first AI at
+   t=140-141).
+2. **The push=0 bisect** (41676736936, mob_ai=1 + CE_PUSH=0): the SR
+   divergence at t=141 is UNCHANGED — the push kernel's cramming audit
+   (the only kernel RNG surface) is EXONERATED.
+3. **The AITR "t=420" line is CUR_TICK-space** (the module's flush
+   counter, 3 per game tick) — CUR_TICK 420 = game tick 140: the
+   engine's FIRST serving IS at t=140-141, exactly where the +17 lands.
+   The module arms at boot, not at t=420.
+
+The engine's own draw SITES were audited against the javap bodies: the
+Lcg recurrence + nextInt(bound)'s biased loop are bit-exact
+(ThreadUnsafeRandom.advanceSeed + BitRandomSource.nextInt), the stroll
+gate packs positiveCeilDiv(interval,2) (reducedTickDelay) correctly, the
+nearest gate takes the raw randomInterval, the lookat/lookaround floats
+match, and the staged resolutions call the REAL virtual bodies
+(MH_FIND_TARGET = the real findTarget, REQ_STROLL_POS = the real
+getPosition). The +17 draws' CONSUMER is still unnamed — the SR state
+probe (one line per tick) cannot attribute draws. The L85 instrument
+(this commit) wraps SHARED_RANDOM with the same delegating proxy the LR
+stream uses: the SRC count + the SRF per-draw caller frames (deepest-
+first) in the window, in BOTH legs. The module's seed handoff reads and
+writes the ORIGINAL object's 'value' field directly — the wrap is a
+pure observer. The next SRF diff names the +17's caller directly.
+
+Instrument archaeology (fixed): the SR/LR probes never stream before
+t=141 because logParityHash early-returns on the EMPTY entity list
+(the pre-fill ticks) — the whole entropy block lives after the emit,
+not before it; and the "entropy-probe-disabled" lines never streamed
+(the whitelist pattern "entropy probe" does not match the hyphenated
+text) — both quirks masked the probe-start boundary for two runs.
