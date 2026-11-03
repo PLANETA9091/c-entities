@@ -986,6 +986,25 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             if ri > 0 && ctx.lcg.next_int_bound(ri) != 0 {
                 return Ok(Cu::No);
             }
+            // L83: ZERO players in the snapshot → getNearestPlayer is
+            // PROVABLY null (the scan has no candidates; the follow range,
+            // the conditions and the LoS never matter — the vanilla query
+            // iterates level.players() which is empty). The null write IS
+            // the only observable (NearestAttackableTargetGoal has no
+            // stop() clear for the field), canUse returns false, no lock
+            // transition, no RNG after the interval pull. The old shape
+            // parked REQ_FIND_TARGET for exactly this case — one JNI
+            // round PER MOB PER EVEN TICK in every player-less world
+            // (the parity scenarios AND the player-less phases of the
+            // benches): ~2500 mobs x ~400 even ticks = ~500k rounds on
+            // mobs-25k, each a full state mirror + crossing. The AITR
+            // witness (run 41670844291, t=420): op=6 r=0 for every
+            // traced mob — the single biggest staged cost in the
+            // engine's profile.
+            if ctx.pcount() == 0 {
+                out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                return Ok(Cu::No);
+            }
             // Player-typed target (cfg SIGN bit — bit1 collided with the
             // randomInterval value 10 = 0b1010!): findTarget() =
             // getNearestPlayer over the snapshot — the non-LoS half of
@@ -996,7 +1015,6 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             if ctx.cfg3(sel, gi) & 1 != 0
                 && !ctx.flag(MF_TEAMS_PRESENT)
                 && !ctx.flag(MF_MANY_PLAYERS)
-                && ctx.pcount() > 0
             {
                 let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
                 let cands = ctx.scan_players(true, false, range);
@@ -1011,7 +1029,9 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
                 return Ok(Cu::Staged);
             }
             // findTarget() — a level query, staged (the gate pull already
-            // happened; the seed handoff keeps the stream exact)
+            // happened; the seed handoff keeps the stream exact). Only
+            // reachable for non-player-typed target goals or the
+            // team/many-players worlds now.
             park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
             Ok(Cu::Staged)
         }
