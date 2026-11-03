@@ -1781,7 +1781,14 @@ fn weave_lhurt_probe(b: Vec<u8>) -> Vec<u8> {
         HOOKS_CLASS,
         "probeLHurt",
         PROBE_LHURT_DESC,
-        &[(0, b'L'), (1, b'L'), (2, b'F')],
+        // hurtServer is an INSTANCE method: slot 0 = this (LivingEntity),
+        // slot 1 = ServerLevel (not passed), slot 2 = DamageSource,
+        // slot 3 = the float amount. The e2e's JVMTI_ERROR_FAILS_VERIFICATION
+        // (run 41651515234) was THIS map reading (0,1,2) with 'F' on the
+        // DamageSource slot — ALOAD of a reference into the bridge's float
+        // param fails verification and the module's fail-closed stop killed
+        // the server at the deferred retransform.
+        &[(0, b'L'), (2, b'L'), (3, b'F')],
     ) {
         Ok(b2) => b2,
         Err(e) => {
