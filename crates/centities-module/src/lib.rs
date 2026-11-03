@@ -1127,8 +1127,17 @@ fn precompute_level(loader: jni::jobject) {
         );
         return;
     };
+    // Two bodies, chained (the goal_tick chain pattern): getEntities first,
+    // then getEntitiesOfClass on its output. A refusal of the SECOND keeps
+    // the first (partial weave — the typed path falls back to vanilla).
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec())
+        let one = cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec());
+        match one {
+            Some(b) if !b.is_empty() => {
+                cplug_sdk::asm::replace_body(env, loader, &b, &level_class_spec())
+            }
+            other => other,
+        }
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
@@ -1137,7 +1146,9 @@ fn precompute_level(loader: jni::jobject) {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
                 pc.insert(LEVEL_CLASS, b);
             }
-            cplug_sdk::log::info("[c-entities] precomputed Level.getEntities rewrite");
+            cplug_sdk::log::info(
+                "[c-entities] precomputed Level.getEntities + getEntitiesOfClass rewrite",
+            );
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -3597,6 +3608,31 @@ fn level_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
         bridge_owner: HOOKS_CLASS,
         bridge_name: "getEntities",
         bridge_desc: "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+        ],
+    }
+}
+
+// L86: the class-typed funnel — Level.getEntitiesOfClass(Class, AABB,
+// Predicate). The EntityGetter 2-arg default dispatches here through the
+// override (invokeinterface on a Level receiver), so ONE weave covers both
+// overloads. This is the targeting cluster's funnel (HurtByTargetGoal.
+// alertOthers, findTarget's non-player branch): the vanilla body AABB-tests
+// every entity in the section range (the profile's ~14% AABB.intersects +
+// getBoundingBox + ListItr cluster); the bridge serves the spatial answer
+// from the Rust index (exact vanilla order, doc 36b) and applies the class
+// + predicate filters on the survivors.
+fn level_class_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getEntitiesOfClass",
+        method_desc: "(Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getEntitiesOfClass",
+        bridge_desc: "(Lnet/minecraft/world/level/Level;Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
         args: &[
             cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
