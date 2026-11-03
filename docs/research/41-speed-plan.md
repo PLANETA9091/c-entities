@@ -849,3 +849,16 @@ re-diff of the failed run's SR/LR probes (L77+L78 shipped) re-confirmed
 the divergence tick: mobs LR first differs at t=143 (141/142
 identical), SR cascades at t=145 — the LRC_WINDOW=138-160 dispatch
 parameters stand.
+
+## L80: the dispatch append drops the dead quad zeros
+
+appendDispatch wrote all four IB_I slots per appended item; the native
+path's ONLY iv read is iv[k*4+2] — the fresh-pickupDelay re-read (the
+plugin-parity guard). The tick/age/rate slots were always dead for
+IF_NATIVE entries: phase 1 overwrites all of them from the store
+(st.tick_count/age/pickup_delay/despawn_rate, the L7 hydration), and
+every Java-side reader of those slots is either the resync writer (the
+check path fills its own quads) or behind the `(f & IF_NATIVE) != 0`
+short-circuit (the rateOk arms, both tails). Three array stores per
+item per tick come off the #2 items leaf. The batch quads of appended
+items now carry stale data in those slots — harmless by the same reads.

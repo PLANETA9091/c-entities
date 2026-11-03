@@ -1102,10 +1102,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         LR_CALLS++;
         if (LR_FRAMES.size() < 512) {
             StackTraceElement[] st = new Throwable().getStackTrace();
-            StringBuilder sb = new StringBuilder(96);
+            StringBuilder sb = new StringBuilder(160);
             // [0]=recLrDraw [1]=the handler lambda [2]=the $Proxy method
-            // [3..]=the real callers
-            for (int i = 3; i < Math.min(st.length, 7); i++) {
+            // [3..4]=the REFLECTIVE DELEGATE HOP (DirectMethodHandleAccessor
+            // + Method.invoke — the handler calls method.invoke on the
+            // original; the JDK-local proxy test pinned the shape: the real
+            // caller sits at [5]) [5..8]=the real callers. Capturing 3..8
+            // keeps the dump robust to a JDK hop-count variation; the two
+            // constant hop frames are noise but never hide the caller.
+            for (int i = 3; i < Math.min(st.length, 9); i++) {
                 sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
                         .append('.').append(st[i].getMethodName()).append(' ');
             }
@@ -1157,10 +1162,17 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
             StringBuilder sb = new StringBuilder(128)
                     .append("LRF t=").append(tickNo).append(" n=").append(LR_FRAMES.size());
-            for (char[] f : LR_FRAMES) {
-                sb.append('\n').append(f);
-            }
             getLogger().info(sb.toString());
+            // one INFO call PER FRAME — a single multi-line record never
+            // reaches the CI job log (the console handler dropped the
+            // embedded newlines: run 41584262024 streamed the n= headers
+            // with zero frame lines). Same per-line shape as the PD dumps;
+            // the k= index keeps the order diffable.
+            int k = 0;
+            for (char[] f : LR_FRAMES) {
+                getLogger().info("LRF t=" + tickNo + " k=" + (k++) + ' '
+                        + new String(f));
+            }
         }
         LR_CALLS = 0;
         LR_FRAMES.clear();

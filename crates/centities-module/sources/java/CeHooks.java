@@ -4065,17 +4065,21 @@ public final class CeHooks {
      *  store owns the full state for IF_NATIVE entries (hydrated from the
      *  last commit). pickupDelay is re-read fresh every dispatch (plugin
      *  parity: a mid-flight change must win over the stored value; the
-     *  flush compares and prefers the batch). */
+     *  flush compares and prefers the batch).
+     *  L80: the other three quad slots stay STALE — the native path's
+     *  only iv read is iv[k*4+2] (the fresh_pd re-read); the tick/age/
+     *  rate slots are overwritten from the store (phase 1) and every
+     *  Java-side read of them is either resync-path (the check writer
+     *  fills its own quads) or behind the (f & IF_NATIVE) != 0
+     *  short-circuit (the rateOk arms). Three stores per item per tick
+     *  off the dispatch append (the #2 items leaf). */
     private static void appendDispatch(ItemEntity e, boolean active) {
         int i = ibN;
         ibN = i + 1;
         IB_IDS[i] = entId(e);
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
         IB_ITEM[i] = e;
-        IB_I[i * 4] = 0;
-        IB_I[i * 4 + 1] = 0;
         IB_I[i * 4 + 2] = e.pickupDelay;
-        IB_I[i * 4 + 3] = 0;
     }
 
     /** L7: an external mutation of this item (box or velocity change
