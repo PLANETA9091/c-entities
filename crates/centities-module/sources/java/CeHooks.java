@@ -1028,9 +1028,20 @@ public final class CeHooks {
                 try {
                     net.minecraft.world.entity.Mob mob =
                             (net.minecraft.world.entity.Mob) e;
+                    // L88 ENTROPY FIX: NO isSunBurnTick() here. The doc-41
+                    // "javap: zero random calls" audit was WRONG for 26.3 —
+                    // Mob.isSunBurnTick draws random.nextFloat() whenever
+                    // getLightLevelDependentMagicValue() > 0.5 (javap bc
+                    // 92-96: getfield random; RandomSource.nextFloat). In
+                    // the open PH_DUMP window the probe's extra call drew
+                    // +1 entity-random PER LIT MOB PER TICK in the ON leg
+                    // only (the SRF frames named it directly: x13
+                    // burnUndead→probeBurn→isSunBurnTick→nextFloat at
+                    // t=141, the exact divergence tick) — the +17 was
+                    // mostly this probe. fire/hp/type are entropy-free
+                    // reads; the line keeps them and drops the burn field.
                     st = "fire=" + e.getRemainingFireTicks()
-                            + " hp=" + mob.getHealth()
-                            + " burn=" + mob.isSunBurnTick();
+                            + " hp=" + mob.getHealth();
                 } catch (Throwable tt) {
                     st = "err:" + tt.getClass().getSimpleName();
                 }
