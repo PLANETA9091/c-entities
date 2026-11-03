@@ -1229,3 +1229,30 @@ group the engine must consume the same count in the same per-mob order.
 Once the hunt gate goes GREEN the AI engine becomes shippable — doc-30
 frontier 0 (mobs −61% per e774d00, the single biggest module-owned move
 toward −90%).
+
+### L88 ledger (the full t=141 multiset, hunt 41712408901)
+
+The complete SRF multiset at the divergence tick (mobs, OFF 208 vs ON
+133 proxy-visible draws):
+
+| group | OFF | ON visible | verdict |
+|---|---:|---:|---|
+| spawn path (ctor UUIDs, finalizeSpawn, randomizeData) | 91 | 91 | EXACT |
+| GoalSelector canUse interval rolls (52 target + 13 lookat + 13 lookaround + 13 stroll) | 91 | 0 (served Rust-side) | engine ledger R=92 |
+| burnUndead real (isSunBurnTick nextFloat + ignite) | 26 | 26 | EXACT |
+| Zombie.tick base-tick group | 13 | 13 | EXACT |
+| probeBurn EXTRA isSunBurnTick | — | 13 | **THE PROBE (+13)** |
+| RandomLookAroundGoal.start (nextDouble+nextInt) | 0 | 2 | engine started a goal vanilla didn't |
+
+Reconciliation: ON_true = 133 visible + 92 Rust = 225 = 208 + 17 (the
+f^17 solve verified end-to-end). The +17 = probe +13 + canUse +1 + starts
++2 (+1 rounding in the cut-string groups).
+
+**The cascade hypothesis**: the probe's +13 landed MID-TICK (burnUndead
+runs per mob inside the same tick as the goal gates), shifting the LCG
+stream for every later consumer — the engine's +1 gate roll and the +2
+start rolls may both be CASCADE effects of reading shifted positions,
+not independent bugs. The L88 hunt (probe neutral) is the decisive read:
+if the engine's Rust ledger lands exactly 91==91 with matching starts,
+the engine is parity-exact and shippable (doc-30 frontier 0, mobs −61%);
+any residual delta is now attributable frame-by-frame.
