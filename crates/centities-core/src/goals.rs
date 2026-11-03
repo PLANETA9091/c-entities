@@ -884,7 +884,16 @@ fn needs_cc_vanilla(kind: i32) -> bool {
 }
 
 fn every_tick(kind: i32) -> bool {
-    kind == GK_LOOKAROUND
+    // javap 26.3 requiresUpdateEveryTick() overrides in the classified
+    // zombie set: RandomLookAroundGoal (iconst_1) AND MeleeAttackGoal
+    // (iconst_1). The L22c Java fast path already knew about the melee
+    // half (aiMeleeRunning gates the odd-branch Java walk); the Rust
+    // side missed it — a running melee goal's odd-tick body (attack
+    // cooldowns + the swing RNG) silently vanished whenever the JNI
+    // path served the odd branch (any targeted mob). GK_ZOMBIE_ATTACK
+    // now rides the same every-tick set; tick_ported does not port its
+    // body, so the odd path emits the exact ACT_GOAL_TICK_V virtual.
+    kind == GK_LOOKAROUND || kind == GK_ZOMBIE_ATTACK
 }
 
 /// the ported canContinueToUse bodies
