@@ -1128,3 +1128,61 @@ t=141 because logParityHash early-returns on the EMPTY entity list
 not before it; and the "entropy-probe-disabled" lines never streamed
 (the whitelist pattern "entropy probe" does not match the hyphenated
 text) — both quirks masked the probe-start boundary for two runs.
+
+## L85b (1d1a2d7): the SRF instrument was blind by construction — the wrap now installs at ENABLE
+
+Run 307 (the L85 SRF hunt) streamed `SRC t=… calls=0` for every tick and
+zero SRF frames. Not a dead probe — a blind one: **javap 26.3 shows
+`Entity.random` is an instance field copied from the static in the
+constructor** (`getstatic SHARED_RANDOM; putfield random`), and every
+entity draw site reads the instance field (`getfield random`). The proxy
+installed lazily at the first non-empty tick (t≈141) — AFTER the whole
+fill batch was constructed — so every mob held the ORIGINAL reference and
+its draws bypassed the proxy forever. The instrument could never see
+anything regardless of the engine's behavior.
+
+The fix (L85b): `installSharedRandomWrap` runs at **onEnable**, right
+after the SHARED_RANDOM seed — before any entity exists — so every fill
+mob captures the proxy. Two contract pieces keep the engine exact:
+
+1. The SR proxy carries the `SrUnwrap` marker interface (defined in the
+   harness): `ceSrOriginal()` returns the wrapped ORIGINAL.
+2. `CeHooks.initMobAiHandles` unwraps duck-typed by the method name
+   (setAccessible waives the cross-loader visibility check; no harness
+   class link). The seed handoff keeps reading/writing the ORIGINAL's
+   `value` — one underlying LCG, the proxy only watches.
+
+Neutrality proof: the push-triggered shipped-config parity on 1d1a2d7
+must stay GREEN (the wrap delegates every call to the same object; the
+OFF leg proxies too). The dispatched hunt (mob_ai=1, trace 83, window
+138-152) now streams real SRC counts + SRF frames in both legs — the
+t=141 SRC diff either names the +17's Java consumer directly or (if the
+Java counts match) pins the +17 on the engine's staged Rust serving.
+
+## L86 (hotspot ledger, engine mode, mobs-25k @ ~215ms): the vanilla lookup cluster is the next lever
+
+The lean profile (CE_MOB_AI=1, bench bot present, 11546 samples):
+
+| cluster | self-time | shape |
+|---|---:|---|
+| vanilla AABB scan | ~14% | `AABB.intersects` 8.58% + `getBoundingBox` 2.94% + `ListItr.next` 2.30%, called from `ChunkEntitySlices$EntityCollectionBySection.getEntities` (3.05%) |
+| targeting | ~4% | `HurtByTargetGoal.start/alertOthers` 2.10+1.59+0.30% — real class-based scans (`getEntitiesOfClass`) |
+| attributes | ~3.5% | `AttributeMap.getValue` 1.84% ← `LivingEntity.travel` (1.65% caller) |
+| module engine hooks | ~4.5% | aiPackSel 0.67, mobTravelNative 0.88, aiMeleeRunning 0.49, sensingTick$ 0.54, aiClassify 0.40, mobBlockEffectsNoOp 1.44, tickEffectsNoOp 0.42 |
+| TTL tracker | ~1.2% | newTrackerTick$ 0.67 caller + ttlCachedPath 0.48 |
+
+With a player present the L83 zero-player findTarget fast path never
+fires — the staged findTarget resolves through the REAL vanilla body:
+`TargetingConditions` → moonrise `ChunkEntitySlices.getEntities(Class,
+Entity, AABB, List, Predicate)` → the AABB.intersects leaf. The
+**native targeting port** (module index scan in the exact vanilla order +
+condition evaluation) is the next staged-round candidate: it deletes the
+~14% lookup cluster per scan and keeps the engine's staged ledger exact.
+
+items-100k-mod (30ms p50, −60%) top costs: `guardEntityTick` 8.15% (the
+vanilla walk itself), `itemTickFlush` 6.29+1.25+1.21+0.82%, the TTL
+tracker cluster 11.3% (ttlCachedPath ×4 lines), `Entity.isRemoved` 4.51%,
+`appendDispatch` 3.95%. The TTL loop pays ~10 loads × 100k entities/tick
+to re-prove per-entity quietness; a Rust-side batched quiet-scan
+(parallel id array → candidate bitset) or an epoch-dirty skip list is
+the next items lever.
