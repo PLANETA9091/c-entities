@@ -961,24 +961,25 @@ public final class CeHooks {
      *  zero hot-path cost outside PH_DUMP. NEVER disarms (a failed
      *  println must not kill the module). */
     public static volatile long lhurtProbes = 0;
-    public static void probeLHurt(Entity e, Object src, float amt) {
+    public static void probeLHurt(net.minecraft.world.entity.LivingEntity e,
+                                  net.minecraft.world.damagesource.DamageSource src,
+                                  float amt) {
         try {
             lhurtProbes++;
             if (phDumpTickNow() && e != null) {
                 String st;
                 try {
-                    st = src == null ? "null"
-                            : ((net.minecraft.world.damagesource.DamageSource) src)
-                                  .type().msgId();
+                    st = src == null ? "null" : src.type().msgId();
                 } catch (Throwable tt) {
                     st = "err:" + tt.getClass().getSimpleName();
                 }
-                float hp = -1f;
+                float hp;
                 String ty;
                 try {
-                    hp = ((net.minecraft.world.entity.LivingEntity) e).getHealth();
+                    hp = e.getHealth();
                     ty = e.getType().toString();
                 } catch (Throwable ignore) {
+                    hp = -1f;
                     ty = e.getClass().getSimpleName();
                 }
                 // ct is the flush-space tick (3 levels at parity): print the
@@ -992,6 +993,54 @@ public final class CeHooks {
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "probeLHurt: " + t;
+        }
+    }
+
+    /** L81b: prefix of Mob.burnUndead() — the SUNLIGHT armor-wear path.
+     *  javap 26.3: burnUndead draws the ENTITY random TWICE (the
+     *  isSunBurnTick nextFloat roll inside aiStep + the nextInt(2) here)
+     *  and — for a damageable ENCHANTED piece — one LEVEL.random draw via
+     *  hurtAndBreak -> processDurabilityChange -> RemoveBinomial, ALL
+     *  WITHOUT touching hurtServer (the armor durability is direct). The
+     *  L81 reference run proved it: LRC/LRF show identical burn draws on
+     *  both legs while LHURT printed nothing — the probe cannot see this
+     *  path by design. The engine hunt's t=143 +1 Level.random draw rides
+     *  THIS path (a burn-roll flip), not the cramming audit; the entity
+     *  random streams must have split EARLIER (the engine's staged-request
+     *  RNG protocol, doc 30 item 4) — the burn probability is just the
+     *  first Level.random-visible consequence. This probe names every
+     *  burn event + the mob's fire/light state on the ON leg; the OFF
+     *  leg's RemoveBinomial LRF lines are the vanilla truth. Window-gated,
+     *  zero hot-path cost outside PH_DUMP. */
+    public static volatile long burnProbes = 0;
+    public static void probeBurn(Entity e) {
+        try {
+            burnProbes++;
+            // L81b liveness: every 500th call prints REGARDLESS of the
+            // window — separates "the woven call never executes" (the class
+            // is vanilla at runtime) from "the window gate is closed".
+            if (burnProbes % 50_000 == 1) {
+                System.out.println("[ce-baseline] BURN-LIVE n=" + burnProbes
+                        + " t=" + (CUR_TICK / 3) + " ct=" + CUR_TICK);
+            }
+            if (phDumpTickNow() && e != null) {
+                String st;
+                try {
+                    net.minecraft.world.entity.Mob mob =
+                            (net.minecraft.world.entity.Mob) e;
+                    st = "fire=" + e.getRemainingFireTicks()
+                            + " hp=" + mob.getHealth()
+                            + " burn=" + mob.isSunBurnTick();
+                } catch (Throwable tt) {
+                    st = "err:" + tt.getClass().getSimpleName();
+                }
+                System.out.println("[ce-baseline] BURN t=" + (CUR_TICK / 3)
+                        + " ct=" + CUR_TICK + " id=" + entId(e)
+                        + " type=" + e.getType() + " " + st);
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeBurn: " + t;
         }
     }
 
@@ -3220,6 +3269,15 @@ public final class CeHooks {
     }
 
     private static boolean phDumpTickNow() {
+        // L81b: one-shot init line — proves the PH_DUMP parse ONCE per boot
+        // (the reference run's LHURT/CRAM silence had two candidate causes:
+        // the probe not woven and the window empty; this line removes the
+        // ambiguity from every future hunt log).
+        if (!MS_INIT_PRINTED) {
+            MS_INIT_PRINTED = true;
+            System.out.println("[ce-baseline] CE-INIT MS_WINDOW=" + java.util.Arrays.toString(MS_WINDOW)
+                    + " PH_DUMP=" + System.getenv("PH_DUMP"));
+        }
         for (int i = 0; i + 1 < MS_WINDOW.length; i += 2) {
             if (CUR_TICK >= MS_WINDOW[i] && CUR_TICK <= MS_WINDOW[i + 1]) {
                 return true;
@@ -3227,6 +3285,8 @@ public final class CeHooks {
         }
         return false;
     }
+
+    private static volatile boolean MS_INIT_PRINTED = false;
 
     // ---- doc-40 addendum-17 instruments: TLO / TTR / KPD ----
     // The push-timing family's surviving hypotheses were (a) the kernel

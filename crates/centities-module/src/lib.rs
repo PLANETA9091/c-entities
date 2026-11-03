@@ -1958,6 +1958,40 @@ fn patch_goalselector(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// L22a: Mob byte hook — same stash/serve pattern as GoalSelector.
+/// L81b hunt: the Mob.burnUndead prefix probe — names every sunlight-burn
+/// event inside the PH_DUMP window. javap 26.3: burnUndead consumes the
+/// ENTITY random twice (the isSunBurnTick nextFloat roll in aiStep + the
+/// nextInt(2) here) and one LEVEL.random draw per enchanted damageable
+/// piece (hurtAndBreak -> processDurabilityChange -> RemoveBinomial) —
+/// ALL without hurtServer, which is why the L81 LHURT ledger printed
+/// nothing on a leg whose LRC/LRF showed identical burn draws. The
+/// engine hunt's t=143 +1 Level.random draw rides this path (a burn-roll
+/// flip after an ENTITY-random split), so this probe + the OFF leg's
+/// RemoveBinomial lines localize the flipping mob. Chained into BOTH
+/// serve paths (the engine cache inside precompute_mob and the shipped
+/// declined arm of patch_mob_inner). Window-gated hook body, optional on
+/// refusal.
+fn weave_burn_probe(b: Vec<u8>) -> Vec<u8> {
+    match patch::insert_static_call_at_start(
+        b.clone(),
+        "burnUndead",
+        "()V",
+        HOOKS_CLASS,
+        "probeBurn",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(b2) => b2,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] Mob.burnUndead probe refused: {e}"
+            ));
+            b
+        }
+    }
+}
+
 fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_mob_inner(bytes))
         .ok()
@@ -1965,6 +1999,7 @@ fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    eprintln!("[c-entities] MOB-HOOK pass (dbg) bridge_ready={}", BRIDGE_READY.load(Ordering::Acquire));
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
         st.entry(MOB_CLASS).or_insert_with(|| bytes.to_vec());
@@ -1983,7 +2018,27 @@ fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             cplug_sdk::log::info("[c-entities] Mob bytes stashed post-arm — verifier will decide");
             None
         }
-        _ => None,
+        _ => {
+            // The AI floor is declined (the SHIPPED config): the Mob class
+            // serves vanilla. The L81b burn probe STILL weaves — the engine
+            // hunt needs the burn ledger in BOTH configs. NO idempotency
+            // flag: JVMTI hands the hook the ORIGINAL bytes on every pass
+            // (the 697 comment), so each pass gets exactly one insert — the
+            // flag would only kill the re-application on the LIVE class
+            // after the boot retransform landed on the doomed bootstrap
+            // object (the smoke-8 lesson: the arm line + rc=0 + a dump with
+            // the probe, and ZERO executions — the live class was vanilla).
+            let b2 = weave_burn_probe(bytes.to_vec());
+            eprintln!("[c-entities] MOB-HOOK declined-arm woven delta={}", b2.len() as isize - bytes.len() as isize);
+            if b2.len() != bytes.len() {
+                if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
+                    let _ = std::fs::write(format!("{dir}/Mob.patched.class"), &b2);
+                }
+                Some(b2)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -2577,7 +2632,7 @@ fn precompute_mob(loader: jni::jobject) {
     match patched {
         Some(Some(b)) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(MOB_CLASS, b);
+                pc.insert(MOB_CLASS, weave_burn_probe(b));
             }
             MOB_WOVEN.store(true, Ordering::Release);
             if set_java_bool("setMobAiOn", true) {
