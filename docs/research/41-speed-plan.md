@@ -991,3 +991,65 @@ CE-INIT proves the window parse once per boot; BURN-LIVE separates
 first m-diff id, exists in both legs) + LRC_WINDOW=138-160. Run B =
 the push-triggered shipped parity on the same commit (already in flight)
 — the weave-neutrality check for the declined-arm burnUndead insert.
+
+## L82 (7f1f72f): THE PARITY FIX — the engine ran a phase 26.3 never runs
+
+The L81b hunt (41670844291, dd59a1d + BURN/AITR/trace-83, LRC_WINDOW
+138-160) collapsed the whole engine-hunt frontier to ONE line of bytecode:
+
+**javap Mob.serverAiStep (26.3)** — the branch structure:
+- bc 75-96: `n = tickCount + getId()`; `if (n % 2 != 0 && tickCount > 1)`
+  → **ODD branch (bc 91-145): `targetSelector.tickRunningGoals(false)` →
+  `goalSelector.tickRunningGoals(false)`** — ONLY the running goals with
+  `requiresUpdateEveryTick()` tick (javap: the classified zombie set's
+  single override is RandomLookAroundGoal → iconst_1; the engine's
+  every_tick() == GK_LOOKAROUND is exact). NO cleanup, NO update.
+- **EVEN branch (bc 148-191): `targetSelector.tick()` →
+  `goalSelector.tick()`** — and GoalSelector.tick() (javap) is ONLY the
+  goalCleanup loop (cc/stop per availableGoals order) + the lockedFlags
+  removeIf + the goalUpdate loop (canUse/start). **NO running-goal tick
+  phase exists on even ticks.**
+
+The engine's even path hopped CLEANUP → LOCK_REBUILD → UPDATE →
+**PH_TICK_RUNNING with force=true** — every running goal's tick body
+(state writes AND any RNG draws) executed between the update and the
+next selector — a phase 26.3 never runs, both a state-write delta and a
+within-tick SHARED_RANDOM serving reorder. The engine comment itself
+("even: full tick()") already described the correct shape; the
+implementation added the extra hop.
+
+The hunt run's ledger pins the causal chain (the streamed job log, no
+artifact): **SR state first diverges at t=141 in ALL THREE mob
+scenarios** — the first tick the engine serves the fill's first batch —
+then the burnUndead armor-wear gates (nextInt(2), SR) read shifted
+positions (mobs t=142: +2 OFF-extra RemoveBinomial draws, k=94+), the
+finalizeSpawn rolls shift, the jockey chickens appear (the t=147 n=92/91
++ id shift; the T382 snapshot's CHICKEN flips are the jockey mounts —
+the fill spawns 100% zombies from a plugin-local Random(42L)), and the
+entity-id streams explode. The previous run's t=143/145/146 LRC ticks
+were cascade effects. The engine's own arithmetic is exonerated: javap
+ThreadUnsafeRandom.advanceSeed (value*25214903917+11 & 2^48-1) and
+BitRandomSource.nextInt(bound) (the exact biased loop) match the Lcg
+mirror bit-for-bit — the divergence was ORDER, not values.
+
+**The fix**: PH_UPDATE ends the even pass — SEL_TARGET's update falls
+through to SEL_GOAL's CLEANUP, SEL_GOAL's update returns done. The odd
+path keeps TICK_RUNNING with every_tick only. The BURN probe's extra
+isSunBurnTick() call is entropy-neutral (javap: zero random calls in
+the body) — the shipped-config parity on c1a0f75 (41670352580) stayed
+GREEN with the weave live, the weave-neutrality check passed.
+
+Instrument fixes in the same commit: the LRF frames print deepest-first
+(the console handler truncated the depth-30 RemoveBinomial line at
+~430 chars — exactly the caller window that names the path: burnUndead
+vs finalizeSpawn vs the cramming hurt) and the whitelist carries
+CE-INIT + BURN-LIVE (both were dropped from the streamed log: zero
+CE-INIT lines in the hunt run was a whitelist artifact, not a dead
+probe — the BURN t= lines proved the weave live).
+
+Dispatched: the push-triggered shipped parity (the neutrality gate) +
+the fixed-engine hunt (mob_ai=1, trace 83, window 138-152). If the SR
+streams now hold through the fill and the window, the gate goes GREEN
+and the AI engine becomes shippable — the doc-30 frontier item 0
+(mobs -61% per e774d00, the single biggest module-owned move toward
+-90%).
