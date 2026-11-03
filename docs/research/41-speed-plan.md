@@ -789,3 +789,63 @@ untouched, every draw is counted and its caller frames captured; the
 tick end prints LRC (the count) always and the LRF frame dump inside
 LRC_WINDOW (default 138-150). The OFF/ON LRF diff names the extra
 caller class.method directly.
+
+## L79 (this commit): the compact pass-2 — the flush applier walks two lists
+
+The frontier's item 1 shipped. The old single apply loop paid its head
+(the `IB_ITEM[i]` null check + the `isRemoved()` pair + the MODE stamp
+writes) for EVERY entry — 9.30% + 1.30% of the items-100k leg at the
+top two flush lines, plus the 1.70% `Entity.isRemoved()` leaf — while
+the post-counter tail population is a small fraction of n on live
+batches (the L78 TAIL_NONE gate already proved MOST tails are no-ops).
+
+The core now appends a COMPACT INDEX LIST after outI[n*4]: outI[n*4] =
+cn, then the batch indices whose Java tail is NOT the proven TAIL_NONE
+no-op — the exact !tail_none predicate the 12/12 L78 gate proved,
+restricted to the IF_NATIVE non-abort entries (non-NATIVE entries never
+reach the Java tail: the applier's IF_NATIVE gate continues first). The
+applier splits into two loops: LOOP A walks all n for the MODE stamps +
+the counters (tickCount/totalEntityAge/age — the ~6 ops/entry the old
+loop paid anyway), LOOP B walks ONLY the compact list for the full
+tails (delta/pd/fd/onGround/setPos/needsSync/merge/despawn/void/land),
+batch order kept. The JNI descriptor is UNCHANGED — only the outI
+length contract grows to n*4 + 1 + n.
+
+Loop-order note (the one semantic delta): the counters now run BEFORE
+any tail of the same pass; the old loop interleaved them. The only
+entries whose counters a tail could have skipped are ones the same pass
+REMOVED (merge absorb / despawn / void) — a removed entity's
+tickCount/totalEntityAge/age are unobservable (discard fires no reads
+of them; the store mirror already holds the core's committed values).
+The itemTailNone diagnostic moved to loop A (the core excludes
+TAIL_NONE entries from the list, so the loop-B belt continue is dead by
+construction).
+
+## The LRC instrument was a silent no-op — the interface scan bug
+
+The first LRC/LRF hunt (run 41581856021, mob_ai=1 + LRC_WINDOW=138-160)
+streamed 6738 LRC lines — EVERY one calls=0, all 160 LRF dumps n=0,
+while the SR/LR stream probes still tracked the LCG state perfectly.
+The parity gate failure was the EXPECTED mob_ai=1 divergence (the hunt
+is not a gate run); the zero counts were the instrument bug.
+
+Root cause: Paper 26.3's Level.random is a
+`ca.spottedleaf.moonrise.common.util.ThreadUnsafeRandom`, whose DIRECT
+interface is `net.minecraft.world.level.levelgen.BitRandomSource` — a
+RandomSource SUB-interface. The harness resolved the proxy interface by
+scanning `random.getClass().getInterfaces()` (directly-declared
+interfaces only), never matched `net.minecraft.util.RandomSource`,
+returned the original object, and the `LR_WRAP != LR_OBJ` guard then
+skipped the field write: the "proxy" was the original, nothing counted,
+and no exception ever fired (the catch's disable-if only covers SR
+failures). javap: `ThreadUnsafeRandom implements BitRandomSource`,
+`Level.random` is `protected final`.
+
+The fix: resolve the interface BY NAME through the delegate's loader
+(`Class.forName("net.minecraft.util.RandomSource")`) and accept it via
+`isInstance()` (hierarchy at any depth); a failing `rf.set` now prints
+`PH t=... LR-wrap-set-failed` instead of degrading silently. The
+re-diff of the failed run's SR/LR probes (L77+L78 shipped) re-confirmed
+the divergence tick: mobs LR first differs at t=143 (141/142
+identical), SR cascades at t=145 — the LRC_WINDOW=138-160 dispatch
+parameters stand.

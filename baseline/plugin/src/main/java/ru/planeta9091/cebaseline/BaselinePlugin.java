@@ -1114,17 +1114,23 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     }
 
     /** Wrap the level's RandomSource in a counting, delegating Proxy. The
-     *  interface type is resolved from the delegate's interfaces (the NMS
-     *  RandomSource is not on the compile classpath). */
+     *  interface type is resolved BY NAME from the delegate's loader —
+     *  Paper 26.3's Level.random is a ThreadUnsafeRandom whose DIRECT
+     *  interface is BitRandomSource (a RandomSource SUB-interface), so the
+     *  old getClass().getInterfaces() scan never matched and the proxy
+     *  degraded to a silent no-op: LR_WRAP == the original object, the
+     *  field write was skipped by the != guard, and every LRC line
+     *  streamed calls=0 (run 41581856021: 6738 zeros). isInstance()
+     *  accepts the hierarchy at any depth. */
     private static Object wrapLevelRandom(Object random) {
-        Class<?> iface = null;
-        for (Class<?> i : random.getClass().getInterfaces()) {
-            if (i.getName().equals("net.minecraft.util.RandomSource")) {
-                iface = i;
-                break;
-            }
+        Class<?> iface;
+        try {
+            iface = Class.forName("net.minecraft.util.RandomSource",
+                    false, random.getClass().getClassLoader());
+        } catch (ClassNotFoundException unexpected) {
+            return random; // unexpected shape: leave it exact
         }
-        if (iface == null) return random; // unexpected shape: leave it exact
+        if (!iface.isInstance(random)) return random;
         return java.lang.reflect.Proxy.newProxyInstance(
                 random.getClass().getClassLoader(),
                 new Class<?>[]{iface},
@@ -1220,7 +1226,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 if (LR_WRAP == null) {
                     LR_WRAP = wrapLevelRandom(LR_OBJ);
                     if (LR_WRAP != LR_OBJ) {
-                        rf.set(handle, LR_WRAP);
+                        try {
+                            rf.set(handle, LR_WRAP);
+                        } catch (Throwable setFail) {
+                            // a silent failure here reads as LRC=0 with the
+                            // probe still live — print it (the PH prefix) so
+                            // a hunt does not burn a whole run on it
+                            getLogger().info("PH t=" + tickNo
+                                    + " LR-wrap-set-failed: " + setFail);
+                            LR_WRAP = null; // no proxy in the field: instrument off
+                        }
                     }
                 }
             }

@@ -5411,7 +5411,11 @@ public final class CeHooks {
             envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
 
             double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
-            int[] outI = growI(n * 4);    // age, pickupDelay, bits, tickCount (L7)
+            // L79 COMPACT APPLY: n*4 per-entry quads + outI[n*4] = cn + the
+            // compact batch indices — the core lists the entries whose
+            // post-counter tail is NOT the proven TAIL_NONE no-op, and the
+            // applier's loop B walks only those.
+            int[] outI = growI(n * 5 + 1); // age, pickupDelay, bits, tickCount (L7)
 
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI);
@@ -5490,7 +5494,6 @@ public final class CeHooks {
             try {
             int epoch = MODE_EPOCH + 1;
             for (int i = 0; i < n; i++) {
-                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
@@ -5561,10 +5564,25 @@ public final class CeHooks {
                 // pre-states (the store/batch carries them). The skipped
                 // compares are exactly the ones the tails would skip; the
                 // gate runs the full 12/12 over every scenario.
-                if ((bits & (1 << 16)) != 0) {
-                    itemTailNone++;
-                    continue;
-                }
+                if ((bits & (1 << 16)) != 0) itemTailNone++;
+            }
+            // L79 loop B: the FULL tail over the core's compact index list
+            // (outI[n*4] = cn, then the batch indices, batch order kept).
+            // The list is the !TAIL_NONE set among the IF_NATIVE non-abort
+            // entries — exactly the population the old single loop ran
+            // tails for. Entries a tail removes LATER in the pass (merge
+            // absorb / despawn / void) had their counters run in loop A;
+            // a removed entity's tickCount/totalEntityAge/age are
+            // unobservable (discard fires no reads of them; the store
+            // mirror already holds the core's committed values).
+            int cn = outI[n * 4];
+            for (int j = 0; j < cn; j++) {
+                int i = outI[n * 4 + 1 + j];
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                int bits = outI[i * 4 + 2];
+                ItemEntity e = IB_ITEM[i];
+                if (e == null || e.isRemoved()) continue;
+                if ((bits & (1 << 16)) != 0) continue; // belt: the core excludes these
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
                     int pd = outI[i * 4 + 1];
@@ -5584,6 +5602,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
+                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
                 int o = i * 8;
                 // L16 DELTA_SAME: when the core reports the post-tick delta
                 // is bit-identical to the pre-tick delta (the resting-item
