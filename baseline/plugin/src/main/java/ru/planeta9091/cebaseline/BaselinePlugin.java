@@ -1085,6 +1085,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static volatile Object LR_WRAP; // the Proxy (RandomSource)
     private static volatile long LR_CALLS;
     private static final java.util.List<char[]> LR_FRAMES = new java.util.ArrayList<>();
+    // L85-hunt: the same proxy machinery for SHARED_RANDOM — the per-draw
+    // caller frames name every ENTITY-random consumer (the engine's staged
+    // serving vs vanilla's per-mob sequence). The module's seed handoff
+    // reads/writes the ORIGINAL's 'value' directly; the proxy only watches.
+    private static volatile Object SR_WRAP;
+    private static volatile long SR_CALLS;
+    private static final java.util.List<char[]> SR_FRAMES = new java.util.ArrayList<>();
     private static final int LRC_LO = parseLrcBound(0), LRC_HI = parseLrcBound(1);
     /** per-draw frame depth (stack indices 3..LRF_DEPTH-1). Env knob
      *  LRF_DEPTH, default 9 (6 real frames after the reflective hop). */
@@ -1115,24 +1122,30 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static void recLrDraw() {
         LR_CALLS++;
         if (LR_FRAMES.size() < 512) {
-            StackTraceElement[] st = new Throwable().getStackTrace();
-            StringBuilder sb = new StringBuilder(160);
-            // [0]=recLrDraw [1]=the handler lambda [2]=the $Proxy method
-            // [3..4]=the REFLECTIVE DELEGATE HOP (DirectMethodHandleAccessor
-            // + Method.invoke — the handler calls method.invoke on the
-            // original; the JDK-local proxy test pinned the shape: the real
-            // caller sits at [5]) [5..LRF_DEPTH-1]=the real callers.
-            // Default 9 = 6 real frames; the t=143 hunt needs DEEPER chains —
-            // the RemoveBinomial (unbreaking ITEM_DAMAGE) draw's frame cut
-            // exactly at Enchantment.modifyItemFilteredCount, hiding WHO hurt
-            // the armor (run 41586036224). LRF_DEPTH=16 renders the full
-            // hurt path (LivingEntity.hurt caller = the damage source).
-            for (int i = 3; i < Math.min(st.length, LRF_DEPTH); i++) {
-                sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
-                        .append('.').append(st[i].getMethodName()).append(' ');
-            }
-            LR_FRAMES.add(sb.toString().toCharArray());
+            LR_FRAMES.add(drawFrames());
         }
+    }
+
+    /** L85: the SHARED_RANDOM twin of recLrDraw — the SR proxy records
+     *  into its own buffers so the SRC/SRF lines diff independently. */
+    private static void recSrDraw() {
+        SR_CALLS++;
+        if (SR_FRAMES.size() < 512) {
+            SR_FRAMES.add(drawFrames());
+        }
+    }
+
+    /** The shared frame capture (the stack shape is identical for both
+     *  proxies: [0]=rec* [1]=the handler lambda [2]=the $Proxy method
+     *  [3..4]=the reflective delegate hop [5..]=the real callers). */
+    private static char[] drawFrames() {
+        StackTraceElement[] st = new Throwable().getStackTrace();
+        StringBuilder sb = new StringBuilder(160);
+        for (int i = 3; i < Math.min(st.length, LRF_DEPTH); i++) {
+            sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
+                    .append('.').append(st[i].getMethodName()).append(' ');
+        }
+        return sb.toString().toCharArray();
     }
 
     /** The DEEPEST frames first: the console/log handler truncates long
@@ -1164,6 +1177,12 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
      *  streamed calls=0 (run 41581856021: 6738 zeros). isInstance()
      *  accepts the hierarchy at any depth. */
     private static Object wrapLevelRandom(Object random) {
+        return wrapRandomSource(random, false);
+    }
+
+    /** The shared proxy factory; isSr routes the recording to the SR
+     *  buffers (the SRF instrument). */
+    private static Object wrapRandomSource(Object random, boolean isSr) {
         Class<?> iface;
         try {
             iface = Class.forName("net.minecraft.util.RandomSource",
@@ -1180,7 +1199,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     if (n.startsWith("next") || n.equals("fork")
                             || n.equals("forkPositional") || n.equals("triangle")
                             || n.equals("consumeCount")) {
-                        recLrDraw();
+                        if (isSr) recSrDraw(); else recLrDraw();
                     }
                     try {
                         return method.invoke(random, args);
@@ -1193,6 +1212,20 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     }
 
     private void lrcTickEnd() {
+        // L85: the SHARED_RANDOM twin — the SRC count + the SRF frames.
+        // Printed BEFORE the LR block so an LR failure never eats it.
+        if (SR_WRAP != null) {
+            getLogger().info("SRC t=" + tickNo + " calls=" + SR_CALLS);
+            if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
+                int k = 0;
+                for (char[] f : SR_FRAMES) {
+                    getLogger().info("SRF t=" + tickNo + " k=" + (k++) + ' '
+                            + lrfFramesReversed(f));
+                }
+            }
+            SR_CALLS = 0;
+            SR_FRAMES.clear();
+        }
         if (LR_WRAP == null) return;
         getLogger().info("LRC t=" + tickNo + " calls=" + LR_CALLS);
         if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
@@ -1247,6 +1280,32 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 f.setAccessible(true);
                 SR_OBJ = f.get(null);
                 SR_SEED = bindValue(SR_OBJ);
+                // L85 hunt: wrap SHARED_RANDOM with the SAME delegating
+                // proxy the LR stream uses — the per-draw CALLER frames
+                // name every ENTITY-random consumer. The LCG math solved
+                // the L82-hunt t=141 divergence to +17 ON-leg draws (the
+                // states relate as f^17), the engine is the only mob-AI
+                // floor alive that early (the push=0 bisect kept the
+                // divergence, the kernel is exonerated), and the SR probe
+                // (one state line per tick) cannot say WHICH consumer.
+                // The wrap is transparent for the module: the engine's
+                // seed handoff reads/writes the ORIGINAL's 'value' field
+                // directly (the captured object), the proxy delegates
+                // every call to that same object — one underlying LCG,
+                // the instrument only watches it. setSeed stays
+                // synchronized on the ORIGINAL receiver (method.invoke).
+                if (SR_WRAP == null) {
+                    SR_WRAP = wrapLevelRandom(SR_OBJ);
+                    if (SR_WRAP != SR_OBJ) {
+                        try {
+                            f.set(null, SR_WRAP);
+                        } catch (Throwable setFail) {
+                            getLogger().info("PH t=" + tickNo
+                                    + " SR-wrap-set-failed: " + setFail);
+                            SR_WRAP = null; // instrument off, stream exact
+                        }
+                    }
+                }
             }
             if (SR_SEED != null && SR_OBJ != null) {
                 long s = (long) SR_SEED.invokeExact(SR_OBJ);
