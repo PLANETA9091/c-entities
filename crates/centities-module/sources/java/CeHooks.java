@@ -1152,60 +1152,8 @@ public final class CeHooks {
                     long dt = System.nanoTime() - t0;
                     fastNanos += dt;
                     if (out != null) {
-                        if (dt <= 0) dt = 1;
-                        ema(FAST_EMA, gi, dt);
-                        if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
-                        // Re-probe backoff + EMA unstick (4a.1): a fast sample
-                        // that lands far above the mirror price must not be
-                        // paid at 1/256 forever, and an EMA trained on an
-                        // empty world (bootstrap during fill) must jump to
-                        // the new reality instead of creeping at 1/8.
-                        long me = MIRR_EMA[gi];
-                        int bk = FAST_BACKOFF[gi];
-                        // L4 backoff: escalate only on a CLEAR loss (4x the
-                        // mirror price — 2x was within fill-phase noise and
-                        // starved probing into suspend storms); the duty
-                        // cycle never drops below 1/1024. A re-probe that is
-                        // CHEAPER than the EMA remembers snaps the EMA down
-                        // instantly: the world got denser (the common
-                        // direction), and the old 1/8 creep kept fast losing
-                        // for thousands of ticks after fill.
-                        if (me > 0 && dt > 4 * me) {
-                            if (bk < 2) bk++;
-                            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
-                            // an expensive sample also breaks the latch — the
-                            // world changed under it (density spike, batch)
-                            FAST_LATCH[gi] = 0;
-                            CHEAP_STREAK[gi] = 0;
-                        } else {
-                            if (me > 0 && dt < me) bk = 0; // cheap again
-                            if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
-                            // L4b win latch: 3 consecutive samples cheaper
-                            // than the mirror EMA latch the bucket to fast
-                            if (me > 0 && dt < me) {
-                                if (++CHEAP_STREAK[gi] >= 3) {
-                                    FAST_LATCH[gi] = 4096;
-                                    CHEAP_STREAK[gi] = 0;
-                                }
-                            } else {
-                                CHEAP_STREAK[gi] = 0;
-                            }
-                        }
-                        FAST_BACKOFF[gi] = bk;
-                        // L4d: the L4c latch release (drop the latch when the
-                        // stale fast EMA stops beating the mirror EMA) is
-                        // REVERTED — it was a self-fulfilling trap. CI mobs-25k:
-                        // releasing the latch stopped the fast stream, the JNI
-                        // path went cold (re-probes priced at ~348us vs ~13us
-                        // warm), everything fell back to a full-load mirror at
-                        // 8us x 18.7k/tick, and the leg regressed -36% -> +4.6%.
-                        // The spread regression L4c chased was the row CEILING
-                        // (rowBig refusals -> JNI toll), never the latch: in
-                        // spread w2b0 hysteresis alone routed fast (15us vs
-                        // 2.9ms mirror) even with the latch armed. The existing
-                        // break (dt > 4 x mirror EMA) still releases a latch
-                        // that genuinely loses.
                         queriesFast++;
+                        priceFastSample(gi, dt);
                         return out;
                     }
                     // fast refused (notReady/regrow/desync) — mirror is the
@@ -1229,6 +1177,168 @@ public final class CeHooks {
         }
         queriesMirror++;
         return mirror(level, source, box, predicate);
+    }
+
+    /** L86: the routing/EMA bookkeeping shared by BOTH getEntities weaves
+     *  (the entity-typed and the class-typed). Verbatim move of the L4/L4b/
+     *  L4d block out of the entity-typed bridge — behavior identical, one
+     *  copy of the pricing logic; the typed weave feeds its samples into
+     *  the same per-cell EMAs so the latch learns from both query kinds.
+     *  Contract: dt > 0 (normalized by the caller), out != null (a refused
+     *  fast query must NOT be priced — the callers keep the latch-kill). */
+    private static void priceFastSample(int gi, long dt) {
+        if (dt <= 0) dt = 1;
+        ema(FAST_EMA, gi, dt);
+        if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
+        // Re-probe backoff + EMA unstick (4a.1): a fast sample that lands
+        // far above the mirror price must not be paid at 1/256 forever, and
+        // an EMA trained on an empty world (bootstrap during fill) must jump
+        // to the new reality instead of creeping at 1/8.
+        long me = MIRR_EMA[gi];
+        int bk = FAST_BACKOFF[gi];
+        // L4 backoff: escalate only on a CLEAR loss (4x the mirror price —
+        // 2x was within fill-phase noise and starved probing into suspend
+        // storms); the duty cycle never drops below 1/1024. A re-probe that
+        // is CHEAPER than the EMA remembers snaps the EMA down instantly:
+        // the world got denser (the common direction), and the old 1/8
+        // creep kept fast losing for thousands of ticks after fill.
+        if (me > 0 && dt > 4 * me) {
+            if (bk < 2) bk++;
+            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
+            // an expensive sample also breaks the latch — the world changed
+            // under it (density spike, batch)
+            FAST_LATCH[gi] = 0;
+            CHEAP_STREAK[gi] = 0;
+        } else {
+            if (me > 0 && dt < me) bk = 0; // cheap again
+            if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
+            // L4b win latch: 3 consecutive samples cheaper than the mirror
+            // EMA latch the bucket to fast
+            if (me > 0 && dt < me) {
+                if (++CHEAP_STREAK[gi] >= 3) {
+                    FAST_LATCH[gi] = 4096;
+                    CHEAP_STREAK[gi] = 0;
+                }
+            } else {
+                CHEAP_STREAK[gi] = 0;
+            }
+        }
+        FAST_BACKOFF[gi] = bk;
+        // L4d: the L4c latch release (drop the latch when the stale fast
+        // EMA stops beating the mirror EMA) is REVERTED — it was a self-
+        // fulfilling trap. CI mobs-25k: releasing the latch stopped the
+        // fast stream, the JNI path went cold (re-probes priced at ~348us
+        // vs ~13us warm), everything fell back to a full-load mirror at
+        // 8us x 18.7k/tick, and the leg regressed -36% -> +4.6%. The
+        // spread regression L4c chased was the row CEILING (rowBig
+        // refusals -> JNI toll), never the latch: in spread w2b0
+        // hysteresis alone routed fast (15us vs 2.9ms mirror) even with
+        // the latch armed. The existing break (dt > 4 x mirror EMA) still
+        // releases a latch that genuinely loses.
+    }
+
+    /** L86: the always-true inner predicate for the typed weave — the
+     *  caller's class+predicate filter runs in the typed post-filter
+     *  (isInstance FIRST — the vanilla class-typed sequence), never inside
+     *  fastQuery: a side-effectful caller predicate must not observe
+     *  non-isInstance entities. */
+    private static final java.util.function.Predicate<? super Entity> FQ_ALL = e -> true;
+
+    // ------------------------------------------------------------------
+    // L86 — Woven (replace_body): Level.getEntitiesOfClass(Class, AABB,
+    // Predicate). The EntityGetter 2-arg default funnels through Level's
+    // override (invokeinterface → the override), so ONE weave covers both
+    // overloads. This is the targeting cluster's funnel (javap: HurtBy-
+    // TargetGoal.alertOthers → getEntitiesOfClass; Mob's 2-arg call sites;
+    // findTarget's non-player branch): the moonrise by-section scan
+    // AABB-tests EVERY entity in the section range — the profile's
+    // 8.58% AABB.intersects + 2.94% getBoundingBox + 2.30% ListItr.next.
+    // The Rust index answers the SPATIAL question first (a margin superset
+    // in the exact vanilla order — doc 36b parity order), the class filter
+    // + the caller predicate run on the survivors in the vanilla sequence
+    // (isInstance → AABB (inside fastQuery) → predicate), so a
+    // side-effectful predicate observes exactly what vanilla's would.
+    // patched-method slots: 0=this(level), 1=clazz, 2=box, 3=predicate
+    // ------------------------------------------------------------------
+    public static List getEntitiesOfClass(
+            net.minecraft.world.level.Level level,
+            Class clazz, AABB box,
+            java.util.function.Predicate predicate) {
+        if (ACTIVE) {
+            try {
+                int gi = gateCell(level, box);
+                if (gi >= 0 && wantFast(gi)) {
+                    long t0 = System.nanoTime();
+                    List<Entity> raw = fastQuery(level, null, box, FQ_ALL);
+                    long dt = System.nanoTime() - t0;
+                    fastNanos += dt;
+                    if (raw != null) {
+                        queriesFast++;
+                        priceFastSample(gi, dt);
+                        List out = new ArrayList<>(Math.min(raw.size(), 64));
+                        for (int i = 0, s = raw.size(); i < s; i++) {
+                            Entity e = raw.get(i);
+                            if (!clazz.isInstance(e)) continue;
+                            if (predicate == null || predicate.test(e)) {
+                                out.add(e);
+                            }
+                        }
+                        if (ORDER_CHECK) {
+                            orderChecks++;
+                            List van = mirrorTyped(level, clazz, box, predicate);
+                            boolean same = van.size() == out.size();
+                            if (same) {
+                                for (int i = 0; i < out.size(); i++) {
+                                    if (van.get(i) != out.get(i)) {
+                                        same = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!same) {
+                                orderMismatches++;
+                                if (orderMismatches <= 12) {
+                                    System.err.println("[c-entities] ORDER-MISMATCH-TYPED"
+                                            + " n_van=" + van.size() + " n_fast=" + out.size()
+                                            + " box=" + box + " clazz=" + clazz.getName());
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    // fast refused — mirror is the safe answer; the latch
+                    // dies (routing must not stick to a refusing path).
+                    FAST_LATCH[gi] = 0;
+                    queriesMirror++;
+                    return mirrorTyped(level, clazz, box, predicate);
+                }
+                queriesMirror++;
+                return mirrorTyped(level, clazz, box, predicate);
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = String.valueOf(t);
+                t.printStackTrace();
+                ACTIVE = false; // never break the server
+            }
+        } else {
+            mDisabled++;
+        }
+        queriesMirror++;
+        return mirrorTyped(level, clazz, box, predicate);
+    }
+
+    /** Vanilla mirror — identical to the replaced body of
+     *  Level.getEntitiesOfClass(Class, AABB, Predicate), 26.3 (javap:
+     *  ArrayList + moonrise EntityLookup.getEntities(clazz, null, box,
+     *  ret, predicate); NO PlatformHooks.addToGetEntities on this overload
+     *  — the class-typed body never had it). Keep in sync. */
+    private static List mirrorTyped(
+            net.minecraft.world.level.Level level,
+            Class clazz, AABB box, java.util.function.Predicate predicate) {
+        List ret = new ArrayList<>();
+        ((net.minecraft.server.level.ServerLevel) level)
+                .moonrise$getEntityLookup().getEntities(clazz, null, box, ret, predicate);
+        return ret;
     }
 
     /** Vanilla mirror — identical to the replaced body of
