@@ -8134,6 +8134,25 @@ public final class CeHooks {
                     .getDeclaredField("SHARED_RANDOM");
             sr.setAccessible(true);
             SHARED_RANDOM = sr.get(null);
+            // L85b: the parity harness wraps the static with a recording
+            // proxy at plugin ENABLE — before any entity (Entity.random is
+            // captured from the static at construction), so by the time
+            // this init runs the field may hold the proxy. A proxy class
+            // has no 'value' field: the seed handoff would fail-fast and
+            // the engine would silently disarm. The proxy answers the
+            // duck-typed ceSrOriginal() contract (SrUnwrap marker from the
+            // harness) with the wrapped ORIGINAL — setAccessible waives
+            // the cross-loader visibility check. No wrap: the call throws,
+            // the catch keeps the plain object, nothing changes.
+            try {
+                java.lang.reflect.Method om = SHARED_RANDOM.getClass()
+                        .getMethod("ceSrOriginal");
+                om.setAccessible(true);
+                Object orig = om.invoke(SHARED_RANDOM);
+                if (orig != null) {
+                    SHARED_RANDOM = orig;
+                }
+            } catch (Throwable noWrap) { /* no harness wrap — plain path */ }
             O_RNG_VALUE = offOf(SHARED_RANDOM.getClass(), "value");
             // protected stroll override + goal-internal fields —
             // privateLookupIn: publicLookup CANNOT unreflect protected

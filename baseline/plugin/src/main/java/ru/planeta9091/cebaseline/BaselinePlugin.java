@@ -187,6 +187,22 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // difference (extra draw, different decision) diverges it.
             boolean seeded = seedSharedRandom("onEnable");
             boolean lvlSeeded = seedLevelRandom("onEnable");
+            // L85b: the SR wrap installs HERE — at enable, before ANY
+            // entity exists. Entity.random is an INSTANCE field captured
+            // from the static in the constructor (javap 26.3: getstatic
+            // SHARED_RANDOM; putfield random), so an entity born before
+            // the wrap holds the original forever and its draws bypass
+            // the proxy. Run 307's SRC calls=0 was exactly that: the lazy
+            // install at the first non-empty tick postdated the whole
+            // fill. Early install = every fill mob carries the proxy =
+            // every entity draw is counted + framed. The wrap is a pure
+            // observer (it delegates to the SAME object the module's seed
+            // handoff reads/writes; the module unwraps via SrUnwrap), so
+            // the stream is untouched — the shipped-config neutrality
+            // gate proves it every push.
+            if (seeded) {
+                installSharedRandomWrap("onEnable");
+            }
             getLogger().info("PARITY harness armed: seed=" + paritySeed
                     + " seeded=" + seeded + " lvlSeeded=" + lvlSeeded
                     + " fillStartTick=" + parityFillStartTick + " (bot ignored)");
@@ -1180,8 +1196,23 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         return wrapRandomSource(random, false);
     }
 
+    /** L85b: the SR proxy carries this marker interface (defined HERE —
+     *  the harness owns the wrap) so the module can unwrap duck-typed by
+     *  method name: ceSrOriginal() returns the wrapped ORIGINAL
+     *  RandomSource. No cross-loader class link — the module resolves the
+     *  method on the proxy object reflectively (setAccessible waives the
+     *  loader-visibility check). */
+    public interface SrUnwrap {
+        Object ceSrOriginal();
+    }
+
+    private static Object wrapSharedRandom(Object random) {
+        return wrapRandomSource(random, true);
+    }
+
     /** The shared proxy factory; isSr routes the recording to the SR
-     *  buffers (the SRF instrument). */
+     *  buffers (the SRF instrument) and attaches the SrUnwrap marker so
+     *  the module's seed handoff can recover the ORIGINAL. */
     private static Object wrapRandomSource(Object random, boolean isSr) {
         Class<?> iface;
         try {
@@ -1191,11 +1222,17 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             return random; // unexpected shape: leave it exact
         }
         if (!iface.isInstance(random)) return random;
+        Class<?>[] ifaces = isSr
+                ? new Class<?>[]{iface, SrUnwrap.class}
+                : new Class<?>[]{iface};
         return java.lang.reflect.Proxy.newProxyInstance(
                 random.getClass().getClassLoader(),
-                new Class<?>[]{iface},
+                ifaces,
                 (proxy, method, args) -> {
                     String n = method.getName();
+                    if (isSr && n.equals("ceSrOriginal")) {
+                        return random; // the unwrap contract: the ORIGINAL
+                    }
                     if (n.startsWith("next") || n.equals("fork")
                             || n.equals("forkPositional") || n.equals("triangle")
                             || n.equals("consumeCount")) {
@@ -1267,6 +1304,43 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         throw new NoSuchFieldException("value not found on " + o.getClass().getName());
     }
 
+    // ------------------------------------------------------------------
+    // L85b: install the SHARED_RANDOM recording proxy. See the onEnable
+    // call site for WHY this must precede the first entity (Entity.random
+    // is captured from the static at construction). The proxy carries the
+    // SrUnwrap marker: the module's seed handoff recovers the ORIGINAL
+    // duck-typed (method-name contract), so the engine keeps reading and
+    // writing the one true LCG state while entities route their draws
+    // through the observer. Idempotent; a failed static write degrades to
+    // instrument-off with the stream exact (the SR_WRAP=null guard).
+    // ------------------------------------------------------------------
+    private void installSharedRandomWrap(String where) {
+        if (SR_WRAP != null) return; // already installed
+        try {
+            Class<?> nms = Class.forName("net.minecraft.world.entity.Entity",
+                    false, getClass().getClassLoader());
+            java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
+            f.setAccessible(true);
+            if (SR_OBJ == null) {
+                SR_OBJ = f.get(null);
+                SR_SEED = bindValue(SR_OBJ);
+            }
+            Object wrap = wrapSharedRandom(SR_OBJ);
+            if (wrap != SR_OBJ) {
+                try {
+                    f.set(null, wrap);
+                    SR_WRAP = wrap;
+                } catch (Throwable setFail) {
+                    getLogger().info("PH SR-wrap-set-failed (" + where + "): " + setFail);
+                    // instrument off, stream exact
+                }
+            }
+            getLogger().info("PH SR-wrap-installed (" + where + ") live=" + (SR_WRAP != null));
+        } catch (Throwable t) {
+            getLogger().info("PH SR-wrap-install-failed (" + where + "): " + t);
+        }
+    }
+
     private void logEntropyStreams() {
         try {
             // SR first, emitted BEFORE the LR bind — a LR failure must not
@@ -1280,32 +1354,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 f.setAccessible(true);
                 SR_OBJ = f.get(null);
                 SR_SEED = bindValue(SR_OBJ);
-                // L85 hunt: wrap SHARED_RANDOM with the SAME delegating
-                // proxy the LR stream uses — the per-draw CALLER frames
-                // name every ENTITY-random consumer. The LCG math solved
-                // the L82-hunt t=141 divergence to +17 ON-leg draws (the
-                // states relate as f^17), the engine is the only mob-AI
-                // floor alive that early (the push=0 bisect kept the
-                // divergence, the kernel is exonerated), and the SR probe
-                // (one state line per tick) cannot say WHICH consumer.
-                // The wrap is transparent for the module: the engine's
-                // seed handoff reads/writes the ORIGINAL's 'value' field
-                // directly (the captured object), the proxy delegates
-                // every call to that same object — one underlying LCG,
-                // the instrument only watches it. setSeed stays
-                // synchronized on the ORIGINAL receiver (method.invoke).
-                if (SR_WRAP == null) {
-                    SR_WRAP = wrapLevelRandom(SR_OBJ);
-                    if (SR_WRAP != SR_OBJ) {
-                        try {
-                            f.set(null, SR_WRAP);
-                        } catch (Throwable setFail) {
-                            getLogger().info("PH t=" + tickNo
-                                    + " SR-wrap-set-failed: " + setFail);
-                            SR_WRAP = null; // instrument off, stream exact
-                        }
-                    }
-                }
+            }
+            // L85b fallback: the normal install happens at onEnable (the
+            // constructor-captured Entity.random makes a late wrap blind —
+            // run 307's SRC calls=0). This retry covers an install failure
+            // at enable; it must use the SAME SrUnwrap-carrying factory.
+            if (SR_WRAP == null) {
+                installSharedRandomWrap("lazy-retry");
             }
             if (SR_SEED != null && SR_OBJ != null) {
                 long s = (long) SR_SEED.invokeExact(SR_OBJ);
