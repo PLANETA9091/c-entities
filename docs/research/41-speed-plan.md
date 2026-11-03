@@ -862,3 +862,68 @@ check path fills its own quads) or behind the `(f & IF_NATIVE) != 0`
 short-circuit (the rateOk arms, both tails). Three array stores per
 item per tick come off the #2 items leaf. The batch quads of appended
 items now carry stale data in those slots — harmless by the same reads.
+
+## L81 (f5d9762): the RemoveBinomial verdict — the engine hunt's t=143 +1 draw is the ARMOR durability path
+
+The L81 re-diff of the 07:16Z run pair (41595180152 push GREEN / 41595189807
+hunt RED, both on 2eb760a) settled the AI-engine hunt's open question and
+CORRECTED its scope:
+
+- The RED run's bisect line reads `CE_MOB_AI=1` — it is the engine hunt, NOT
+  the shipped config. The push-triggered parity on the SAME commit is GREEN:
+  the shipped-config parity is intact, the divergence belongs to the
+  mob_ai=1 path.
+- The LRF frame diff at the first divergence tick (mobs t=143, window
+  138-148, LRF_DEPTH=16): the ON leg consumed EXACTLY ONE extra
+  Level.random draw — `k=92` (the tick's LAST draw, k=0..91 byte-identical):
+  `RemoveBinomial.process <- Enchantment.lambda$modifyItemFilteredCount$0 <-
+  Enchantment$FloatAction.lambda$asGeneric$0 <- Enchantment.applyEffects <-
+  Enchantment.modifyDurabilityChange <- EnchantmentHelper.processDurabilityChange
+  <- ItemStack.processDurabilityChange <- ItemStack.hurtAndBreak` — the
+  armor durability path (Unbreaking-family effect) fired by a hurt event.
+  The frame is depth-cut at 13 — the caller of hurtAndBreak (which damage
+  source, which entity) needs LRF_DEPTH=30.
+- The module has EXACTLY ONE hurtServer call site: the kernel's cramming
+  audit (CeHooks pushDispatch: `roll == 0 && nonPass > cramming - 1 ->
+  hurtServer(cramming, 6f)`). A hurt on an armored LivingEntity consumes a
+  Level.random draw in `ItemStack.hurtAndBreak` -> processDurabilityChange
+  — the L38f comment's "an extra hurt with ZERO RNG draw" premise is FALSE
+  whenever the crammed mob wears an enchanted armor piece (the LRF
+  populateDefaultEquipmentSlots frames prove the scenario mobs DO spawn
+  equipped).
+- The SAME signature reproduces on the other legs of the SAME hunt run, in
+  the OPPOSITE direction: mixed first-divergence t=146 and spread t=145 are
+  OFF-extra RemoveBinomial draws (vanilla hurt, module did not). The
+  kernel's mirror-based cramming audit (hits_count/non_pass over the
+  mirror) diverges from vanilla's LIVE `getEntities(this, box,
+  pushableBy(this))` list in BOTH directions at the cramming boundary —
+  never a stream-level shift: items (no LivingEntities, no armor) are
+  bit-identical through the whole window.
+- mobs LRC counts at the window: t=142 96/96, t=143 92 (off) / 93 (on),
+  t=144 95/97, t=145 92/95, t=146 94/96 — the +1 persists and grows as the
+  extra hurt repeats on later ticks before the spawn rolls explode at t=147
+  (the doc-40 PD observation).
+
+The L81 instrument (this commit) names the culprit pair per run:
+
+- `LHURT t= ct= id= src= amt= hp= type=` — the LivingEntity.hurtServer
+  PREFIX probe (woven into the die-probe chain, javap-verified 26.3
+  signature `(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world
+  /damagesource/DamageSource;F)Z`), window-gated, prints EVERY living-entity
+  hurt on the ON leg (the vanilla-internal fire/fall/cramming hurts reach
+  the same virtual call) — the ON leg's full hurt ledger.
+- `CRAM t= ct= id= np= roll= ncol= hurt=` — every kernel cramming-condition
+  firing (bit1 = hits_count > cramming-1) with the audit's numbers — the
+  module's view of the list vanilla counts live.
+- The OFF leg's LRF draw stream (LRF_DEPTH=30 renders the full armor-hurt
+  chain + the aiStep/baseTick frame that names the damage path) is
+  vanilla's truth.
+- The whitelist carries both lines (run-baseline.sh).
+
+Dispatched: 41651523897 (shipped config + instruments — the reference
+ledger and the weave-parity check) and 41651746764 (mob_ai=1 + the same
+instruments — the red-leg reproduction with entity naming). The verdict
+reads: at the divergence tick the hunt run's CRAM line (module fired) with
+NO matching OFF-leg LRF armor draw (vanilla did not hurt) — or the inverse
+— IS the divergence; the entity id + the kernel's np/ncol numbers then aim
+the mirror-freshness fix (the KPI/KPIc dump aims the candidate set).
