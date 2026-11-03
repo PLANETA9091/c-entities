@@ -927,3 +927,67 @@ reads: at the divergence tick the hunt run's CRAM line (module fired) with
 NO matching OFF-leg LRF armor draw (vanilla did not hurt) — or the inverse
 — IS the divergence; the entity id + the kernel's np/ncol numbers then aim
 the mirror-freshness fix (the KPI/KPIc dump aims the candidate set).
+
+## L81b pre-dispatch: the 41653564594 post-mortem — the streamed job log alone triangulates the divergence to the fill's t=140-147 seed zone
+
+The L81-fixed re-run (41653564594, d159bfa, mob_ai=1, PH_DUMP=138-152; the
+push-paired 41653558651 shipped GREEN again): gate RED on mobs/mixed/spread,
+items bit-identical. The 1.8GB parity-results artifact was NOT needed — the
+delta-tail whitelist already streams PH/PD/SR/LR/LRC/LRF for every leg, and
+the PH adaptive emit covers t=1..400 at full resolution. The per-leg diff of
+the JOB LOG (8 legs = 4 scenarios x 2):
+
+- PH (pos+vel+fire+hp+item-amount avalanche): first h-diff mobs t=147,
+  mixed t=147, spread t=146; items NEVER. First n-diff: mobs t=147
+  (off 92 / on 91, adds 13/13 BOTH), mixed t=153, spread t=161.
+- LRC (Level.random calls/tick): mobs t=143 92/93 (ON +1), mixed t=146
+  65/64 (OFF +1), spread t=145 58/57 (OFF +1) — re-confirms the L81
+  verdict ticks on the new commit.
+- SR (SHARED_RANDOM end-of-tick state): first diff mobs t=145, mixed
+  t=146, spread t=145 — AFTER the mobs LR count diff, BEFORE the PH diff.
+- PD (per-entity avalanche, ids sorted): mobs t=147 ids 83..91 m-diff,
+  id 92 OFF-only; mixed t=147 ids 451..457 m-diff (no only-*); spread
+  t=146 ids 251..263 m-diff (no only-*). Ids 1..82 byte-identical.
+- The fill mapping (mobs: scale 2500, 13/tick, fill starts plugin-t=140):
+  the t=146 batch = ids 79..91, so the OFF-only id 92 is an EXTRA entity
+  created during that batch, and the m-diff at 83..91 is the +1 id shift
+  (OFF's id 84..92 = ON's 83..91). The T382 snapshot flips (off=CHICKEN
+  at ids 84/165/354/415/871/873/1227/1308) are the JOCKEY CHICKENS: the
+  mobs fill spawns 100% zombies (plugin rnd = Random(42L), item/stand
+  percentages 0), so every chicken is a Mob.finalizeSpawn jockey mount.
+
+The LRF_DEPTH=30 frames name BOTH extra-draw paths exactly:
+
+- mobs t=143 k=92 (ON-extra): RemoveBinomial.process <- ...
+  <- ItemStack.hurtAndBreak x3 <- **Mob.burnUndead <- Mob.aiStep** <-
+  Monster.aiStep <- LivingEntity.tick <- Zombie.tick <- tickNonPassenger
+  <- guardEntityTick <- CeHooks.tickListForEach <- EntityTickList.forEach
+  <- ServerLevel.tick. The SUNLIGHT ARMOR-WEAR path — the L81b
+  hypothesis confirmed verbatim.
+- mixed t=146 k=64 + spread t=145 k=57 (OFF-extra): RemoveBinomial <-
+  ... <- ItemStack.hurtAndBreak <- **Mob.finalizeSpawn <-
+  Zombie.finalizeSpawn <- CraftRegionAccessor.addEntity <-
+  BaselinePlugin.fillStep** — the SPAWN-TIME equipment roll.
+
+Verdict refinement (kills the L81 kernel-cramming hypothesis): CRAM lines
+are ZERO across the whole window (the kernel audit never fired) and the PH
+hash — which mixes fire AND hp since doc-40 — is byte-identical at the
+mobs t=143 wear divergence: a cramming hurtServer would flip hp the same
+tick. The t=143 +1 draw is durability-only (invisible to PH AND to the
+snapshot — neither hashes durability). With SR end-of-tick state identical
+at t=143..144 and the first 92 LR draws byte-identical (same callers, same
+order), the extra burnUndead wear is a WITHIN-TICK serving flip: the
+engine's staged-request RNG protocol (doc-30 item 4) hands the burn
+gate (nextInt(2)) a different value while keeping the per-tick SR draw
+COUNT identical — a reorder/reassignment, not a count error. The LR count
+flip is the first VISIBLE consumer consequence; the jockey rolls (t=146
+finalizeSpawn, Level.random) then flip and the id streams explode.
+
+Dispatch plan (L81b, commit c1a0f75): the BURN ledger (per burnUndead
+call: id/type/fire/hp/isSunBurnTick, BOTH legs — the module weaves the
+probe in the shipped declined arm too) names the exact flipping call;
+CE-INIT proves the window parse once per boot; BURN-LIVE separates
+"not woven" from "window empty". Run A = mob_ai=1 + TRACE_ID=83 (the
+first m-diff id, exists in both legs) + LRC_WINDOW=138-160. Run B =
+the push-triggered shipped parity on the same commit (already in flight)
+— the weave-neutrality check for the declined-arm burnUndead insert.
