@@ -1053,3 +1053,34 @@ streams now hold through the fill and the window, the gate goes GREEN
 and the AI engine becomes shippable — the doc-30 frontier item 0
 (mobs -61% per e774d00, the single biggest module-owned move toward
 -90%).
+
+## L83 (b30936d): the zero-player findTarget resolves natively — the biggest staged cost dies
+
+The AITR witness of the L81b hunt (run 41670844291, t=420): EVERY traced
+mob's first staged round is `op=6 r=0` — REQ_FIND_TARGET, parked once per
+mob per even tick. The gate that forced the park was
+`ctx.pcount() > 0` on the player-typed native path: with an EMPTY player
+snapshot (the parity scenarios, the player-less phases of the benches)
+the engine skipped the native scan and parked — one full selector-state
+mirror + JNI crossing per mob per even tick, ~2500 x ~400 = ~500k rounds
+on mobs-25k (at the doc-30 ~300ns/round order: 150ms+ of the leg).
+
+But ZERO players is the MOST provable case: getNearestPlayer iterates an
+empty level.players() — the follow range, the TargetingConditions and
+the Sensing LoS never matter, the result is null, and the null write
+(ACT_REF_SET_PLAYER(-1)) + canUse=false is the whole observable. The
+player-typed native path's own cands.is_empty() branch already performed
+the identical write for the provably-empty-after-range case; the L83
+gate extends it to the provably-empty-before-scan case. No RNG on either
+side (the park drew nothing at zero players) — the streams are untouched;
+the JNI budget collapses. Also in this window: L82b (the melee
+requiresUpdateEveryTick fix — the Java fast path knew, the Rust side
+didn't) and the profile.yml extra_env input (the engine-speed profiling
+without workflow edits).
+
+In flight: the L82 hunt (7f1f72f — the even-path fix, the first parity
+verdict of the corrected engine) and the definitive hunt on b30936d
+(L82+82b+83). If GREEN, the engine config is shippable and the next
+frontier is the engine's remaining staged rounds (the stroll getPosition
+park — REQ_STROLL_POS fires only when the 1/interval gate passes, ~1/60
+per mob — negligible) and the travel/collide port (frontier 1).
