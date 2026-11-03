@@ -1086,6 +1086,20 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static volatile long LR_CALLS;
     private static final java.util.List<char[]> LR_FRAMES = new java.util.ArrayList<>();
     private static final int LRC_LO = parseLrcBound(0), LRC_HI = parseLrcBound(1);
+    /** per-draw frame depth (stack indices 3..LRF_DEPTH-1). Env knob
+     *  LRF_DEPTH, default 9 (6 real frames after the reflective hop). */
+    private static final int LRF_DEPTH = parseLrfDepth();
+
+    private static int parseLrfDepth() {
+        try {
+            String s = System.getenv("LRF_DEPTH");
+            if (s != null && !s.isBlank()) {
+                int v = Integer.parseInt(s.trim());
+                if (v >= 6 && v <= 40) return v;
+            }
+        } catch (Throwable quiet) { /* default */ }
+        return 9;
+    }
 
     private static int parseLrcBound(int idx) {
         try {
@@ -1107,10 +1121,13 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // [3..4]=the REFLECTIVE DELEGATE HOP (DirectMethodHandleAccessor
             // + Method.invoke — the handler calls method.invoke on the
             // original; the JDK-local proxy test pinned the shape: the real
-            // caller sits at [5]) [5..8]=the real callers. Capturing 3..8
-            // keeps the dump robust to a JDK hop-count variation; the two
-            // constant hop frames are noise but never hide the caller.
-            for (int i = 3; i < Math.min(st.length, 9); i++) {
+            // caller sits at [5]) [5..LRF_DEPTH-1]=the real callers.
+            // Default 9 = 6 real frames; the t=143 hunt needs DEEPER chains —
+            // the RemoveBinomial (unbreaking ITEM_DAMAGE) draw's frame cut
+            // exactly at Enchantment.modifyItemFilteredCount, hiding WHO hurt
+            // the armor (run 41586036224). LRF_DEPTH=16 renders the full
+            // hurt path (LivingEntity.hurt caller = the damage source).
+            for (int i = 3; i < Math.min(st.length, LRF_DEPTH); i++) {
                 sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
                         .append('.').append(st[i].getMethodName()).append(' ');
             }
