@@ -1695,7 +1695,7 @@ fn precompute_livingentity(loader: jni::jobject) {
                 PROBE_ENTITY_DESC,
                 &[(0, b'L')],
             ) {
-                Ok(b2) => Some(b2),
+                Ok(b2) => Some(weave_lhurt_probe(b2)),
                 Err(e) => {
                     PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
                     cplug_sdk::log::info(&format!(
@@ -1713,7 +1713,7 @@ fn precompute_livingentity(loader: jni::jobject) {
                 PROBE_ENTITY_DESC,
                 &[(0, b'L')],
             ) {
-                Ok(b2) => Some(b2),
+                Ok(b2) => Some(weave_lhurt_probe(b2)),
                 Err(e) => {
                     PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
                     cplug_sdk::log::info(&format!(
@@ -1757,6 +1757,41 @@ fn patch_livingentity(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_livingentity_inner(bytes))
         .ok()
         .flatten()
+}
+
+/// L81 hunt: the LivingEntity.hurtServer prefix probe — names EVERY
+/// living-entity hurt (damage type + amount) inside the PH_DUMP window.
+/// The LRF armor-draw diff (RemoveBinomial) proved the kernel's cramming
+/// audit diverges from vanilla's live list in BOTH directions (mobs t=143
+/// ON-extra hurt, mixed t=146 / spread t=145 OFF-extra); this probe is the
+/// ON leg's hurt ledger against the OFF leg's LRF draw stream. Chained
+/// AFTER the die-probe weave: applied to whatever bytes survived it,
+/// optional on refusal (hunt-only instrument — the module ships without
+/// needing it). Window-gated hook body: zero hot-path cost outside
+/// PH_DUMP.
+fn weave_lhurt_probe(b: Vec<u8>) -> Vec<u8> {
+    const HURT_DESC: &str =
+        "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/damagesource/DamageSource;F)Z";
+    const PROBE_LHURT_DESC: &str =
+        "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/damagesource/DamageSource;F)V";
+    match patch::insert_static_call_at_start(
+        b.clone(),
+        "hurtServer",
+        HURT_DESC,
+        HOOKS_CLASS,
+        "probeLHurt",
+        PROBE_LHURT_DESC,
+        &[(0, b'L'), (1, b'L'), (2, b'F')],
+    ) {
+        Ok(b2) => b2,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] LivingEntity.hurtServer probe refused: {e}"
+            ));
+            b
+        }
+    }
 }
 
 /// L62a: EnchantmentHelper byte hook — the stash/serve pattern.

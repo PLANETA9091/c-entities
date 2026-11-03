@@ -948,6 +948,53 @@ public final class CeHooks {
     // TEMP 4b.2a bring-up diagnostics (first rowKey miss snapshot).
     public static volatile long dbgExpKey = 0, dbgGotKey = 0, dbgExpSlot = -1, dbgMisses = 0;
 
+    /** L81 hunt: prefix of LivingEntity.hurtServer — names EVERY living
+     *  entity hurt inside the PH_DUMP window (tick, id, damage type,
+     *  amount, hp, type). The LRF armor-draw diff (RemoveBinomial at the
+     *  divergence ticks — mobs t=143 ON-extra, mixed t=146 / spread t=145
+     *  OFF-extra) proved the kernel's cramming audit diverges from
+     *  vanilla's live list in BOTH directions. This probe catches the
+     *  vanilla-internal hurts too (fire/fall/cramming all reach the same
+     *  virtual hurtServer), so the ON leg gets the full hurt ledger while
+     *  the OFF leg's truth is its LRF draw stream — cross-referencing the
+     *  two names the missed/extra cramming hurt's entity. Window-gated:
+     *  zero hot-path cost outside PH_DUMP. NEVER disarms (a failed
+     *  println must not kill the module). */
+    public static volatile long lhurtProbes = 0;
+    public static void probeLHurt(Entity e, Object src, float amt) {
+        try {
+            lhurtProbes++;
+            if (phDumpTickNow() && e != null) {
+                String st;
+                try {
+                    st = src == null ? "null"
+                            : ((net.minecraft.world.damagesource.DamageSource) src)
+                                  .type().msgId();
+                } catch (Throwable tt) {
+                    st = "err:" + tt.getClass().getSimpleName();
+                }
+                float hp = -1f;
+                String ty;
+                try {
+                    hp = ((net.minecraft.world.entity.LivingEntity) e).getHealth();
+                    ty = e.getType().toString();
+                } catch (Throwable ignore) {
+                    ty = e.getClass().getSimpleName();
+                }
+                // ct is the flush-space tick (3 levels at parity): print the
+                // derived plugin tick too so the lines diff against LRF t=
+                // directly (t = ct/3, run 40789269145: ct=423 at t=141).
+                System.out.println("[ce-baseline] LHURT t=" + (CUR_TICK / 3)
+                        + " ct=" + CUR_TICK + " id=" + entId(e)
+                        + " src=" + st + " amt=" + amt + " hp=" + hp
+                        + " type=" + ty);
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeLHurt: " + t;
+        }
+    }
+
     /** One-line diagnostic snapshot (all counters). */
     public static String stats() {
         return "fast=" + queriesFast + " mirror=" + queriesMirror
@@ -3572,6 +3619,21 @@ public final class CeHooks {
                     lastErrorText = "pushRng: " + t;
                     ACTIVE = false;
                     return false;
+                }
+                // L81 hunt: every kernel cramming-condition firing (bit1 =
+                // hits_count > cramming-1) with the audit's numbers — the
+                // module's view of the list the vanilla aiStep counts live.
+                // The OFF leg's LRF armor-draw stream is vanilla's truth;
+                // a CRAM line whose tick carries no OFF draw (or vice versa)
+                // IS the divergence. Window-gated, one line per firing.
+                if (phDumpTickNow()) {
+                    System.out.println("[ce-baseline] CRAM t=" + (CUR_TICK / 3)
+                            + " ct=" + CUR_TICK + " id=" + entId(le)
+                            + " np=" + nonPass + " roll=" + roll
+                            + " ncol=" + ncolNew
+                            + " hurt=" + (roll == 0
+                                          && nonPass > PUSH_CFG_CRAMMING - 1
+                                          ? 1 : 0));
                 }
                 if (roll == 0 && nonPass > PUSH_CFG_CRAMMING - 1) {
                     le.hurtServer(sl, sl.damageSources().cramming(), 6.0f);
