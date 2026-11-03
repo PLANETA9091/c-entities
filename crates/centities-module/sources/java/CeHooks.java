@@ -1341,6 +1341,148 @@ public final class CeHooks {
         return ret;
     }
 
+    // ------------------------------------------------------------------
+    // L87 — Woven (replace_body): Level.getEntities(EntityTypeTest, AABB,
+    // Predicate, List, int) — the DEEPEST funnel: both the 3-arg and the
+    // 4-arg EntityTypeTest overloads delegate here, and the profile shows
+    // the route burning twice: the class-shaped tests reach
+    // EntityLookup.getEntities(Class, ...) DIRECTLY (spread: 2.36% —
+    // bypassing the L86 Level.getEntitiesOfClass weave), and the
+    // baseClass==Entity shape runs the entity-typed scan under a tryCast
+    // combining predicate.
+    //
+    // javap 26.3 shape (the 5-arg): EntityType INSTANCE → the type-indexed
+    // lookup scan (REFUSED — mirror; the Rust index carries no EntityType
+    // partition). null typeTest or baseClass null/Entity → the entity-
+    // typed scan under `e -> typeTest.tryCast(e) != null [&& pred.test]`.
+    // else → the CLASS-typed scan (baseClass) under the same combined
+    // predicate. ALL branches end with PlatformHooks.addToGetEntities —
+    // the fast path calls it identically (a compat hook may append).
+    // The limit semantics: the limited lookup scan returns the FIRST
+    // `limit` matches in scan order — the index order IS the vanilla scan
+    // order (doc 36b), so collecting up to `limit` on the fast path is
+    // the same answer.
+    // patched-method slots: 0=this, 1=typeTest, 2=box, 3=pred, 4=out,
+    // 5=limit
+    // ------------------------------------------------------------------
+    public static void getEntitiesTest$(
+            net.minecraft.world.level.Level level,
+            net.minecraft.world.level.entity.EntityTypeTest typeTest, AABB box,
+            java.util.function.Predicate pred, List out, int limit) {
+        boolean fast = false;
+        if (ACTIVE && out != null && typeTest != null
+                && !(typeTest instanceof net.minecraft.world.entity.EntityType)
+                && SERVER_THREAD.get()) {
+            try {
+                int gi = gateCell(level, box);
+                if (gi >= 0 && wantFast(gi)) {
+                    fast = true;
+                    long t0 = System.nanoTime();
+                    // the combined predicate, replicating the vanilla
+                    // invokedynamic lambdas exactly: tryCast FIRST (the
+                    // caller predicate only ever sees tryCast survivors),
+                    // then pred.
+                    List<Entity> raw = fastQuery(level, null, box, (e) -> {
+                        Object t = typeTest.tryCast(e);
+                        return t != null && (pred == null || pred.test(t));
+                    });
+                    long dt = System.nanoTime() - t0;
+                    fastNanos += dt;
+                    if (raw != null) {
+                        queriesFast++;
+                        priceFastSample(gi, dt);
+                        int n = raw.size();
+                        int lim = limit <= 0 ? 0 : Math.min(limit, n);
+                        for (int i = 0; i < lim; i++) {
+                            out.add(raw.get(i));
+                        }
+                        ca.spottedleaf.moonrise.common.PlatformHooks.get()
+                                .addToGetEntities(level, typeTest, box, pred, out, limit);
+                        return;
+                    }
+                    FAST_LATCH[gi] = 0;
+                }
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = String.valueOf(t);
+                t.printStackTrace();
+                ACTIVE = false; // never break the server
+                fast = false;
+            }
+        }
+        if (!fast) {
+            queriesMirror++;
+        }
+        // vanilla body replica (javap-verified; keep in sync). The RAW
+        // predicate flows through the null-typeTest branch (bc 103-190:
+        // aload_3 straight into the lookup scan) and the EntityType branch
+        // (bc 31-67: aload_3 — the type IS the test, no tryCast); the
+        // tryCast-combining lambda is built ONLY for the generic branch
+        // (bc 199-221).
+        if (typeTest == null) {
+            if (limit != Integer.MAX_VALUE) {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities((Entity) null, box, out, pred, limit);
+            } else {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities((Entity) null, box, out, pred);
+            }
+        } else if (typeTest instanceof net.minecraft.world.entity.EntityType et) {
+            if (limit != Integer.MAX_VALUE) {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities(et, box, out, pred, limit);
+            } else {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities(et, box, out, pred);
+            }
+        } else {
+            java.util.function.Predicate combined;
+            if (pred == null) {
+                combined = (e) -> typeTest.tryCast(e) != null;
+            } else {
+                combined = (e) -> {
+                    Object t = typeTest.tryCast(e);
+                    return t != null && pred.test(t);
+                };
+            }
+            // RAW Class on purpose: a Class<?> capture cannot satisfy the
+            // generic getEntities(Class<? extends T>, ...) inference with
+            // the raw list/predicate args (javac: "no suitable method") —
+            // the raw declaration makes the invocation an unchecked call
+            // with the exact erasure the bytecode uses.
+            Class base = typeTest.getBaseClass();
+            if (base == null || base == Entity.class) {
+                if (limit != Integer.MAX_VALUE) {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities((Entity) null, box, out, combined, limit);
+                } else {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities((Entity) null, box, out, combined);
+                }
+            } else {
+                if (limit != Integer.MAX_VALUE) {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities(base, (net.minecraft.world.entity.Entity) null, box,
+                                    out, combined, limit);
+                } else {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities(base, (net.minecraft.world.entity.Entity) null, box,
+                                    out, combined);
+                }
+            }
+        }
+        ca.spottedleaf.moonrise.common.PlatformHooks.get()
+                .addToGetEntities(level, typeTest, box, pred, out, limit);
+    }
+
     /** Vanilla mirror — identical to the replaced body of
      *  Level.getEntities(Entity, AABB, Predicate), Paper 1.21.8
      *  (decompiled from the shipped jar; keep in sync). */

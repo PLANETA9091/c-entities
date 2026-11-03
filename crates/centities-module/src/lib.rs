@@ -1127,18 +1127,27 @@ fn precompute_level(loader: jni::jobject) {
         );
         return;
     };
-    // Two bodies, chained (the goal_tick chain pattern): getEntities first,
-    // then getEntitiesOfClass on its output. A refusal of the SECOND must
-    // keep the FIRST (degrade to the entity-typed weave only — the typed
-    // path routes vanilla); dropping both on a second-spec failure would
-    // silently disable the whole Level fast path.
+    // Three bodies, chained (the goal_tick chain pattern): getEntities,
+    // getEntitiesOfClass, then the EntityTypeTest funnel. A refusal of a
+    // LATER spec must keep the EARLIER ones (degrade one weave at a time —
+    // the refused path routes vanilla); dropping all on a later-spec
+    // failure would silently disable the whole Level fast path.
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         let one = cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec());
-        match one {
+        let one = match one {
             Some(b) if !b.is_empty() => {
                 match cplug_sdk::asm::replace_body(env, loader, &b, &level_class_spec()) {
                     Some(b2) if !b2.is_empty() => Some(b2),
                     _ => Some(b), // second refused — keep the first weave
+                }
+            }
+            other => other,
+        };
+        match one {
+            Some(b) if !b.is_empty() => {
+                match cplug_sdk::asm::replace_body(env, loader, &b, &level_test_spec()) {
+                    Some(b3) if !b3.is_empty() => Some(b3),
+                    _ => Some(b), // third refused — keep the first two weaves
                 }
             }
             other => other,
@@ -3643,6 +3652,34 @@ fn level_class_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
             cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+        ],
+    }
+}
+
+// L87: the DEEPEST EntityTypeTest funnel — Level.getEntities(typeTest,
+// AABB, Predicate, List, int). Both the 3-arg and 4-arg overloads
+// delegate here; class-shaped tests reach EntityLookup.getEntities(Class,
+// ...) DIRECTLY through this route, bypassing the L86 weave (spread:
+// 2.36% caller entry). The bridge (CeHooks.getEntitiesTest$) refuses the
+// EntityType-indexed shape (no type partition in the Rust index) and
+// serves the entity-typed + class-typed shapes with the exact tryCast
+// combining predicate (javap-verified lambdas), the limit semantics
+// (first `limit` matches in scan order — the index order IS the vanilla
+// scan order) and the PlatformHooks.addToGetEntities tail.
+fn level_test_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getEntities",
+        method_desc: "(Lnet/minecraft/world/level/entity/EntityTypeTest;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;Ljava/util/List;I)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getEntitiesTest$",
+        bridge_desc: "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/level/entity/EntityTypeTest;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;Ljava/util/List;I)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 4, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 5, ty: b'I' },
         ],
     }
 }
