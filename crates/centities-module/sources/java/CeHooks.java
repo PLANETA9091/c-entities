@@ -5897,6 +5897,9 @@ public final class CeHooks {
             IN_ITEM_APPLY = true;
             try {
             int epoch = MODE_EPOCH + 1;
+            // L92: one volatile read per flush - TT_MIRROR flips only in
+            // the tracker reconcile (between flushes), never mid-flush.
+            final boolean quietStampArm = TTL_QUIET_ON && TT_MIRROR;
             for (int i = 0; i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
@@ -5982,7 +5985,7 @@ public final class CeHooks {
                     // excluded (checked), updateDataBeforeSync iterates an
                     // EMPTY dirty set (no metadata writer ran — merge is a
                     // TAIL_NONE breaker).
-                    if (TTL_QUIET_ON && TT_MIRROR && !e.syncVelocity) {
+                    if (quietStampArm && !e.syncVelocity) {
                         Object[] rq = TT_REF;
                         long[] fq = TT_FLAT;
                         if (rq != null && fq != null) {
