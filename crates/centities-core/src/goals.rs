@@ -93,16 +93,22 @@ pub static GL_STAGED: [AtomicU32; 9] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
     AtomicU32::new(0),
 ];
+pub static GL_ROLLS: [AtomicU32; 9] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
-/// Read+reset the ledger into `dst` (27 ints: evals/no/staged per class 0..8)
-/// and set the arming for the NEXT engine calls. Returns whether the ledger
-/// WAS armed during the interval that just ended (i.e. `dst` is fresh data).
+/// Read+reset the ledger into `dst` (36 ints: evals/no/staged/rolls per
+/// class 0..8) and set the arming for the NEXT engine calls. Returns whether
+/// the ledger WAS armed during the interval that just ended.
 pub fn gl_take(dst: &mut [u32], arm: bool) -> bool {
     let was = GL_ON.swap(arm, Ordering::Relaxed);
     for k in 0..9 {
-        dst[k * 3] = GL_EVALS[k].swap(0, Ordering::Relaxed);
-        dst[k * 3 + 1] = GL_NO[k].swap(0, Ordering::Relaxed);
-        dst[k * 3 + 2] = GL_STAGED[k].swap(0, Ordering::Relaxed);
+        dst[k * 4] = GL_EVALS[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 1] = GL_NO[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 2] = GL_STAGED[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 3] = GL_ROLLS[k].swap(0, Ordering::Relaxed);
     }
     was
 }
@@ -280,11 +286,16 @@ fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
 
 pub struct Lcg {
     pub value: u64,
+    /// L89: the number of advance() calls in THIS ai_floor entry — the
+    /// canUse wrapper reads the delta around each goal's body to attribute
+    /// the exact RNG draw count per gate class.
+    pub draws: u32,
 }
 
 impl Lcg {
     #[inline]
     fn advance(&mut self) -> u64 {
+        self.draws = self.draws.wrapping_add(1);
         self.value = self.value.wrapping_mul(25214903917).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
         self.value
     }
@@ -664,6 +675,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         ],
         lcg: Lcg {
             value: ((in_buf[IN_SEED_HI] as u64) << 32) | (in_buf[IN_SEED_LO] as u64 & 0xFFFF_FFFF),
+            draws: 0,
         },
         lock: [[-1; MAX_GOALS]; 2],
         running: [[false; MAX_GOALS]; 2],
@@ -968,9 +980,11 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
         return can_use_inner(ctx, out, sel, gi, phase);
     }
     let kind = ctx.kind(sel, gi);
+    let d0 = ctx.lcg.draws;
     let r = can_use_inner(ctx, out, sel, gi, phase);
     let k = kind.clamp(0, 8) as usize;
     GL_EVALS[k].fetch_add(1, Ordering::Relaxed);
+    GL_ROLLS[k].fetch_add(ctx.lcg.draws - d0, Ordering::Relaxed);
     match &r {
         Ok(Cu::No) => {
             GL_NO[k].fetch_add(1, Ordering::Relaxed);

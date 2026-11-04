@@ -9415,12 +9415,13 @@ public final class CeHooks {
      *  ST_DONE / ST_REQUEST / ST_FALLBACK and fills out. */
     public static native int nativeMobAiFloor(int[] in, int[] out);
 
-    /** L89: the gate ledger — per-class canUse census (evals/no/staged for
-     *  the GK_* classes 0..8, 27 ints) collected by the engine while armed;
-     *  null when the interval was not armed. `on` arms the NEXT interval. */
+    /** L89: the gate ledger — per-class canUse census (evals/no/staged/rolls
+     *  for the GK_* classes 0..8, 36 ints) collected by the engine while
+     *  armed; null when the interval was not armed. `on` arms the NEXT
+     *  interval. */
     private static native int[] nativeGlTake(int on);
 
-    /** One GL line per dump tick: c<kind>=evals/no/staged. The arming rides
+    /** One GL line per dump tick: c<kind>=evals/no/staged/rolls. The arming rides
      *  the CURRENT window check (the counters cover the tick that is about
      *  to run); the read returns the interval that just ended. */
     private static void gateLedgerPrint() {
@@ -9431,11 +9432,11 @@ public final class CeHooks {
         boolean any = false;
         StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3);
         for (int k = 0; k < 9; k++) {
-            int e = l[k * 3], n = l[k * 3 + 1], s = l[k * 3 + 2];
-            if ((e | n | s) != 0) {
+            int e = l[k * 4], n = l[k * 4 + 1], s = l[k * 4 + 2], r = l[k * 4 + 3];
+            if ((e | n | s | r) != 0) {
                 any = true;
                 sb.append(' ').append(k).append('=').append(e).append('/')
-                        .append(n).append('/').append(s);
+                        .append(n).append('/').append(s).append('/').append(r);
             }
         }
         if (any) {

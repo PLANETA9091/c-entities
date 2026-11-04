@@ -5108,16 +5108,16 @@ pub extern "system" fn n_gl_take(
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
         let vt = *raw;
-        let mut buf = [0u32; 27];
+        let mut buf = [0u32; 36];
         if !centities_core::goals::gl_take(&mut buf, on != 0) {
             return std::ptr::null_mut();
         }
-        let arr = ((*vt).NewIntArray)(raw, 27);
+        let arr = ((*vt).NewIntArray)(raw, 36);
         if arr.is_null() {
             return std::ptr::null_mut();
         }
-        let tmp: [i32; 27] = std::array::from_fn(|i| buf[i] as i32);
-        ((*vt).SetIntArrayRegion)(raw, arr, 0, 27, tmp.as_ptr());
+        let tmp: [i32; 36] = std::array::from_fn(|i| buf[i] as i32);
+        ((*vt).SetIntArrayRegion)(raw, arr, 0, 36, tmp.as_ptr());
         arr
     }
 }
