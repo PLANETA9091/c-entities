@@ -8357,6 +8357,11 @@ public final class CeHooks {
     private static long O_MOB_LASTHURTBY = -1, O_MOB_LASTHURTBY_TS = -1;
     private static long O_LVL_SKYDARKEN = -1;
     private static long O_NAT_TARGET = -1; // NearestAttackableTargetGoal.target
+    // L93: the native-funnel findTarget handles - the goal's targetType
+    // (the class filter) and targetConditions (the REAL test() object;
+    // getTargetConditions() re-applies range(fd) per call - replicated
+    // by invoking the private method itself).
+    private static long O_NAT_TYPE = -1, O_NAT_CONDS = -1;
     private static long O_STROLL_FORCE = -1, O_STROLL_WX = -1, O_STROLL_WY = -1, O_STROLL_WZ = -1;
     private static long O_NAV_PATH = -1, O_NAV_TICK = -1, O_NAV_DELAYED = -1;
     private static long O_PATH_NEXT = -1, O_PATH_NODES = -1;
@@ -8373,7 +8378,8 @@ public final class CeHooks {
     private static long O_RNG_VALUE = -1;
     private static java.lang.invoke.MethodHandle MH_GET_POSITION;   // RandomStrollGoal subclass
     private static java.lang.invoke.MethodHandle MH_STROLL_WX, MH_STROLL_WY, MH_STROLL_WZ;
-    private static java.lang.invoke.MethodHandle MH_FIND_TARGET, MH_NEAREST_TARGET_F;
+    private static java.lang.invoke.MethodHandle MH_FIND_TARGET, MH_NEAREST_TARGET_F,
+            MH_TARGET_CONDS;
     private static java.lang.invoke.MethodHandle MH_LOOKAT_CTX;     // lookAtContext getter
     private static Object MOVE_OP_WAIT; // MoveControl.Operation.WAIT enum ref
 
@@ -8431,6 +8437,10 @@ public final class CeHooks {
             O_NAT_TARGET = offOf(Class.forName(
                     "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal"),
                     "target");
+            Class<?> natCls0 = Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal");
+            O_NAT_TYPE = offOf(natCls0, "targetType");
+            O_NAT_CONDS = offOf(natCls0, "targetConditions");
             MOVE_OP_WAIT = java.lang.Enum.valueOf(
                     (Class<? extends java.lang.Enum>) Class.forName(
                             "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
@@ -8507,6 +8517,12 @@ public final class CeHooks {
             MH_FIND_TARGET = pnl.findVirtual(nat, "findTarget",
                     java.lang.invoke.MethodType.methodType(void.class));
             MH_NEAREST_TARGET_F = pnl.unreflectGetter(nat.getDeclaredField("target"));
+            // L93: the private getTargetConditions() - the per-call
+            // range(fd) re-application the vanilla findTarget performs
+            // (javap bc 55-56: the STORED conditions object is mutated).
+            MH_TARGET_CONDS = pnl.findVirtual(nat, "getTargetConditions",
+                    java.lang.invoke.MethodType.methodType(
+                            net.minecraft.world.entity.ai.targeting.TargetingConditions.class));
             Class<?> lalCls = Class.forName("net.minecraft.world.entity.ai.goal.LookAtPlayerGoal");
             MH_LOOKAT_CTX = java.lang.invoke.MethodHandles.privateLookupIn(lalCls, pub)
                     .unreflectGetter(lalCls.getDeclaredField("lookAtContext"));
@@ -8538,7 +8554,8 @@ public final class CeHooks {
                 || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0 || O_NAT_TARGET < 0
                 || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
                 || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
-                || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null) {
+                || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null
+                || MH_TARGET_CONDS == null || O_NAT_TYPE < 0 || O_NAT_CONDS < 0) {
             MOB_AI_HANDLES_OK = false;
         } else {
             MOB_AI_HANDLES_OK = true;
@@ -9251,17 +9268,105 @@ public final class CeHooks {
                     break;
                 }
                 case REQ_FIND_TARGET: {
-                    try {
-                        MH_FIND_TARGET.invoke(wg.getGoal());
-                        Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
-                        res = t != null ? 1 : 0;
-                    } catch (Throwable t2) {
+                    boolean done = false;
+                    // L93: the native-funnel findTarget. The vanilla body
+                    // (javap 26.3) is
+                    //   getEntitiesOfClass(targetType,
+                    //       mob.getBoundingBox().inflate(fd, fd, fd), p -> true)
+                    //   + getNearestEntity(list, getTargetConditions(), mob,
+                    //       mob.getX(), mob.getEyeY(), mob.getZ())
+                    // where getTargetConditions() = the goal's OWN stored
+                    // conditions re-applied with range(fd) (the object is
+                    // MUTATED), and getNearestEntity walks the list IN
+                    // ORDER keeping the FIRST strict-min
+                    // distanceToSqr(x, eyeY, z) among the test()-passing
+                    // candidates. The class scan is the ~14% vanilla slice
+                    // walk (mobs-25k: 25k queries/tick for classes that
+                    // are absent); the module index answers the same AABB
+                    // in bit-identical vanilla order (doc 36b), so the
+                    // class-filtered SUBSEQUENCE and the tie rule see the
+                    // exact vanilla sequence. The conditions run as the
+                    // REAL virtual test() calls; test() draws no RNG
+                    // (visibility/LoS only) and Sensing caches, so the
+                    // port is stream-neutral. Any failure routes the real
+                    // findTarget body (the pre-L93 behavior) below.
+                    if (ACTIVE && O_NAT_TYPE >= 0 && O_NAT_CONDS >= 0
+                            && MH_TARGET_CONDS != null) {
+                        try {
+                            Object g2 = wg.getGoal();
+                            @SuppressWarnings("unchecked")
+                            Class<? extends net.minecraft.world.entity.LivingEntity> tt =
+                                    (Class<? extends net.minecraft.world.entity.LivingEntity>)
+                                            U.getObject(g2, O_NAT_TYPE);
+                            Object conds0 = U.getObject(g2, O_NAT_CONDS);
+                            net.minecraft.server.level.ServerLevel lvl =
+                                    (net.minecraft.server.level.ServerLevel) mob.level();
+                            if (tt != null && conds0 != null && lvl != null
+                                    && tt != net.minecraft.world.entity.player.Player.class
+                                    && tt != net.minecraft.server.level.ServerPlayer.class) {
+                                // the EXACT double: getFollowDistance() = getAttributeValue(
+                                // FOLLOW_RANGE) (javap TargetGoal) - the packed IN_FOLLOW
+                                // is the f32 rounding and would shift the query area
+                                double fd = mob.getAttributeValue(
+                                        net.minecraft.world.entity.ai.attributes.Attributes.FOLLOW_RANGE);
+                                net.minecraft.world.phys.AABB bb = mob.getBoundingBox();
+                                net.minecraft.world.phys.AABB area = bb.inflate(fd, fd, fd);
+                                net.minecraft.world.entity.ai.targeting.TargetingConditions conds =
+                                        (net.minecraft.world.entity.ai.targeting.TargetingConditions)
+                                                MH_TARGET_CONDS.invoke(g2);
+                                long[] qout = QBUF.get();
+                                if (qout.length < 4096) {
+                                    qout = new long[4096];
+                                    QBUF.set(qout);
+                                }
+                                int qn = queryNative(worldId(lvl),
+                                        area.minX, area.minY, area.minZ,
+                                        area.maxX, area.maxY, area.maxZ,
+                                        qout, 0, B_IDS, B_BOX, B_SY, B_SEQ);
+                                if (qn >= 0) {
+                                    net.minecraft.world.entity.LivingEntity best = null;
+                                    double bd = -1.0;
+                                    double mx = mob.getX(), mey = mob.getEyeY(), mz = mob.getZ();
+                                    for (int qi = 0; qi < qn; qi++) {
+                                        long lid = qout[qi];
+                                        Entity ce = ARENA[(int) (lid & AMASK)];
+                                        if (ce == null || ce.isRemoved()
+                                                || !tt.isInstance(ce)) {
+                                            continue;
+                                        }
+                                        net.minecraft.world.entity.LivingEntity le =
+                                                (net.minecraft.world.entity.LivingEntity) ce;
+                                        if (!conds.test(lvl, mob, le)) {
+                                            continue;
+                                        }
+                                        double d2 = le.distanceToSqr(mx, mey, mz);
+                                        if (bd < 0.0 || d2 < bd) {
+                                            bd = d2;
+                                            best = le;
+                                        }
+                                    }
+                                    U.putObject(g2, O_NAT_TARGET, best);
+                                    res = best != null ? 1 : 0;
+                                    done = true;
+                                }
+                            }
+                        } catch (Throwable portFail) {
+                            done = false; // the real findTarget resolves it
+                        }
+                    }
+                    if (!done) {
+                        try {
+                            MH_FIND_TARGET.invoke(wg.getGoal());
+                            Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
+                            res = t != null ? 1 : 0;
+                        } catch (Throwable t2) {
                         mobAiFallbackWhy = FB_JAVA_PREDICATE;
                         mobAiFallbackRound = round;
                         mobAiFallbackReq = lastReqOp;
                         mobAiFallbackMob = mob.getClass().getName();
                         logFirstFallback();
                         return ST_FALLBACK;
+                    }
                     }
                     break;
                 }
