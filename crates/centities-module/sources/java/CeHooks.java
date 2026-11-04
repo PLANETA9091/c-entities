@@ -1660,18 +1660,19 @@ public final class CeHooks {
             // se/sit/steps refs ride the same slot lifecycle.
             if (e != null) {
                 int sm = entId(e) & AMASK;
-                Object[] te0 = TT_TE;
-                if (te0 != null) te0[sm] = null;
-                Object[] ses = TT_SE;
-                if (ses != null) ses[sm] = null;
-                Object[] so = TT_SITOBJ;
-                if (so != null) so[sm] = null;
-                Object[] st = TT_STEPS;
-                if (st != null) st[sm] = null;
+                Object[] rf0 = TT_REF;
+                if (rf0 != null) {
+                    int ob = sm * 5;
+                    rf0[ob] = null;
+                    rf0[ob + 1] = null;
+                    rf0[ob + 2] = null;
+                    rf0[ob + 3] = null;
+                    rf0[ob + 4] = null;
+                }
+                long[] fl0 = TT_FLAT;
+                if (fl0 != null) fl0[sm * 2] = 0;
                 Entity[] fe = FROZ_E;
                 if (fe != null) fe[sm] = null;
-                Entity[] tes = TT_E;
-                if (tes != null) tes[sm] = null;
                 AT_E[sm & (AT_CAP - 1)] = null;
                 // L73: the AI floor's shadow keys are STRONG — the removed
                 // mob's selector must be dropped explicitly (its goalSelector
@@ -8195,6 +8196,13 @@ public final class CeHooks {
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
             mobAiClassified = 0, mobAiRefused = 0, mobAiOddJava = 0;
+    // L90b: the per-tick branch counters of the AI floor — the GL line
+    // prints `br=<even-ai>/<odd-java>/<odd-rust>`; the vanilla cadence
+    // reference: even+oddJava+oddRust == the AI'd mob count and even ==
+    // {tickCount<=1} U {(tickCount+id)%2==0} — the L90 census caught the
+    // engine's set running ONE TICK EARLY (engine-set(t) ==
+    // vanilla-set(t+1), five consecutive ticks).
+    public static long floorEven = 0, floorOddJava = 0, floorOddRust = 0;
     /** Diagnostics: reason (FB_*) + round + request op of the FIRST fallback
      *  this boot; the one-shot log line makes a classified-mob fallback
      *  diagnosable from the CI log alone (behavior itself stays exact — the
@@ -9009,6 +9017,17 @@ public final class CeHooks {
             // run it in pure Java and skip the JNI entirely (half the ticks
             // of a peaceful zombie).
             boolean odd = ((mob.tickCount + entId(mob)) & 1) != 0 && mob.tickCount > 1;
+            if (phDumpTickNow()) {
+                if (odd) {
+                    floorOddRust++; // reached only when the melee walk runs
+                    if (!aiMeleeRunning(ctx)) {
+                        floorOddRust--;
+                        floorOddJava++;
+                    }
+                } else {
+                    floorEven++;
+                }
+            }
             if (odd && !aiMeleeRunning(ctx)) {
                 for (int i = 0; i < ctx.gGoals.length; i++) {
                     if (ctx.gKind[i] == GK_LOOKAROUND && ctx.gGoals[i].isRunning()) {
@@ -9432,6 +9451,11 @@ public final class CeHooks {
         boolean any = false;
         StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3)
                 .append(" sc=").append(System.getenv("RUN_NAME"));
+        sb.append(" br=").append(floorEven).append('/').append(floorOddJava)
+                .append('/').append(floorOddRust);
+        floorEven = 0;
+        floorOddJava = 0;
+        floorOddRust = 0;
         for (int k = 0; k < 9; k++) {
             int e = l[k * 4], n = l[k * 4 + 1], s = l[k * 4 + 2], r = l[k * 4 + 3];
             if ((e | n | s | r) != 0) {
@@ -9787,19 +9811,17 @@ public final class CeHooks {
     // verdict holds until the te identity changes. Per-tick volatile
     // inputs (syncVelocity, syncPosition, steps-emptiness for SIT) stay
     // per-entity reads in the cached path.
-    private static volatile Object[] TT_TE;   // slot -> TrackedEntity (identity key)
-    private static volatile long[] TT_SHAPE;  // slot -> (TT_OK|TT_SIT)
+    // L66r: the FLAT slot layout — ONE Object[] (stride 5: [te, se, ent,
+    // sitObj, steps]) + ONE long[] (stride 2: [shape, tickCount]) instead
+    // of the six parallel arrays (TT_TE/TT_SHAPE/TT_SE/TT_SITOBJ/TT_STEPS/
+    // TT_TC/TT_E). The per-tick walk for an item reads ent/se (adjacent
+    // refs, one cache line) + shape/tickCount (adjacent longs, one line
+    // shared by 4 slots) — 2 misses per entity instead of 5-6 (the
+    // items-100k-mod JFR pinned 9.9% across the array-ref loads — pure
+    // cache-miss traffic). Slot base ob = slot*5, long base lb = slot*2.
+    private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
+    private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
     private static final long TT_OK = 1L, TT_SIT = 2L;
-    // L65: the fill-time REF caches — serverEntity (TrackedEntity, public
-    // final), interpolationTracker (ServerEntity, private final) and
-    // trackedSteps (SteppedInterpolationTracker, private final List) are
-    // ALL final fields whose owner chain is pinned by the te identity
-    // check, so the cached path skips the three Unsafe hops per entity
-    // per tick and reads the live objects directly. The SIT pair is
-    // allocated lazily (items-only populations never need it).
-    private static volatile net.minecraft.server.level.ServerEntity[] TT_SE;
-    private static volatile Object[] TT_SITOBJ;
-    private static volatile Object[] TT_STEPS;
     // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
     // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
     // increment — the counter is unobservable while nobody tracks the
@@ -9809,18 +9831,22 @@ public final class CeHooks {
     // decline tick (real sendChanges ran) re-captures per entity, so the
     // mirror can never fork from the real counter. Any reconcile failure
     // disables the mirror (TT_TC=null) — the real RMW stays the fallback.
-    private static volatile int[] TT_TC;
-    // L72: the per-slot entity identity — the cached path's identity key.
-    // The te read (an Unsafe hop into the entity's moonrise field per
-    // entity per tick) existed ONLY to prove the slot; TT_E[m] == ent
-    // proves the same thing with one array read. probeRemove clears the
-    // slot unconditionally (same block as TT_TE/TT_SE) so a removal can
-    // never pass the check; a fresh te for a re-added entity re-fills.
-    private static volatile Entity[] TT_E;
+    // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
+    // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
+    // increment — the counter is unobservable while nobody tracks the
+    // entity (its ONLY reader is sendChanges' interval gate). Transitions
+    // reconcile exactly: armed->disarmed hands the mirror back into the
+    // real field, disarmed->armed re-captures the real field, and every
+    // decline tick (real sendChanges ran) re-captures per entity, so the
+    // mirror can never fork from the real counter. Any reconcile failure
+    // disables the mirror (TT_MIRROR=false) — the real RMW stays the
+    // fallback.
+    private static volatile boolean TT_MIRROR;
     // the per-ChunkMap armed memo (tiny direct map; #dims entries)
     private static final Object[] TT_ARM_CM = new Object[8];
     private static final boolean[] TT_ARM_VAL = new boolean[8];
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
+
 
     public static void initTrackerLoopHandles() {
         try {
@@ -9849,12 +9875,10 @@ public final class CeHooks {
             // L63b: the shape-cache arrays (slot-indexed like the ARENA;
             // allocated once — the identity check tolerates stale entries,
             // probeRemove clears the slot to release the te ref).
-            if (TT_TE == null) {
-                TT_TE = new Object[ARENA.length];
-                TT_SHAPE = new long[ARENA.length];
-                TT_SE = new net.minecraft.server.level.ServerEntity[ARENA.length];
-                TT_TC = new int[ARENA.length];
-                TT_E = new Entity[ARENA.length];
+            if (TT_REF == null) {
+                TT_REF = new Object[ARENA.length * 5];
+                TT_FLAT = new long[ARENA.length * 2];
+                TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
                     && VH_SIT_TICKS.off >= 0) {
@@ -10031,7 +10055,7 @@ public final class CeHooks {
      *  empty, trackedPlayers empty, !hardColliding (a ctor-fixed field),
      *  and the interp shape (NO_OP or a SteppedInterpolationTracker). None
      *  of those can change without a player or a new TrackedEntity — the
-     *  identity check (TT_TE[m] == te) covers the latter, the per-pass
+     *  te identity check (TT_REF[ob] == te) covers the latter, the per-pass
      *  players gate covers the former. What CAN change every tick stays a
      *  per-entity read here: syncVelocity (markHurt), syncPosition (the
      *  bounce/ServerEntity writers), and — for SIT entities — the
@@ -10039,20 +10063,25 @@ public final class CeHooks {
      *  decline must re-fire on any live step). The replicated effects are
      *  byte-identical to the fill path's fused tail. */
     private static boolean ttlCachedPath(Entity ent, int m) {
-        // L72: the identity key is TT_E[m] == ent (one array read — the te
-        // Unsafe hop existed only to prove the slot). probeRemove clears
-        // TT_E unconditionally, so a removed entity can never pass; a
-        // re-tracked entity (fresh te for a fresh add) re-fills.
-        Entity[] es = TT_E;
-        if (es == null || es[m] != ent) return false;
-        long[] sh0 = TT_SHAPE;
-        if (sh0 == null) return false;
-        long sh = sh0[m];
+        // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
+        // read — the te Unsafe hop existed only to prove the slot).
+        // probeRemove clears the slot unconditionally, so a removed
+        // entity can never pass; a re-tracked entity (fresh te for a
+        // fresh add) re-fills.
+        Object[] rf = TT_REF;
+        if (rf == null) return false;
+        int ob = m * 5;
+        if (rf[ob + 2] != ent) return false;
+        long[] fl = TT_FLAT;
+        if (fl == null) return false;
+        int lb = m * 2;
+        long sh = fl[lb];
         if ((sh & TT_OK) == 0) return false;
-        // L67: typed read — the TT_TE[m] == te identity above pins this
-        // slot to the fill that validated the type (the fill probe's
-        // instanceof is the check; per-tick it is a proven tautology).
-        net.minecraft.server.level.ServerEntity serverEntity = TT_SE[m];
+        // L67: typed read — the te identity above pins this slot to the
+        // fill that validated the type (the fill probe's instanceof is
+        // the check; per-tick it is a proven tautology).
+        net.minecraft.server.level.ServerEntity serverEntity =
+                (net.minecraft.server.level.ServerEntity) rf[ob + 1];
         if (serverEntity == null) {
             return false;
         }
@@ -10062,17 +10091,14 @@ public final class CeHooks {
                 // L65: the interp handler and the steps LIST are fill-cached
                 // (both final; the te identity pins the chain) — the per-tick
                 // reads are the cached refs' live state.
-                Object[] so = TT_SITOBJ;
-                Object[] st = TT_STEPS;
-                if (so == null || st == null || O_SIT_DELTA < 0
-                        || O_SIT_TICKS < 0 || O_ENT_SYNC_POS < 0) {
+                if (O_SIT_DELTA < 0 || O_SIT_TICKS < 0 || O_ENT_SYNC_POS < 0) {
                     return false;
                 }
-                Object sitObj = so[m];
+                Object sitObj = rf[ob + 3];
                 if (sitObj == null) {
                     return false; // L67: the type was fill-proven
                 }
-                Object steps = st[m];
+                Object steps = rf[ob + 4];
                 if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
                     return false; // a live step: addStep would mutate — vanilla
                 }
@@ -10096,9 +10122,8 @@ public final class CeHooks {
             // increment rides the mirror (the real field is handed back on
             // the armed->disarmed transition; the L70 tail below);
             // the real RMW stays the fallback.
-            int[] tc = TT_TC;
-            if (tc != null) {
-                tc[m]++;
+            if (TT_MIRROR) {
+                fl[lb + 1] = fl[lb + 1] + 1;
             } else {
                 U.putInt(serverEntity, O_SE_TICKCOUNT,
                         U.getInt(serverEntity, O_SE_TICKCOUNT) + 1);
@@ -10152,7 +10177,7 @@ public final class CeHooks {
                     && O_SE_INTERP > 0 && O_SE_TICKCOUNT > 0;
             boolean cacheArm = false;
             if (on) {
-                cacheArm = TT_TE != null && TT_SHAPE != null
+                cacheArm = TT_REF != null && TT_FLAT != null
                         && O_ENT_SYNC_POS >= 0;
                 if (cacheArm) {
                     try {
@@ -10166,11 +10191,11 @@ public final class CeHooks {
                 // L70: the tickCount mirror reconcile on the armed-state
                 // transition (and on first sight of this ChunkMap). One list
                 // walk per transition; the steady state walks nothing. Any
-                // failure disables the mirror globally (TT_TC=null) — the
+                // failure disables the mirror globally (TT_MIRROR=false) — the
                 // cached path falls back to the real RMW, which is exact
                 // once the mirror is off (the real field is authoritative
                 // again from the next tick).
-                if (TT_TC != null) {
+                if (TT_MIRROR) {
                     int cmi = -1;
                     boolean lastArm = false;
                     boolean known = false;
@@ -10189,22 +10214,26 @@ public final class CeHooks {
                     }
                     if (cacheArm != lastArm) {
                         try {
+                            Object[] rfr = TT_REF;
+                            long[] flr = TT_FLAT;
                             for (int i = 0; i < size; i++) {
                                 Entity ent = raw[i];
                                 int m = entId(ent) & AMASK;
+                                int ob2 = m * 5;
                                 Object te2 = trackedEntityOf(ent);
-                                if (te2 == null || TT_TE[m] != te2) continue;
+                                if (te2 == null || rfr[ob2] != te2) continue;
                                 Object se2 = U.getObject(te2, O_TE_SE);
                                 if (!(se2 instanceof net.minecraft.server.level.ServerEntity)) continue;
                                 if (cacheArm) { // re-capture: the real field is the truth
-                                    TT_TC[m] = U.getInt(se2, O_SE_TICKCOUNT);
+                                    flr[m * 2 + 1] = U.getInt(se2, O_SE_TICKCOUNT);
                                 } else {        // hand the mirror back
-                                    U.putInt(se2, O_SE_TICKCOUNT, TT_TC[m]);
+                                    U.putInt(se2, O_SE_TICKCOUNT,
+                                            (int) flr[m * 2 + 1]);
                                 }
                             }
                             TT_ARM_VAL[cmi] = cacheArm;
                         } catch (Throwable reconcileFail) {
-                            TT_TC = null; // mirror off; real RMW everywhere
+                            TT_MIRROR = false; // mirror off; real RMW everywhere
                         }
                     } else if (!known) {
                         TT_ARM_VAL[cmi] = cacheArm;
@@ -10242,31 +10271,29 @@ public final class CeHooks {
                                     (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
                             Object interp = O_SE_INTERP > 0
                                     ? U.getObject(se0, O_SE_INTERP) : null;
-                            TT_TE[m] = te;
-                            TT_SE[m] = se0;
-                            TT_E[m] = ent;
+                            Object[] rff = TT_REF;
+                            long[] flf = TT_FLAT;
+                            int ob = m * 5;
+                            rff[ob] = te;
+                            rff[ob + 1] = se0;
+                            rff[ob + 2] = ent;
                             // L70: stamp the mirror from the real field
                             // (the fast path just did its real RMW — the
                             // stamp captures the post-increment truth)
-                            TT_TC[m] = U.getInt(se0, O_SE_TICKCOUNT);
-                            TT_SHAPE[m] = TT_OK;
+                            flf[m * 2 + 1] = U.getInt(se0, O_SE_TICKCOUNT);
+                            flf[m * 2] = TT_OK;
                             if (interp instanceof
                                             net.minecraft.world.entity
                                                     .SteppedInterpolationTracker
                                     && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
                                     && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
-                                // L65: lazy SIT arrays (mobs populations only)
-                                if (TT_SITOBJ == null) {
-                                    TT_SITOBJ = new Object[ARENA.length];
-                                    TT_STEPS = new Object[ARENA.length];
-                                }
-                                TT_SITOBJ[m] = interp;
-                                TT_STEPS[m] = U.getObject(interp, O_SIT_STEPS);
-                                TT_SHAPE[m] |= TT_SIT;
+                                rff[ob + 3] = interp;
+                                rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
+                                flf[m * 2] = TT_OK | TT_SIT;
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {
-                            TT_TE[m] = null;
+                            TT_REF[m * 5] = null;
                         }
                         continue;
                     }
@@ -10291,11 +10318,12 @@ public final class CeHooks {
                     // real counter while armed. Skipped when disarmed (the
                     // real field is the truth there; the re-arm transition
                     // walk re-captures everything).
-                    int[] tcd = TT_TC;
-                    if (tcd != null && TT_TE[m] == te) {
+                    long[] flc = TT_FLAT;
+                    Object[] rfc = TT_REF;
+                    if (flc != null && rfc != null && rfc[m * 5] == te) {
                         Object se2 = U.getObject(te, O_TE_SE);
                         if (se2 instanceof net.minecraft.server.level.ServerEntity) {
-                            tcd[m] = U.getInt(se2, O_SE_TICKCOUNT);
+                            flc[m * 2 + 1] = U.getInt(se2, O_SE_TICKCOUNT);
                         }
                     }
                     continue;
