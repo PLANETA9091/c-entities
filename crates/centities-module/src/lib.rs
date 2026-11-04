@@ -3599,6 +3599,15 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 jni::jintArray,
             ) -> i32
     );
+    push!(
+        "nativeGlTake",
+        "(I)[I",
+        n_gl_take as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+        ) -> jni::jintArray
+    );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -5082,5 +5091,33 @@ pub extern "system" fn n_mob_ai_floor(
                 st
             })
         })
+    }
+}
+
+/// nativeGlTake(int on) -> int[] — the L89 gate ledger read+reset.
+/// Java calls it once per level-tick at the entity-loop boundary: the return
+/// carries the ledger collected while armed (27 ints: evals/no/staged per
+/// class 0..8), `on != 0` arms the counting for the NEXT tick. Null when the
+/// interval was not armed.
+pub extern "system" fn n_gl_take(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    on: i32,
+) -> jni::jintArray {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let mut buf = [0u32; 27];
+        if !centities_core::goals::gl_take(&mut buf, on != 0) {
+            return std::ptr::null_mut();
+        }
+        let arr = ((*vt).NewIntArray)(raw, 27);
+        if arr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let tmp: [i32; 27] = std::array::from_fn(|i| buf[i] as i32);
+        ((*vt).SetIntArrayRegion)(raw, arr, 0, 27, tmp.as_ptr());
+        arr
     }
 }

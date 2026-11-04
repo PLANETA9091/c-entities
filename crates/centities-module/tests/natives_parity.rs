@@ -37,6 +37,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeItemInvalidate", "(II[I[I[I)V"));
     // L22a: the native goal engine
     s.insert(("nativeMobAiFloor", "([I[I)I"));
+    // L89: the gate ledger — per-class canUse census read+reset
+    s.insert(("nativeGlTake", "(I)[I"));
     s
 }
 

@@ -1256,3 +1256,53 @@ not independent bugs. The L88 hunt (probe neutral) is the decisive read:
 if the engine's Rust ledger lands exactly 91==91 with matching starts,
 the engine is parity-exact and shippable (doc-30 frontier 0, mobs −61%);
 any residual delta is now attributable frame-by-frame.
+
+## L89 (this commit): the L88 decisive read — t=141 is DEAD, the front moved to t=145 (m = −27, the stroll-start split)
+
+The probe-neutral hunt (run 41713824607, TRACE_ID=83, PH_DUMP=138-152,
+mob_ai=1 — the first hunt with the L88 entropy fix live) closed the L88
+ledger exactly as predicted and moved the frontier:
+
+**t=141 is EXACT.** Both streams lock tick-by-tick: SR/LR at t=141-144 are
+bit-identical across the legs (2469881e26ae / 65be53106748 … through
+60c556ead8d5 / fc99facf6375). The +13 probe draws were the whole t=141
+cascade: with the probe entropy-free the engine's canUse +1 and the
+start +2 vanished — the cascade hypothesis CONFIRMED.
+
+**The new first divergence: t=145, entity stream only.** LR stays locked
+(92 == 92 Level draws at t=145; the Level stream never splits in this
+window). SR splits at t=145: OFF end-state 55e72a9954cf, ON 8fd42ee257f2.
+The f-solve over the legacy LCG (a=25214903917, c=11, mod 2^48) gives
+**m = −27** — the ON leg consumed 27 FEWER entity-random draws at t=145
+(ON total 510 = 223 visible + 287 Rust-served vs OFF 537).
+
+**The visible-stream LCS ledger** (OFF's 247 non-canUse frames vs ON's
+223, longest-common-subsequence):
+- OFF-only ×30 `RandomPos.generateRandomDirection nextInt` + ×1
+  `WaterAvoidingRandomStrollGoal.getPosition nextFloat` — vanilla ran
+  STROLL STARTS (position generation) the engine never did;
+- ON-only ×1 `RandomLookAroundGoal.start` pair — the engine started a
+  lookaround vanilla did not;
+- net −24 visible draws, and the remaining −3 are the gate rolls.
+
+Reconciliation: m = −27 = −24 (starts) − 3 (canUse rolls). Vanilla
+canUse = 290 (537 − 247), engine Rust-served = 287 (510 − 223).
+
+**The instrument (this commit)**: the L89 GATE LEDGER — per-class canUse
+census (evals/No/Staged for the 9 GK_* classes) counted Rust-side in
+relaxed atomics, armed per-tick by `nativeGlTake(phDumpTickNow())` at the
+itemTickFlush boundary (one JNI crossing per level-tick, zero cost
+outside the window, read+reset in the same call), printed as
+`GL t=<game> c<k>=evals/no/staged`. The GL line against the OFF SRF
+census (canUse frames per class + start frames) names the gate whose
+verdict split at t=145 — the candidates are the stroll gate
+(noActionTime/passenger flag short-circuits) and the target gate's
+pcount==0 fast path.
+
+Zombie target-selector fact sheet (javap 26.3): FOUR
+NearestAttackableTargetGoals — prio2 Player (randomInterval 1), prio3
+AbstractVillager (0), prio3 IronGolem (1), prio5 Turtle (10); the
+interval roll draws nextInt ONLY when randomInterval > 0; findTarget for
+non-Player types goes through level.getEntitiesOfClass (the L86 funnel).
+The Player goal at pcount==0 consumes exactly 1 roll (interval) + 0
+(getNearestPlayer over an empty players() list).

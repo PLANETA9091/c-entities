@@ -5727,6 +5727,11 @@ public final class CeHooks {
         int n = ibN;
         itemFlushes++;
         CUR_TICK++;
+        // L89: the gate ledger — one JNI crossing per level-tick, the print
+        // only at dump ticks; must run BEFORE the n==0 early return.
+        if (MOB_AI_ON) {
+            gateLedgerPrint();
+        }
         if (n == 0) return;
         ibN = 0;
         int cdN = ibCDN;
@@ -9409,6 +9414,34 @@ public final class CeHooks {
     /** The native goal engine (centities-core/src/goals.rs) — returns
      *  ST_DONE / ST_REQUEST / ST_FALLBACK and fills out. */
     public static native int nativeMobAiFloor(int[] in, int[] out);
+
+    /** L89: the gate ledger — per-class canUse census (evals/no/staged for
+     *  the GK_* classes 0..8, 27 ints) collected by the engine while armed;
+     *  null when the interval was not armed. `on` arms the NEXT interval. */
+    private static native int[] nativeGlTake(int on);
+
+    /** One GL line per dump tick: c<kind>=evals/no/staged. The arming rides
+     *  the CURRENT window check (the counters cover the tick that is about
+     *  to run); the read returns the interval that just ended. */
+    private static void gateLedgerPrint() {
+        int[] l = nativeGlTake(phDumpTickNow() ? 1 : 0);
+        if (l == null) {
+            return;
+        }
+        boolean any = false;
+        StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3);
+        for (int k = 0; k < 9; k++) {
+            int e = l[k * 3], n = l[k * 3 + 1], s = l[k * 3 + 2];
+            if ((e | n | s) != 0) {
+                any = true;
+                sb.append(' ').append(k).append('=').append(e).append('/')
+                        .append(n).append('/').append(s);
+            }
+        }
+        if (any) {
+            System.out.println(sb.toString());
+        }
+    }
 
     public static void setMobAiOn(boolean on) {
         MOB_AI_ON = on;

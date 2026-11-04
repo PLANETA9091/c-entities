@@ -60,6 +60,53 @@ pub const GK_LOOKAROUND: i32 = 6;
 pub const GK_HURT_BY: i32 = 7;
 pub const GK_NEAREST_TARGET: i32 = 8;
 
+// ---------------------------------------------------------------------------
+// L89 GATE LEDGER — the per-class canUse census.
+//
+// The L88 hunt read (run 41713824607): the SR stream locked ticks 141-144
+// (the probe-neutral fix worked, the t=141 cascade is gone) and the new
+// first divergence is t=145, entity stream, m = -27 (LCG-solved: the ON leg
+// consumed 27 fewer entity-random draws). The visible-stream LCS ledger:
+// OFF-only x30 RandomPos.generateRandomDirection nextInt + x1
+// WaterAvoidingRandomStrollGoal.getPosition nextFloat (vanilla ran stroll
+// STARTS the engine did not) vs ON-only x1 RandomLookAroundGoal.start
+// pair (the engine started a lookaround vanilla did not); net -24 visible
+// -3 gate rolls. The per-class outcome census names the gate whose verdict
+// split. Zero cost when GL_ON is false (the window gate); Java reads+resets
+// once per dump tick via nativeGlTake.
+// ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+pub static GL_ON: AtomicBool = AtomicBool::new(false);
+pub static GL_EVALS: [AtomicU32; 9] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static GL_NO: [AtomicU32; 9] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static GL_STAGED: [AtomicU32; 9] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Read+reset the ledger into `dst` (27 ints: evals/no/staged per class 0..8)
+/// and set the arming for the NEXT engine calls. Returns whether the ledger
+/// WAS armed during the interval that just ended (i.e. `dst` is fresh data).
+pub fn gl_take(dst: &mut [u32], arm: bool) -> bool {
+    let was = GL_ON.swap(arm, Ordering::Relaxed);
+    for k in 0..9 {
+        dst[k * 3] = GL_EVALS[k].swap(0, Ordering::Relaxed);
+        dst[k * 3 + 1] = GL_NO[k].swap(0, Ordering::Relaxed);
+        dst[k * 3 + 2] = GL_STAGED[k].swap(0, Ordering::Relaxed);
+    }
+    was
+}
+
 // goal flags — the vanilla Goal.Flag ordinals as bits
 pub const FL_MOVE: i64 = 1;
 pub const FL_LOOK: i64 = 1 << 1;
@@ -913,7 +960,30 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 }
 
 /// the ported canUse bodies
+/// L89: the ledgered canUse entry — one relaxed atomic add per eval, only
+/// while the dump window holds (GL_ON); the wrapper is transparent
+/// otherwise.
 fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+    if !GL_ON.load(Ordering::Relaxed) {
+        return can_use_inner(ctx, out, sel, gi, phase);
+    }
+    let kind = ctx.kind(sel, gi);
+    let r = can_use_inner(ctx, out, sel, gi, phase);
+    let k = kind.clamp(0, 8) as usize;
+    GL_EVALS[k].fetch_add(1, Ordering::Relaxed);
+    match &r {
+        Ok(Cu::No) => {
+            GL_NO[k].fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
+            GL_STAGED[k].fetch_add(1, Ordering::Relaxed);
+        }
+        Err(()) => {}
+    }
+    r
+}
+
+fn can_use_inner(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
     match ctx.kind(sel, gi) {
         GK_SPEAR_USE => {
             // ableToAttack() && !isUsingItem() — native only when the
