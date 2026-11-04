@@ -1110,6 +1110,7 @@ public final class CeHooks {
                 + " tt=" + ttCalls + "/" + ttGate
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
                 + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
+                + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -5728,6 +5729,14 @@ public final class CeHooks {
         int n = ibN;
         itemFlushes++;
         CUR_TICK++;
+        // L92: the quiet-bitset epoch — cleared at every flush entry, so a
+        // slot without THIS tick's applier stamp is conservatively full-path
+        // in the tracker pass. Per-level order (flush -> tracker) keeps the
+        // stamps valid exactly for the level being tracked.
+        if (TTL_QUIET_ON) {
+            long[] tq = TT_QUIET;
+            if (tq != null) java.util.Arrays.fill(tq, 0L);
+        }
         // L89: the gate ledger — one JNI crossing per level-tick, the print
         // only at dump ticks; must run BEFORE the n==0 early return.
         if (MOB_AI_ON) {
@@ -5959,7 +5968,37 @@ public final class CeHooks {
                 // pre-states (the store/batch carries them). The skipped
                 // compares are exactly the ones the tails would skip; the
                 // gate runs the full 12/12 over every scenario.
-                if ((bits & (1 << 16)) != 0) itemTailNone++;
+                if ((bits & (1 << 16)) != 0) {
+                    itemTailNone++;
+                    // L92: the tracker-quiet stamp — the whole post-counter
+                    // tail is a provable no-op, so nothing tracker-visible
+                    // changed. With the L70 mirror owning the tickCount and
+                    // the fill's structural verdicts pinned (TT_OK, no SIT
+                    // handler, the slot identity), the tracker pass for this
+                    // slot reduces to the mirror bump — performed HERE and
+                    // the tracker loop skips the slot. ttlCachedPath's
+                    // remaining per-tick work for such an entity was exactly
+                    // this bump: syncVelocity is false (checked), SIT is
+                    // excluded (checked), updateDataBeforeSync iterates an
+                    // EMPTY dirty set (no metadata writer ran — merge is a
+                    // TAIL_NONE breaker).
+                    if (TTL_QUIET_ON && TT_MIRROR && !e.syncVelocity) {
+                        Object[] rq = TT_REF;
+                        long[] fq = TT_FLAT;
+                        if (rq != null && fq != null) {
+                            int mq = (int) (IB_IDS[i] & AMASK);
+                            int obq = mq * 5;
+                            if (rq[obq + 2] == e) {
+                                long shq = fq[mq * 2];
+                                if ((shq & TT_OK) != 0 && (shq & TT_SIT) == 0) {
+                                    fq[mq * 2 + 1] = fq[mq * 2 + 1] + 1;
+                                    TT_QUIET[mq >> 6] |= 1L << (mq & 63);
+                                    ttlQuietBumps++;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // L79 loop B: the FULL tail over the core's compact index list
             // (outI[n*4] = cn, then the batch indices, batch order kept).
@@ -9787,6 +9826,7 @@ public final class CeHooks {
     public static final boolean TTL_FLAG_ON =
             !"false".equals(System.getProperty("centities.trackerLoop", "true"));
     public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
+    public static long ttlQuiet = 0, ttlQuietBumps = 0; // L92
     // L59a/L61 decline-site counters (the fuse verdict, per site) + the
     // per-pass chunk memo (reset at every newTrackerTick$ entry).
     public static long ttlDeclChunk = 0, ttlDeclSeen = 0, ttlDeclSe = 0,
@@ -9839,6 +9879,22 @@ public final class CeHooks {
     private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
     private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
     private static final long TT_OK = 1L, TT_SIT = 2L;
+    // L92: the QUIET bitset — per mirror slot, set by the item-tick applier
+    // for batch-owned items whose ENTIRE tracker-visible surface is provably
+    // untouched this tick (TAIL_NONE out-flag + no velocity sync + the fill
+    // stamped TT_OK with no SIT handler + the L70 mirror owning the tickCount
+    // bump). While a ChunkMap is ARMED (players() empty — the same gate the
+    // L63b cache requires) the tracker pass for a quiet slot reduces to the
+    // ServerEntity.tickCount mirror bump, which the applier performs INLINE
+    // (one array write it already pays cache residency for); the tracker
+    // loop then skips the slot entirely. The bitset is cleared at every
+    // itemTickFlush entry, so a slot without this tick's applier stamp is
+    // conservatively FULL-PATH (the exact pre-L92 behavior). Entities the
+    // batch does not own (mobs, stands, fresh spawns) never get a stamp and
+    // never take the quiet path.
+    private static volatile long[] TT_QUIET;
+    public static final boolean TTL_QUIET_ON =
+            !"false".equals(System.getProperty("centities.ttlQuiet", "true"));
     // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
     // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
     // increment — the counter is unobservable while nobody tracks the
@@ -9895,6 +9951,7 @@ public final class CeHooks {
             if (TT_REF == null) {
                 TT_REF = new Object[ARENA.length * 5];
                 TT_FLAT = new long[ARENA.length * 2];
+                TT_QUIET = new long[(ARENA.length + 63) >> 6];
                 TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
@@ -10079,6 +10136,21 @@ public final class CeHooks {
      *  trackedSteps emptiness (addStep is NOT player-gated: the L62b
      *  decline must re-fire on any live step). The replicated effects are
      *  byte-identical to the fill path's fused tail. */
+    /** L92: the quiet-cohort skip — the bitset was stamped by THIS tick's
+     *  item-tick applier (cleared at every flush entry) and the slot
+     *  identity still pins the same entity. The tracker pass's remaining
+     *  per-tick work for such an entity (the ServerEntity.tickCount mirror
+     *  bump) already ran inline in the flush. */
+    private static boolean ttlQuietSkip(Entity ent, int m) {
+        long[] tq = TT_QUIET;
+        if (tq == null) return false;
+        int q = m & 63;
+        int w = m >> 6;
+        if ((tq[w] & (1L << q)) == 0) return false;
+        Object[] rq = TT_REF;
+        return rq != null && rq[m * 5 + 2] == ent;
+    }
+
     private static boolean ttlCachedPath(Entity ent, int m) {
         // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
         // read — the te Unsafe hop existed only to prove the slot).
@@ -10257,6 +10329,11 @@ public final class CeHooks {
                     }
                 }
             }
+            // L92: the quiet-skip arm: the mirror state AFTER the reconcile
+            // block above. Stamps made under TT_MIRROR=true are consumed only
+            // while the mirror still owns the counter (a mid-pass reconcile
+            // failure routes everything conservative).
+            boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON;
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
@@ -10267,6 +10344,14 @@ public final class CeHooks {
                 // the fill probe on any doubt.
                 if (cacheArm) {
                     int m0 = entId(ent) & AMASK;
+                    // L92: the applier-stamped quiet cohort — the mirror bump
+                    // already ran inline in the item-tick flush; skip the
+                    // whole probe chain (the cached path's remaining work for
+                    // such an entity was exactly that bump).
+                    if (quietArm && ttlQuietSkip(ent, m0)) {
+                        ttlQuiet++;
+                        continue;
+                    }
                     if (ttlCachedPath(ent, m0)) {
                         ttlFuse++;
                         continue;
