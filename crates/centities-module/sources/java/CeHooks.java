@@ -9430,7 +9430,8 @@ public final class CeHooks {
             return;
         }
         boolean any = false;
-        StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3);
+        StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3)
+                .append(" sc=").append(System.getenv("RUN_NAME"));
         for (int k = 0; k < 9; k++) {
             int e = l[k * 4], n = l[k * 4 + 1], s = l[k * 4 + 2], r = l[k * 4 + 3];
             if ((e | n | s | r) != 0) {

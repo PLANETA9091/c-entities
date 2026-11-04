@@ -1147,8 +1147,56 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private static void recSrDraw() {
         SR_CALLS++;
         if (SR_FRAMES.size() < 512) {
-            SR_FRAMES.add(drawFrames());
+            char[] f = drawFrames();
+            SR_FRAMES.add(f);
+            glvClassify(f);
+        } else {
+            // L90: the census must cover EVERY draw — past the 512-frame
+            // cap the stack walk is no longer stored but still classified.
+            glvClassify(drawFrames());
         }
+    }
+
+    /** L90: the scenario tag — RUN_NAME of the leg (parity-mobs-on ...).
+     *  Every streamed census/state line carries it so the interleaved
+     *  8-server job log separates per-scenario without positional
+     *  heuristics (the t=145 GL lines of run 41766511483 were unreadable
+     *  across the three mob scenarios sharing one console). */
+    private static final String SC_TAG = env("RUN_NAME", "?");
+
+    /** L90: the vanilla-side twin of the engine's GL ledger — a per-
+     *  callsite draw census keyed by the SIMPLE caller of the proxy draw
+     *  (token[1] of the stored frame: RandomStrollGoal.canUse,
+     *  RandomPos.generateRandomDirection, RandomLookAroundGoal.start,
+     *  the spawn-path ctors ...). The 512-frame SRF cap eats the AI
+     *  frames when the spawn noise is high (run 41766511483: 2572 spawn
+     *  frames at t=145 left only a biased prefix of the AI frames) — the
+     *  counters are cap-free, so the OFF leg's per-gate roll census
+     *  survives any fill noise. Printed inside the LRC window as
+     *  GLV t=<tick> sc=<tag> n=<total> <Class.method>=<n> ... (sorted,
+     *  one line per tick), reset per tick; the ON leg's GLV shows only
+     *  the Java-visible draws (the Rust-served rolls bypass the proxy) —
+     *  the GL line covers those. */
+    private static final java.util.TreeMap<String, Integer> GLV = new java.util.TreeMap<>();
+    private static int GLV_N;
+
+    private static void glvClassify(char[] f) {
+        String s = new String(f);
+        int sp = s.indexOf(' ');
+        if (sp < 0) {
+            return;
+        }
+        int sp2 = s.indexOf(' ', sp + 1);
+        String site = sp2 < 0 ? s.substring(sp + 1) : s.substring(sp + 1, sp2);
+        // keep the last two dot segments (Class.method)
+        int dot = site.lastIndexOf('.');
+        if (dot <= 0) {
+            return;
+        }
+        int cls = site.lastIndexOf('.', dot - 1);
+        String key = cls < 0 ? site : site.substring(cls + 1);
+        GLV.merge(key, 1, Integer::sum);
+        GLV_N++;
     }
 
     /** The shared frame capture (the stack shape is identical for both
@@ -1267,19 +1315,29 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         // L85: the SHARED_RANDOM twin — the SRC count + the SRF frames.
         // Printed BEFORE the LR block so an LR failure never eats it.
         if (SR_WRAP != null) {
-            getLogger().info("SRC t=" + tickNo + " calls=" + SR_CALLS);
+            getLogger().info("SRC t=" + tickNo + " calls=" + SR_CALLS + " sc=" + SC_TAG);
             if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
+                if (GLV_N > 0) {
+                    StringBuilder sb = new StringBuilder(256).append("GLV t=").append(tickNo)
+                            .append(" sc=").append(SC_TAG).append(" n=").append(GLV_N);
+                    for (java.util.Map.Entry<String, Integer> e : GLV.entrySet()) {
+                        sb.append(' ').append(e.getKey()).append('=').append(e.getValue());
+                    }
+                    getLogger().info(sb.toString());
+                }
                 int k = 0;
                 for (char[] f : SR_FRAMES) {
                     getLogger().info("SRF t=" + tickNo + " k=" + (k++) + ' '
                             + lrfFramesReversed(f));
                 }
             }
+            GLV.clear();
+            GLV_N = 0;
             SR_CALLS = 0;
             SR_FRAMES.clear();
         }
         if (LR_WRAP == null) return;
-        getLogger().info("LRC t=" + tickNo + " calls=" + LR_CALLS);
+        getLogger().info("LRC t=" + tickNo + " calls=" + LR_CALLS + " sc=" + SC_TAG);
         if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
             StringBuilder sb = new StringBuilder(128)
                     .append("LRF t=").append(tickNo).append(" n=").append(LR_FRAMES.size());
@@ -1379,7 +1437,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             }
             if (SR_SEED != null && SR_OBJ != null) {
                 long s = (long) SR_SEED.invokeExact(SR_OBJ);
-                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s));
+                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s) + " sc=" + SC_TAG);
             }
             if (LR_OBJ == null) {
                 // the field belongs to the NMS Level — CraftWorld is the
@@ -1418,7 +1476,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             }
             if (LR_XLO != null && LR_OBJ != null) {
                 long a = (long) LR_XLO.invokeExact(LR_OBJ);
-                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a));
+                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a) + " sc=" + SC_TAG);
             }
         } catch (Throwable t) {
             // log ONCE then disable — but through INFO with the PH prefix so
