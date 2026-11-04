@@ -6,31 +6,31 @@ Server: `26.3-241-5050b0f (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 59941 / stands 20059 / zombies 20000) (merge shrink: 97384 -> 97384) |
+| entities spawned | 100000 (items 59941 / stands 20059 / zombies 20000) (merge shrink: 97416 -> 97416) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 287.631 / 391.305 / 499.406 / 628.466 |
-| MSPT mean, ms | 298.486 |
-| TPS estimate (1000/p50) | 3.5 |
-| heap used / max, MB | 2127.1 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 462.217 / 613.378 / 759.903 / 1079.996 |
+| MSPT mean, ms | 484.179 |
+| TPS estimate (1000/p50) | 2.2 |
+| heap used / max, MB | 2278.9 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 10.12% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3099` |
-| 2 | 4.33% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
-| 3 | 3.70% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 4 | 2.74% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 10100` |
-| 5 | 2.59% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3137` |
-| 6 | 2.21% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2669` |
-| 7 | 2.16% | `dev.planeta9091.centities.CeHooks.setTicksFrozen$(Entity, int) line: 10723` |
-| 8 | 1.89% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 9 | 1.84% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 6742` |
-| 10 | 1.83% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
-| 11 | 1.60% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 12 | 1.30% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getInstance(Holder) line: 46` |
-| 13 | 1.18% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 14 | 1.14% | `dev.planeta9091.centities.CeHooks.lambda$ordSortVanilla$0(Entity, Entity) line: 2400` |
-| 15 | 1.00% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 1 | 7.88% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
+| 2 | 5.27% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3100` |
+| 3 | 4.53% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2670` |
+| 4 | 3.35% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3138` |
+| 5 | 2.49% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 10175` |
+| 6 | 1.93% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 7 | 1.77% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 8 | 1.68% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 6784` |
+| 9 | 1.49% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3112` |
+| 10 | 1.40% | `dev.planeta9091.centities.CeHooks.setTicksFrozen$(Entity, int) line: 10811` |
+| 11 | 1.21% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3083` |
+| 12 | 1.18% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.getAtIndexAcquire(ConcurrentChainedLong2ReferenceHashTable$TableEntry[], int) line: 187` |
+| 13 | 1.18% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
+| 14 | 0.99% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
+| 15 | 0.94% | `dev.planeta9091.centities.CeHooks.lambda$ordSortVanilla$0(Entity, Entity) line: 2401` |
 
