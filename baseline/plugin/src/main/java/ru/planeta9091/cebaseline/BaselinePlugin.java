@@ -87,6 +87,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private long paritySeed = 4242L;
     private int parityFillStartTick = 100; // fixed-tick fill window start
     private long fillDoneTick = -1;
+    private long fillAnchorTick = -1; // L94: the absolute tick the fill's first batch spawns at
     private Object sharedRandom;           // net.minecraft...Entity.SHARED_RANDOM
     private boolean sharedRandomTried;
     private static final int[] PARITY_SNAP_OFFSETS = {50, 300};
@@ -365,12 +366,28 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
 
         phase = "FILL";
+        // L94: the fill phase is pinned in ABSOLUTE plugin ticks. The old
+        // registration relied on the scheduler's RELATIVE 40-tick delay,
+        // whose first-fire tick depends on WHERE within the boot the
+        // begin() poll task happened to cross its tickNo threshold - a
+        // +-1 REAL-tick race between the A/B legs (observed locally: the
+        // OFF leg's first spawn batch at tickNo 141, the ON leg's at 140;
+        // reproduced across two boots of the same seed). The shifted fill
+        // phase shifts every mob's tickCount at the same game tick, the
+        // (tickCount+id) cadence gate flips, the AI'd sets diverge by one
+        // tick, the shared-RNG consumer order splits at the first goal
+        // start, and the whole A/B reads as an engine divergence. The
+        // fillStep now polls the absolute anchor instead.
+        fillAnchorTick = tickNo + 40L;
         Bukkit.getScheduler().runTaskTimer(this, this::fillStep, 40L, 1L);
     }
 
     private void fillStep() {
         World w = Bukkit.getWorlds().get(0);
         if (tickNo < 1) return;
+        // L94: the absolute fill-phase pin - the spawns wait for the SAME
+        // plugin tick in both legs regardless of the scheduler phase.
+        if (tickNo < fillAnchorTick) return;
 
         // --- entities ---
         if (spawnedItems + spawnedStands + spawnedZombies < scale) {
