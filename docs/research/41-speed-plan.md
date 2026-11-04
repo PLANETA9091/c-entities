@@ -1379,3 +1379,71 @@ the tick was already serving the wrong mob set.
 `br=<even-ai>/<odd-java>/<odd-rust>` (per-tick, window-gated, two
 integer adds per mob). The even counter IS the engine's AI'd set — the
 next hunt run names the divergence side directly.
+
+## L91 (008275e): the br counters CONFIRM the one-tick-early verdict — and the tc-phase instruments aim at the mechanism
+
+The ab9b8f2 hunt (41795650141, the shipped knobs + mob_ai=1,
+TRACE_ID=15, PH_DUMP=141-150) failed the parity gate with the SAME
+families as before — mobs 2 only-off/14 type swaps, mixed 883/915/
+2289, spread 99/101/4573, items bit-exact — and its L90b br lines +
+GLV censuses settle the L90 question with independent instruments:
+
+- OFF canUse census (vanilla truth, NAT.canUse/4): AI'd(t) =
+  13,19,27,31,41,43 at t=141..146 (baseTick 26,39,52,65,78,91 — the
+  fill runs 13/tick from t=140).
+- ON br even: 13,19,27,31,41,43,55 at t=140..146 = vanilla(t+1).
+  **The engine's AI'd set runs one tick early, now measured by the
+  Java-side guard counters themselves.**
+- mobs PD hashes: bit-identical through t=150 — the AI'd-set shift is
+  STATE-invisible until the first stroll start moves a zombie (SR
+  splits at t=145 exactly, the L89/L90 verdict reproduced).
+- mixed: SR+LR split at t=146; the first PD diff at t=147 hits the
+  t=147 spawn batch (ids 451+, 55 of 525) — the spawn stream itself
+  diverged mid-fill. spread: SR t=145, LR t=143 (!).
+
+The cadence model that fits BOTH sequences (simulation over
+s0/first-offset/gate-shift variants): vanilla gate reads tc_pre at the
+mob's first ticker tick s+1; the engine effectively reads tc_post and
+reaches the fresh batch one tick earlier — EITHER a +1 tickCount
+phase, OR the fresh batch entering the engine's sweep at the spawn
+tick, OR both. The three instruments shipped here discriminate them
+in ONE run:
+
+1. **PH_TC** — Entity.tickCount joins the per-entity PD avalanche at
+   dump ticks (rotate 83): the first tick where the legs' tc phases
+   split lights up in the (id -> m) diff with no post-processing.
+2. **TC line** — `TC t= sc= n= tc0= tc1= tcmin= tcmax=` per dump tick
+   in BOTH legs (same plugin): the tc0/tc1 cohorts name the fresh
+   batch's first AI tick (spawn tick vs s+1) per leg directly.
+3. **GL gr=** — the guard-reach census (entries / tc<=1 entries) on
+   the ON leg, comparable with the OFF canUse census.
+
+Also fixed en route: the sandbox was recycled between sessions (cargo
+and JDK 25 gone; Temurin 25 must be re-provisioned before any local
+module build), and the stale parity-order WIP in the working tree was
+a superseded duplicate of the landed doc-36b feature — discarded via
+reset to origin/main.
+
+## L92 (beeb480): the tracker-quiet epoch — the items TTL cluster's structural fix
+
+items-100k-mod JFR (5057 samples): the ttlCachedPath cluster is
+**15.6%** of the 28.6ms p50 (11.86 the identity/prologue line + 2.10
++ 0.95 + 0.73 across the SIT/syncVelocity reads) — the probe chain
+re-proves per-entity quietness ~100k times per tick for a verdict the
+item-tick applier already computed THIS tick.
+
+The design (Java-only): the applier stamps a TT_QUIET bitset for
+IF_NATIVE TAIL_NONE entries (the fill's TT_OK verdict still pinned, no
+SIT handler, !syncVelocity, the L70 mirror owning the counter) and
+performs the ServerEntity.tickCount mirror bump INLINE; the tracker
+pass skips the stamped slots (quietArm = cacheArm && TT_MIRROR read
+after the reconcile). Cleared at every flush entry — a slot without
+this tick's stamp is conservatively full-path; non-owned entities
+never get stamps; -Dcentities.ttlQuiet=false disarms.
+
+Byte-exactness ledger for the skipped work: syncVelocity consume
+(false — checked), SIT bookkeeping (excluded — checked),
+updateDataBeforeSync (javap: an EMPTY stub in 26.3 — the call IS the
+whole effect), the tickCount bump (the same +=1 the applier performed).
+The parity legs run playerless (cacheArm armed), so the gate exercises
+the path end-to-end.
