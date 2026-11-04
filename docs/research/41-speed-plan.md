@@ -1447,3 +1447,49 @@ updateDataBeforeSync (javap: an EMPTY stub in 26.3 — the call IS the
 whole effect), the tickCount bump (the same +=1 the applier performed).
 The parity legs run playerless (cacheArm armed), so the gate exercises
 the path end-to-end.
+
+## L94 (9fdda23): THE +-1-TICK FILL-START RACE - the parity harness itself was the divergence
+
+The tc-phase instruments (L91) + a LOCAL A/B (the sandbox can boot both
+legs now: JDK 25 + the mapped jar + the CRUSSTY runtime, ~2 min/leg)
+settled what three CI hunts could not:
+
+**The legs' fill phases were never tick-aligned.** begin() registered
+fillStep with the scheduler's RELATIVE 40-tick delay; its first-fire
+tick depends on where within the boot the begin() poll crossed its
+tickNo threshold. Two local boots of the SAME seed put the first spawn
+batch at tickNo 141 (OFF) and 140 (ON).
+
+Every L90 signature follows mechanically:
+- The shared-RNG re-seed pins the stream to the FILL COUNT, not the
+  absolute tick, so the SR end-states stay locked through the fill
+  while the entities' tickCount phases differ by one REAL tick.
+- The (tickCount+id) cadence gate then classifies the same game tick
+  differently: OFF census(141)=13 with ONE batch (its fill at 141) vs
+  ON br even(141)=19 with TWO batches (its fill at 140) - BOTH are the
+  vanilla model applied to their own fill phase. The "engine-set(t) ==
+  vanilla-set(t+1)" verdict compared the legs' models across a one-tick
+  fill offset; the ENGINE'S OWN SET WAS EXACT ALL ALONG (the local A/B
+  with the fill pinned: the engine's br even = the OFF census
+  tick-for-tick, 3=3, 4=4, 5=5, 6=6, 7=7, 8=8).
+- The PD hashes stayed identical (positions don't move until a goal
+  starts) while the SR split at the first goal start (t=145 in the CI
+  hunts' 13/tick fill = the first stroll-start cohort).
+
+The fix: fillAnchorTick = tickNo at begin() + 40; fillStep polls the
+absolute anchor. Local A/B after the fix: the SR end-states match
+tick-by-tick through t=154; the first REAL divergence is t=155, a
+single +1 entity-RNG draw (the LCG state diff solved from the SR
+end-states: off 194 vs on 195 advances), which surfaces at t=162 as
+entity 30's yaw/vx (the engine started a lookaround vanilla did not,
+on the shifted stream). That residual is the mob-AI engine's own bug,
+now bisectable in minutes locally instead of CI round-trips.
+
+Also shipped en route:
+- L92: the tracker-quiet epoch (the applier stamps TAIL_NONE items,
+  the tracker pass skips them) - the shipped-config parity gate went
+  GREEN on 655b4be with it live.
+- L93: the native-funnel findTarget (javap facts: findTarget =
+  getEntitiesOfClass(type, inflate(fd,fd,fd), TRUE) + getNearestEntity
+  (first strict-min over test()); the module index answers the class
+  scan in bit-identical vanilla order).
