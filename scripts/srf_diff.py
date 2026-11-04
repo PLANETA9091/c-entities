@@ -22,13 +22,39 @@ import sys
 from collections import Counter
 
 LEG_RE = re.compile(r"=== parity leg parity-(\w+)-(off|on) \(module=")
-SRC_RE = re.compile(r"SRC t=(\d+) calls=(\d+)")
-SR_RE = re.compile(r"SR t=(\d+) s=([0-9a-f]+)")
+SRC_RE = re.compile(r"SRC t=(\d+) calls=(\d+)(?: sc=(\S+))?")
+SR_RE = re.compile(r"SR t=(\d+) s=([0-9a-f]+)(?: sc=(\S+))?")
 SRF_RE = re.compile(r"SRF t=(\d+) k=(\d+) (.*)$")
-LRC_RE = re.compile(r"LRC t=(\d+) calls=(\d+)")
+LRC_RE = re.compile(r"LRC t=(\d+) calls=(\d+)(?: sc=(\S+))?")
 LRF_RE = re.compile(r"LRF t=(\d+) k=(\d+) n=(\d+)")
 LRFF_RE = re.compile(r"LRF t=(\d+) k=(\d+) (.*)$")
 PH_RE = re.compile(r"PH t=(\d+) ct=(-?\d+) h=([0-9a-f]+) n=(\d+) adds=(-?\d+)")
+# L90: the engine's gate ledger (ON leg only — the module prints it):
+# GL t=<tick> sc=<tag> <kind>=evals/no/staged/rolls ...
+GL_RE = re.compile(r"GL t=(\d+) sc=(\S+)((?: \d+=\d+/\d+/\d+/\d+)+)")
+# L90: the vanilla-side per-callsite census (BOTH legs, cap-free):
+# GLV t=<tick> sc=<tag> n=<total> <Class.method>=<n> ...
+GLV_RE = re.compile(r"GLV t=(\d+) sc=(\S+) n=(\d+)((?: [^ ]+))")
+GLV_SITE_RE = re.compile(r"([A-Za-z0-9_$]+\.[A-Za-z0-9_$]+)=(\d+)")
+GL_KIND_RE = re.compile(r"(\d+)=(\d+)/(\d+)/(\d+)/(\d+)")
+
+
+def line_tag(line, cur):
+    """L90: attribute the line by its trailing sc= tag when present — the
+    8 interleaved consoles share one job log and the LAST marker no
+    longer decides. Falls back to the current leg marker."""
+    i = line.rfind(" sc=")
+    if i >= 0:
+        tag = line[i + 4:].split()[0]
+        m = LEG_RE.match(tag, 0)
+        # tags look like parity-mobs-on — same shape as the leg key
+        if tag in LEGS_KNOWN or m:
+            return tag
+        return tag
+    return cur
+
+
+LEGS_KNOWN = set()
 
 
 def parse(path):
@@ -40,12 +66,17 @@ def parse(path):
             m = LEG_RE.search(line)
             if m:
                 cur = m.group(1) + "-" + m.group(2)
+                LEGS_KNOWN.add(cur)
                 legs.setdefault(cur, {"SRC": {}, "SR": {}, "SRF": {},
-                                      "LRC": {}, "PH": {}, "LRF": {}})
+                                      "LRC": {}, "PH": {}, "LRF": {},
+                                      "GL": {}, "GLV": {}})
                 continue
             if cur is None:
                 continue
-            d = legs[cur]
+            tag = line_tag(line, cur)
+            d = legs.setdefault(tag, {"SRC": {}, "SR": {}, "SRF": {},
+                                      "LRC": {}, "PH": {}, "LRF": {},
+                                      "GL": {}, "GLV": {}})
             m = SRC_RE.search(line)
             if m:
                 d["SRC"][int(m.group(1))] = int(m.group(2))
@@ -57,6 +88,20 @@ def parse(path):
             m = SR_RE.search(line)
             if m:
                 d["SR"][int(m.group(1))] = m.group(2)
+                continue
+            m = GL_RE.search(line)
+            if m:
+                tick = int(m.group(1))
+                kinds = d["GL"].setdefault(tick, {})
+                for km in GL_KIND_RE.finditer(m.group(3)):
+                    kinds[int(km.group(1))] = tuple(int(km.group(i)) for i in range(2, 6))
+                continue
+            m = GLV_RE.search(line)
+            if m:
+                tick = int(m.group(1))
+                sites = d["GLV"].setdefault(tick, Counter())
+                for sm in GLV_SITE_RE.finditer(m.group(4)):
+                    sites[sm.group(1)] += int(sm.group(2))
                 continue
             m = LRC_RE.search(line)
             if m:
@@ -129,6 +174,26 @@ def main():
             print(f"  SRF at t={t}: no frames recorded "
                   f"(off={len(off['SRF'].get(t, []))} "
                   f"on={len(on['SRF'].get(t, []))})")
+        # L90: the census diff — the OFF leg's GLV is the vanilla truth;
+        # the ON leg's GLV shows only the Java-visible draws (the engine
+        # serves Rust-side) and its GL ledger carries the Rust rolls.
+        for td in sorted(set(off["GLV"]) | set(on["GLV"])):
+            fo2 = off["GLV"].get(td, Counter())
+            fn2 = on["GLV"].get(td, Counter())
+            if fo2 == fn2:
+                continue
+            keys = sorted(set(fo2) | set(fn2))
+            print(f"  GLV diff at t={td} (vanilla-census off vs java-visible on):")
+            for k2 in keys:
+                a, b = fo2.get(k2, 0), fn2.get(k2, 0)
+                if a != b:
+                    print(f"    {k2}: off={a} on={b}")
+        for td in sorted(on["GL"]):
+            kinds = on["GL"][td]
+            if kinds:
+                s2 = " ".join(f"k{k}=e{v[0]}/n{v[1]}/st{v[2]}/r{v[3]}"
+                              for k, v in sorted(kinds.items()))
+                print(f"  GL(on) t={td}: {s2}")
 
 
 if __name__ == "__main__":
