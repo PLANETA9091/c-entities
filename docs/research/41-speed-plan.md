@@ -1306,3 +1306,76 @@ interval roll draws nextInt ONLY when randomInterval > 0; findTarget for
 non-Player types goes through level.getEntitiesOfClass (the L86 funnel).
 The Player goal at pcount==0 consumes exactly 1 roll (interval) + 0
 (getNearestPlayer over an empty players() list).
+
+## L90 (this commit): the GLV census + the sc= tags — the OFF side of the t=145 split is finally countable, and the canUse-eval SET is one tick early
+
+Two instrument defects blocked the L89 read: the SRF frames cap at 512
+entries (the fill's spawn noise — 2572 frames at mobs t=145 — left only
+a biased prefix of the AI frames, so the vanilla-side per-gate census
+was arithmetic noise) and the 8 interleaved consoles shared one job log
+with no per-scenario marker (the three 43/18/33-scale GL t=145 lines
+were unattributable). The fix: the GLV census — a per-CALLSITE draw
+counter keyed by token[1] of the stored frame (RandomStrollGoal.canUse,
+RandomPos.generateRandomDirection, ...), cap-free, printed BOTH legs as
+`GLV t=<tick> sc=<RUN_NAME> n=<total> <Class.method>=<n> ...` — and the
+`sc=` suffix on every streamed census/state line (SRC/SR/LRC/LR/GLV/GL).
+
+**The GLV totals are EXACT**: the per-site sums equal the SRC calls=
+totals on every tick (mobs OFF t=145: 285 canUse + 31 posgen + 221
+spawn/baseTick = 537 ✓).
+
+**The corrected fact sheet (javap 26.3, the doc-41 L89 sheet was
+WRONG)**: `NearestAttackableTargetGoal`'s 3-arg ctor passes
+`bipush 10` — DEFAULT_RANDOM_INTERVAL = 10. The zombie's FOUR NAT goals
+are Player(10, prio2), AbstractVillager(10, prio3, behind the
+zombieAggressiveTowardsVillager spigot flag), IronGolem(10, prio3),
+Turtle(10, prio5) — EVERY goal rolls every eval; the engine's GL
+k8=172/172 for 43 mobs (4 per mob) is CORRECT. The vanilla target
+census = 4 × AI'd-mobs − (4 × mobs whose whole selector skipped).
+
+**The AI-cadence reference set** (javap Mob.serverAiStep bc 75-148:
+`sum = tickCount + getId(); if (sum % 2 != 0 && tickCount > 1) {
+tickRunningGoals(false) ×2 } else { tick() ×2 }`; tickCount is
+POST-increment at serverAiStep — LivingEntity.tick bc 1 runs
+Entity.tick (baseTick, tickCount++) before bc 178 aiStep):
+
+    AI'd(t) = { mob : tickCount<=1 or (tickCount+id) even }
+
+With the fill spawning 13 zombies/tick from t=141 (ids 1..13, 14..26,
+...), the model reproduces the OFF census EXACTLY: t=142 → 19 (b1 tc=2
+even-ids 6 + b2 tc=1 all 13), t=143 → 26, t=144 → 31, t=146 → 43.
+
+**THE ENGINE'S SET RUNS ONE TICK EARLY** (mobs, GL k4/k5/k6 evals vs
+the model):
+
+| t | population | vanilla AI'd | engine evals |
+|---:|---:|---:|---:|
+| 141 | 13 | 13 | 13 |
+| 142 | 26 | 19 | 27 |
+| 143 | 39 | 26 | 31 |
+| 144 | 52 | 31 | 41 |
+| 145 | 65 | 41 | 43 |
+| 146 | 78 | 43 | 55 |
+| 147 | 91 | 55 | 55 |
+
+engine-set(t) == vanilla-set(t+1) for five consecutive ticks. The
+shifted set re-rolls gates vanilla did not eval that tick (the
+stream's CONSUMER ORDER differs), and at t=145 it flipped the verdicts:
+vanilla ran the steady-state single-stroll-start search loop (31 posgen
+draws — RandomPos.generateRandomDirection 30 + getPosition 1, ONE new
+start per tick, each start's navigation instantly done so the goal
+stops and re-evals next tick); the engine staged ONE stroll and ran
+ZERO posgen draws — the −31 (+2 engine-only lookaround-start) visible
+delta the L89 f-solve read as m=−27.
+
+The t=143 burnUndead census (off=5 on=4) is the same story one tick
+earlier: the shifted set drew the burn group one draw short and one
+gate roll long — the SR LCG END-STATE stayed equal (the state after N
+advances is unique — the totals matched even while the consumer order
+did not), which is why the SR probe stayed green through t=144 while
+the tick was already serving the wrong mob set.
+
+**L90b (this commit): the branch counters** — the GL line prints
+`br=<even-ai>/<odd-java>/<odd-rust>` (per-tick, window-gated, two
+integer adds per mob). The even counter IS the engine's AI'd set — the
+next hunt run names the divergence side directly.
