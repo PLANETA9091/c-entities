@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(st, ST_DONE);
 
         // reference: advance the LCG with the exact pull sequence
-        let mut r = Lcg { value: seed0 };
+        let mut r = Lcg { value: seed0, draws: 0 };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1508,7 +1508,7 @@ mod tests {
         // loop skips running goals), which is exactly why the old even-path
         // force-tick was a serving-order bug: it both ticked the body AND
         // let the tick's effects change what the update phase would draw.
-        let mut r = Lcg { value: seed0 };
+        let mut r = Lcg { value: seed0, draws: 0 };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1550,7 +1550,7 @@ mod tests {
         // seed whose 4th pull (after the 3 nearest gates) yields 0
         let mut seed = 1u64;
         loop {
-            let mut r = Lcg { value: seed };
+            let mut r = Lcg { value: seed, draws: 0 };
             for _ in 0..3 {
                 r.next_int_bound(10);
             }
@@ -1593,7 +1593,7 @@ mod tests {
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_DONE);
         // reference: 3 nearest gates + lookat + lookaround (NO stroll pull)
-        let mut r = Lcg { value: seed0 };
+        let mut r = Lcg { value: seed0, draws: 0 };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1617,6 +1617,7 @@ mod tests {
         // java.util.Random(42) reference: nextInt(60), nextFloat(), nextDouble()
         // computed with the same recurrence (value starts at seed ^ MUL & MASK)
         let mut r = Lcg {
+            draws: 0,
             value: (42u64 ^ 25214903917) & 0xFFFF_FFFF_FFFF,
         };
         let a = r.next_int_bound(60);
