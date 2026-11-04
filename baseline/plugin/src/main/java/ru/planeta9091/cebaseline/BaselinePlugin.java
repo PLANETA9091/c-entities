@@ -789,7 +789,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // signatures (no boxing), ~8 invokes + 7 multiplies per entity.
     // ------------------------------------------------------------------
     private static volatile java.lang.invoke.MethodHandle PH_GET_HANDLE,
-            PH_X, PH_Y, PH_Z, PH_DM, PH_VX, PH_VY, PH_VZ;
+            PH_X, PH_Y, PH_Z, PH_DM, PH_VX, PH_VY, PH_VZ, PH_TC;
+    // L91: Entity.tickCount getter — the PD avalanche CANNOT see a counter
+    // phase shift (a mob ticked one extra time at spawn / a gate reading the
+    // post-increment field leaves x/y/z/v identical on that tick). Mixing
+    // tickCount into the per-entity hash makes the FIRST tick where the
+    // legs' tc phases split light up in the PD diff directly; the TC line
+    // (below) aggregates the distribution so the reach difference (the
+    // fresh batch's first AI tick: spawn tick vs s+1) is readable per tick
+    // without any post-processing.
     private long phMaxId;
     private long phLines;
     private long phFails;
@@ -876,6 +884,10 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
             PH_VZ = lk.findGetter(vec3, "z", double.class)
                     .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            // L91: tickCount is a PUBLIC int field on the NMS Entity (the
+            // module reads it directly) — a plain findGetter bind.
+            PH_TC = lk.findGetter(nms, "tickCount", int.class)
+                    .asType(java.lang.invoke.MethodType.methodType(int.class, Object.class));
         } catch (Throwable t) {
             getLogger().warning("PH bind failed (n/adds only): " + t);
         }
@@ -912,6 +924,8 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             boolean dump = phDumpActive();
             StringBuilder dsb = dump ? new StringBuilder(1024) : null;
             int dcnt = 0;
+            // L91 TC-line accumulators (dump ticks only)
+            int tcn = 0, tcZero = 0, tcOne = 0, tcMin = 0, tcMax = -1;
             for (int i = 0; i < n; i++) {
                 Entity be = ents.get(i);
                 int id = be.getEntityId();
@@ -962,6 +976,19 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                         // count is the merge arithmetic's whole state.
                         m ^= Long.rotateLeft(phMix(ie2.getItemStack().getAmount()), 79);
                     }
+                    if (dump && PH_TC != null) {
+                        // L91: the counter phase rides the avalanche at dump
+                        // ticks — both legs run the same plugin, so the hash
+                        // stays comparable and the first tc split names its
+                        // tick + entity set with no new tooling.
+                        int tc = (int) PH_TC.invokeExact(e);
+                        m ^= Long.rotateLeft(phMix(tc & 0xFFFF_FFFFL), 83);
+                        tcn++;
+                        if (tc <= 0) tcZero++;
+                        if (tc == 1) tcOne++;
+                        if (tcn == 1 || tc < tcMin) tcMin = tc;
+                        if (tcn == 1 || tc > tcMax) tcMax = tc;
+                    }
                     h += phMix(m);
                 }
                 if (dump) {
@@ -977,6 +1004,15 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             }
             if (dump && dcnt > 0) {
                 getLogger().info("PD t=" + tickNo + " " + dsb.toString().trim());
+            }
+            if (dump && tcn > 0) {
+                // L91: the tickCount phase census — the OFF-vs-ON diff of the
+                // distribution per tick names the reach/phase difference
+                // directly: tc0 = entities still at tc<=0 (never baseTicked),
+                // tc1 = the first-tick cohort, min/max bracket the spread.
+                getLogger().info("TC t=" + tickNo + " sc=" + runName
+                        + " n=" + tcn + " tc0=" + tcZero + " tc1=" + tcOne
+                        + " tcmin=" + tcMin + " tcmax=" + tcMax);
             }
             phMaxId = maxId;
             phLines++;

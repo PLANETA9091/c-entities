@@ -8203,6 +8203,14 @@ public final class CeHooks {
     // engine's set running ONE TICK EARLY (engine-set(t) ==
     // vanilla-set(t+1), five consecutive ticks).
     public static long floorEven = 0, floorOddJava = 0, floorOddRust = 0;
+    // L91: the guard-reach census — grEntries counts EVERY mobAiFloor entry
+    // that passed the ACTIVE gate (= the ON leg's serverAiStep call sites);
+    // grFresh counts the entries with tickCount <= 1 (the fresh batch). The
+    // GL line prints gr=<entries>/<fresh>: the vanilla cadence model plus
+    // the OFF leg's canUse census then name the reach difference (the
+    // engine's fresh batch reaching the AI one tick early is the L90
+    // one-tick-early verdict's remaining candidate mechanism).
+    public static long grEntries = 0, grFresh = 0;
     /** Diagnostics: reason (FB_*) + round + request op of the FIRST fallback
      *  this boot; the one-shot log line makes a classified-mob fallback
      *  diagnosable from the CI log alone (behavior itself stays exact — the
@@ -8998,6 +9006,10 @@ public final class CeHooks {
         if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK || VH_GS_DISABLED == null) {
             return false;
         }
+        // L91: guard-reach census — every entry that passed the kill-switch
+        // gate (a real serverAiStep call site on the ON leg)
+        grEntries++;
+        if (mob.tickCount <= 1) grFresh++;
         boolean stepped = false;
         try {
             AiCtx ctx = aiClassify(mob);
@@ -9453,9 +9465,14 @@ public final class CeHooks {
                 .append(" sc=").append(System.getenv("RUN_NAME"));
         sb.append(" br=").append(floorEven).append('/').append(floorOddJava)
                 .append('/').append(floorOddRust);
+        boolean guardData = grEntries != 0 || floorEven != 0
+                || floorOddJava != 0 || floorOddRust != 0;
+        sb.append(" gr=").append(grEntries).append('/').append(grFresh);
         floorEven = 0;
         floorOddJava = 0;
         floorOddRust = 0;
+        grEntries = 0;
+        grFresh = 0;
         for (int k = 0; k < 9; k++) {
             int e = l[k * 4], n = l[k * 4 + 1], s = l[k * 4 + 2], r = l[k * 4 + 3];
             if ((e | n | s | r) != 0) {
@@ -9464,7 +9481,7 @@ public final class CeHooks {
                         .append(n).append('/').append(s).append('/').append(r);
             }
         }
-        if (any) {
+        if (any || guardData) {
             System.out.println(sb.toString());
         }
     }
