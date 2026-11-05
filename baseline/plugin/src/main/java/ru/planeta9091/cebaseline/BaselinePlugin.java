@@ -1190,7 +1190,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
 
     private static void recLrDraw() {
         LR_CALLS++;
-        if (LR_FRAMES.size() < 512) {
+        if (LR_FRAMES.size() < 4096) {
             LR_FRAMES.add(drawFrames());
         }
     }
@@ -1199,7 +1199,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
      *  into its own buffers so the SRC/SRF lines diff independently. */
     private static void recSrDraw() {
         SR_CALLS++;
-        if (SR_FRAMES.size() < 512) {
+        if (SR_FRAMES.size() < 4096) {
             char[] f = drawFrames();
             SR_FRAMES.add(f);
             glvClassify(f);

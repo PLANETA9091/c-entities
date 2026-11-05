@@ -9194,9 +9194,11 @@ public final class CeHooks {
             // diverge at mobs t=143/145 with the engine armed; the PH hash
             // covers only x/y/z+v so the state was still "identical")
             if (AITR) {
+                boolean oddB = ((mob.tickCount + entId(mob)) & 1) != 0 && mob.tickCount > 1;
                 System.out.println("[ce-baseline] AITR t=" + CUR_TICK
                         + " id=" + entId(mob) + " r=" + round
                         + " op=" + req + " gi=" + gi + " cur=" + cursor
+                        + " tc=" + mob.tickCount + " odd=" + (oddB ? 1 : 0)
                         + " seed=" + Long.toHexString(seed));
             }
             res = 1;
@@ -9242,7 +9244,20 @@ public final class CeHooks {
                         U.putDouble(g, O_STROLL_WZ, v.z);
                         U.putByte(g, O_STROLL_FORCE, (byte) 0);
                         rx = v.x; ry = v.y; rz = v.z;
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRPOS t=" + CUR_TICK
+                                    + " id=" + entId(mob)
+                                    + " v=" + v
+                                    + " cls=" + wg.getGoal().getClass().getSimpleName()
+                                    + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
+                        }
                     } else {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRPOS t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " v=NULL"
+                                    + " cls=" + wg.getGoal().getClass().getSimpleName()
+                                    + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
+                        }
                         res = 0;
                     }
                     break;
@@ -9396,6 +9411,14 @@ public final class CeHooks {
                     mobAiFallbackMob = mob.getClass().getName();
                     logFirstFallback();
                     return ST_FALLBACK;
+            }
+            if (AITR) {
+                System.out.println("[ce-baseline] AITR t=" + CUR_TICK
+                        + " id=" + entId(mob) + " r=" + round
+                        + " op=" + req + " RES=" + res
+                        + " pos=" + Double.toHexString(rx) + ","
+                        + Double.toHexString(ry) + "," + Double.toHexString(rz)
+                        + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
             }
         }
         mobAiFallbackWhy = FB_JAVA_ROUND_CAP;

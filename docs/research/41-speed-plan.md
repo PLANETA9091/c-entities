@@ -1616,3 +1616,53 @@ the per-tick field trace names the exact diverging FIELD of the seed pair
 says tc: the cadence classification of the 50/tick CI fill cohort (spawn
 tick 143 → first even 145) has a one-tick serving skew in the engine's
 packer; if x/v: a drawless movement divergence — chase the nav mirroring.
+
+## L97.1 (session 19:00-20:10Z): THE t=157 SPLIT DECOMPOSED TO +8 TARGET ROLLS — 2 mobs the vanilla skipped and the engine evaluated
+
+The FULL local repro (byte-exact: SR t=159 off=4db7f953bdae on=34322a937683 —
+the CI hashes) made this a minutes-per-iteration loop:
+
+- PD first split: **t=157, ids 107 and 139 ONLY** (x/vx/yaw differ; tc, y, z
+  identical). Vanilla mob 107 MOVES from t=157 (stroll start), the engine
+  stands; the SR end-state stays identical through t=158 (per-mob roll
+  redistribution is invisible to the tick-end hash; the advance-parity
+  breaks at t=159).
+- SRF flows at t=157 (plugin frame cap raised 512→4096): cleaned flows
+  (gate-draw frames removed from BOTH) are IDENTICAL through cleaned-310:
+  there vanilla calls `getPosition → nextFloat` (the stroll posgen of a
+  start) where the engine goes straight to the next mob's sunburn. So the
+  engine's mob X stroll roll did NOT return 0 while vanilla's did.
+- The roll-count ledger: vanilla even-мobs on t=157 = 119 (119 complete
+  4-roll NearestTarget runs; +1 mob with lookat-but-zero-target = 2 skipped
+  mobs total; lookat 116 = 119-3 running-LOOK skips; stroll 114 = -5
+  running-MOVE skips) — the engine's GL ledger k=8 rolls = 484 = 121×4:
+  **the engine evaluated 2 more mobs than vanilla. Those 2 extra mobs'
+  rolls shifted every subsequent roll position in the tick → the stroll
+  rolls of ~2 later mobs flipped → the observed start-set swap (107 moves
+  in vanilla, stands in the engine).**
+- The vanilla skip is NOT lockedFlags: nobody in the classified set can be
+  RUNNING with FL_TARGET (HurtBy needs lastHurtByMob, Nearest can never
+  start on a null findTarget; javap canUse: the interval roll is ALWAYS
+  drawn when canUse is called — so the 2 mobs' canUse was NEVER CALLED by
+  vanilla's GoalSelector).
+- javap Mob.serverAiStep (26.3, mapped): cadence gate is
+  `sum = tickCount + getId(); sum % 2 != 0 → odd branch` — read from the
+  SAME mob.tickCount the engine's aiPack passes. PTRACE (tick end) shows
+  tc=9 in BOTH legs; the engine classified (9+107) even. Vanilla's skip
+  therefore points at these 2 mobs NOT reaching the even branch inside
+  serverAiStep despite the same end-of-tick tc — the remaining suspects:
+  (a) the Paper `aware` early-return (bc 10-48: !aware → FloatGoal +
+  jumpControl + RETURN — no selectors, no cadence), (b) a passenger /
+  double-tick subtlety, (c) the dispatcher's commonTick++ ordering vs
+  aiStep read.
+- NEXT (the mechanical bisect): (1) javap who writes Mob.aware and when
+  (Paper nerf-spawner paths), (2) a CI dispatch ai_floor=0 (GoalSelector
+  floor only) vs mob_ai=0 — isolates which floor introduces the skip, (3)
+  if aware: the engine's aiClassify must reproduce the !aware early-return
+  BEFORE the cadence gate (and the fill-probe must not differ).
+
+Also shipped here: plugin SRF frame cap 512→4096 (both recLrDraw/recSrDraw)
+— the full-tick flow now fits the artifact; local A/B harness steps are
+recorded in the session (build-plugin.sh + mvn aliyun mirror + run-baseline
+legs MODULE=off/on, SCALE=2500, FILL_TICKS=200 → 13/tick fill, seed 4242 —
+reproduces the CI entity-id stream exactly).
