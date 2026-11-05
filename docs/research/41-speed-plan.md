@@ -1493,3 +1493,55 @@ Also shipped en route:
   getEntitiesOfClass(type, inflate(fd,fd,fd), TRUE) + getNearestEntity
   (first strict-min over test()); the module index answers the class
   scan in bit-identical vanilla order).
+
+## L95 (this session): the FULL-SCALE local A/B — the sets are EXACT, the residual is the update-pass micro-semantics
+
+The sandbox was rebuilt from zero (rustup stable 1.99.1 + Temurin
+25.0.5 + maven-3.9.9 via the aliyun mirror after central 429s + the
+paperclip mapped jar) and ran the L94 local A/B at FULL scale
+(SCALE=2500, fill 13/tick, CE_MOB_AI=1, LRC_WINDOW=144-160,
+LRF_DEPTH=30, both legs clean-room booted, world wiped between runs).
+The first SR split reproduces exactly: **t=145, off=55e72a9954cf,
+on=8fd42ee257f2** — the CI hunts' signature — with LR split at t=147
+and PH at t=151.
+
+**The one-tick-early verdict (L90b) is DEAD — an artifact stack.** The
+GLV census column I first built (target-canUse draws / 4) said
+"engine even(t) == vanilla(t+1) for 8 consecutive ticks" — but the
+census counts DRAWS, not evals: vanilla's flag-conflict skips remove
+evals that do not draw, so the divisor-derived "set" undercounts
+exactly when the skip semantics differ. The javap cadence model
+(cohorts 13/tick from t=140, ids strictly sequential, set(t) =
+{tc<=1} U {(tc+id)%2==0}) gives set(145)=43, set(146)=55, set(147)=55,
+set(148)=68 — and the engine's own GL br counters read
+43/35, 55/36, 55/49, 68/49, 69/61, 80/63, 83/73, 92/77 —
+**tick-for-tick EXACT against the model.** The L94 fill-pin holds; the
+engine's even/odd classification is exact at full scale.
+
+**The real residual (all inside ONE update pass, t=145, 78 live mobs,
+43 even):** the engine's GL gate ledger (1=43/43/0/0 … 8=172/172/0/172)
+against the OFF SRF census names four deltas:
+1. **+8 target-gate evals** (engine 172 = 43x4; vanilla DREW 164): two
+   mobs' target-selector update ran in the engine where vanilla's
+   lockedFlags skipped it — the engine's flag-conflict gate does not
+   reproduce the running-goal TARGET-flag skip.
+2. **+2 stroll evals** (engine 43, vanilla drew 41): same skip family
+   in the goal selector.
+3. **-3 gate-roll values**: the canUse draws the engine served read
+   shifted stream positions (the within-pass serving order is not
+   vanilla's), so the stroll interval rolls flipped: vanilla said YES
+   on mobs where the engine said NO.
+4. **-31 posgen +2 lookaround starts**: the cascade of (3) — vanilla
+   ran 30 RandomPos.generateRandomDirection + 1 WaterAvoiding
+   getPosition starts the engine never did (m = -27 reconciliation:
+   -31 +2 +2 net = the L89 ledger exactly), and 2 lookarounds STARTED
+   in the engine (java-side RandomLookAroundGoal.start=2 in the ON
+   GLV) that vanilla's stroll-start had blocked.
+
+**The fix surface is now one function**: the engine's update pass
+(goals.rs, the canUse eval loop) must reproduce vanilla
+GoalSelector.tick()'s (a) lockedFlags skip before canUse, (b) exact
+eval order across the selector pair, (c) the staged stroll posgen
+serving. The verification loop is FULLY LOCAL now: build (~10 s) +
+two legs (~4 min each) + srlr_first_div.py + the GL/GLV/SRF diff —
+minutes per iteration instead of CI round-trips.
