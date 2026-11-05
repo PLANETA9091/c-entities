@@ -1666,3 +1666,45 @@ Also shipped here: plugin SRF frame cap 512→4096 (both recLrDraw/recSrDraw)
 recorded in the session (build-plugin.sh + mvn aliyun mirror + run-baseline
 legs MODULE=off/on, SCALE=2500, FILL_TICKS=200 → 13/tick fill, seed 4242 —
 reproduces the CI entity-id stream exactly).
+
+## L97.2 (session 20:30-21:15Z): TWO HARD FACTS from the selector-state dump
+
+Plugin PTRACE now streams `targetSelector=[...] goalSelector=[...]` (the
+lockedFlags map + isRunning) for PARITY_TRACE_ID in BOTH legs (L97.2 patch:
+findField walk + callIsRunning helpers). Local A/B (l97h/l97i runs):
+
+1. **ENGINE BUG (must fix): the engine's start path never fills the vanilla
+   lockedFlags map.** aiApply ACT_GOAL_START calls WrappedGoal.start()
+   (sets isRunning + goal.start()) — but vanilla's update loop sets
+   `lockedFlags.put(flag, goal)` BEFORE start() (javap bc 211-265), and the
+   displaced holder's stop() rides the same walk. The engine's displaced
+   stops + starts are correct, but the map stays EMPTY (PTRACE on t=157:
+   goalSelector=[] while vanilla shows MOVE=Stroll=true). Consequences:
+   the vanilla-side cleanup (lockedFlags.removeIf), the
+   canBeReplacedForAllFlags checks of any OTHER code path reading the map,
+   and the A/B legs' observable selector state diverge from the first
+   engine start ever. Fix surface: the engine must emit an explicit
+   ACT_LOCK_PUT (flag→goal map write) or the floor must call a
+   GoalSelector-shaped helper instead of bare wg.start(); the lock table
+   the engine keeps internally is already right.
+
+2. **t=157 resolved further:** vanilla mob 107: goalSelector=[MOVE=Stroll
+   running=true] from t=157 (its stroll start), targetSelector=[] ALWAYS
+   (149-160) — so the earlier "2 vanilla-skipped target mobs" CAN NOT be
+   lockedFlags skips: the vanilla TARGET lock map is empty all along. The
+   engine's RLA start (gi=7, AITRACT START cls=RandomLookAroundGoal) DID
+   run wg.start() — but the engine started the RLA where vanilla started
+   the stroll (different rolls at shifted stream positions — the +8
+   target-roll shift is still the top-level drift). Remaining mystery: why
+   vanilla evaluated only 119 even mobs' target gates while the engine
+   evaluated 121 (tc=9, (tc+id)%2==0 in both legs per PTRACE) — next
+   suspects: Paper's entity-activation-range inactive rotation (no players
+   in the parity world — check the AI-tick cadence the vanilla leg
+   actually serves) and the passenger paths. The activation hypothesis
+   would also explain why the even-count looks like a rotation slice
+   rather than a plain cadence half.
+
+Next session: (1) fix the ACT lock-map write (parity surface), (2) count
+the vanilla leg's REAL even-mob AI-tick set vs the (tc+id) model — if the
+vanilla set is the Paper inactive-rotation slice, the engine's serverAiStep
+floor must gate on the same activation state before the cadence gate.

@@ -9463,7 +9463,18 @@ public final class CeHooks {
             switch (op) {
                 case ACT_GOAL_START: {
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
-                    if (wg == null) return;
+                    if (wg == null) {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " START-NULL gi=" + p0);
+                        }
+                        return;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " START gi=" + p0
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
                     wg.start();
                     break;
                 }

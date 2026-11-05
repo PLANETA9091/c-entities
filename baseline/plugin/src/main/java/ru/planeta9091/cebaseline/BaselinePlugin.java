@@ -1722,6 +1722,46 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             if (traced instanceof org.bukkit.entity.LivingEntity tle) {
                 sb.append(" hp=").append(hex(tle.getHealth()));
             }
+            // L97.2: the selector-state dump for the traced mob — the
+            // vanilla GoalSelector skip that the engine must reproduce
+            // (t=157: 2 mobs the vanilla update pass never called canUse
+            // on) needs the lockedFlags/running snapshot in BOTH legs.
+            try {
+                Object h = PARITY_GET_HANDLE.invoke(traced);
+                for (String selName : new String[]{"targetSelector", "goalSelector"}) {
+                    java.lang.reflect.Field sf = h.getClass().getSuperclass() != null
+                            ? findField(h.getClass(), selName) : null;
+                    Object sel = sf != null ? sf.get(h) : null;
+                    if (sel == null) continue;
+                    java.lang.reflect.Field lf = findField(sel.getClass(), "lockedFlags");
+                    Object locks = lf != null ? lf.get(sel) : null;
+                    StringBuilder lb = new StringBuilder("[");
+                    if (locks instanceof java.util.Map<?, ?> lm) {
+                        for (java.util.Map.Entry<?, ?> e2 : lm.entrySet()) {
+                            Object g = e2.getValue();
+                            if (g != null && !"NO_GOAL".equals(String.valueOf(
+                                    g.getClass().getSimpleName()))) {
+                                Object inner = null;
+                                try {
+                                    java.lang.reflect.Method gm = g.getClass()
+                                            .getMethod("getGoal");
+                                    inner = gm.invoke(g);
+                                } catch (Throwable ignore) { }
+                                lb.append(e2.getKey()).append('=')
+                                        .append(g.getClass().getSimpleName())
+                                        .append(':').append(
+                                        inner == null ? "?" : inner.getClass().getSimpleName())
+                                        .append(" isRunning=")
+                                        .append(callIsRunning(g)).append(", ");
+                            }
+                        }
+                    }
+                    lb.append(']');
+                    sb.append(" ").append(selName).append("=").append(lb);
+                }
+            } catch (Throwable quiet) {
+                sb.append(" selDump=fail");
+            }
             sb.append('\n');
             traceOut.write(sb.toString());
             traceOut.flush();
@@ -1732,6 +1772,27 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     + sb.substring(sb.indexOf(" type=")).trim());
         } catch (Throwable t) {
             getLogger().warning("trace step failed: " + t);
+        }
+    }
+
+    /** L97.2 helpers: declared-field walk up the hierarchy (targetSelector
+     *  / goalSelector live on Mob, lockedFlags on GoalSelector). */
+    private static java.lang.reflect.Field findField(Class<?> c, String name) {
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = k.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) { }
+        }
+        return null;
+    }
+
+    private static boolean callIsRunning(Object wrappedGoal) {
+        try {
+            return (Boolean) wrappedGoal.getClass().getMethod("isRunning").invoke(wrappedGoal);
+        } catch (Throwable t) {
+            return false;
         }
     }
 }
