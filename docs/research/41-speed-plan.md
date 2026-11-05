@@ -1580,3 +1580,39 @@ RUNNING (the t=145-158 pass was all-idle mobs). The hunt continues:
 the staged-request continuation draws (park → java continuation →
 resume) must land at the exact vanilla walk position once the mob's
 serve spans multiple JNI rounds.
+
+## L97-hunt (session 2026-11-05T18:xxZ): the t=159 SR split DECOMPOSED — the seed pair is (107, 139) at t=157, pre-draw
+
+CI bisect run (dispatch 18:11:27Z, e106368, shipped config mob_ai=1, ph_dump=138-170,
+LRC_WINDOW=138-170, LRF_DEPTH=14) — the live-log readout:
+
+- The push-triggered parity on L96 (run 42075260274, mob_ai=0) is FULL GREEN:
+  all 12 snapshot comparisons PASS bit-identical — the module is exact once
+  the native AI floor is off. The residual lives ONLY in the AI floor.
+- The shipped-config dispatch (42075292474, mob_ai=1): mobs/items... FAILs —
+  the T382 snapshot shows off=2509 on=2508 with 12 CHICKEN↔ZOMBIE type
+  mismatches — the id-stream shifted AFTER t=165 (PD hashes identical
+  through t=165 in the 140-165 window).
+- The new window (138-170) caught the REAL first split: **PD t=157, ids
+  107 and 139 ONLY** (their x/y/z/v/tc avalanche differs), with the SR
+  end-state still IDENTICAL through t=158. The draw avalanche (SR split,
+  +62 posgen, 6 vs 2 lookaround starts) lands on t=159+ — it is the
+  CONSEQUENCE of the two-mob tc/phase drift, not the seed.
+- SRF t=159 morphology: OFF streams [baseTick → target×4 → lookat →
+  lookaround → stroll → sunburn/burnUndead] per mob (all gates are Java
+  draws); ON streams [sunburn/baseTick...] with ZERO Java gate draws
+  (gates are NATIVE — the LCG handoff covers them) + 60 RandomPos + 2
+  WaterAvoiding + 6 RLA.start. GLV off-vs-on comparison is therefore NOT
+  apples-to-apples (vanilla counts Java gate draws, the engine's gate
+  draws are invisible to the proxy).
+- items-100k: the SAME run's A/B is p50 64.98→29.98 (−53.9%) at L96
+  (mobs −31.0%, mixed −41.7%, spread −19.9%). The perf residual per JFR:
+  fastQuery/rowQuery/ordSortVanilla ≈ 17% (mobs-mod) — the query path,
+  not the tracker (ttlCachedPath 1-2.7%), is the next −90% front.
+
+Next: trace_id=107 (ph_dump=152-162, LRC_WINDOW=152-162) dispatch 18:26:55Z —
+the per-tick field trace names the exact diverging FIELD of the seed pair
+(tc-phase at the first even tick vs a drawless nav/pos move). If the trace
+says tc: the cadence classification of the 50/tick CI fill cohort (spawn
+tick 143 → first even 145) has a one-tick serving skew in the engine's
+packer; if x/v: a drawless movement divergence — chase the nav mirroring.
