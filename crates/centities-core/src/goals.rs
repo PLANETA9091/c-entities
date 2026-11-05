@@ -1174,14 +1174,29 @@ fn can_use_inner(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32
     }
 }
 
-/// WrappedGoal.canBeReplacedBy: other.priority <= locked.priority
+/// WrappedGoal.canBeReplacedBy (26.3 bytecode, javap-verified):
+/// `return this.isInterruptable() && other.getPriority() < this.getPriority();`
+/// — the candidate must be STRICTLY more important than the current lock
+/// holder, and the holder must be interruptable. The old transcription
+/// (`other.priority <= locked.priority` — equal-priority replacement
+/// ALLOWED) fired exactly on the zombie set's two equal-priority
+/// same-flag pairs — LookAtPlayer(8)/RandomLookAround(8) on LOOK and
+/// NearestAttackable(Villager,3)/NearestAttackable(Golem,3) on TARGET:
+/// the engine evaluated canUse (and started lookarounds) where vanilla's
+/// strict check refused — the L95 ledger deltas (+2 lookaround starts,
+/// the extra target/stroll evals and their RNG cascade).
+/// isInterruptable: no goal in the classified zombie set overrides it
+/// (javap: MeleeAttack/RandomLookAround/LookAtPlayer/Stroll/MTV/HurtBy/
+/// Nearest/Float/SpearUse — zero isInterruptable references, the Goal
+/// default true applies); model it as a per-goal cfg bit when a
+/// non-interruptable kind ever enters the classified set.
 fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
         if bit < MAX_GOALS {
             let locked = ctx.lock[sel][bit];
-            if locked != -1 && ctx.prio(sel, locked as usize) < ctx.prio(sel, gi) {
+            if locked != -1 && ctx.prio(sel, gi) >= ctx.prio(sel, locked as usize) {
                 return false;
             }
         }
@@ -1503,17 +1518,19 @@ mod tests {
         assert_eq!(st, ST_DONE);
         assert_eq!(out[5], 0, "NO tick actions on an even tick");
         // the seed advances ONLY by the update phase's canUse pulls of the
-        // NON-running goals: 3 nearest gates + stroll + lookat — the running
-        // lookaround's 0.02 canUse roll does NOT happen (vanilla's update
-        // loop skips running goals), which is exactly why the old even-path
-        // force-tick was a serving-order bug: it both ticked the body AND
-        // let the tick's effects change what the update phase would draw.
+        // NON-running goals: 3 nearest gates + stroll. The lookat pull does
+        // NOT happen either — L95: the lookaround (prio 8) is RUNNING and
+        // holds the LOOK flag; vanilla WrappedGoal.canBeReplacedBy (javap,
+        // 26.3) refuses the lookat(8) candidate at EQUAL priority
+        // (other.prio < this.prio is false), so its 0.02-roll canUse never
+        // evaluates. The old engine drew the lookat pull (the <= model) and
+        // the old even path additionally force-ticked the running body —
+        // both reorder the SHARED_RANDOM serving vs vanilla.
         let mut r = Lcg { value: seed0, draws: 0 };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
         r.next_int_bound(60);
-        r.next_f32();
         let seed1 = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
         assert_eq!(seed1, r.value, "the even tick must not draw anything extra");
         // the lookaround's lookTime state is untouched (no tick body ran)

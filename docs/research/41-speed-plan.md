@@ -1545,3 +1545,38 @@ eval order across the selector pair, (c) the staged stroll posgen
 serving. The verification loop is FULLY LOCAL now: build (~10 s) +
 two legs (~4 min each) + srlr_first_div.py + the GL/GLV/SRF diff —
 minutes per iteration instead of CI round-trips.
+
+## L96 (this session): THE EQUAL-PRIORITY LOCK FIX — the t=145 split is GONE, the frontier moved to t=159
+
+javap on the mapped jar settled the L95 ledger's root cause:
+`WrappedGoal.canBeReplacedBy` (26.3) is
+`return this.isInterruptable() && other.getPriority() < this.getPriority();`
+— STRICT. The engine's `can_replace_all` transcribed `<=` (equal-
+priority replacement ALLOWED). The 26.3 zombie set carries TWO
+equal-priority same-flag pairs — LookAtPlayer(8)/RandomLookAround(8)
+on LOOK and NearestAttackable(Villager,3)/NearestAttackable(Golem,3)
+on TARGET (registerGoals/addBehaviourGoals bytecode) — so every
+equal-priority refusal vanilla makes was an eval+start in the engine.
+isInterruptable is a no-op for the classified set (zero overrides,
+javap across all nine goal classes).
+
+The fix: `can_replace_all` returns false when
+`candidate.prio >= holder.prio` (strict-only replacement), the
+`even_tick_never_ticks_running_goals` reference corrected to the
+4-draw vanilla model (3 target + stroll; the lookat(8) pull is
+REFUSED by the running lookaround(8)'s lock — the old 5-draw model
+encoded the bug). All 41 core tests green.
+
+Local A/B (SCALE=2500, fill 13/tick, CE_MOB_AI=1): **SR identical
+t=141..158 — the t=145 split (m=-27, the L89 ledger) is DEAD.** The
+new first split: t=159 (260 live mobs, 133 even) — the NEXT residual,
+inverted shape: the engine now runs the starts vanilla refuses —
+62 java-side posgen draws (RandomPos=60 + WaterAvoiding=2) vs
+vanilla's ZERO, 6 lookaround starts vs 2, +1 burnUndead draw, while
+the target gates match EXACTLY (class 8: 532 evals == 532 vanilla
+draws). The stroll gate rolls read shifted stream positions for 2 of
+133 mobs — the within-tick serving order diverges once goals are
+RUNNING (the t=145-158 pass was all-idle mobs). The hunt continues:
+the staged-request continuation draws (park → java continuation →
+resume) must land at the exact vanilla walk position once the mob's
+serve spans multiple JNI rounds.
