@@ -2122,3 +2122,36 @@ after serve, draws, started goal kinds) per even-cohort mob into a ring
 buffer the hooks@ printer dumps inside LRC_WINDOW. Diffed against the
 OFF leg's SRF chronological frames (k-index = the global draw order),
 the wrong resume position for 107/139 becomes a one-line fix.**
+
+### L100d addendum (same session): the GL ledger quantifies the gate-set mismatch — kind-8 +8, kind-4 +2 at t=157
+
+The engine's own per-class ledger (GL line, k=evals/no/staged/rolls) at
+t=157 vs the vanilla leg's GLV draw groups:
+
+| kind | class | engine evals/rolls | vanilla draws | delta |
+|---:|---|---:|---:|---:|
+| 4 | GK_STROLL | 116/116 | Stroll.canUse=114 | **+2** |
+| 5 | GK_LOOKAT_PLAYER | 116/116 | LookAtPlayer.canUse=116 | 0 |
+| 6 | GK_LOOKAROUND | 111/111 | RandomLookAround.canUse=111 | 0 |
+| 8 | GK_NEAREST_TARGET | 484/484 | NearestAttackable.canUse=476 | **+8** |
+
+The deltas are EXACTLY the seed pair: +8 = 2 mobs × 4 target-gate rolls,
++2 = 2 mobs × 1 stroll-gate roll. The engine evaluated the TARGET and
+STROLL gates for two even mobs whose vanilla leg did NOT draw them, while
+kinds 5/6 (lookat/lookaround) match exactly. t=156: kind-8 476 vs 436
+(+40), t=158: 532 vs 484 (+48) — the mismatch grows with the even cohort,
+yet the shared stream stays EXACT through t=158 (SR+PD evidence): the
+engine's handback reconstructs vanilla's expected position globally, and
+the divergence is LOCAL to the pair's own later gates — 107's stroll/RLA
+decision read a shifted LOCAL position and started the RLA where vanilla
+started the stroll.
+
+The vanilla leg DID evaluate 107's stroll (it started one — PTRACE), so
+the +2/+8 skip set is NOT literally {107,139}; the exact skip set needs
+the closing instruments (designed in L100c): the per-mob Rust ledger dump
+(CE_MOB_LEDGER) for the engine side, and a PTRACE extension printing
+mob.getTarget(), mob.aware and per-WrappedGoal isRunning for the traced
+mob in BOTH legs to name the vanilla skip condition (the L97.2 suspects
+stand: the activation-rotation cadence slice and the already-targeting
+short-circuit — targetSelector=[] in the trace rules out the lock-based
+skips).
