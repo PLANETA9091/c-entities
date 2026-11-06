@@ -1799,3 +1799,40 @@ Also landed this session: the floor + ACT lock-map writes (L97.3 — the
 push parity PASSed on them) and the order ledger (L97.4 — the prescan
 skips the sorted-input sort; the orderCheck profile names the stale-stamp
 side if the TimSort tax persists).
+
+## L97.5 addendum (session 16:10Z): the unaware hypothesis is DEAD — the +2 is NOT aware
+
+The dispatch-2 GL comparison killed it in one read: `GL t=157 br=121/113/0
+gr=236/13` — IDENTICAL to dispatch-1 (pre-L97.5). The aware gate declined
+NOTHING: all 236 fill-phase serverAiStep entries are aware mobs (mob 107's
+PTRACE: `aw=1` both legs). The L97.5 guard gate stays shipped as a
+correctness hardening (the guard no longer preempts a branch vanilla never
+runs — a real hazard for any future unaware mob), but it is NOT the t=157
+fix.
+
+Tick-mapping correction (mined from the CE-INIT + the GL windows): the GL
+`GL t=` is `CUR_TICK/3` in gameTime units — gameTime ≈ pluginT + 314 (the
+pre-plugin world boot ticks). The GL t=157 row IS the fill-phase t=157 —
+the +2 walk-set delta stands: the engine's native even walk = 121 mobs ×
+4 NearestTarget rolls = 484; vanilla's = 476 (the L97.1 local SRF count).
+The phase formula is identical on both legs (the same tc, all aware), so
+the remaining suspects are DOWNSTREAM of the phase gate:
+
+(a) the vanilla even branch's canUse is gated by
+goalCanBeReplacedForAllFlags — the TARGET lock map — vanilla's own walk
+maintains it; the engine's native walk consults ITS lock table. If the two
+lock tables disagree about a TARGET-flag holder for 2 mobs (a stale
+holder on either side), the canUse counts diverge. The L97.3 map writes
+make the VANILLA-side map consistent on the ON leg — the PTRACE
+selector-state dumps in the dispatch-2 artifact now show both legs' full
+lockedFlags per tick for mob 107 (t=149-956) — the first
+apples-to-apples lock-map evidence.
+(b) the L97.1 local SRF count (119) itself — the GLV-vs-engine
+apples-to-apples caveat; a re-count with the 4096-frame streams of the
+dispatch-2 artifact names the exact 2 mobs' draw frames.
+
+NEXT: the dispatch-2 artifact (PD 152-162 + the PTRACE selector states +
+the 4096 SRF streams) is the data pack; the local A/B harness (rustup +
+maven, the L97.1 loop) is the iteration tool. The even-set question —
+121 vs 119 on an identical phase formula — has two concrete, checkable
+suspects and the evidence to settle both.
