@@ -23,7 +23,8 @@ from collections import defaultdict
 LEG_RE = re.compile(r"=== parity leg parity-(\w+)-(off|on) \(module=")
 ML_RE = re.compile(
     r"MLEDGER t=(\d+) seq=(\d+) id=(\d+) tc=(\d+) s0=([0-9a-f]+) "
-    r"s1=([0-9a-f]+) dr=(\d+) st=(\d+) rs=(\d+) k=([0-9a-f]+)")
+    r"s1=([0-9a-f]+) dr=(\d+) st=(\d+) rs=(\d+) k=([0-9a-f]+)"
+    r"(?: e=([0-9a-f]+) rt=([0-9a-f]+))?")
 PTR_RE = re.compile(r"PTRACE t=(\d+) (.*)$")
 PTR_FIELD = re.compile(r"(\w+)=([^ ]*)")
 SEL_RE = re.compile(r"(targetSelector|goalSelector)=\[(.*?)\]")
@@ -53,6 +54,8 @@ def parse_mledger(text):
             "s0": int(m.group(5), 16), "s1": int(m.group(6), 16),
             "dr": int(m.group(7)), "st": int(m.group(8)),
             "rs": int(m.group(9)), "k": int(m.group(10), 16),
+            "e": int(m.group(11), 16) if m.group(11) else None,
+            "rt": int(m.group(12), 16) if m.group(12) else None,
         })
     return per_tick
 
@@ -101,10 +104,20 @@ def chain_report(ch):
             for x in open_serve:
                 kinds |= x["k"]
             kinds_str = ",".join(str(b) for b in range(1, 9) if kinds >> b & 1) or "-"
+            evals = 0
+            running = 0
+            for x in open_serve:
+                if x.get("e") is not None:
+                    evals |= x["e"]
+                if x.get("rt") is not None:
+                    running |= x["rt"]
+            ev_str = ",".join(str(b) for b in range(1, 9) if evals >> b & 1) or "-"
+            rt_str = ",".join(str(b) for b in range(1, 9) if running >> b & 1) or "-"
             lines.append(
                 f"  serve#{serve_no} t={open_serve[0]['t']} tc={r['tc']} "
                 f"rounds={len(open_serve)} draws={total_dr} "
-                f"kinds={kinds_str} s0={s0:016x} s1={s1:016x} "
+                f"kinds={kinds_str} eval={ev_str} rt={rt_str} "
+                f"s0={s0:016x} s1={s1:016x} "
                 f"gaps={[g for g in gaps if g != 0] or '0'}")
             open_serve = None
     return lines

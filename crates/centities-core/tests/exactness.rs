@@ -247,7 +247,11 @@ fn query_expansion_is_bounded_and_correct() {
     assert!(!out.contains(&1), "margin leak: a 0.5-gap entity came back");
     // a genuinely touching-face query (65.0 is the entity's x1, and
     // vanilla's strict compare needs x1 > qx0) still finds it:
-    idx.query(0, &Aabb::new(64.99, 60.0, 64.99, 70.0, 70.0, 70.0), &mut out);
+    idx.query(
+        0,
+        &Aabb::new(64.99, 60.0, 64.99, 70.0, 70.0, 70.0),
+        &mut out,
+    );
     assert!(out.contains(&1), "border-crossing entity missed");
     assert!(idx.max_half_span() <= MAX_HALF_SPAN);
 }
@@ -307,14 +311,7 @@ fn packed_window_is_conservative() {
             // 0.01 past the box's min corner on every axis.
             idx.query(
                 0,
-                &Aabb::new(
-                    x0 - 0.01,
-                    63.99,
-                    z0 - 0.01,
-                    x0 + 0.01,
-                    64.01,
-                    z0 + 0.01,
-                ),
+                &Aabb::new(x0 - 0.01, 63.99, z0 - 0.01, x0 + 0.01, 64.01, z0 + 0.01),
                 &mut probe,
             );
             assert!(probe.contains(&id0));

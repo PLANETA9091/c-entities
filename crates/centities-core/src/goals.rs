@@ -79,23 +79,47 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub static GL_ON: AtomicBool = AtomicBool::new(false);
 pub static GL_EVALS: [AtomicU32; 9] = [
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
     AtomicU32::new(0),
 ];
 pub static GL_NO: [AtomicU32; 9] = [
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
     AtomicU32::new(0),
 ];
 pub static GL_STAGED: [AtomicU32; 9] = [
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
     AtomicU32::new(0),
 ];
 pub static GL_ROLLS: [AtomicU32; 9] = [
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
     AtomicU32::new(0),
 ];
 
@@ -660,13 +684,14 @@ enum Cu {
 pub static ML_ON: AtomicBool = AtomicBool::new(false);
 static ML_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// One record = 6 u64: [0] (id u32) | (tickCount u32 << 32), [1] seed_in,
+/// One record = 7 u64: [0] (id u32) | (tickCount u32 << 32), [1] seed_in,
 /// [2] seed_out, [3] (draws u32) | (kinds u32 << 32), [4] (cursor) |
-/// (status as u64 << 56), [5] seq.
-static ML_RING: std::sync::Mutex<Vec<[u64; 6]>> = std::sync::Mutex::new(Vec::new());
+/// (status as u64 << 56), [5] seq, [6] (eval kind-mask u32) |
+/// (pack running kind-mask u32 << 32).
+static ML_RING: std::sync::Mutex<Vec<[u64; 7]>> = std::sync::Mutex::new(Vec::new());
 pub const ML_CAP: usize = 1 << 16;
 
-pub fn mob_ledger_take(arm: bool) -> Option<Vec<[u64; 6]>> {
+pub fn mob_ledger_take(arm: bool) -> Option<Vec<[u64; 7]>> {
     // the arm flag sets the NEXT interval's state (gl_take semantics):
     // drain whatever was collected so far, then re-arm as requested.
     ML_ON.store(arm, Ordering::Relaxed);
@@ -714,6 +739,26 @@ fn ml_kind_bits(inb: &[i32], out_buf: &[i32]) -> u32 {
 }
 
 #[inline]
+fn ml_running_kind_bits(inb: &[i32]) -> u32 {
+    // the pack's INCOMING running state per kind — what the engine was
+    // told the selectors believe is running (the WrappedGoal.isRunning
+    // mirrors). Both selectors' records scan.
+    let nt = inb[5] as usize;
+    let ng = inb[6] as usize;
+    let mut bits = 0u32;
+    for g in 0..(nt + ng) {
+        let base = IN_HEADER + g * GOAL_STRIDE;
+        if base + 4 < inb.len() && inb[base + 4] != 0 {
+            let k = inb[base];
+            if (0..9).contains(&k) {
+                bits |= 1u32 << k;
+            }
+        }
+    }
+    bits
+}
+
+#[inline]
 fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER {
         return;
@@ -724,11 +769,12 @@ fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
             let tc = ((in_buf[2] as i64).max(0) as u64) << 32;
             let seed_in = (((in_buf[IN_SEED_HI] as u64) & 0xFFFF_FFFF) << 32)
                 | ((in_buf[IN_SEED_LO] as u64) & 0xFFFF_FFFF);
-            let seed_out = (((out_buf[4] as u64) & 0xFFFF_FFFF) << 32)
-                | ((out_buf[3] as u64) & 0xFFFF_FFFF);
-            let draws = ML_DRAW_SWAPS
-                .swap(0, Ordering::Relaxed);
+            let seed_out =
+                (((out_buf[4] as u64) & 0xFFFF_FFFF) << 32) | ((out_buf[3] as u64) & 0xFFFF_FFFF);
+            let draws = ML_DRAW_SWAPS.swap(0, Ordering::Relaxed);
+            let evals = ML_EVAL_SWAPS.swap(0, Ordering::Relaxed);
             let kinds = ml_kind_bits(in_buf, out_buf);
+            let running = ml_running_kind_bits(in_buf);
             let cursor = (in_buf[0] as u64) & 0x00FF_FFFF_FFFF_FFFF;
             let status = (st as i64).max(0) as u64;
             let seq = ML_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -739,6 +785,7 @@ fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
                 ((kinds as u64) << 32) | ((draws as u64) & 0xFFFF_FFFF),
                 cursor | (status << 56),
                 seq as u64,
+                ((evals as u64) << 32) | ((running as u64) & 0xFFFF_FFFF),
             ]);
         }
     }
@@ -747,6 +794,18 @@ fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
 /// The draw counter lives with the LCG (ctx.lcg.draws is per-ctx); the
 /// wrapper stamps it here — set by ai_floor_run at exit.
 pub static ML_DRAW_SWAPS: AtomicU32 = AtomicU32::new(0);
+
+/// The per-call EVAL mask: one bit per goal kind whose can_use the update
+/// walk actually evaluated this call. The t=157 hunt proved the engine's
+/// TOTAL draw count exceeds vanilla's by exactly the L100d extra-eval
+/// amount (+8 kind-8/+2 kind-4) — the engine evaluated gates vanilla
+/// skipped (running/flag-locked). The eval mask × the pack's running
+/// mask names the guilty mob AND the bug side: eval bit set while the
+/// pack said the goal was RUNNING = an engine-walk bug; the eval bit set
+/// while the pack said NOT running = the pack mirror diverged from
+/// vanilla's actual state (freshness). Stamped by can_use, drained by
+/// the wrapper per record.
+pub static ML_EVAL_SWAPS: AtomicU32 = AtomicU32::new(0);
 
 /// The floor entry. Returns the status written to out_buf[0].
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
@@ -1112,6 +1171,15 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 /// while the dump window holds (GL_ON); the wrapper is transparent
 /// otherwise.
 fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+    // the eval-mask stamp (see ML_EVAL_SWAPS): one relaxed OR per eval —
+    // zero cost when the ledger is disarmed (the load in the wrapper
+    // short-circuits the record, the OR itself is negligible).
+    {
+        let k = ctx.kind(sel, gi);
+        if (0..9).contains(&k) {
+            ML_EVAL_SWAPS.fetch_or(1u32 << k, Ordering::Relaxed);
+        }
+    }
     if !GL_ON.load(Ordering::Relaxed) {
         return can_use_inner(ctx, out, sel, gi, phase);
     }
@@ -1133,7 +1201,13 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
     r
 }
 
-fn can_use_inner(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+fn can_use_inner(
+    ctx: &mut Ctx,
+    out: &mut Out,
+    sel: usize,
+    gi: usize,
+    phase: i32,
+) -> Result<Cu, ()> {
     match ctx.kind(sel, gi) {
         GK_SPEAR_USE => {
             // ableToAttack() && !isUsingItem() — native only when the
@@ -1642,7 +1716,10 @@ mod tests {
         assert_eq!(st, ST_DONE);
 
         // reference: advance the LCG with the exact pull sequence
-        let mut r = Lcg { value: seed0, draws: 0 };
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1681,7 +1758,10 @@ mod tests {
         // evaluates. The old engine drew the lookat pull (the <= model) and
         // the old even path additionally force-ticked the running body —
         // both reorder the SHARED_RANDOM serving vs vanilla.
-        let mut r = Lcg { value: seed0, draws: 0 };
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1722,7 +1802,10 @@ mod tests {
         // seed whose 4th pull (after the 3 nearest gates) yields 0
         let mut seed = 1u64;
         loop {
-            let mut r = Lcg { value: seed, draws: 0 };
+            let mut r = Lcg {
+                value: seed,
+                draws: 0,
+            };
             for _ in 0..3 {
                 r.next_int_bound(10);
             }
@@ -1765,7 +1848,10 @@ mod tests {
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_DONE);
         // reference: 3 nearest gates + lookat + lookaround (NO stroll pull)
-        let mut r = Lcg { value: seed0, draws: 0 };
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1837,18 +1923,13 @@ mod tests {
         let st = ai_floor(&inb, &mut out);
         let recs = mob_ledger_take(false).unwrap();
         mob_ledger_arm(false);
-        let mine: Vec<&[u64; 6]> = recs
+        let mine: Vec<&[u64; 7]> = recs
             .iter()
-            .filter(|r| {
-                r[0] & 0xFFFF_FFFF == 42
-                    && r[0] >> 32 == 100
-                    && r[1] == seed
-            })
+            .filter(|r| r[0] & 0xFFFF_FFFF == 42 && r[0] >> 32 == 100 && r[1] == seed)
             .collect();
         assert_eq!(mine.len(), 1, "one record for this (id, tc) per call");
         let r = mine[0];
-        let s_out = (((out[4] as u64) & 0xFFFF_FFFF) << 32)
-            | ((out[3] as u64) & 0xFFFF_FFFF);
+        let s_out = (((out[4] as u64) & 0xFFFF_FFFF) << 32) | ((out[3] as u64) & 0xFFFF_FFFF);
         assert_eq!(r[2], s_out, "seed out == the out header seed");
         assert_eq!(r[4] >> 56, if st < 0 { 0u64 } else { st as u64 }, "status");
     }

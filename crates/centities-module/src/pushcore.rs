@@ -181,8 +181,7 @@ impl PushCore {
             let ocz = ((self.pz[s].floor() as i64) >> 4) as i32;
             let ncx = ((px.floor() as i64) >> 4) as i32;
             let ncz = ((pz.floor() as i64) >> 4) as i32;
-            structural = self.seq[s] != seq || self.sy[s] != sy
-                || ocx != ncx || ocz != ncz;
+            structural = self.seq[s] != seq || self.sy[s] != sy || ocx != ncx || ocz != ncz;
         }
         let o = s * 6;
         self.box6[o] = b.x0;
@@ -213,8 +212,8 @@ impl PushCore {
             let ccz = (((b.z0 + b.z1) * 0.5).floor() as i32) >> centities_core::CELL_SHIFT;
             let new_home = centities_core::cell_key_pub(wid, ccx, ccz);
             self.sorted_at.remove(&new_home);
-            let pcx = (((px.floor() as i32)) >> centities_core::CELL_SHIFT) as i64;
-            let pcz = (((pz.floor() as i32)) >> centities_core::CELL_SHIFT) as i64;
+            let pcx = ((px.floor() as i32) >> centities_core::CELL_SHIFT) as i64;
+            let pcz = ((pz.floor() as i32) >> centities_core::CELL_SHIFT) as i64;
             let pos_key = centities_core::cell_key_pub(wid, pcx as i32, pcz as i32);
             if pos_key != new_home {
                 self.sorted_at.remove(&pos_key);
@@ -319,8 +318,7 @@ pub fn push_tick(
     let self_pushable = pc.flags[self_slot] & PF_PUSHABLE != 0;
     let self_nophys = pc.flags[self_slot] & PF_NOPHYSICS != 0;
     if diag {
-        out.diag_sb
-            .copy_from_slice(&pc.box6[sc..sc + 6]);
+        out.diag_sb.copy_from_slice(&pc.box6[sc..sc + 6]);
         out.diag_walk[5] = world as f64;
     }
 
@@ -410,217 +408,217 @@ pub fn push_tick(
     let mut base_dz = pc.dz[self_slot];
 
     for detect in [true, false] {
-    // ADDENDUM-18e: the diag pass tag (0=detect, 1=apply) rides bit 4 of
-    // every stage code this pass emits.
-    let dtag: u8 = if detect { 0 } else { 16 };
-    // per-pass reset: the detection pass's replay must not leak into the
-    // apply pass (pc.dx[self] stays unmutated until the tail write, so it
-    // is the correct base for both passes)
-    hits_count = 0;
-    non_pass = 0;
-    ddx = 0.0;
-    ddz = 0.0;
-    base_dx = pc.dx[self_slot];
-    base_dy = pc.dy[self_slot];
-    base_dz = pc.dz[self_slot];
-    ncol_self = ncol_self_0;
-    for cz in cz0..=cz1 {
-        for cx in cx0..=cx1 {
-            let key = centities_core::cell_key_pub(world, cx, cz);
-            if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
-                pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
-                    Some(s) => {
-                        // px/pz are POSITIONS: >> 4 first (chunk coords,
-                        // ±2M), then the 22-bit bias — the same key shape
-                        // as CeHooks.ordKey (which reads the already-chunk-
-                        // sized moonrise section fields directly).
-                        let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
-                        let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
-                        let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
-                        let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
-                        ((czk << 22) | cxk, (syk << 40) | seq)
+        // ADDENDUM-18e: the diag pass tag (0=detect, 1=apply) rides bit 4 of
+        // every stage code this pass emits.
+        let dtag: u8 = if detect { 0 } else { 16 };
+        // per-pass reset: the detection pass's replay must not leak into the
+        // apply pass (pc.dx[self] stays unmutated until the tail write, so it
+        // is the correct base for both passes)
+        hits_count = 0;
+        non_pass = 0;
+        ddx = 0.0;
+        ddz = 0.0;
+        base_dx = pc.dx[self_slot];
+        base_dy = pc.dy[self_slot];
+        base_dz = pc.dz[self_slot];
+        ncol_self = ncol_self_0;
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
+                let key = centities_core::cell_key_pub(world, cx, cz);
+                if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
+                    pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
+                        Some(s) => {
+                            // px/pz are POSITIONS: >> 4 first (chunk coords,
+                            // ±2M), then the 22-bit bias — the same key shape
+                            // as CeHooks.ordKey (which reads the already-chunk-
+                            // sized moonrise section fields directly).
+                            let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                            let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                            let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
+                            let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
+                            ((czk << 22) | cxk, (syk << 40) | seq)
+                        }
+                        // unknown slot (index-only id): never a kernel candidate
+                        // (the pushable filter needs the mirror); park it last.
+                        None => (i64::MAX, i64::MAX),
+                    });
+                    pc.sorted_at.insert(key, tick);
+                }
+                cell_hits.clear();
+                pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits);
+                out.raw += cell_hits.len() as u32;
+                for &id in cell_hits.iter() {
+                    if id == self_id {
+                        // ADDENDUM-18f: self rows are RECORDED (stage 10) — the
+                        // duplicated-self family (raw=2 with zero records) was
+                        // invisible to the KPI because the self skip was silent.
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[sc..sc + 6]);
+                            out.diag.push((dtag | 10, id, mb));
+                        }
+                        continue;
                     }
-                    // unknown slot (index-only id): never a kernel candidate
-                    // (the pushable filter needs the mirror); park it last.
-                    None => (i64::MAX, i64::MAX),
-                });
-                pc.sorted_at.insert(key, tick);
+                    let Some(hs) = pc.slot_of(id) else {
+                        if diag && out.diag.len() < 128 {
+                            out.diag.push((dtag | 9, id, [0.0; 6]));
+                        }
+                        continue;
+                    };
+                    let fl = pc.flags[hs];
+                    if fl & PF_PUSHABLE == 0 || fl & PF_SPECTATOR != 0 || fl & PF_NOPHYSICS != 0 {
+                        if diag && out.diag.len() < 128 {
+                            let o = hs * 6;
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 1, id, mb));
+                        }
+                        continue;
+                    }
+                    let o = hs * 6;
+                    // exact vanilla AABB.intersects(AABB) — strict compares
+                    if !(pc.box6[o] < sx1
+                        && pc.box6[o + 3] > sx0
+                        && pc.box6[o + 1] < sy1
+                        && pc.box6[o + 4] > sy0
+                        && pc.box6[o + 2] < sz1
+                        && pc.box6[o + 5] > sz0)
+                    {
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 2, id, mb));
+                        }
+                        continue;
+                    }
+                    hits_count += 1;
+                    let is_pass = fl & PF_PASSENGER != 0;
+                    if !is_pass {
+                        non_pass += 1;
+                    }
+                    // numCollisions cap (vanilla `return`s the whole body)
+                    if ncol_self >= max_ec {
+                        // keep counting hits for the cramming audit, skip the rest
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 3, id, mb));
+                        }
+                        continue;
+                    }
+                    // ---- vanilla loop body: numCollisions bookkeeping happens
+                    // BEFORE doPush — an Entity.push early return (same vehicle,
+                    // noPhysics, eps) never undoes it (javap 295-319) ----
+                    if !detect {
+                        pc.ncol[hs] += 1;
+                        // ADDENDUM-18: the candidate's REAL counter hit rides
+                        // out.hits — the Java apply loop applies it (U.putInt)
+                        // for gated candidates too, exactly like vanilla's
+                        // pre-doPush `entityx.numCollisions++` (the increments
+                        // precede the push gates, so a gated candidate still
+                        // consumes its hit — the old emit-only loop lost every
+                        // gated hit and the entity's numCollisions grew ~10x
+                        // slower than vanilla: the OFF nc(78) trace 2..18 by
+                        // t=274 vs the kernel's flat 0-1, which let the
+                        // kernel's pass serve pairs vanilla's maxEntityCollisions
+                        // cap had already excluded — the mobs t=275 seed).
+                        if out.hits.len() < MAX_PUSH_PAIRS {
+                            out.hits.push(id);
+                        }
+                    }
+                    ncol_self += 1;
+                    // Entity.push pair gates (all live INSIDE push, after ncol++)
+                    if is_pass && pc.vid[hs] == self_id {
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 4, id, mb));
+                        }
+                        continue; // isPassengerOfSameVehicle
+                    }
+                    if self_nophys || fl & PF_NOPHYSICS != 0 {
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 5, id, mb));
+                        }
+                        continue;
+                    }
+                    if only_players_collide && !self_player && fl & PF_PLAYER == 0 {
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 6, id, mb));
+                        }
+                        continue;
+                    }
+                    if fl & PF_PLAYER != 0 && !player_collisions {
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 6, id, mb));
+                        }
+                        continue;
+                    }
+                    // ---- Entity.push force math (exact constants) ----
+                    let opx = pc.px[hs];
+                    let opz = pc.pz[hs];
+                    let mut dx = opx - spx;
+                    let mut dz = opz - spz;
+                    let d0 = abs_max(dx, dz);
+                    if d0 < PUSH_EPS {
+                        // vanilla crammed branch: 26.3 push(Entity) applies NO
+                        // force here (the dd >= 0.01 gate has no else) — but the
+                        // counters already moved. Route vanilla to keep the
+                        // RNG/counter semantics byte-exact (the L37e contract).
+                        if detect {
+                            out.reason = 2;
+                            return; // ok stays false, mirrors untouched
+                        }
+                        if diag && out.diag.len() < 128 {
+                            let mut mb = [0.0; 6];
+                            mb.copy_from_slice(&pc.box6[o..o + 6]);
+                            out.diag.push((dtag | 7, id, mb));
+                        }
+                        continue;
+                    }
+                    let d = d0.sqrt();
+                    dx /= d;
+                    dz /= d;
+                    let mut f = 1.0 / d;
+                    if f > 1.0 {
+                        f = 1.0;
+                    }
+                    dx *= f;
+                    dz *= f;
+                    dx *= PUSH_QUANTUM;
+                    dz *= PUSH_QUANTUM;
+                    // this.push(-dx, 0, -dz) when not a vehicle and pushable
+                    if !self_vehicle && self_pushable {
+                        base_dx += -dx;
+                        base_dz += -dz;
+                        ddx += -dx;
+                        ddz += -dz;
+                    }
+                    // other.push(dx, 0, dz) when other is not a vehicle — L42:
+                    // the force is EMITTED for the Java apply loop (the
+                    // candidate's delta write lands THIS TICK, mirroring
+                    // vanilla's doPush mutual push); the write's own probe event
+                    // (the value-carrying capture) re-syncs the mirror before
+                    // the next kernel read (every dispatch flushes first). The
+                    // old mirror+kadd mutation deferred the write to the
+                    // candidate's own kernel run — lost whenever that run
+                    // declined (the first-move divergence, doc 40 addendum 5).
+                    if !detect && fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
+                        out.pairs.push((id, dx, dz));
+                    }
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((dtag | 8, id, mb));
+                    }
+                }
             }
-            cell_hits.clear();
-            pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits);
-            out.raw += cell_hits.len() as u32;
-            for &id in cell_hits.iter() {
-                if id == self_id {
-                    // ADDENDUM-18f: self rows are RECORDED (stage 10) — the
-                    // duplicated-self family (raw=2 with zero records) was
-                    // invisible to the KPI because the self skip was silent.
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[sc..sc + 6]);
-                        out.diag.push((dtag | 10, id, mb));
-                    }
-                    continue;
-                }
-                let Some(hs) = pc.slot_of(id) else {
-                    if diag && out.diag.len() < 128 {
-                        out.diag.push((dtag | 9, id, [0.0; 6]));
-                    }
-                    continue;
-                };
-                let fl = pc.flags[hs];
-                if fl & PF_PUSHABLE == 0 || fl & PF_SPECTATOR != 0 || fl & PF_NOPHYSICS != 0 {
-                    if diag && out.diag.len() < 128 {
-                        let o = hs * 6;
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 1, id, mb));
-                    }
-                    continue;
-                }
-                let o = hs * 6;
-                // exact vanilla AABB.intersects(AABB) — strict compares
-                if !(pc.box6[o] < sx1
-                    && pc.box6[o + 3] > sx0
-                    && pc.box6[o + 1] < sy1
-                    && pc.box6[o + 4] > sy0
-                    && pc.box6[o + 2] < sz1
-                    && pc.box6[o + 5] > sz0)
-                {
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 2, id, mb));
-                    }
-                    continue;
-                }
-                hits_count += 1;
-                let is_pass = fl & PF_PASSENGER != 0;
-                if !is_pass {
-                    non_pass += 1;
-                }
-                // numCollisions cap (vanilla `return`s the whole body)
-                if ncol_self >= max_ec {
-                    // keep counting hits for the cramming audit, skip the rest
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 3, id, mb));
-                    }
-                    continue;
-                }
-                // ---- vanilla loop body: numCollisions bookkeeping happens
-                // BEFORE doPush — an Entity.push early return (same vehicle,
-                // noPhysics, eps) never undoes it (javap 295-319) ----
-                if !detect {
-                    pc.ncol[hs] += 1;
-                    // ADDENDUM-18: the candidate's REAL counter hit rides
-                    // out.hits — the Java apply loop applies it (U.putInt)
-                    // for gated candidates too, exactly like vanilla's
-                    // pre-doPush `entityx.numCollisions++` (the increments
-                    // precede the push gates, so a gated candidate still
-                    // consumes its hit — the old emit-only loop lost every
-                    // gated hit and the entity's numCollisions grew ~10x
-                    // slower than vanilla: the OFF nc(78) trace 2..18 by
-                    // t=274 vs the kernel's flat 0-1, which let the
-                    // kernel's pass serve pairs vanilla's maxEntityCollisions
-                    // cap had already excluded — the mobs t=275 seed).
-                    if out.hits.len() < MAX_PUSH_PAIRS {
-                        out.hits.push(id);
-                    }
-                }
-                ncol_self += 1;
-                // Entity.push pair gates (all live INSIDE push, after ncol++)
-                if is_pass && pc.vid[hs] == self_id {
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 4, id, mb));
-                    }
-                    continue; // isPassengerOfSameVehicle
-                }
-                if self_nophys || fl & PF_NOPHYSICS != 0 {
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 5, id, mb));
-                    }
-                    continue;
-                }
-                if only_players_collide && !self_player && fl & PF_PLAYER == 0 {
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 6, id, mb));
-                    }
-                    continue;
-                }
-                if fl & PF_PLAYER != 0 && !player_collisions {
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 6, id, mb));
-                    }
-                    continue;
-                }
-                // ---- Entity.push force math (exact constants) ----
-                let opx = pc.px[hs];
-                let opz = pc.pz[hs];
-                let mut dx = opx - spx;
-                let mut dz = opz - spz;
-                let d0 = abs_max(dx, dz);
-                if d0 < PUSH_EPS {
-                    // vanilla crammed branch: 26.3 push(Entity) applies NO
-                    // force here (the dd >= 0.01 gate has no else) — but the
-                    // counters already moved. Route vanilla to keep the
-                    // RNG/counter semantics byte-exact (the L37e contract).
-                    if detect {
-                        out.reason = 2;
-                        return; // ok stays false, mirrors untouched
-                    }
-                    if diag && out.diag.len() < 128 {
-                        let mut mb = [0.0; 6];
-                        mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 7, id, mb));
-                    }
-                    continue;
-                }
-                let d = d0.sqrt();
-                dx /= d;
-                dz /= d;
-                let mut f = 1.0 / d;
-                if f > 1.0 {
-                    f = 1.0;
-                }
-                dx *= f;
-                dz *= f;
-                dx *= PUSH_QUANTUM;
-                dz *= PUSH_QUANTUM;
-                // this.push(-dx, 0, -dz) when not a vehicle and pushable
-                if !self_vehicle && self_pushable {
-                    base_dx += -dx;
-                    base_dz += -dz;
-                    ddx += -dx;
-                    ddz += -dz;
-                }
-                // other.push(dx, 0, dz) when other is not a vehicle — L42:
-                // the force is EMITTED for the Java apply loop (the
-                // candidate's delta write lands THIS TICK, mirroring
-                // vanilla's doPush mutual push); the write's own probe event
-                // (the value-carrying capture) re-syncs the mirror before
-                // the next kernel read (every dispatch flushes first). The
-                // old mirror+kadd mutation deferred the write to the
-                // candidate's own kernel run — lost whenever that run
-                // declined (the first-move divergence, doc 40 addendum 5).
-                if !detect && fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
-                    out.pairs.push((id, dx, dz));
-                }
-                if diag && out.diag.len() < 128 {
-                    let mut mb = [0.0; 6];
-                    mb.copy_from_slice(&pc.box6[o..o + 6]);
-                    out.diag.push((dtag | 8, id, mb));
-                }
-            }
-        }
         }
         if !detect {
             break;
@@ -758,7 +756,20 @@ mod tests {
 
     fn core_with(id: i64, x: f64, z: f64) -> PushCore {
         let mut pc = PushCore::new();
-        pc.upsert(id, 0, &zbox(x, z), x, z, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            id,
+            0,
+            &zbox(x, z),
+            x,
+            z,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         pc
     }
 
@@ -779,12 +790,26 @@ mod tests {
         let sq = 0.5f64 / 0.5f64.sqrt();
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert!(out.ok);
         let want = sq * 0.05000000074505806;
@@ -818,12 +843,26 @@ mod tests {
     fn same_position_eps_routes_vanilla() {
         let mut pidx = idx_with(2, 0.0, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, 0, &zbox(0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.0, 0.0),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert!(!out.ok, "a crammed pair routes the whole tick vanilla");
         assert_eq!(out.ncol, 0, "no kernel bookkeeping on the routed tick");
@@ -844,13 +883,27 @@ mod tests {
         for k in 2..7i64 {
             let x = 0.05 * (k - 1) as f64; // 0.05..0.25 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+            pc.upsert(
+                k,
+                0,
+                &zbox(x, 0.0),
+                x,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                PF_PUSHABLE,
+                0,
+                0,
+                0,
+            );
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.non_passengers, 5, "all hits audited despite the cap");
         assert_eq!(out.ncol, 2, "the cap stops pair processing at maxEC");
@@ -870,13 +923,27 @@ mod tests {
         for k in 2..32i64 {
             let x = 0.01 * (k - 1) as f64; // 0.01..0.29 — all intersect
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+            pc.upsert(
+                k,
+                0,
+                &zbox(x, 0.0),
+                x,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                PF_PUSHABLE,
+                0,
+                0,
+                0,
+            );
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.non_passengers, 30);
         assert!(out.cramming);
@@ -906,7 +973,8 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.non_passengers, 0, "passengers excluded from the audit");
         assert_eq!(out.ncol, 1, "the loop counted the pair");
@@ -925,13 +993,27 @@ mod tests {
     fn removed_candidate_never_pushed() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         pc.remove(2);
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.non_passengers, 0);
         assert_eq!(out.ncol, 0);
@@ -947,17 +1029,31 @@ mod tests {
         let mut pc = core_with(1, 0.0, 0.0);
         for k in (2..12i64).rev() {
             let x = 0.02 * (k - 1) as f64; // 0.02..0.18 — all intersect
-            // seq REVERSE of id: vanilla re-appends make seq, not id, the
-            // order authority
+                                           // seq REVERSE of id: vanilla re-appends make seq, not id, the
+                                           // order authority
             let seq = (14 - k) as i32;
             pidx.upsert(k, 0, &zbox(x, 0.0));
-            pc.upsert(k, 0, &zbox(x, 0.0), x, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, seq);
+            pc.upsert(
+                k,
+                0,
+                &zbox(x, 0.0),
+                x,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                PF_PUSHABLE,
+                0,
+                0,
+                seq,
+            );
         }
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 2, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.ncol, 2);
         for k in 2..12i64 {
@@ -978,12 +1074,26 @@ mod tests {
     fn java_delta_event_resyncs_mirror_after_emitted_push() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         let s2 = pc.slot_of(2).unwrap();
         assert_eq!(out.pairs.len(), 1, "one emitted pair");
@@ -1005,13 +1115,27 @@ mod tests {
     fn density_gate_routes_sparse_worlds() {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         let mut out = PushOut::default();
         let s1 = pc.slot_of(1).unwrap();
         // gate_min=96 with 2 rows -> decline, NO state changes
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 96, 1, rn, false,
+            &mut out,
         );
         assert!(!out.ok, "sparse world must route vanilla");
         assert_eq!(out.ncol, 0);
@@ -1020,7 +1144,8 @@ mod tests {
         // gate_min=0 -> the tick runs
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert!(out.ok);
         assert_eq!(out.ncol, 1);
@@ -1051,7 +1176,8 @@ mod tests {
         let s1 = pc.slot_of(1).unwrap();
         let rn = pc.ncol[s1];
         push_tick(
-            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false, &mut out,
+            &mut pc, &mut pidx, 0, 1, s1, false, false, false, true, 8, 24, 0, 1, rn, false,
+            &mut out,
         );
         assert_eq!(out.ddy, 0.0);
         let s2 = pc.slot_of(2).unwrap();
@@ -1068,16 +1194,55 @@ mod tests {
         let mut pidx = idx_with(2, 0.5, 0.0);
         let mut pc = core_with(1, 0.0, 0.0);
         // 2 = served pair (boxes overlap, dx=0.5 >= eps)
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         // 3 = intersect-fail: its x0 sits 4e-7 beyond the exact self box
         // (gap 4e-7) but inside the 1e-3 query margin (the f32 superset)
         let b3 = zbox(0.6 + 4e-7, 0.0);
         pidx.upsert(3, 0, &b3);
-        pc.upsert(3, 0, &b3, 0.6 + 4e-7, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            3,
+            0,
+            &b3,
+            0.6 + 4e-7,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         // 4 = flags-drop (spectator)
         let b4 = zbox(0.5, 0.0);
         pidx.upsert(4, 0, &b4);
-        pc.upsert(4, 0, &b4, 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE | PF_SPECTATOR, 0, 0, 0);
+        pc.upsert(
+            4,
+            0,
+            &b4,
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE | PF_SPECTATOR,
+            0,
+            0,
+            0,
+        );
         // 9 = index-only id (never upserted into the push mirror)
         pidx.upsert(9, 0, &zbox(0.5, 0.0));
         let mut out = PushOut::default();
@@ -1089,7 +1254,11 @@ mod tests {
         );
         assert!(out.ok);
         let sc = s1 * 6;
-        assert_eq!(out.diag_sb, pc.box6[sc..sc + 6], "diag_sb = the self's mirror box6");
+        assert_eq!(
+            out.diag_sb,
+            pc.box6[sc..sc + 6],
+            "diag_sb = the self's mirror box6"
+        );
         let (mut served, mut ifail, mut fdrop, mut noslot) = (false, false, false, false);
         for &(stage, id, ref mb) in out.diag.iter() {
             assert!(stage >> 4 <= 1, "pass tag only");
@@ -1150,7 +1319,20 @@ mod tests {
         assert_eq!(pc.ncol[s1], 5);
         // WITH a candidate the reset + cap replay applies as before:
         // real=5, maxEC=8 -> post-decay 0, one candidate -> ncol=1.
-        pc.upsert(2, 0, &zbox(0.5, 0.0), 0.5, 0.0, 0.0, 0.0, 0.0, PF_PUSHABLE, 0, 0, 0);
+        pc.upsert(
+            2,
+            0,
+            &zbox(0.5, 0.0),
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            PF_PUSHABLE,
+            0,
+            0,
+            0,
+        );
         pidx.upsert(2, 0, &zbox(0.5, 0.0));
         let mut out2 = PushOut::default();
         push_tick(
@@ -1158,6 +1340,9 @@ mod tests {
             &mut out2,
         );
         assert!(out2.ok);
-        assert_eq!(out2.ncol, 1, "non-empty roster: reset-then-increment as vanilla");
+        assert_eq!(
+            out2.ncol, 1,
+            "non-empty roster: reset-then-increment as vanilla"
+        );
     }
 }

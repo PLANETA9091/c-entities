@@ -9896,11 +9896,12 @@ public final class CeHooks {
     private static native int[] nativeGlTake(int on);
 
     /** doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) — the staged
-     *  continuation witness for the t=157 residual. Records are 6 longs:
+     *  continuation witness for the t=157 residual. Records are 7 longs:
      *  [0] id | tickCount<<32, [1] seed in, [2] seed out, [3] draws |
-     *  kinds<<32, [4] cursor | status<<56, [5] seq. `arm` sets the NEXT
-     *  interval's arming (gl_take semantics); the dump rides the SAME
-     *  per-tick boundary and window gate as gateLedgerPrint. */
+     *  kinds<<32, [4] cursor | status<<56, [5] seq, [6] eval-mask |
+     *  pack-running-mask<<32. `arm` sets the NEXT interval's arming
+     *  (gl_take semantics); the dump rides the SAME per-tick boundary and
+     *  window gate as gateLedgerPrint. */
     private static native long[] nativeMobLedgerTake(int arm);
 
     /** The env master switch — the native is never called when off, so the
@@ -9918,9 +9919,10 @@ public final class CeHooks {
         if (rec == null) {
             return;
         }
-        for (int i = 0; i + 5 < rec.length; i += 6) {
+        for (int i = 0; i + 6 < rec.length; i += 7) {
             long meta = rec[i], sin = rec[i + 1], sout = rec[i + 2];
             long dk = rec[i + 3], cur = rec[i + 4], seq = rec[i + 5];
+            long ev = rec[i + 6];
             System.out.println("[ce-baseline] MLEDGER t=" + CUR_TICK / 3
                     + " seq=" + seq + " id=" + (meta & 0xFFFF_FFFFL)
                     + " tc=" + (meta >>> 32)
@@ -9929,7 +9931,9 @@ public final class CeHooks {
                     + " dr=" + (dk & 0xFFFF_FFFFL)
                     + " st=" + (cur >>> 56)
                     + " rs=" + (cur & 0x00FF_FFFF_FFFF_FFFFL)
-                    + " k=" + Long.toHexString(dk >>> 32));
+                    + " k=" + Long.toHexString(dk >>> 32)
+                    + " e=" + Long.toHexString(ev >>> 32)
+                    + " rt=" + Long.toHexString(ev & 0xFFFF_FFFFL));
         }
     }
 

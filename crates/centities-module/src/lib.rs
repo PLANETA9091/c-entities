@@ -363,11 +363,7 @@ fn publish(env: &JniEnv, st: &mut CeState) {
             if row.is_null() {
                 match env.new_long_array((2 + ROW_CAP) as i32) {
                     Some(narr) => {
-                        env.set_object_array_element(
-                            info.rows as jni::jobjectArray,
-                            slot,
-                            narr,
-                        );
+                        env.set_object_array_element(info.rows as jni::jobjectArray, slot, narr);
                         row = narr;
                     }
                     None => {
@@ -446,10 +442,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
     cplug_sdk::hooks::register_bytes(LOOK_CONTROL_CLASS, |_n, b| patch_lookcontrol(b));
-    cplug_sdk::hooks::register_bytes(
-        ENCH_HELPER_CLASS,
-        |_n, b| patch_ench(b),
-    );
+    cplug_sdk::hooks::register_bytes(ENCH_HELPER_CLASS, |_n, b| patch_ench(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -619,9 +612,7 @@ fn precompute_idle_controls(loader: jni::jobject) {
                     pc.insert(cls, b);
                 }
                 woven.store(true, Ordering::Release);
-                cplug_sdk::log::info(&format!(
-                    "[c-entities] precomputed {label} idle guard"
-                ));
+                cplug_sdk::log::info(&format!("[c-entities] precomputed {label} idle guard"));
             }
             _ => {
                 declined.store(true, Ordering::Release);
@@ -1595,27 +1586,19 @@ fn precompute_livingentity(loader: jni::jobject) {
             return base;
         }
         let base = match base {
-            Some(b) => match cplug_sdk::asm::insert_early_return_guard(
-                env,
-                loader,
-                &b,
-                &eff_spec,
-            ) {
-                Some(b2) => {
-                    EFF_WOVEN.store(true, Ordering::Release);
-                    Some(b2)
+            Some(b) => {
+                match cplug_sdk::asm::insert_early_return_guard(env, loader, &b, &eff_spec) {
+                    Some(b2) => {
+                        EFF_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
+                    }
+                    None => Some(b),
                 }
-                None => Some(b),
-            },
+            }
             None => {
                 // no base guard survived; the eff guard alone is still worth
                 // applying — vanilla keeps the other two bodies.
-                match cplug_sdk::asm::insert_early_return_guard(
-                    env,
-                    loader,
-                    &bytes,
-                    &eff_spec,
-                ) {
+                match cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &eff_spec) {
                     Some(b2) => {
                         EFF_WOVEN.store(true, Ordering::Release);
                         Some(b2)
@@ -1634,7 +1617,8 @@ fn precompute_livingentity(loader: jni::jobject) {
             method_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
             bridge_owner: HOOKS_CLASS,
             bridge_name: "canCollideWithBukkit$",
-            bridge_desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/Entity;)Z",
+            bridge_desc:
+                "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/Entity;)Z",
             args: &[
                 cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
                 cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
@@ -1679,24 +1663,20 @@ fn precompute_livingentity(loader: jni::jobject) {
         };
         let guarded = if equip_ok {
             match guarded {
-                Some(b) => {
-                    match cplug_sdk::asm::replace_body(env, loader, &b, &equip_spec) {
-                        Some(b2) if !b2.is_empty() => {
-                            EQUIP_WOVEN.store(true, Ordering::Release);
-                            Some(b2)
-                        }
-                        _ => Some(b),
+                Some(b) => match cplug_sdk::asm::replace_body(env, loader, &b, &equip_spec) {
+                    Some(b2) if !b2.is_empty() => {
+                        EQUIP_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
                     }
-                }
-                None => {
-                    match cplug_sdk::asm::replace_body(env, loader, &bytes, &equip_spec) {
-                        Some(b2) if !b2.is_empty() => {
-                            EQUIP_WOVEN.store(true, Ordering::Release);
-                            Some(b2)
-                        }
-                        _ => None,
+                    _ => Some(b),
+                },
+                None => match cplug_sdk::asm::replace_body(env, loader, &bytes, &equip_spec) {
+                    Some(b2) if !b2.is_empty() => {
+                        EQUIP_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
                     }
-                }
+                    _ => None,
+                },
             }
         } else {
             guarded
@@ -1838,7 +1818,8 @@ fn patch_ench_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         // Boot load: stash the original bytes, stay vanilla. The floor is
         // woven by the verifier (precompute_ench).
         let mut st = STASH.lock().ok()?;
-        st.entry(ENCH_HELPER_CLASS).or_insert_with(|| bytes.to_vec());
+        st.entry(ENCH_HELPER_CLASS)
+            .or_insert_with(|| bytes.to_vec());
         return None;
     }
     let pre = PRECOMPUTED.lock().ok()?.get(ENCH_HELPER_CLASS).cloned();
@@ -1848,11 +1829,10 @@ fn patch_ench_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             cplug_sdk::log::info("[c-entities] patched EnchantmentHelper tickEffects floor");
             Some(b)
         }
-        _ if !ENCH_WOVEN.load(Ordering::Acquire)
-            && !ENCH_DECLINED.load(Ordering::Acquire) =>
-        {
+        _ if !ENCH_WOVEN.load(Ordering::Acquire) && !ENCH_DECLINED.load(Ordering::Acquire) => {
             let mut st = STASH.lock().ok()?;
-            st.entry(ENCH_HELPER_CLASS).or_insert_with(|| bytes.to_vec());
+            st.entry(ENCH_HELPER_CLASS)
+                .or_insert_with(|| bytes.to_vec());
             cplug_sdk::log::info(
                 "[c-entities] EnchantmentHelper bytes stashed post-arm — verifier will decide",
             );
@@ -1878,22 +1858,24 @@ fn precompute_ench(loader: jni::jobject) {
         .and_then(|mut s| s.remove(ENCH_HELPER_CLASS));
     let Some(bytes) = stash else {
         PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-        cplug_sdk::log::info(
-            "[c-entities] precompute Ench floor: original bytes not seen at boot",
-        );
+        cplug_sdk::log::info("[c-entities] precompute Ench floor: original bytes not seen at boot");
         return;
     };
     if read_java_flag("ENCH_FLAG_ON") != Some(true) {
         ENCH_DECLINED.store(true, Ordering::Release);
-        cplug_sdk::log::info("[c-entities] enchTick floor declined (centities.enchTick) — vanilla kept");
+        cplug_sdk::log::info(
+            "[c-entities] enchTick floor declined (centities.enchTick) — vanilla kept",
+        );
         return;
     }
     let spec = cplug_sdk::asm::EarlyReturnGuard2 {
         method_name: "tickEffects",
-        method_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
+        method_desc:
+            "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
         check_class: HOOKS_CLASS,
         check_name: "enchGate$",
-        check_desc: "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)Z",
+        check_desc:
+            "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)Z",
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &spec)
@@ -1904,7 +1886,9 @@ fn precompute_ench(loader: jni::jobject) {
                 pc.insert(ENCH_HELPER_CLASS, b.clone());
             }
             ENCH_WOVEN.store(true, Ordering::Release);
-            cplug_sdk::log::info("[c-entities] precomputed EnchantmentHelper tickEffects floor (op-5 prefix)");
+            cplug_sdk::log::info(
+                "[c-entities] precomputed EnchantmentHelper tickEffects floor (op-5 prefix)",
+            );
         }
         _ => {
             ENCH_DECLINED.store(true, Ordering::Release);
@@ -2009,9 +1993,7 @@ fn weave_burn_probe(b: Vec<u8>) -> Vec<u8> {
         Ok(b2) => b2,
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!(
-                "[c-entities] Mob.burnUndead probe refused: {e}"
-            ));
+            cplug_sdk::log::info(&format!("[c-entities] Mob.burnUndead probe refused: {e}"));
             b
         }
     }
@@ -2024,7 +2006,10 @@ fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
-    eprintln!("[c-entities] MOB-HOOK pass (dbg) bridge_ready={}", BRIDGE_READY.load(Ordering::Acquire));
+    eprintln!(
+        "[c-entities] MOB-HOOK pass (dbg) bridge_ready={}",
+        BRIDGE_READY.load(Ordering::Acquire)
+    );
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
         st.entry(MOB_CLASS).or_insert_with(|| bytes.to_vec());
@@ -2054,7 +2039,10 @@ fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             // object (the smoke-8 lesson: the arm line + rc=0 + a dump with
             // the probe, and ZERO executions — the live class was vanilla).
             let b2 = weave_burn_probe(bytes.to_vec());
-            eprintln!("[c-entities] MOB-HOOK declined-arm woven delta={}", b2.len() as isize - bytes.len() as isize);
+            eprintln!(
+                "[c-entities] MOB-HOOK declined-arm woven delta={}",
+                b2.len() as isize - bytes.len() as isize
+            );
             if b2.len() != bytes.len() {
                 if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
                     let _ = std::fs::write(format!("{dir}/Mob.patched.class"), &b2);
@@ -3148,7 +3136,10 @@ fn precompute_chunkmap(loader: jni::jobject) {
         );
         return;
     }
-    let Some(bytes) = STASH.lock().ok().and_then(|s| s.get(CHUNKMAP_CLASS).cloned())
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|s| s.get(CHUNKMAP_CLASS).cloned())
     else {
         cplug_sdk::log::info(
             "[c-entities] ChunkMap not stashed yet — tracker-loop floor deferred to the verifier",
@@ -3186,8 +3177,7 @@ fn patch_chunkmap_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         // Boot load: stash the original bytes, stay vanilla. The floor is
         // woven at arm time (precompute_chunkmap).
         let mut st = STASH.lock().ok()?;
-        st.entry(CHUNKMAP_CLASS)
-            .or_insert_with(|| bytes.to_vec());
+        st.entry(CHUNKMAP_CLASS).or_insert_with(|| bytes.to_vec());
         return None;
     }
     let pre = PRECOMPUTED.lock().ok()?.get(CHUNKMAP_CLASS).cloned();
@@ -3199,8 +3189,7 @@ fn patch_chunkmap_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         _ if !TTL_WOVEN.load(Ordering::Acquire) && !TTL_DECLINED.load(Ordering::Acquire) => {
             let mut st = STASH.lock().ok()?;
-            st.entry(CHUNKMAP_CLASS)
-                .or_insert_with(|| bytes.to_vec());
+            st.entry(CHUNKMAP_CLASS).or_insert_with(|| bytes.to_vec());
             cplug_sdk::log::info(
                 "[c-entities] ChunkMap bytes stashed post-arm — verifier will decide",
             );
@@ -3580,13 +3569,14 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     push!(
         "nativeIndexBox",
         "(IJ[D)I",
-        n_index_box as extern "system" fn(
-            *mut jni::JNIEnv,
-            jni::jclass,
-            i32,
-            i64,
-            jni::jdoubleArray,
-        ) -> i32
+        n_index_box
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                i64,
+                jni::jdoubleArray,
+            ) -> i32
     );
     push!(
         "nativeMobAiFloor",
@@ -3602,20 +3592,13 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     push!(
         "nativeGlTake",
         "(I)[I",
-        n_gl_take as extern "system" fn(
-            *mut jni::JNIEnv,
-            jni::jclass,
-            i32,
-        ) -> jni::jintArray
+        n_gl_take as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jintArray
     );
     push!(
         "nativeMobLedgerTake",
         "(I)[J",
-        n_mob_ledger_take as extern "system" fn(
-            *mut jni::JNIEnv,
-            jni::jclass,
-            i32,
-        ) -> jni::jlongArray
+        n_mob_ledger_take
+            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jlongArray
     );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
@@ -3881,12 +3864,7 @@ fn patch_chunk_slices_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     // retransform serve: the verifier precomputed the weave
-    if let Some(b) = PRECOMPUTED
-        .lock()
-        .ok()?
-        .get(CHUNK_SLICES_CLASS)
-        .cloned()
-    {
+    if let Some(b) = PRECOMPUTED.lock().ok()?.get(CHUNK_SLICES_CLASS).cloned() {
         if !b.is_empty() {
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
             cplug_sdk::log::info("[c-entities] patched ChunkEntitySlices add-order probe");
@@ -4740,7 +4718,11 @@ pub extern "system" fn n_push(
             let e = JniEnv::from_raw(env);
             let raw_env = e.raw();
             let vt = *raw_env;
-            for (name, v) in [("PUSH_RAW", raw), ("PUSH_DROWS", drows), ("PUSH_DIAG_N", n_diag)] {
+            for (name, v) in [
+                ("PUSH_RAW", raw),
+                ("PUSH_DROWS", drows),
+                ("PUSH_DIAG_N", n_diag),
+            ] {
                 if let Some(fid) = e.get_static_field_id(cls, name, "I") {
                     ((*vt).SetStaticIntField)(raw_env, cls, fid, v);
                 }
@@ -4828,7 +4810,10 @@ pub extern "system" fn n_push(
                 o.dz,
                 o.pairs.len(),
                 o.pairs.iter().map(|p| p.0).collect::<Vec<i64>>(),
-                o.pairs.iter().flat_map(|p| [p.1, p.2]).collect::<Vec<f64>>(),
+                o.pairs
+                    .iter()
+                    .flat_map(|p| [p.1, p.2])
+                    .collect::<Vec<f64>>(),
                 o.hits.len(),
                 o.hits.iter().copied().collect::<Vec<i64>>(),
             )
@@ -5146,16 +5131,19 @@ pub extern "system" fn n_mob_ledger_take(
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
         let vt = *raw;
-        let recs = centities_core::goals::mob_ledger_take(arm != 0)
-            .unwrap_or_default();
-        let n = recs.len() * 6;
+        let recs = centities_core::goals::mob_ledger_take(arm != 0).unwrap_or_default();
+        const W: usize = 7; // u64 fields per record (see ml_record)
+        let n = recs.len() * W;
         let arr = ((*vt).NewLongArray)(raw, n.max(1) as i32);
         if arr.is_null() {
             return std::ptr::null_mut();
         }
         if n > 0 {
-            let flat: Vec<i64> = recs.iter().flat_map(|r| r.iter().copied())
-                .map(|v| v as i64).collect();
+            let flat: Vec<i64> = recs
+                .iter()
+                .flat_map(|r| r.iter().copied())
+                .map(|v| v as i64)
+                .collect();
             ((*vt).SetLongArrayRegion)(raw, arr, 0, n as i32, flat.as_ptr());
         }
         arr

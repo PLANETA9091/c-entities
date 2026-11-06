@@ -440,10 +440,10 @@ pub struct EntityIndex {
     // so the concatenated stream is bit-identical to vanilla's scan order —
     // merge partner ties, maxEntityCollisions caps and targeting all see
     // the same neighbor sequence as the vanilla server.
-    sy: Vec<i32>,       // per-slot section Y stamp
-    seq: Vec<i64>,      // per-slot insertion seq stamp
-    cell_ov: Vec<u64>,  // per-cell order version (bumped on order change)
-    cell_sv: Vec<u64>,  // per-cell version the layout was last sorted to
+    sy: Vec<i32>,      // per-slot section Y stamp
+    seq: Vec<i64>,     // per-slot insertion seq stamp
+    cell_ov: Vec<u64>, // per-cell order version (bumped on order change)
+    cell_sv: Vec<u64>, // per-cell version the layout was last sorted to
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
     cell_ids: Vec<Vec<i64>>,
     cell_box: Vec<Vec<f32>>,   // blocked-SoA: blocks of 48 f32 (simd.rs)
@@ -994,9 +994,7 @@ impl EntityIndex {
                 kb,
             ));
         }
-        rows.sort_by(|a, b| {
-            (a.3, a.4).cmp(&(b.3, b.4))
-        });
+        rows.sort_by(|a, b| (a.3, a.4).cmp(&(b.3, b.4)));
         let mut blocks: Vec<f32> = Vec::with_capacity(((n + 7) >> 3) * BLOCK_F32);
         let mut chunk: [f32; 6] = [0.0; 6];
         for (i, (_id, slot, b6, _, _)) in rows.iter().enumerate() {
@@ -1149,17 +1147,41 @@ impl EntityIndex {
             self.free_slot(slot as usize);
             self.stats.entities -= 1;
             if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
-                self.oversize[p] = Oversize { id, world, b, sy, seq };
+                self.oversize[p] = Oversize {
+                    id,
+                    world,
+                    b,
+                    sy,
+                    seq,
+                };
                 return UpsertEv::ToOversize { old: Some(home) };
             }
-            self.oversize.push(Oversize { id, world, b, sy, seq });
+            self.oversize.push(Oversize {
+                id,
+                world,
+                b,
+                sy,
+                seq,
+            });
             self.stats.oversize += 1;
             return UpsertEv::ToOversize { old: Some(home) };
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
-            self.oversize[p] = Oversize { id, world, b, sy, seq };
+            self.oversize[p] = Oversize {
+                id,
+                world,
+                b,
+                sy,
+                seq,
+            };
             return UpsertEv::OversizeSame;
         }
-        self.oversize.push(Oversize { id, world, b, sy, seq });
+        self.oversize.push(Oversize {
+            id,
+            world,
+            b,
+            sy,
+            seq,
+        });
         self.stats.oversize += 1;
         UpsertEv::ToOversize { old: None }
     }

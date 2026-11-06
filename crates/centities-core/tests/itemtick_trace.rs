@@ -199,7 +199,10 @@ fn sliding_item_decays_and_merges_on_floor_change() {
         tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
     };
     assert!(out.has(TickOutcome::MOVED));
-    assert!(out.has(TickOutcome::MERGE), "POST 2: floor changed, 2%2==0 fires");
+    assert!(
+        out.has(TickOutcome::MERGE),
+        "POST 2: floor changed, 2%2==0 fires"
+    );
     assert!(out.has(TickOutcome::MERGE2));
     let f = (0.6f32 * 0.98f32) as f64;
     assert_eq!(

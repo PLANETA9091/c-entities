@@ -256,8 +256,8 @@ pub fn travel_in_air_open_ground(
 /// ~6.1e-3) does NOT setPos in vanilla — the writeback must skip it too.
 pub fn move_sets_position(delta: (f64, f64, f64)) -> bool {
     let movement = (delta.0, 0.0f64, delta.2);
-    let movement_length = (movement.0 * movement.0 + movement.1 * movement.1)
-        + movement.2 * movement.2;
+    let movement_length =
+        (movement.0 * movement.0 + movement.1 * movement.1) + movement.2 * movement.2;
     let delta_length = (delta.0 * delta.0 + delta.1 * delta.1) + delta.2 * delta.2;
     movement_length > 1.0e-7 || delta_length - movement_length < 1.0e-7
 }
