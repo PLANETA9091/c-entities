@@ -291,6 +291,7 @@ pub const ACT_NAV_IDLE: i32 = 7; // navigation.tick idle port done natively (exe
 pub const ACT_MOVE_ZZA0: i32 = 8; // moveControl WAIT: setZza(0)
 pub const ACT_LOOK_COOL_VANILLA: i32 = 9; // lookControl.tick routes vanilla (cooldown > 0)
 pub const ACT_REF_SET_PLAYER: i32 = 10; // goal.lookAt/target = players[p1] (p0 = global goalIdx)
+pub const ACT_GOAL_LOCK_MAP: i32 = 11; // lockedFlags.put(flag, wg) ONLY — the start body runs at the REQ_START_VANILLA resolution (L102)
 pub const ACT_NOOP: i32 = 0;
 
 // phases within one selector tick
@@ -719,7 +720,7 @@ fn ml_kind_bits(inb: &[i32], out_buf: &[i32]) -> u32 {
     let mut bits = 0u32;
     for a in 0..n_act {
         let b = OUT_HEADER + a * OUT_ACT;
-        if out_buf[b] == ACT_GOAL_START {
+        if out_buf[b] == ACT_GOAL_START || out_buf[b] == ACT_GOAL_LOCK_MAP {
             let gi = out_buf[b + 1];
             let kind = if (gi as usize) < nt {
                 inb[IN_HEADER + gi as usize * GOAL_STRIDE]
@@ -918,14 +919,19 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
-            REQ_CANUSE_VANILLA | REQ_STROLL_POS | REQ_LOOKAT_QUERY | REQ_FIND_TARGET
-            | REQ_START_VANILLA => {
+            REQ_CANUSE_VANILLA | REQ_STROLL_POS | REQ_LOOKAT_QUERY | REQ_FIND_TARGET => {
                 // the continuation resolved the PREDICATE only — the lock
                 // transition (displaced stops, then start) is the engine's
                 // job, emitted as actions the floor applies IMMEDIATELY
                 if res && lock_only(&mut ctx, &mut out, sel, gi).is_err() {
                     return fallback(&mut out, FB_STATE_MISMATCH);
                 }
+            }
+            REQ_START_VANILLA => {
+                // L102: the transition rode the PARK round
+                // (lock_only_resolved) and the REAL start() ran inline at
+                // the resolution — the walk continues with the transition
+                // already applied and the stream exact. Nothing to do.
             }
             REQ_LOS_SCAN => {
                 // res_mask = the passing bitmask over the staged candidates.
@@ -1374,6 +1380,16 @@ fn can_use_inner(
             // nextFloat() < 0.02F → start (staged — start() writes
             // relX/relZ/lookTime and consumes nextDouble + nextInt(20))
             if ctx.lcg.next_f32() < 0.02f32 {
+                // L102: the lock transition rides the PARK round (the
+                // displaced stops + the map put apply BEFORE the
+                // resolution); the REAL start() runs inline at the
+                // REQ_START_VANILLA resolution — vanilla performs the
+                // start's draws mid-walk, before the remaining gates.
+                if lock_only_resolved(ctx, out, sel, gi).is_err() {
+                    out.buf[0] = ST_FALLBACK;
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return Ok(Cu::No);
+                }
                 park(ctx, out, sel, phase, gi, REQ_START_VANILLA);
                 Ok(Cu::StartStaged)
             } else {
@@ -1453,6 +1469,40 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
     }
     ctx.running[sel][gi] = true;
     out.push(ACT_GOAL_START, ctx.global(sel, gi), 0, 0, 0);
+    Ok(())
+}
+
+/// The L102 variant for the DRAWING start bodies (the RLA start draws
+/// nextDouble + nextInt(20) — javap 26.3): the lock transition (displaced
+/// stops + the map put) rides the PARK round so the apply lands it in the
+/// vanilla order (stops → put → start), the REAL start() runs at the
+/// REQ_START_VANILLA resolution — INLINE, before the walk's remaining
+/// gates — and the engine's LCG model stays exact for them. The old shape
+/// (start at apply, after the walk) left the model 2 draws behind per
+/// staged start: every later gate of the same tick read a shifted stream
+/// position — the t=157 stroll flip (the engine's stroll gate refused at
+/// position P−2 where vanilla passed at P) and the +10..12/tick roll
+/// surplus the L101 ledger reconciliation measured.
+fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
+    let mut fl = ctx.flags(sel, gi);
+    while fl != 0 {
+        let bit = fl.trailing_zeros() as usize;
+        if bit >= MAX_GOALS {
+            return Err(());
+        }
+        let cur = ctx.lock[sel][bit];
+        if cur != -1 {
+            let c = cur as usize;
+            if ctx.running[sel][c] {
+                ctx.running[sel][c] = false;
+                out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
+            }
+        }
+        ctx.lock[sel][bit] = gi as i32;
+        fl &= fl - 1;
+    }
+    ctx.running[sel][gi] = true;
+    out.push(ACT_GOAL_LOCK_MAP, ctx.global(sel, gi), 0, 0, 0);
     Ok(())
 }
 

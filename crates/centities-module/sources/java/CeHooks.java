@@ -8461,7 +8461,8 @@ public final class CeHooks {
             MF_MANY_PLAYERS = 512;
     static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
             ACT_GOAL_STOP_D = 4,
-            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10;
+            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10,
+            ACT_GOAL_LOCK_MAP = 11;
     static final int REQ_LOS_SCAN = 7;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
     static final int MAX_GOALS = 16, GOAL_STRIDE = 8, IN_HEADER = 34, OUT_HEADER = 8;
@@ -9420,9 +9421,35 @@ public final class CeHooks {
                 case REQ_CANUSE_VANILLA:
                     res = wg.canUse() ? 1 : 0;
                     break;
-                case REQ_START_VANILLA:
-                    res = 1; // the engine emits the start action
+                case REQ_START_VANILLA: {
+                    // L102: the REAL start() runs INLINE at the resolution —
+                    // vanilla's update walk performs start() (and its RNG
+                    // draws) mid-walk, BEFORE the remaining gates. The old
+                    // apply-time start left the engine's LCG model behind by
+                    // the body's draws (the RLA start: nextDouble +
+                    // nextInt(20) — javap 26.3) — every later gate of the
+                    // same tick read a shifted stream position (the t=157
+                    // stroll flip). The lock transition (stops + map put)
+                    // rode the PARK round's actions (ACT_GOAL_LOCK_MAP), so
+                    // this is the vanilla order: stops → put → start.
+                    try {
+                        wg.start();
+                    } catch (Throwable t) {
+                        mobAiFallbackWhy = FB_JAVA_PREDICATE;
+                        mobAiFallbackRound = round;
+                        mobAiFallbackReq = lastReqOp;
+                        mobAiFallbackMob = mob.getClass().getName();
+                        logFirstFallback();
+                        return ST_FALLBACK;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " START-RESOLVED gi=" + gi
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
+                    res = 1;
                     break;
+                }
                 case REQ_STROLL_POS: {
                     Object pos = null;
                     try {
@@ -9684,6 +9711,28 @@ public final class CeHooks {
                     lockWrite(lockedOf((p0 < ctx.tGoals.length)
                             ? ctx.targetSel : ctx.goalSel), wg, true);
                     wg.start();
+                    break;
+                }
+                case ACT_GOAL_LOCK_MAP: {
+                    // L102: the map write ONLY — the start body ran at the
+                    // REQ_START_VANILLA resolution (inline, vanilla order:
+                    // stops → put → start); the real start() also set the
+                    // WrappedGoal.isRunning flag.
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " LOCKMAP-NULL gi=" + p0);
+                        }
+                        return;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " LOCKMAP gi=" + p0
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, true);
                     break;
                 }
                 case ACT_GOAL_TICK_V: {
