@@ -1242,20 +1242,9 @@ fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 }
 
 fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
-    // vanilla update-pass transition (javap 26.3 GoalSelector.tick bc 193-264):
-    // for each flag — cur = lockedFlags.getOrDefault(flag, NO_GOAL); cur.stop();
-    // lockedFlags.put(flag, goalx) — then goalx.start() AFTER the whole flag
-    // walk. TWO subtleties the L97.7 javap read named:
-    //  1. WrappedGoal.stop() NEVER touches the map — a displaced holder's
-    //     entries on the new goal's OTHER flags stay as !isRunning records
-    //     until the NEXT tick's removeIf, and goalCanBeReplacedForAllFlags
-    //     does NOT check isRunning (javap bc 17-73) — those records gate
-    //     the same-tick candidates' replace checks.
-    //  2. The displaced stop fires ONCE per holder even when both a replaced
-    //     flag and a surviving flag exist: the second stop() is the
-    //     isRunning-guarded no-op (javap WrappedGoal.stop bc 0-19).
-    // So the displaced stop rides ACT_GOAL_STOP_D (map-preserving wg.stop()),
-    // and the flag releases happen only where the put overwrites below.
+    // D1-BISECT: the pre-L97.7 displaced semantics — stop_goal releases
+    // ALL of the displaced holder's flags immediately (the record does not
+    // survive in the lock table to the next rebuild).
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
@@ -1263,16 +1252,8 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
             return Err(());
         }
         let cur = ctx.lock[sel][bit];
-        if cur != -1 {
-            let c = cur as usize;
-            if ctx.running[sel][c] {
-                // first stop on this holder this walk — the vanilla
-                // isRunning-guarded body (goal.stop() + isRunning=false)
-                ctx.running[sel][c] = false;
-                out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
-            }
-            // a !isRunning holder: vanilla stop() is a no-op — the record
-            // survives exactly as ctx.lock holds it
+        if cur != -1 && stop_goal(ctx, out, sel, cur as usize).is_err() {
+            return Err(());
         }
         ctx.lock[sel][bit] = gi as i32;
         fl &= fl - 1;
