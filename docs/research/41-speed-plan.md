@@ -1936,3 +1936,40 @@ trace_id=107, PH 152-162) — the fixes must keep t<157 EXACT and kill the
 t=157 residual (the engine's RLA lifecycle now matches vanilla, and the
 +8 roll shift's downstream surface — MOVE=RLA — is a legal state both
 legs can produce).
+
+## L98 (session 18:05Z): THE BENCH WAS PLAYERLESS — the ViaVersion install step sat AFTER the run step
+
+The live parity job log (dispatch 42262639761, hooks@ lines) showed
+`ttlQ=0/0/1` — the L92 quiet stamps never fire — while the b0a71c-era
+items profile burns 14.47% inside ttlCachedPath. Walking that contradiction
+uncovered the benchmark-era bug: baseline.yml ran the "Install ViaVersion
++ ViaBackwards" step AFTER the "Run paired A/B" step, so the staged jars
+never existed at run time, run-baseline.sh silently skipped them (`if [ -f
+... ]`), the bench bot was kicked "Outdated client" and EVERY paired
+benchmark since the fix landed was PLAYERLESS:
+
+- the activation range never sees a player — Paper's inactive rotation
+  gates the mob AI cadence the vanilla leg serves (the L97.2
+  "activation hypothesis" item — the bench mirror of it),
+- cacheArm = players().isEmpty() is TRUE in the mod leg — the tracker
+  cache + the L92 stamps live in a mode the honest benchmark never
+  exercises (ttlCachedPath 14.47% is a playerless-only number),
+- the L83 zero-player findTarget fast path fires in scenarios that were
+  designed to carry a player.
+
+FIX (cc3ca1a): the install step now precedes the paired A/B run;
+run-baseline.sh FATALs on missing ViaVersion/ViaBackwards jars for bench
+legs (parity legs skip the bot and do not need the jars). The push
+re-dispatched the honest player-present baseline — every delta on this
+page resets to that run, and the -90% grind re-ranks on it (the tracker
+cluster, the activation-gated AI and the item sync streams change shape
+with a player present).
+
+Parity bisect note (same session): the L97.7 fixes moved the mobs
+first-divergence EARLIER — dispatch-2 desynced at t=157, the post-L97.7
+run desyncs at t=145 (SR) / t=143 (Level.random) / t=147 (PH entity
+count: off 92 vs on 91 — the jockey-egg zone). items SR+LR stay
+IDENTICAL through t=164 (24 ticks) — the L97.7 surface is mob-only. Two
+bisect dispatches (bisect-no-d2 = keep displaced-stop map semantics,
+drop the even-tick tickRunning phase; bisect-no-d1 = the inverse) run in
+parallel with ph_dump 140-165 to name the guilty fix.
