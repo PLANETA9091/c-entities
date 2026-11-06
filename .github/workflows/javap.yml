@@ -16,7 +16,10 @@ on:
     inputs:
       classes:
         description: 'fully-qualified class names, space-separated'
-        default: 'net.minecraft.world.entity.Mob net.minecraft.world.entity.LivingEntity net.minecraft.world.entity.ai.goal.RandomStrollGoal net.minecraft.world.entity.ai.goal.MeleeAttackGoal'
+        default: 'net.minecraft.world.entity.ai.goal.RandomLookAroundGoal net.minecraft.world.entity.ai.goal.GoalSelector net.minecraft.world.entity.ai.goal.WrappedGoal net.minecraft.world.entity.ai.goal.Goal net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal'
+      method:
+        description: 'optional: print ONLY this method of each class (awk slice past the head cap)'
+        default: ''
 
 permissions:
   contents: read
@@ -56,7 +59,13 @@ jobs:
             CLS=$(find "$WORK" -name "$NAME.class" | head -1)
             if [ -z "$CLS" ]; then echo "=== $C: CLASS NOT FOUND ==="; continue; fi
             echo "=== javap $C ($(dirname "$CLS" | sed "s|$WORK/||")) ==="
-            javap -p -c -cp "$WORK" "$C" 2>&1 | grep -v "^Constant pool" | head -400 || true
+            if [ -n "${{ inputs.method }}" ]; then
+              # method slice: javap signatures start with 2 spaces, method
+              # bodies with 4+ — stop at the next 2-space signature line
+              javap -p -c -cp "$WORK" "$C" 2>&1 | awk 'f{if ($0 ~ /^  [a-z]/) exit; print; next} /${{ inputs.method }}\(/{f=1; print}'
+            else
+              javap -p -c -cp "$WORK" "$C" 2>&1 | grep -v "^Constant pool" | head -400 || true
+            fi
           done
       - name: Upload .class files (for re-javap without a re-boot)
         uses: actions/upload-artifact@v4
