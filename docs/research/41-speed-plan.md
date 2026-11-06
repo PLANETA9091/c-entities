@@ -2074,3 +2074,51 @@ The shipped-config gate (same tree, no engine) PASSED 12/12 in run
 42267190981 — the L99 tracker-cache shape is parity-clean, and the
 t=157/159 split is ENGINE-ONLY. The honest baselines (player-present)
 for L99 and L100a are in flight.
+
+## L100c (session 19:15Z): THE t=157 MECHANISM NAMED BIT-EXACT — vanilla starts the stroll, the engine starts the RLA on the MOVE flag
+
+The LRC_WINDOW=154-164 bisect (run 42271699015) carried the decisive
+instruments. Three legs of evidence, all bit-exact and reproduced across
+THREE independent engine dispatches (42268195723, 42270181680,
+42271699015 — identical PD victim cascades per tick):
+
+**1. The victim cascade (PD position-delta hashes, mobs legs):**
+t=157 (107,139) → t=159 (+124,+146) → t=160 (+8,+17,+54) → t=163
+(+29,+87,+122) → 20 victims by t=165. SR hashes identical t=141..158,
+first SR split t=159. Level.random EXACT through t=158 (first LR diff
+t=159: off 102 vs on 101).
+
+**2. The GLV census at t=157 reconciles BIT-EXACTLY:**
+off n=1426 = on-visible 611 + Rust-served 815 (LookAtPlayer canUse
+115 + NearestAttackable 476 + RLA canUse 110 + Stroll canUse 114).
+Every JAVA-SIDE start body matches exactly: RLA.start 6=6,
+RandomPos 60=60, WaterAvoiding.getPosition 2=2, handleAttributes 39=39,
+reinforcements 13=13, baseTick 223=223, burnUndead 6=6, isSunBurnTick
+221=221, UUID 26=26. THE STREAM IS EXACT — the divergence is not a draw
+count or a value; it is the PER-MOB ASSIGNMENT of the Rust-served rolls.
+
+**3. PTRACE (per-tick selector dump for the traced mob 107) at t=157:**
+
+- OFF (vanilla): `goalSelector=[MOVE=WaterAvoidingRandomStrollGoal
+  isRunning=true, LOOK=RandomLookAroundGoal isRunning=false]` — the
+  stroll won the MOVE flag, the RLA was refused; 107 MOVES (x 8.5→8.59,
+  yaw 15.0, vx −0.0289).
+- ON (engine): `goalSelector=[MOVE=RandomLookAroundGoal isRunning=true,
+  LOOK=RandomLookAroundGoal isRunning=true]` — THE RLA HOLDS THE MOVE
+  FLAG AND IS RUNNING ON IT; no stroll; 107 STANDS STILL (x=8.5, yaw=0).
+
+So for 2 of the 133 serving mobs the engine's gate evaluation produced a
+different START SET with an identical global stream: the engine assigned
+107's stroll-gate roll (or evaluation order) differently, the RLA gate
+passed where vanilla's stroll gate passed. Because the counts and values
+reconcile globally, the residual is the WITHIN-TICK PER-MOB SERVING
+ORDER at the staged-request continuation (park → java start body →
+resume): the resume must land at the exact vanilla walk position per
+mob. 131 of 133 mobs land right; 107/139 do not.
+
+**Next instrument (the one that closes it): a per-mob Rust ledger dump —
+CE_MOB_LEDGER=1 makes the engine append (tick, mobId, lcg.value before/
+after serve, draws, started goal kinds) per even-cohort mob into a ring
+buffer the hooks@ printer dumps inside LRC_WINDOW. Diffed against the
+OFF leg's SRF chronological frames (k-index = the global draw order),
+the wrong resume position for 107/139 becomes a one-line fix.**
