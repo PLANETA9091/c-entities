@@ -2296,3 +2296,35 @@ bodies, javap) keep the resume-time transition.
   STATE evidence (PD/PH/PTRACE) is the ground truth and it improved
   monotonically; the draw-count identity stays an open instrument bug,
   not a parity fact.
+
+### L103 scoping (run 42310648124): the t=169 cohort = the residual +2-draw/mob surplus
+
+The burn hypothesis is DEAD (36199/36200 BURN lines fire=0 — the mobs
+never ignite; LHURT silent). The t=169 flip is bit-reproducible with the
+EXACT same 7-id fingerprint (31, 40, 89, 139, 189, 295, 299 — same hash
+pairs as run-3). The traced victim 31's PTRACE: vanilla's stroll STARTED
+at tc=27 (yaw 0→15, the first walk step), the engine stood still — **the
+same stroll-gate fingerprint as t=157, one cohort later.**
+
+The ledger names the mechanism precisely: mob 31's serve at tc=27 is
+rounds=1 draws=7 with the FULL eval set {1,2,3,4,5,6,7,8} and NO
+park/start — the stroll gate DREW and REFUSED at the engine's position
+where vanilla's PASSED at its position. The static draw decomposition of
+the classified walk = 5 (NA×2 interval gates + LaP + RLA + stroll gate;
+HurtBy/TurtleEgg/ZA/Spear/MtV draw nothing at 0 players/targets) —
+**the engine draws 7: a +2-per-mob SURPLUS at a fixed point in the walk.**
+The surplus shifts every later mob's within-tick stream position by
+2×(earlier serves) — the stroll's 1/60 gate flips for the cohort whose
+accumulated shift crosses the roll — exactly the 7-id pattern, and
+exactly why L102 (the start-draw order) moved but did not close the
+frontier.
+
+**The next session's decisive step (one javap pass)**: audit the 26.3
+canUse bodies of the classified set draw-by-draw against
+goals.rs::can_use (the suspects: the SECOND NearestAttackableTargetGoal's
+path for a non-player target class at empty snapshots — the L83 fast
+path is player-typed only; the ZombieAttackTurtleEggGoal's gate; the
+SpearUseGoal's gate) and pin the +2 site. The fix is then local to
+can_use, and the engine gate should finally close: the shipped floors
+are proven (the push 18g family, L74's move band, L102's start order);
+only the per-mob stream position remains.
