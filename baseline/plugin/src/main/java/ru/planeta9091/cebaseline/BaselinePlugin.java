@@ -1715,6 +1715,22 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     } catch (Throwable awQuiet) {
                         // diagnostics only
                     }
+                    // L101: the target — the NearestAttackableTarget lock
+                    // state (getTarget() != null skips its own canUse via
+                    // the targeting short-circuit; the L97.2 suspect list).
+                    // Both legs print it, so the ON/OFF diff names the pair's
+                    // lock state at the divergence tick.
+                    try {
+                        Object tgt = h.getClass().getMethod("getTarget").invoke(h);
+                        if (tgt == null) {
+                            sb.append(" tg=null");
+                        } else {
+                            Object tid = tgt.getClass().getMethod("getId").invoke(tgt);
+                            sb.append(" tg=").append(tid);
+                        }
+                    } catch (Throwable tgQuiet) {
+                        sb.append(" tg=?");
+                    }
                 } catch (Throwable quiet) {
                     // diagnostics only
                 }

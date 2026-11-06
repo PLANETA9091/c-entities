@@ -3608,6 +3608,15 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             i32,
         ) -> jni::jintArray
     );
+    push!(
+        "nativeMobLedgerTake",
+        "(I)[J",
+        n_mob_ledger_take as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+        ) -> jni::jlongArray
+    );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
@@ -5118,6 +5127,37 @@ pub extern "system" fn n_gl_take(
         }
         let tmp: [i32; 36] = std::array::from_fn(|i| buf[i] as i32);
         ((*vt).SetIntArrayRegion)(raw, arr, 0, 36, tmp.as_ptr());
+        arr
+    }
+}
+
+/// nativeMobLedgerTake(int arm) -> long[] — the doc-41 L101 per-mob serve
+/// ledger read+drain (CE_MOB_LEDGER). Each record is 6 longs (see
+/// centities-core::goals::ml_record): [0] id | tickCount<<32, [1] seed in,
+/// [2] seed out, [3] draws | kinds<<32, [4] cursor | status<<56, [5] seq.
+/// `arm != 0` keeps the ledger armed for the next interval; the plugin
+/// dumps per tick inside LRC_WINDOW and disarms with one final arm=0 call.
+pub extern "system" fn n_mob_ledger_take(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    arm: i32,
+) -> jni::jlongArray {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let recs = centities_core::goals::mob_ledger_take(arm != 0)
+            .unwrap_or_default();
+        let n = recs.len() * 6;
+        let arr = ((*vt).NewLongArray)(raw, n.max(1) as i32);
+        if arr.is_null() {
+            return std::ptr::null_mut();
+        }
+        if n > 0 {
+            let flat: Vec<i64> = recs.iter().flat_map(|r| r.iter().copied())
+                .map(|v| v as i64).collect();
+            ((*vt).SetLongArrayRegion)(raw, arr, 0, n as i32, flat.as_ptr());
+        }
         arr
     }
 }

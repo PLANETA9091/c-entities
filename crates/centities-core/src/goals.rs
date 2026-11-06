@@ -643,8 +643,121 @@ enum Cu {
     Staged,
 }
 
+// ---------------------------------------------------------------------------
+// doc-41 L101 MOB LEDGER (CE_MOB_LEDGER) — the per-mob serve witness.
+//
+// The t=157 residual is LOCAL to the pair (107, 139): the engine's staged
+// continuation resumed the wrong goal for them while the GLOBAL stream
+// stayed exact. The class ledger (GL_) reconciles globally; the per-mob
+// ledger records EVERY ai_floor call so the serve chain of one mob is
+// reconstructible: per call — (id, tickCount, seed in, seed out, draws
+// this call, started-kind bits, cursor, status). The chained s1->s0
+// continuity quantifies each staged predicate's draws, and the kinds
+// name the START the engine emitted at the shifted stream position.
+// Zero cost when disarmed (one relaxed load per call). Read+drain via
+// nativeMobLedgerTake (the plugin dumps inside LRC_WINDOW).
+// ---------------------------------------------------------------------------
+pub static ML_ON: AtomicBool = AtomicBool::new(false);
+static ML_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// One record = 6 u64: [0] (id u32) | (tickCount u32 << 32), [1] seed_in,
+/// [2] seed_out, [3] (draws u32) | (kinds u32 << 32), [4] (cursor) |
+/// (status as u64 << 56), [5] seq.
+static ML_RING: std::sync::Mutex<Vec<[u64; 6]>> = std::sync::Mutex::new(Vec::new());
+pub const ML_CAP: usize = 1 << 16;
+
+pub fn mob_ledger_take(arm: bool) -> Option<Vec<[u64; 6]>> {
+    // the arm flag sets the NEXT interval's state (gl_take semantics):
+    // drain whatever was collected so far, then re-arm as requested.
+    ML_ON.store(arm, Ordering::Relaxed);
+    let mut ring = ML_RING.lock().ok()?;
+    let out = std::mem::take(&mut *ring);
+    Some(out)
+}
+
+pub fn mob_ledger_arm(on: bool) {
+    ML_ON.store(on, Ordering::Relaxed);
+    if !on {
+        if let Ok(mut r) = ML_RING.lock() {
+            r.clear();
+        }
+    }
+}
+
+#[inline]
+fn ml_kind_bits(inb: &[i32], out_buf: &[i32]) -> u32 {
+    // decode the emitted ACT_GOAL_START actions back to kind bits: the
+    // global index layout is [target goals | goal goals] (offset_of).
+    let nt = inb[5] as usize;
+    let ng = inb[6] as usize;
+    let n_act = out_buf[5].max(0) as usize;
+    let mut bits = 0u32;
+    for a in 0..n_act {
+        let b = OUT_HEADER + a * OUT_ACT;
+        if out_buf[b] == ACT_GOAL_START {
+            let gi = out_buf[b + 1];
+            let kind = if (gi as usize) < nt {
+                inb[IN_HEADER + gi as usize * GOAL_STRIDE]
+            } else {
+                let j = gi as usize - nt;
+                if j >= ng {
+                    continue;
+                }
+                inb[IN_HEADER + (nt + j) * GOAL_STRIDE]
+            };
+            if (0..9).contains(&kind) {
+                bits |= 1u32 << kind;
+            }
+        }
+    }
+    bits
+}
+
+#[inline]
+fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
+    if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER {
+        return;
+    }
+    if let Ok(mut ring) = ML_RING.lock() {
+        if ring.len() < ML_CAP {
+            let id = (in_buf[3] as u64) & 0xFFFF_FFFF;
+            let tc = ((in_buf[2] as i64).max(0) as u64) << 32;
+            let seed_in = (((in_buf[IN_SEED_HI] as u64) & 0xFFFF_FFFF) << 32)
+                | ((in_buf[IN_SEED_LO] as u64) & 0xFFFF_FFFF);
+            let seed_out = (((out_buf[4] as u64) & 0xFFFF_FFFF) << 32)
+                | ((out_buf[3] as u64) & 0xFFFF_FFFF);
+            let draws = ML_DRAW_SWAPS
+                .swap(0, Ordering::Relaxed);
+            let kinds = ml_kind_bits(in_buf, out_buf);
+            let cursor = (in_buf[0] as u64) & 0x00FF_FFFF_FFFF_FFFF;
+            let status = (st as i64).max(0) as u64;
+            let seq = ML_SEQ.fetch_add(1, Ordering::Relaxed);
+            ring.push([
+                id | tc,
+                seed_in,
+                seed_out,
+                ((kinds as u64) << 32) | ((draws as u64) & 0xFFFF_FFFF),
+                cursor | (status << 56),
+                seq as u64,
+            ]);
+        }
+    }
+}
+
+/// The draw counter lives with the LCG (ctx.lcg.draws is per-ctx); the
+/// wrapper stamps it here — set by ai_floor_run at exit.
+pub static ML_DRAW_SWAPS: AtomicU32 = AtomicU32::new(0);
+
 /// The floor entry. Returns the status written to out_buf[0].
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
+    let st = ai_floor_run(in_buf, out_buf);
+    if ML_ON.load(Ordering::Relaxed) {
+        ml_record(in_buf, out_buf, st);
+    }
+    st
+}
+
+fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
@@ -916,6 +1029,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
 fn done(ctx: &mut Ctx, out: &mut Out) -> i32 {
     // the engine's ported control decisions ride the actions; the executor's
     // Java tail (nav tick++, look idle rotate, jump reset) finishes the rest.
+    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_DONE;
     out.buf[1] = 0;
     out.buf[2] = 0;
@@ -934,6 +1048,7 @@ fn fallback(out: &mut Out, reason: i32) -> i32 {
 }
 
 fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
+    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_REQUEST;
     out.buf[1] = req;
     out.buf[2] = gi as i32;
@@ -1705,5 +1820,36 @@ mod tests {
         assert_eq!(positive_ceil_div(120, 2), 60);
         assert_eq!(positive_ceil_div(121, 2), 61);
         assert_eq!(positive_ceil_div(40, 2), 20);
+    }
+
+    #[test]
+    fn mob_ledger_records_and_drains() {
+        // L101: arm -> one serve -> the record mirrors the wire contract
+        // (id/tc, seed in == pack seed, seed out == the out header seed,
+        // status/cursor packed per the doc) -> arm=false take drains empty.
+        // NOTE: ML_ON/ring are process-global and the suite runs tests in
+        // parallel — the pre-drain + the (id, tc, seed) filter keep this
+        // test's own record identifiable regardless of interleaving.
+        let seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let inb = build_in(seed, 100, 42, 3);
+        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let _ = mob_ledger_take(true); // clear + arm
+        let st = ai_floor(&inb, &mut out);
+        let recs = mob_ledger_take(false).unwrap();
+        mob_ledger_arm(false);
+        let mine: Vec<&[u64; 6]> = recs
+            .iter()
+            .filter(|r| {
+                r[0] & 0xFFFF_FFFF == 42
+                    && r[0] >> 32 == 100
+                    && r[1] == seed
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "one record for this (id, tc) per call");
+        let r = mine[0];
+        let s_out = (((out[4] as u64) & 0xFFFF_FFFF) << 32)
+            | ((out[3] as u64) & 0xFFFF_FFFF);
+        assert_eq!(r[2], s_out, "seed out == the out header seed");
+        assert_eq!(r[4] >> 56, if st < 0 { 0u64 } else { st as u64 }, "status");
     }
 }
