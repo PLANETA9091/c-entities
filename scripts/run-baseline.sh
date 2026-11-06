@@ -18,12 +18,21 @@ cp "$ROOT/build/ce-baseline.jar" "$S/plugins/"
 # the server is 26.3 — server-side translation is required for the bot to
 # join. Staged whenever the jar was fetched by CI (or manually) — present in
 # BOTH A/B legs, so the paired comparison stays fair.
-if [ -f "$ROOT/build/viaversion/ViaVersion.jar" ]; then
+if [ "${PARITY:-0}" = "1" ]; then
+  # Parity legs skip the bot entirely (deterministic replay) — ViaVersion
+  # jars are NOT needed there.
+  :
+else
+  # The bench bot speaks 26.1: without ViaVersion+ViaBackwards the bot is
+  # kicked "Outdated client" and the leg runs PLAYERLESS — the activation
+  # range stops ticking mob AI and the tracker cache arms on the empty
+  # player list. Silent playerless runs produced a whole benchmark era
+  # (observed: the ViaVersion install step sat AFTER the run step in
+  # baseline.yml). Fail loudly: the jar must be staged (baseline.yml does
+  # it) or the leg is not the benchmark we think it is.
+  [ -f "$ROOT/build/viaversion/ViaVersion.jar" ] || { echo "FATAL: ViaVersion.jar missing — bench legs must be player-present"; exit 1; }
+  [ -f "$ROOT/build/viaversion/ViaBackwards.jar" ] || { echo "FATAL: ViaBackwards.jar missing — bench legs must be player-present"; exit 1; }
   cp "$ROOT/build/viaversion/ViaVersion.jar" "$S/plugins/"
-fi
-# ViaBackwards is REQUIRED for old clients (26.1) on the new server: ViaVersion
-# alone only supports newer client versions and the bot gets kicked.
-if [ -f "$ROOT/build/viaversion/ViaBackwards.jar" ]; then
   cp "$ROOT/build/viaversion/ViaBackwards.jar" "$S/plugins/"
 fi
 cp "$PAPER_JAR" "$S/paper.jar"

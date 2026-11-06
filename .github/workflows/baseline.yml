@@ -91,11 +91,6 @@ jobs:
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
         run: mkdir -p tools && cd tools && npm install mineflayer minecraft-data@3.117.0 --no-save --loglevel=error
-      - name: Run paired A/B (vanilla then module, same runner)
-        if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
-        run: |
-          bash scripts/run-baseline.sh
-          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Install ViaVersion + ViaBackwards (bench bot speaks 26.1; ViaBackwards is REQUIRED — ViaVersion alone refuses old clients, which is why every 26.3 run so far was playerless)
         run: |
           mkdir -p build/viaversion
@@ -109,6 +104,11 @@ jobs:
           curl -fsSL -o build/viaversion/ViaVersion.jar "$VV"
           curl -fsSL -o build/viaversion/ViaBackwards.jar "$VB"
 
+      - name: Run paired A/B (vanilla then module, same runner)
+        if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
+        run: |
+          bash scripts/run-baseline.sh
+          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
         if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh
