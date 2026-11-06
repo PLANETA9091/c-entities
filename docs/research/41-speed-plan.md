@@ -2227,3 +2227,39 @@ pack said NOT running (a pack-mirror freshness bug) — the guilty mob
 and the bug side in one line.
 
 Dispatch: mob_ai=1 + TRACE_ID=107 + PH_DUMP=150-165 + CE_MOB_LEDGER=1.
+
+## L102 (session 23:0xZ): THE t=157 FIX — the staged start's draws run inline at the resolution
+
+The L101b masks decoded the pack and closed the hunt's open question in
+one run (42302201172):
+
+**The pack decoded (javap 26.3 Zombie.registerGoals + addBehaviourGoals)**:
+goalSelector insertion order = [ZombieAttackTurtleEgg(4, kind 2 — paper's
+zombiesTargetTurtleEggs default), LookAtPlayer(8, kind 5),
+RandomLookAround(8, kind 6), SpearUse(2, kind 1 — 26.3 registers it for
+ZOMBIE), ZombieAttack(3, kind 2), MoveThroughVillage(6, kind 3),
+WaterAvoidingRandomStroll(7, kind 4)]; targetSelector = [HurtBy(1, kind
+7), NearestAttackable(2, kind 8), NearestAttackable(3, kind 8), ...].
+The cursor's gi=2 = the RLA, gi=6 = the Stroll — every ledger record and
+AITR line reconciles against this order.
+
+**The mechanism**: at tc=9 the walk evaluated {2,5,6,7,8} and parked
+op=5 (REQ_START_VANILLA) at the RLA (its 2% gate PASSED). The RES line's
+seed was UNCHANGED — the real start() had NOT run yet (it runs at APPLY)
+— but javap RandomLookAroundGoal.start draws nextDouble + nextInt(20)
+(2 draws, INLINE in vanilla). The resume continued the walk (the eval
+mask {1,2,3,4} proves Spear/Za/MtV/Stroll evaluated) — with the model
+2 draws BEHIND: the stroll's gate drew at P−2 where vanilla drew at P.
+The 1/60 gate flipped (refused where vanilla passed) — the RLA survived
+on MOVE where vanilla's stroll displaced it. The per-tick surplus
+(+10..12 rolls) = the L100d extra-eval identity, now verified
+arithmetically from the ledger (OFF_SRC − ON_SRC vs Σdr per tick).
+
+**The fix**: the lock transition (displaced stops + the map put via the
+NEW ACT_GOAL_LOCK_MAP action) rides the PARK round; the REAL start()
+runs INLINE at the REQ_START_VANILLA resolution — the vanilla order
+(stops → put → start) lands before the walk's remaining gates, and the
+next pack reads the advanced seed. The stroll then draws at the TRUE
+position, passes, starts, displaces the RLA — the vanilla end state.
+The RNG-neutral staged starts (stroll/LaP — no draws in their start
+bodies, javap) keep the resume-time transition.
