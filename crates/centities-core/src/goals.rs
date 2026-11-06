@@ -259,7 +259,8 @@ pub const FB_JAVA_PREDICATE: i32 = 104;
 // action opcodes (applied by the executor after the FINAL round)
 pub const ACT_GOAL_START: i32 = 1; // goal.start() virtual (p0 = global goalIdx)
 pub const ACT_GOAL_TICK_V: i32 = 3; // goal.tick() virtual (p0 = goalIdx)
-pub const ACT_GOAL_STOP: i32 = 2; // goal.stop() virtual (p0 = goalIdx)
+pub const ACT_GOAL_STOP: i32 = 2; // goal.stop() virtual + the paired map remove (cleanup: the same-tick removeIf equivalent)
+pub const ACT_GOAL_STOP_D: i32 = 4; // DISPLACED stop (update walk): vanilla cur.stop() only — the map entry STAYS (!isRunning) until the next tick's removeIf
 pub const ACT_LOOK_TICK_AROUND: i32 = 5; // lookaround tick port: lookTime-- (p1 = new), setLookAt(x+relX, eyeY, z+relZ)
 pub const ACT_LOOK_TICK_AT: i32 = 6; // lookat tick port: lookTime-- (p1 = new), setLookAt(lookAt)
 pub const ACT_NAV_IDLE: i32 = 7; // navigation.tick idle port done natively (executor does tick++ etc.)
@@ -709,8 +710,17 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
 
     if resume {
         // the fresh pack carries the post-continuation running state —
-        // rebuild the lock table for the parked selector before continuing
-        // (the displaced goals were stopped with their flags released)
+        // rebuild the lock table for the parked selector before continuing.
+        // This is the running-subset rebuild = the next tick's removeIf
+        // equivalent. KNOWN WINDOW (L97.7): displaced !isRunning records
+        // created EARLIER in the same update walk (a start displaced a
+        // holder whose other-flag entries survive to the next removeIf)
+        // are lost here when a later candidate of the SAME tick parks —
+        // the vanilla map keeps them until its removeIf. The classified
+        // zombie set never chains a second park after a displaced start
+        // (stroll pos / lookat / LOS stages precede their starts), so the
+        // window is theoretical today; if a family ever hits it, the pack
+        // must carry the displaced flags explicitly.
         let count = ctx.counts[sel];
         for bit in 0..MAX_GOALS {
             ctx.lock[sel][bit] = -1;
@@ -859,6 +869,32 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // LCG position at mobs t=143 (+1 RemoveBinomial draw),
                 // the spawn rolls shifted next tick, the jockey rolls
                 // flipped at t=146 and the entity-id streams exploded.
+                // L97.7 (javap 26.3 GoalSelector.tick bc 277-282): the tick()
+                // body ends with tickRunningGoals(true) — the EVEN branch
+                // ticks EVERY running goal of THIS selector right after the
+                // update walk, and the serverAiStep even branch calls the
+                // selectors' tick() (bc 148-191 per L82). The L82 removal
+                // dropped the phase entirely — right about the ORDER being
+                // broken (the old hop served both selectors' bodies between
+                // them), wrong about the phase not existing. Without it
+                // RandomLookAroundGoal.tick() runs at half rate in the
+                // engine (vanilla ticks it on even via force=true AND on
+                // odd via the every-tick filter) and lookTime decays twice
+                // as slowly — the selector state diverges from the first
+                // RLA start (the t=157-era residual family).
+                // RandomStrollGoal has NO tick() override (javap 26.3 —
+                // start() owns the moveTo; Goal.tick() is empty for it),
+                // so its slot is skipped — the only classified goal whose
+                // even-tick body is provably nothing.
+                let mut j = 0usize;
+                while j < count {
+                    if ctx.running[sel][j] && ctx.kind(sel, j) != GK_STROLL {
+                        if !tick_ported(&mut ctx, &mut out, sel, j) {
+                            out.push(ACT_GOAL_TICK_V, ctx.global(sel, j), 0, 0, 0);
+                        }
+                    }
+                    j += 1;
+                }
                 if sel == SEL_TARGET {
                     sel = SEL_GOAL;
                     phase = PH_CLEANUP;
@@ -1206,9 +1242,20 @@ fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 }
 
 fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
-    // vanilla update-pass transition: for each flag — currentGoal.stop();
-    // lock[flag] = goalx — then goalx.start(). The stops ride first so the
-    // executor applies stop→start in the exact vanilla order.
+    // vanilla update-pass transition (javap 26.3 GoalSelector.tick bc 193-264):
+    // for each flag — cur = lockedFlags.getOrDefault(flag, NO_GOAL); cur.stop();
+    // lockedFlags.put(flag, goalx) — then goalx.start() AFTER the whole flag
+    // walk. TWO subtleties the L97.7 javap read named:
+    //  1. WrappedGoal.stop() NEVER touches the map — a displaced holder's
+    //     entries on the new goal's OTHER flags stay as !isRunning records
+    //     until the NEXT tick's removeIf, and goalCanBeReplacedForAllFlags
+    //     does NOT check isRunning (javap bc 17-73) — those records gate
+    //     the same-tick candidates' replace checks.
+    //  2. The displaced stop fires ONCE per holder even when both a replaced
+    //     flag and a surviving flag exist: the second stop() is the
+    //     isRunning-guarded no-op (javap WrappedGoal.stop bc 0-19).
+    // So the displaced stop rides ACT_GOAL_STOP_D (map-preserving wg.stop()),
+    // and the flag releases happen only where the put overwrites below.
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
@@ -1216,8 +1263,16 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
             return Err(());
         }
         let cur = ctx.lock[sel][bit];
-        if cur != -1 && stop_goal(ctx, out, sel, cur as usize).is_err() {
-            return Err(());
+        if cur != -1 {
+            let c = cur as usize;
+            if ctx.running[sel][c] {
+                // first stop on this holder this walk — the vanilla
+                // isRunning-guarded body (goal.stop() + isRunning=false)
+                ctx.running[sel][c] = false;
+                out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
+            }
+            // a !isRunning holder: vanilla stop() is a no-op — the record
+            // survives exactly as ctx.lock holds it
         }
         ctx.lock[sel][bit] = gi as i32;
         fl &= fl - 1;

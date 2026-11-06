@@ -1877,3 +1877,62 @@ on MOVE) reads it. NEXT:
 
 The parity split is now a two-line diff in observable selector state, not
 a roll-count mystery.
+
+## L97.7 (session 17:30Z): THE JAVAP 26.3 READS SETTLE BOTH L97.6 ITEMS — RLA carries MOVE in 26.3, and GoalSelector.tick() ends with tickRunningGoals(true)
+
+The javap mini-workflow (dispatch 42259235979, the mapped 26.3 jar) read
+the four classes the L97.6 NEXT items pointed at. Both hypotheses moved:
+
+**1. The "impossible in vanilla" MOVE=RLA state is VANILLA 26.3.**
+RandomLookAroundGoal's constructor: `setFlags(EnumSet.of(Goal.Flag.MOVE,
+Goal.Flag.LOOK))` — 26.3 gave RLA the MOVE flag (older versions carried
+LOOK only). The engine reads flags from the live goals, so flags(RLA)
+={MOVE,LOOK} in the pack, lock_only writes RLA under BOTH flags, and the
+dispatch-2 PTRACE ON t=157 `gs=[MOVE=RLA(true), LOOK=RLA(true)]` is the
+EXACT vanilla-model state. The L97.6 wrong-flag-bug suspect is DEAD — the
+engine's displaced-slot bookkeeping was already right.
+
+**2. The displaced-stop map semantics — the OFF-leg `LOOK=RLA(false)`
+survivor is vanilla too.** javap: WrappedGoal.stop() sets isRunning=false
+and calls goal.stop() — it NEVER touches the map; the only map writes are
+the update walk's put(flag, g) per flag BEFORE start() and the cleanup
+removeIf (`!isRunning → remove`, lambda$tick$0). A displaced holder whose
+flags extend beyond the replaced flag keeps its !isRunning entries until
+the NEXT tick's removeIf — and goalCanBeReplacedForAllFlags (bc 17-73)
+reads map records WITHOUT an isRunning check, so those zombie records
+gate the same-tick candidates' replace checks by priority. The engine's
+old displaced stop released ALL of the holder's flags immediately — a
+one-tick semantic window where the engine's lock table was STRICTLY
+cleaner than vanilla's map. FIX LANDED (goals.rs lock_only): the
+displaced stop rides the new ACT_GOAL_STOP_D (map-preserving wg.stop(),
+fired once per holder — the second stop() is the isRunning-guarded
+no-op), the flag releases happen only where the put overwrites. The
+resume-rebuild window (a second park after a displaced start would lose
+the !isRunning records the vanilla map keeps) is documented as
+theoretical for the classified set.
+
+**3. THE BIG ONE: GoalSelector.tick() ends with tickRunningGoals(true)**
+(bc 277-282). The L82 model ("the even branch runs cleanup + removeIf +
+update, the tick bodies live in the ODD branch's tickRunningGoals(false)")
+is WRONG for 26.3: every tick() call ticks EVERY running goal of that
+selector (force=true) right after its update walk. L82 was right that the
+old engine's placement was broken (bodies served between the selectors'
+updates, re-ordering the SHARED_RANDOM serving) — but wrong that the
+phase does not exist. The parity gate stayed green to t=159 only because
+the classified set has no running every-tick goals before t=157 and
+RandomStrollGoal has NO tick() override (javap: start() owns the moveTo;
+Goal.tick() is empty — verified in round 2). From the first RLA start the
+engine's RLA.tick() ran at HALF rate (odd ticks only) and lookTime decayed
+twice as slowly. FIX LANDED (goals.rs PH_UPDATE tail): the even branch
+ticks every running goal of the CURRENT selector after its update walk
+(the per-selector vanilla order), GK_STROLL slots skipped (javap-proved
+empty body), the rest ride the ported bodies or the exact virtual
+ACT_GOAL_TICK_V.
+
+NEXT: the javap round 4 (Mob.serverAiStep / LivingEntity.aiStep — the
+even/odd branch structure and the selector call order) confirms the
+branch model the two fixes assume; then the parity dispatch (mob_ai=1,
+trace_id=107, PH 152-162) — the fixes must keep t<157 EXACT and kill the
+t=157 residual (the engine's RLA lifecycle now matches vanilla, and the
++8 roll shift's downstream surface — MOVE=RLA — is a legal state both
+legs can produce).

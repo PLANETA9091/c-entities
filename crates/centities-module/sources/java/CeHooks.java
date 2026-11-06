@@ -8405,6 +8405,7 @@ public final class CeHooks {
             MF_NEAR_VILLAGE = 64, MF_PEACEFUL = 128, MF_TEAMS_PRESENT = 256,
             MF_MANY_PLAYERS = 512;
     static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
+            ACT_GOAL_STOP_D = 4,
             ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10;
     static final int REQ_LOS_SCAN = 7;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
@@ -9644,6 +9645,18 @@ public final class CeHooks {
                     // exact whether or not WrappedGoal.stop() cleans itself.
                     lockWrite(lockedOf((p0 < ctx.tGoals.length)
                             ? ctx.targetSel : ctx.goalSel), wg, false);
+                    wg.stop();
+                    break;
+                }
+                case ACT_GOAL_STOP_D: {
+                    // L97.7 (javap 26.3): the DISPLACED stop of the update
+                    // walk — vanilla cur.stop() NEVER touches the map (the
+                    // holder's entries on the new goal's other flags stay
+                    // !isRunning until the next tick's removeIf, and
+                    // goalCanBeReplacedForAllFlags reads them without an
+                    // isRunning check). So: wg.stop() ONLY — no map remove.
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
                     wg.stop();
                     break;
                 }
