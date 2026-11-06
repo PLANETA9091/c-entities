@@ -2045,3 +2045,32 @@ Expected: −2..4% MSPT in mixed/items (the Unsafe cluster halves), −1..2%
 in mobs; the push-pair confirm loops (~10% of samples at t-collision
 peaks) lose their Unsafe hop too. Rides the shipped-config gate — the
 push parity re-proves bit-exactness before any bench claim.
+
+## L100b (session 18:45Z): the CI engine frontier CONFIRMED at t=157 — the seed pair (107, 139) named by the PD diff
+
+Run 42268195723 (dispatched by the previous session as the L97.8 bisect
+follow-up: mob_ai=1, TRACE_ID=107, PH_DUMP=140-165) FAILED the gate —
+and its PD per-entity position-delta hashes give the cleanest frontier
+read yet. Parsing the PD lines per leg (mobs-off 438 / mobs-on 438
+records, sectioned by sc tag):
+
+| t | diff ids |
+|---:|---|
+| 156 | none (identical) |
+| 157 | **107, 139** |
+| 158 | 107, 139 |
+| 159 | 107, 124, 139, 146 |
+| 160 | 8, 17, 54, 107, 124, 139, 146 |
+
+The L97-hunt's seed pair (107, 139) is CONFIRMED on CI bit-exact
+infrastructure: the first position-delta divergence is EXACTLY the pair
+at t=157, one tick before the SR hash split (t=159 — SR hashes identical
+t=141..158, 334 ticks parsed). The cascade then spreads +2/+3/+... per
+tick. SRF frames cover only t=141-150 in this run (LRC_WINDOW defaults
+138-150, independent of PH_DUMP) — the follow-up dispatch carries
+LRC_WINDOW=154-164 to catch the drawers at the divergence tick.
+
+The shipped-config gate (same tree, no engine) PASSED 12/12 in run
+42267190981 — the L99 tracker-cache shape is parity-clean, and the
+t=157/159 split is ENGINE-ONLY. The honest baselines (player-present)
+for L99 and L100a are in flight.
