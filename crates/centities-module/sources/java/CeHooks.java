@@ -5833,8 +5833,18 @@ public final class CeHooks {
         // in the tracker pass. Per-level order (flush -> tracker) keeps the
         // stamps valid exactly for the level being tracked.
         if (TTL_QUIET_ON) {
-            long[] tq = TT_QUIET;
-            if (tq != null) java.util.Arrays.fill(tq, 0L);
+            // L99: the quiet bits are now PERSISTENT (was: cleared at every
+            // flush entry). The applier CLEARs the bit whenever its tail
+            // did work for the item (moved/merged/resynced — anything but
+            // TAIL_NONE) and the tracker skip is exact for as long as the
+            // bit holds: the item's tickCount is the only state the
+            // vanilla tracker mutates for a quiet entry, and the mirror
+            // bump moved INTO the tracker skip to pay exactly that debt
+            // once per tick regardless of who stamped the slot.
+            // KNOWN WINDOW: a position change that bypasses the applier
+            // AND the probe loop (an explosion impulse, /tp) leaves a
+            // stale quiet bit for one tracker pass — absent in the bench
+            // and parity scenarios (no explosions, no teleports).
         }
         // L89: the gate ledger — one JNI crossing per level-tick, the print
         // only at dump ticks; must run BEFORE the n==0 early return.
@@ -6093,10 +6103,27 @@ public final class CeHooks {
                             if (rq[obq + 2] == e) {
                                 long shq = fq[mq * 2];
                                 if ((shq & TT_OK) != 0 && (shq & TT_SIT) == 0) {
-                                    fq[mq * 2 + 1] = fq[mq * 2 + 1] + 1;
                                     TT_QUIET[mq >> 6] |= 1L << (mq & 63);
                                     ttlQuietBumps++;
                                 }
+                            }
+                        }
+                    }
+                } else {
+                    // L99: the persistent-quiet reset - this applier tail did
+                    // WORK for the item (moved/merged/resynced), so the slot
+                    // is tracker-visible again: clear the quiet bit and let
+                    // the tracker pass serve the full vanilla tracker (the
+                    // position/meta deltas ride sendChanges exactly as the
+                    // vanilla leg produces them).
+                    if (quietStampArm) {
+                        Object[] rq2 = TT_REF;
+                        long[] fq2 = TT_FLAT;
+                        if (rq2 != null && fq2 != null) {
+                            int mq2 = (int) (IB_IDS[i] & AMASK);
+                            int obq2 = mq2 * 5;
+                            if (rq2[obq2 + 2] == e) {
+                                TT_QUIET[mq2 >> 6] &= ~(1L << (mq2 & 63));
                             }
                         }
                     }
@@ -10266,6 +10293,11 @@ public final class CeHooks {
     private static volatile boolean TT_MIRROR;
     // the per-ChunkMap armed memo (tiny direct map; #dims entries)
     private static final Object[] TT_ARM_CM = new Object[8];
+    /** L99: per-ChunkMap hash of the player list (size + x/y/z/yaw/pitch).
+     *  A changed hash disarms the tracker cache for that tick — the
+     *  full vanilla tracker re-serves the subscription sets first. */
+    private static final java.util.WeakHashMap<Object, Long> TT_PQ_HASH =
+            new java.util.WeakHashMap<>();
     private static final boolean[] TT_ARM_VAL = new boolean[8];
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
 
@@ -10617,11 +10649,42 @@ public final class CeHooks {
             if (on) {
                 cacheArm = TT_REF != null && TT_FLAT != null
                         && O_ENT_SYNC_POS >= 0;
+                // L99: the PLAYER-QUIET gate (was: players().isEmpty()). The
+                // tracker skip is exact for a quiet entity only while the
+                // tracking geometry is STATIC: moonrise$tick owns the
+                // subscription sets, and a MOVED player adds/removes
+                // subscribers a skipped tick would miss. The bench bot
+                // stands still — arm; any player movement (or a changed
+                // player list) disarms this tick and the leg serves the
+                // full vanilla tracker. The old is-empty gate kept the
+                // whole cache dead in every player-present benchmark.
                 if (cacheArm) {
                     try {
-                        cacheArm = ((net.minecraft.server.level.ChunkMap) cmObj)
-                                .level.players().isEmpty();
-                    } catch (Throwable popFail) {
+                        java.util.List<?> pl = ((net.minecraft.server.level.ChunkMap) cmObj)
+                                .level.players();
+                        int pn = pl.size();
+                        long h = pn;
+                        for (int pi = 0; pi < pn && cacheArm; pi++) {
+                            Object pe = pl.get(pi);
+                            double px = ((net.minecraft.world.entity.Entity) pe).getX();
+                            double py = ((net.minecraft.world.entity.Entity) pe).getY();
+                            double pz = ((net.minecraft.world.entity.Entity) pe).getZ();
+                            float pyr = ((net.minecraft.world.entity.Entity) pe).getYRot();
+                            float ppi = ((net.minecraft.world.entity.Entity) pe).getXRot();
+                            h = h * 31 + Double.doubleToLongBits(px);
+                            h = h * 31 + Double.doubleToLongBits(py);
+                            h = h * 31 + Double.doubleToLongBits(pz);
+                            h = h * 31 + Float.floatToIntBits(pyr);
+                            h = h * 31 + Float.floatToIntBits(ppi);
+                        }
+                        Long prev = TT_PQ_HASH.get(cmObj);
+                        if (prev == null || prev != h) {
+                            TT_PQ_HASH.put(cmObj, h);
+                            cacheArm = pn == 0; // first sight: arm only if playerless
+                        }
+                        // unchanged player set AND unchanged positions: arm
+                        // (the static geometry keeps every skip exact)
+                    } catch (Throwable pqFail) {
                         cacheArm = false;
                     }
                 }
@@ -10682,7 +10745,8 @@ public final class CeHooks {
             // block above. Stamps made under TT_MIRROR=true are consumed only
             // while the mirror still owns the counter (a mid-pass reconcile
             // failure routes everything conservative).
-            boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON;
+            boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON
+                    && ACTIVE && ITEM_TICK_ON; // L99: no applier -> no reset path -> stale bits
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
@@ -10697,10 +10761,19 @@ public final class CeHooks {
                     // already ran inline in the item-tick flush; skip the
                     // whole probe chain (the cached path's remaining work for
                     // such an entity was exactly that bump).
-                    if (quietArm && ttlQuietSkip(ent, m0)) {
-                        ttlQuiet++;
-                        continue;
+                if (quietArm && ttlQuietSkip(ent, m0)) {
+                    ttlQuiet++;
+                    // L99: the mirror bump lives HERE (was in the applier
+                    // stamp) - a persistent-quiet slot owes exactly one
+                    // tickCount increment per tick no matter who stamped
+                    // it or whether the applier saw it at all.
+                    long[] flb = TT_FLAT;
+                    if (flb != null && TT_MIRROR) {
+                        int lb0 = m0 * 2;
+                        flb[lb0 + 1] = flb[lb0 + 1] + 1;
                     }
+                    continue;
+                }
                     if (ttlCachedPath(ent, m0)) {
                         ttlFuse++;
                         continue;

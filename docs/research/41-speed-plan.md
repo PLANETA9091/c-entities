@@ -1973,3 +1973,46 @@ IDENTICAL through t=164 (24 ticks) — the L97.7 surface is mob-only. Two
 bisect dispatches (bisect-no-d2 = keep displaced-stop map semantics,
 drop the even-tick tickRunning phase; bisect-no-d1 = the inverse) run in
 parallel with ph_dump 140-165 to name the guilty fix.
+
+## L99 (session 18:40Z): THE TRACKER CACHE GOES PLAYER-PRESENT — persistent quiet stamps + the player-quiet gate
+
+The playerless-era discovery (L98) inverted the tracker economics: with a
+player PRESENT the old `cacheArm = players().isEmpty()` gate kept the
+whole cache dead — the mod leg served the FULL vanilla tracker
+(moonrise$tick + sendChanges per entity per tick) while the vanilla leg
+paid the same. The honest benchmark would show zero tracker gain. The L99
+shape:
+
+1. **The player-quiet gate** (was: is-empty). Arm the cache when the
+   player list hash (size + x/y/z/yaw/pitch) is UNCHANGED from the last
+   tick — static tracking geometry keeps every skip exact; a moved player
+   (or a join/quit) disarms exactly one tick and the full vanilla tracker
+   re-serves the subscription sets. First sight of a ChunkMap arms only
+   if playerless. The bench bot stands still — armed all run.
+2. **Persistent quiet stamps** (was: cleared at every flush). The
+   applier now CLEARs the quiet bit whenever its tail did work
+   (anything but TAIL_NONE: moved/merged/resynced) and leaves it set
+   otherwise. A settled item keeps its quiet bit for the whole idle era —
+   the tracker skip fires every tick for free.
+3. **The mirror bump moved INTO the tracker skip** — a persistent-quiet
+   slot owes exactly one tickCount increment per tick regardless of
+   whether the applier saw it this tick (an idle item is not in the IB
+   batch at all). Exactly one bump per slot per tick.
+4. **quietArm now requires the applier live** (ACTIVE && ITEM_TICK_ON):
+   no applier -> no reset path -> stale bits would skip moving items
+   (the CE_ITEM_TICK=0 bisect mode stays honest).
+
+Exactness ledger for the skip with a player present: a quiet entity
+mutates NO synced field (no position delta — the applier/probe reset
+covers movement; no metadata — the TAIL_NONE breaker covers writers), so
+vanilla sendChanges() produces zero packets for it — the skip is
+observationally identical. moonrise$tick's subscription sets are static
+while the player hash holds (the quiet entity's distance to a standing
+player cannot cross the tracking range). Known window: an applier-bypass
+position change (explosion impulse, /tp) keeps one stale quiet tick —
+absent in the bench and parity scenarios.
+
+Expected effect on the honest baseline: the items-100k tracker cluster
+(playerless profile said 14.47% ttlCachedPath + the vanilla tracker the
+cache replaces) moves to near-zero in the mod leg; mixed-150k and
+mobs-25k tracker work goes quiet-er with every settled entity.
