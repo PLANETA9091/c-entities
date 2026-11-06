@@ -16,7 +16,7 @@ on:
     inputs:
       classes:
         description: 'fully-qualified class names, space-separated'
-        default: 'net.minecraft.world.entity.ai.goal.RandomLookAroundGoal net.minecraft.world.entity.ai.goal.GoalSelector net.minecraft.world.entity.ai.goal.WrappedGoal net.minecraft.world.entity.ai.goal.Goal net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal'
+        default: 'net.minecraft.world.entity.Mob net.minecraft.world.entity.LivingEntity net.minecraft.world.entity.ai.goal.RandomStrollGoal net.minecraft.world.entity.ai.goal.MeleeAttackGoal'
 
 permissions:
   contents: read
