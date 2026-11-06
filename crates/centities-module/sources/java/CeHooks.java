@@ -1660,9 +1660,12 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
-                ARENA[entId(e) & AMASK] = e;
+                int paId = entId(e);
+                int paSlot = paId & AMASK;
+                ARENA[paSlot] = e;
+                ARENA_ID[paSlot] = paId;
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
-                batchUpsert(entId(e), worldId(e.level()), e, e.getBoundingBox(), false);
+                batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -1677,9 +1680,12 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
-                ARENA[entId(e) & AMASK] = null;
-                REST_GEN[entId(e) & AMASK] = 0; // gone: drop the rest state
-                batchRemove(entId(e));
+                int prId = entId(e);
+                int prSlot = prId & AMASK;
+                ARENA[prSlot] = null;
+                ARENA_ID[prSlot] = 0;
+                REST_GEN[prSlot] = 0; // gone: drop the rest state
+                batchRemove(prId);
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
             // the entity — the identity check tolerates stale slots, but a
@@ -1746,8 +1752,10 @@ public final class CeHooks {
                     && e instanceof net.minecraft.world.entity.LivingEntity
                     && SERVER_THREAD.get()
                     && e.level() != null && !e.level().isClientSide()) {
-                ARENA[entId(e) & AMASK] = e;
-                batchUpsert(entId(e), worldId(e.level()), e, e.getBoundingBox(), true);
+                int pdId = entId(e);
+                ARENA[pdId & AMASK] = e;
+                ARENA_ID[pdId & AMASK] = pdId;
+                batchUpsert(pdId, worldId(e.level()), e, e.getBoundingBox(), true);
             }
         } catch (Throwable t) {
             // uncertain -> the mirror stays as-is. The failure mode is the
@@ -1773,9 +1781,12 @@ public final class CeHooks {
             l7ExternalMutation(e);
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide()) {
                 probesBox++;
-                ARENA[entId(e) & AMASK] = e;
-                if (REST_GEN[entId(e) & AMASK] != 0) {
-                    REST_GEN[entId(e) & AMASK] = 0; // a box change is a disturbance
+                int pbId = entId(e);
+                int pbSlot = pbId & AMASK;
+                ARENA[pbSlot] = e;
+                ARENA_ID[pbSlot] = pbId;
+                if (REST_GEN[pbSlot] != 0) {
+                    REST_GEN[pbSlot] = 0; // a box change is a disturbance
                     wakesBox++;
                 }
                 // Row-neutral classification (4b.2a): a box change WITHIN one
@@ -2138,6 +2149,13 @@ public final class CeHooks {
     // within the same home cell is a vanilla re-append and must force a
     // dirty republish (see the rowNeutral classification in probeBox).
     private static final int[] LAST_SY = new int[ARENA.length];
+    // L100a: the id mirror of the ARENA — ARENA_ID[si] is the FULL id of the
+    // entity ARENA[si] holds (0 when null). Every ARENA write pairs with an
+    // ARENA_ID write (probeAdd/probeRemove/probeDie/probeBox/ordBackfill), so
+    // the resolve loops' `entId(e) != cid` Unsafe read becomes one plain int[]
+    // load in the cache line next to the ARENA ref. Same invariant, same
+    // full-id compare (slot aliasing still falls back to the getter).
+    private static final int[] ARENA_ID = new int[ARENA.length];
 
     // ------------------------------------------------------------------
     // L37 — VANILLA SCAN ORDER. The parity A/B (run 40529103630) proved the
@@ -2384,7 +2402,9 @@ public final class CeHooks {
                     getEnts.invoke(lookup, null, box, all, null);
                     for (int i = 0; i < all.size(); i++) {
                         Entity en = all.get(i);
-                        ARENA[entId(en) & AMASK] = en;
+                        int enId = entId(en);
+                        ARENA[enId & AMASK] = en;
+                        ARENA_ID[enId & AMASK] = enId;
                         ordStamp(en);
                     }
                 }
@@ -2712,8 +2732,9 @@ public final class CeHooks {
             // ZERO-RESOLVE: the probes keep refs in ARENA[id & AMASK]; the
             // id-match rejects stale/wrapped slots, the getter is only a
             // fallback (e.g. right after a resync window).
-            Entity e = ARENA[cid & AMASK];
-            if (e == null || entId(e) != cid) {
+            int rSlot = cid & AMASK;
+            Entity e = ARENA[rSlot];
+            if (e == null || ARENA_ID[rSlot] != cid) {
                 arenaMiss++;
                 e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                 if (e == null) {
@@ -3076,8 +3097,9 @@ public final class CeHooks {
                     }
                     if (pqAdded) break;              // one row match is enough
                     int pid = (int) (l & 0xFFFF_FFFFL);
-                    Entity pe = ARENA[pid & AMASK];
-                    if (pe == null || entId(pe) != pid) {
+                    int pSlot = pid & AMASK;
+                    Entity pe = ARENA[pSlot];
+                    if (pe == null || ARENA_ID[pSlot] != pid) {
                         rowPending++;
                         fastRefuse = "pending";
                         return null;
@@ -3208,8 +3230,9 @@ public final class CeHooks {
                     }
                     continue;
                 }
-                Entity e = ARENA[cid & AMASK];
-                if (e == null || entId(e) != cid) {
+                int rSlot = cid & AMASK;
+                Entity e = ARENA[rSlot];
+                if (e == null || ARENA_ID[rSlot] != cid) {
                     e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                     if (e == null) { stale++; continue; }
                 }
@@ -3298,8 +3321,9 @@ public final class CeHooks {
         // skipped for them — vanilla registers a crosser in BOTH sections,
         // and a fresh add's PRE registration is the covered cell itself.
         for (int q = 0; q < pqN; q++) {
-            Entity pe = ARENA[PQ_ID[q] & AMASK];
-            if (pe == null || entId(pe) != PQ_ID[q]) continue;
+            int qSlot = PQ_ID[q] & AMASK;
+            Entity pe = ARENA[qSlot];
+            if (pe == null || ARENA_ID[qSlot] != PQ_ID[q]) continue;
             boolean dup = false;
             for (int k = 0; k < out.size(); k++) {
                 if (out.get(k).getId() == PQ_ID[q]) { dup = true; break; }
@@ -4083,8 +4107,9 @@ public final class CeHooks {
             int hn = PUSH_HIT_N;
             for (int i = 0; i < hn; i++) {
                 long hid = PUSH_HIT_IDS[i];
-                Entity he = ARENA[(int) (hid & AMASK)];
-                if (he == null || entId(he) != (int) (hid & 0xFFFF_FFFFL)) {
+                int hSlot = (int) (hid & AMASK);
+                Entity he = ARENA[hSlot];
+                if (he == null || ARENA_ID[hSlot] != (int) (hid & 0xFFFF_FFFFL)) {
                     pushPairMiss++;
                     continue;
                 }
@@ -4092,8 +4117,9 @@ public final class CeHooks {
             }
             for (int i = 0; i < pn; i++) {
                 long pid = PUSH_PAIR_IDS[i];
-                Entity pe = ARENA[(int) (pid & AMASK)];
-                if (pe == null || entId(pe) != (int) (pid & 0xFFFF_FFFFL)) {
+                int p2Slot = (int) (pid & AMASK);
+                Entity pe = ARENA[p2Slot];
+                if (pe == null || ARENA_ID[p2Slot] != (int) (pid & 0xFFFF_FFFFL)) {
                     // unreachable once the JNI side writes the arrays IN
                     // PLACE: the pair ids come from the mirror the ARENA
                     // feeds, no Java code runs between n_push and this loop.
@@ -4191,8 +4217,9 @@ public final class CeHooks {
         for (int i = 0; i < PUSH_DIAG_N; i++) {
             long cid = PUSH_DIAG_IDS[i];
             int stg = (int) PUSH_DIAG_STAGES[i];
-            Entity ce = ARENA[(int) (cid & AMASK)];
-            boolean live = ce != null && entId(ce) == (int) (cid & 0xFFFF_FFFFL);
+            int cSlot = (int) (cid & AMASK);
+            Entity ce = ARENA[cSlot];
+            boolean live = ce != null && ARENA_ID[cSlot] == (int) (cid & 0xFFFF_FFFFL);
             StringBuilder rb = new StringBuilder(256);
             rb.append("[ce-baseline] KPIc t=").append(CUR_TICK)
                     .append(" self=").append(le.getId())

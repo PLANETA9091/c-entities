@@ -2016,3 +2016,32 @@ Expected effect on the honest baseline: the items-100k tracker cluster
 (playerless profile said 14.47% ttlCachedPath + the vanilla tracker the
 cache replaces) moves to near-zero in the mod leg; mixed-150k and
 mobs-25k tracker work goes quiet-er with every settled entity.
+
+## L100a (session 18:30Z): the ARENA_ID id-mirror — the resolve loops drop the Unsafe entId read
+
+The honest player-present profiles re-ranked the query cluster: mixed
+fastQuery 12.54% + Unsafe.getInt 7.84% + getSectionZ 3.28% + ordSort
+2.65% + ordKey 1.94%; mobs fastQuery 13.55% + Unsafe 5.51% + ordSort
+3.09%. The Unsafe.getInt leaf is entId(Entity)'s one field load, paid
+per CANDIDATE per query in the resolve loops (fastQuery 6-arg, rowQuery,
+the PQ pending scan, the push-pair/hit confirms, the KPIc diag printer).
+
+L100a: a parallel `int[] ARENA_ID` (full id per ARENA slot, 0 when null)
+maintained by the five ARENA writers (probeAdd / probeRemove / probeDie /
+probeBox / ordBackfillWorlds) — every ARENA write pairs with an ARENA_ID
+write, so the invariant is identical by construction. Every resolve site
+`ARENA[cid & AMASK]` + `entId(e) != cid` becomes
+`ARENA[slot]` + `ARENA_ID[slot] != cid` — a plain int[] load in the cache
+line next to the ARENA ref instead of the Unsafe object-field hop (and it
+also deletes the null-check ordering hazard: the slot int load needs no
+entity deref). The full-id compare keeps the exact slot-aliasing fallback:
+a wrapped id still fails the ARENA_ID test and routes to
+LevelEntityGetter.byId. ordKey keeps its entId (the id IS the ORD_SEQ
+key — no mirror can serve it). Zero semantic surface: the id stored is
+the same value entId reads (the probes write it), and the compare is the
+same int equality.
+
+Expected: −2..4% MSPT in mixed/items (the Unsafe cluster halves), −1..2%
+in mobs; the push-pair confirm loops (~10% of samples at t-collision
+peaks) lose their Unsafe hop too. Rides the shipped-config gate — the
+push parity re-proves bit-exactness before any bench claim.
