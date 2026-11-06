@@ -1836,3 +1836,44 @@ the 4096 SRF streams) is the data pack; the local A/B harness (rustup +
 maven, the L97.1 loop) is the iteration tool. The even-set question —
 121 vs 119 on an identical phase formula — has two concrete, checkable
 suspects and the evidence to settle both.
+
+## L97.6 (session 16:25Z): THE LOCK-MAP EVIDENCE — the engine holds the RLA on the MOVE flag (impossible in vanilla)
+
+The L97.3 writes paid off immediately. The dispatch-2 PTRACE selector-state
+dump for mob 107 (t=155-158, both legs — the FIRST apples-to-apples
+lock-map evidence):
+
+- OFF t=157: `gs=[MOVE=WaterAvoidingRandomStrollGoal isRunning=true,
+  LOOK=RandomLookAroundGoal isRunning=false]` — vanilla started the stroll.
+- ON t=157: `gs=[MOVE=RandomLookAroundGoal isRunning=true,
+  LOOK=RandomLookAroundGoal isRunning=true]` — the ENGINE started the RLA
+  AND its state holds the RLA under the MOVE flag.
+
+The RLA's flags = {LOOK} — vanilla NEVER puts it under MOVE. The engine's
+state has the RLA on BOTH flags — the displaced-slot bookkeeping (the
+Rust lock table or the start emission) wrote the wrong flag for the
+displaced stroll's slot: at t=157 the engine's walk refused the stroll
+(the shifted roll), started the RLA — and the MOVE slot ended up holding
+the RLA instead of being left empty or holding a stopped goal.
+
+This is the CONCRETE divergence surface the +8-roll shift produces and
+amplifies: from t=157 the engine's mob 107 carries MOVE=RLA — a state no
+vanilla tick can produce — and every later replace-check (canBeReplacedBy
+on MOVE) reads it. NEXT:
+
+1. Trace the engine's t=157 walk for mob 107 (the goals.rs emission for
+   the traced mob + the flag ordinals it used for the displaced
+   stroll's slot and the RLA's start) — the ACT protocol carries no flag
+   field, so the wrong-flag state must come from the Rust lock table's
+   displaced-slot update or from the classifier's flag metadata.
+2. The OFF-leg map's `LOOK=RLA(false)` entry at t=157 (a non-running
+   holder that survived the same-tick removeIf) needs one javap check of
+   the update-walk's put-vs-start pairing — it may be the vanilla
+   displaced-stop's map semantics (the displaced holder's entry stays
+   until the next cleanup), which the mirror's removeIf port must then
+   reproduce EXACTLY (the engine-side cleanup currently removes
+   !isRunning entries the same tick — a semantic difference on the
+   ENGINE side worth one bisect).
+
+The parity split is now a two-line diff in observable selector state, not
+a roll-count mystery.
