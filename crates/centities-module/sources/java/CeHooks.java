@@ -9190,6 +9190,23 @@ public final class CeHooks {
         if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK || VH_GS_DISABLED == null) {
             return false;
         }
+        // L97.5 THE t=157 ROOT CAUSE: the EarlyReturnGuard is woven at the
+        // METHOD TOP (bc 0) — vanilla's aware branch (javap bc 10-48:
+        // !aware → goalFloat.canUse/tick + jumpControl.tick + RETURN, NO
+        // selectors, NO cadence gate, NO RNG) runs AFTER it. An unaware mob
+        // must take the vanilla body — the engine's AI preempts a branch
+        // vanilla never runs and evaluates its gates natively: +2 mobs in
+        // the engine's even walk = +8 NearestTarget/stroll rolls = THE +8
+        // stream shift at t=157 (GL t=157: gr=236, br=121+113, kind-8
+        // 484=121×4 vs vanilla 119×4=476; the PTRACE: vanilla 107 strolls,
+        // the engine starts RLA at the shifted stream positions). The
+        // aware branch draws NO randomness — declining the guard for
+        // !aware mobs is byte-exact (the vanilla body IS the semantics).
+        // The gr census now counts post-aware entries: gr-br = the aiClassify
+        // refusal count (was: refusals + the unaware set).
+        if (!mob.aware) {
+            return false;
+        }
         // L91: guard-reach census — every entry that passed the kill-switch
         // gate (a real serverAiStep call site on the ON leg)
         grEntries++;

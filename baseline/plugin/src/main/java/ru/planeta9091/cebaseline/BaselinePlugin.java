@@ -1703,6 +1703,18 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     if (PARITY_NCOL != null) {
                         sb.append(" nc=").append(PARITY_NCOL.getInt(h));
                     }
+                    // L97.5: the aware flag — the t=157 root-cause evidence
+                    // (the engine's guard preempts vanilla's aware branch;
+                    // the unaware set must be visible in BOTH legs' traces).
+                    try {
+                        java.lang.reflect.Field af =
+                                findField(h.getClass(), "aware");
+                        if (af != null) {
+                            sb.append(" aw=").append(af.getBoolean(h) ? 1 : 0);
+                        }
+                    } catch (Throwable awQuiet) {
+                        // diagnostics only
+                    }
                 } catch (Throwable quiet) {
                     // diagnostics only
                 }

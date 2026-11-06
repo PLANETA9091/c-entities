@@ -1767,3 +1767,35 @@ in one commit:
 Diagnostic dispatch: profile mobs-25k with -Dcentities.orderCheck=true —
 the mirror-per-query cost is accepted for one run; the FD prints + the
 ord= ledger answer the 4.18% question in a single pass.
+
+## L97.5 (session 15:40Z): THE t=157 ROOT CAUSE — the guard preempts vanilla's aware branch
+
+The dispatch (mob_ai=1, trace_id=107, PH 152-162) live log gave the decisive
+ledger. The ON leg at t=157: `GL t=157 br=121/113/0 gr=236/13 ... 8=484/484/0/484`
+— the native even walk = 121 mobs × 4 NearestTarget rolls = 484, vanilla =
+119 × 4 = 476, the delta = THE +8 roll shift. The PTRACE (mob 107): vanilla
+strolls at t=157, the engine stands with `goalSelector=[MOVE=...Random...]`
+— the L97.3 lock-map writes are LIVE (the engine-side map is populated for
+the first time; the A/B selector-state comparison is apples-to-apples now).
+
+The mechanism: the EarlyReturnGuard is woven at serverAiStep's METHOD TOP
+(bc 0) — vanilla's aware branch (javap bc 10-48: !aware → goalFloat +
+jumpControl.tick + RETURN, NO selectors, NO cadence, NO RNG) runs AFTER the
+guard. A mob the vanilla body would serve with the aware branch (zero
+selector walks) is served by the ENGINE with the full native AI walk —
++2 mobs in the even set, +8 rolls, the stream shifts, mob 107's stroll
+roll reads a shifted value → RLA starts instead. The `gr - br` delta at
+t=157 (236 - 234 = 2) is exactly the 2-mob set.
+
+FIX: `if (!mob.aware) return false;` at the guard top — the vanilla body
+IS the semantics for unaware mobs (the aware branch draws nothing, so the
+decline is byte-exact). The gr census now counts post-aware entries
+(gr - br = the aiClassify refusals). The PTRACE carries `aw=` in both legs
+— the next dispatch either confirms the unaware set or kills the
+hypothesis in one read. Either way the guard no longer preempts a branch
+vanilla never runs.
+
+Also landed this session: the floor + ACT lock-map writes (L97.3 — the
+push parity PASSed on them) and the order ledger (L97.4 — the prescan
+skips the sorted-input sort; the orderCheck profile names the stale-stamp
+side if the TimSort tax persists).
