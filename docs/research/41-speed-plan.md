@@ -2185,3 +2185,45 @@ Analyzer: scripts/ledger_diff.py (serve chains + OFF/ON PTRACE
 selector/tg diffs for the victim ids). Dispatch: mob_ai=1, TRACE_ID=107,
 PH_DUMP=154-164, CE_MOB_LEDGER=1 — the MLEDGER stream covers exactly the
 window where the pair's stroll/RLA decision went wrong.
+
+### L101 run-1 read (42297730115): the ledger reconciles the +10 — the engine draws rolls vanilla never drew
+
+The push-triggered shipped parity on the same commit stayed GREEN (the
+instrument is parity-clean); the hunt run RED as expected — and its
+MLEDGER stream (6921 records, 390 served mobs, window 154-164) produced
+the decisive reconciliation:
+
+**The draw-count identity**: per tick, OFF_SRC − ON_SRC (vanilla's total
+entity-random draws minus the ON leg's Java-side draws) must equal the
+engine's summed ledger dr (the Rust-side rolls). Read at t=157 (the
+divergence tick): 1426 − 611 = **815** vs the engine's Σdr = 827 —
+**+12**, matching the L100d GL ledger (+8 kind-8 +2 kind-4 = the pair's
+gate rolls) within the ±1-tick ledger-bucket smear (CUR_TICK/3 labels
+span flush boundaries; the window sums read +238/5 ticks ≈ +48/tick
+during the fill churn, settling to the +10..12 stable state after).
+
+**The engine draws rolls vanilla never drew.** The PH_UPDATE walk skips
+running goals (`if !ctx.running[sel][gi]`), so the extra evals mean the
+PACK's running state disagreed with vanilla's actual state for exactly
+the 2 L100d mobs — the HurtBy-target lock suspect (a cramming-hurt mob
+holds the TARGET flag; if the engine's HurtBy never started for it,
+NearestAttackable evaluates +4 rolls where vanilla skipped).
+
+**The serve-chain witness (mob 107, tc=9 = game t=157)**: the ledger's
+fresh call drew 6 and parked op=5 (REQ_START_VANILLA) — the RLA's 2%
+gate PASSED in Rust where vanilla's walk had the stroll running (its
+canUse never called; the stroll gate passed at tc=9 and STARTED, the
+PTRACE: OFF goalSelector=[MOVE=Stroll running] vs ON [MOVE=RLA running
++ LOOK=RLA running]). The stroll refusal at the same global stream
+position = the LOCAL position shift — the +N extra rolls of the OTHER
+mobs served earlier in the tick. The serve chain confirms the
+L100c reading to the record level.
+
+**L101b (this commit)**: record[6] = (eval kind-mask << 32) | (pack
+running kind-mask) — can_use stamps one relaxed OR per eval; the Java
+line grows e=/rt=. The next run names, per serve, whether the engine
+evaluated a gate the pack said was RUNNING (an engine-walk bug) or the
+pack said NOT running (a pack-mirror freshness bug) — the guilty mob
+and the bug side in one line.
+
+Dispatch: mob_ai=1 + TRACE_ID=107 + PH_DUMP=150-165 + CE_MOB_LEDGER=1.
