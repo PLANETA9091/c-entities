@@ -1742,3 +1742,28 @@ for the first time. Then the L97.2 item (2): the vanilla leg's REAL
 even-mob AI-tick set vs the (tc+id) model (the Paper inactive-rotation
 hypothesis) decides whether the engine's serverAiStep floor must gate on
 the activation state before the cadence gate.
+
+## L97.4 (session 15:00Z): THE ORDER LEDGER — prescan-skip + the first-diff prints
+
+The mobs-25k-mod profile (e73c42c-era) still burns `lambda$ordSortVanilla$0`
+4.18% + TimSort.countRunAndMakeAscending 0.99% AFTER the L58b index-order
+work — real TimSort merges mean the native query's id stream and the live
+Java ORD_SEQ disagree somewhere (the index sorts by its STORED stamps; the
+Java comparator sorts by ORD_SEQ — a stale-stamp window exists). Two moves
+in one commit:
+
+- **ordSortVanilla prescan** (both branches): O(n) already-in-key-order
+  test over the extracted ORD_KA/ORD_KB — a fresh index skips the sort
+  outright (ordSkip), a stale one pays it (ordWork). The ratio rides the
+  hooks@ line (` ord=<skip>/<work>`): if skip dominates, the residual tax
+  was TimSort on sorted input (dead); if work dominates, the stale-stamp
+  window is the lever (the Rust-side resync / the stamp must move).
+- **ORDER-MISMATCH first-diff prints** (both the typed and the untyped
+  check): the first differing POSITION now names both entities' full order
+  keys — `FD=<i> van=(id sec seq) fast=(id sec seq)` — the stale-stamp side
+  identifies itself in one read. ORDER-MISMATCH joined the watchdog
+  whitelist, so the prints stream into the job log live.
+
+Diagnostic dispatch: profile mobs-25k with -Dcentities.orderCheck=true —
+the mirror-per-query cost is accepted for one run; the FD prints + the
+ord= ledger answer the 4.18% question in a single pass.

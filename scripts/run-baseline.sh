@@ -206,7 +206,7 @@ JPID=$!
     TOTAL=$(wc -l < "$R/server.log" 2>/dev/null || echo 0)
     if [ "$TOTAL" -gt "$PHDONE" ]; then
       tail -n +$((PHDONE + 1)) "$R/server.log" 2>/dev/null \
-        | grep -aE "PH t=|PD t=|SR t=|LR t=|SRC t=|SRF t=|MS t=|MSQ t=|MSR t=|MSS t=|MSH t=|MSP t=|QB t=|KPH t=|KVM t=|PTRACE |PARITY-SNAP|TLO t=|TTR |KPD t=|KPX t=|PQ t=|TL t=|KPI t=|KPIc t=|GL t=|GLV t=|AITR |LRC |LRF t=|LHURT t=|CRAM t=|BURN t=|BURN-LIVE|CE-INIT|measure window|hooks@|entropy probe|SR-wrap|harness armed|fill start" || true
+        | grep -aE "PH t=|PD t=|SR t=|LR t=|ORDER-MISMATCH|SRC t=|SRF t=|MS t=|MSQ t=|MSR t=|MSS t=|MSH t=|MSP t=|QB t=|KPH t=|KVM t=|PTRACE |PARITY-SNAP|TLO t=|TTR |KPD t=|KPX t=|PQ t=|TL t=|KPI t=|KPIc t=|GL t=|GLV t=|AITR |LRC |LRF t=|LHURT t=|CRAM t=|BURN t=|BURN-LIVE|CE-INIT|measure window|hooks@|entropy probe|SR-wrap|harness armed|fill start" || true
       PHDONE=$TOTAL
     fi
   done

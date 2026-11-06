@@ -1097,6 +1097,7 @@ public final class CeHooks {
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
                 + "/" + pushPairs + "/" + pushPairMiss
+                + " ord=" + ordSkip + "/" + ordWork
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
@@ -1310,9 +1311,34 @@ public final class CeHooks {
                             if (!same) {
                                 orderMismatches++;
                                 if (orderMismatches <= 12) {
-                                    System.err.println("[c-entities] ORDER-MISMATCH-TYPED"
+                                    // L97.4: name the FIRST differing position
+                                    // with both entities' order keys (id,
+                                    // section, ORD_SEQ) — the stale stamp side
+                                    // is identifiable in one read.
+                                    StringBuilder sb = new StringBuilder(360);
+                                    sb.append("[c-entities] ORDER-MISMATCH-TYPED"
                                             + " n_van=" + van.size() + " n_fast=" + out.size()
                                             + " box=" + box + " clazz=" + clazz.getName());
+                                    int fd = -1;
+                                    for (int i = 0; i < Math.min(van.size(), out.size()); i++) {
+                                        if (van.get(i) != out.get(i)) { fd = i; break; }
+                                    }
+                                    if (fd >= 0) {
+                                        Entity ve = (Entity) van.get(fd);
+                                        Entity fe = (Entity) out.get(fd);
+                                        sb.append(" FD=").append(fd)
+                                                .append(" van=(id=").append(ve.getId())
+                                                .append(" sec=").append(ve.moonrise$getSectionZ())
+                                                .append(',').append(ve.moonrise$getSectionX())
+                                                .append(',').append(ve.moonrise$getSectionY())
+                                                .append(" seq=").append(ORD_SEQ[entId(ve) & AMASK]).append(')')
+                                                .append(" fast=(id=").append(fe.getId())
+                                                .append(" sec=").append(fe.moonrise$getSectionZ())
+                                                .append(',').append(fe.moonrise$getSectionX())
+                                                .append(',').append(fe.moonrise$getSectionY())
+                                                .append(" seq=").append(ORD_SEQ[entId(fe) & AMASK]).append(')');
+                                    }
+                                    System.err.println(sb);
                                 }
                             }
                         }
@@ -2244,6 +2270,13 @@ public final class CeHooks {
     private static long[] ORD_KA = new long[0];
     private static long[] ORD_KB = new long[0];
 
+    /** L97.4: the ordSortVanilla prescan ledger — ordSkip = inputs already in
+     *  vanilla key order (the sort skipped), ordWork = genuinely stale inputs
+     *  that paid the full sort. The ratio names whether the residual
+     *  TimSort tax is index-order staleness (a Rust-side resync fix) or
+     *  inherent re-append ordering (the stamps must move). */
+    public static long ordSkip = 0, ordWork = 0;
+
     /** L38 — the collide fast path (CE_COLLIDE=0 disables the weave).
      *  Byte-exact port of LivingEntity.canCollideWithBukkit (26.3):
      *  `isPushable() && collides != collidableExemptions.contains(uuid)` —
@@ -2379,6 +2412,17 @@ public final class CeHooks {
                 ORD_E[i] = en;
                 ordKey(en, i);
             }
+            // L97.4 prescan: the index streams cells in vanilla order (doc
+            // 36b ensure_cell_order + the chunkZ-major walk) — a fresh index
+            // makes the sort a no-op; skip it (ordSkip) and keep the sorting
+            // machinery for genuinely stale inputs (ordWork). A skipped sort
+            // is semantics-free: the input order already IS the key order.
+            boolean sorted = ordPrescan(n);
+            if (sorted) {
+                ordSkip++;
+                return;
+            }
+            ordWork++;
             for (int i = 1; i < n; i++) {
                 Entity te = ORD_E[i];
                 long ta = ORD_KA[i];
@@ -2396,6 +2440,28 @@ public final class CeHooks {
             }
             for (int i = 0; i < n; i++) out.set(i, ORD_E[i]);
         } else {
+            if (ORD_E.length < n) {
+                ORD_E = new Entity[Math.max(n, ORD_E.length * 2)];
+                ORD_KA = new long[ORD_E.length];
+                ORD_KB = new long[ORD_E.length];
+            }
+            for (int i = 0; i < n; i++) {
+                Entity en = out.get(i);
+                ORD_E[i] = en;
+                ordKey(en, i);
+            }
+            // L97.4 prescan (the big-scan branch): the >512 TimSort with the
+            // per-compare moonrise getters + ORD_SEQ lookups was 4.18%+0.99%
+            // self-time on the fresh mobs-25k-mod profile — the index order
+            // and the live ORD_SEQ disagree somewhere, so the sort does REAL
+            // merges. The prescan names which side wins (ordSkip vs ordWork
+            // on the hooks@ line) and kills the sorted-input cost outright.
+            boolean sorted = ordPrescan(n);
+            if (sorted) {
+                ordSkip++;
+                return;
+            }
+            ordWork++;
             Entity[] arr = out.toArray(new Entity[0]);
             java.util.Arrays.sort(arr, (a, b) -> {
                 long cza = a.moonrise$getSectionZ();
@@ -2411,6 +2477,17 @@ public final class CeHooks {
             });
             for (int i = 0; i < n; i++) out.set(i, arr[i]);
         }
+    }
+
+    /** L97.4: O(n) already-in-vanilla-order test over ORD_KA/ORD_KB. */
+    private static boolean ordPrescan(int n) {
+        for (int i = 1; i < n; i++) {
+            if (ORD_KA[i] < ORD_KA[i - 1]
+                    || (ORD_KA[i] == ORD_KA[i - 1] && ORD_KB[i] < ORD_KB[i - 1])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -2746,6 +2823,28 @@ public final class CeHooks {
                             .append(')')
                             .append(" src=").append(srcId);
                     java.util.HashSet<Entity> vanSet = new java.util.HashSet<>(van);
+                    // L97.4: the first differing POSITION (both sides in
+                    // order, with the full order key) — the stale-stamp side
+                    // names itself (id, section, ORD_SEQ).
+                    int fd = -1;
+                    for (int i = 0; i < Math.min(van.size(), out.size()); i++) {
+                        if (van.get(i) != out.get(i)) { fd = i; break; }
+                    }
+                    if (fd >= 0) {
+                        Entity vfe = van.get(fd);
+                        Entity ffe = out.get(fd);
+                        sb.append(" FD=").append(fd)
+                                .append(" van=(id=").append(vfe.getId())
+                                .append(" sec=").append(vfe.moonrise$getSectionZ())
+                                .append(',').append(vfe.moonrise$getSectionX())
+                                .append(',').append(vfe.moonrise$getSectionY())
+                                .append(" seq=").append(ORD_SEQ[entId(vfe) & AMASK]).append(')')
+                                .append(" fast=(id=").append(ffe.getId())
+                                .append(" sec=").append(ffe.moonrise$getSectionZ())
+                                .append(',').append(ffe.moonrise$getSectionX())
+                                .append(',').append(ffe.moonrise$getSectionY())
+                                .append(" seq=").append(ORD_SEQ[entId(ffe) & AMASK]).append(')');
+                    }
                     int shown = 0;
                     for (Entity fe : out) {
                         if (!vanSet.contains(fe) && shown < 4) {
