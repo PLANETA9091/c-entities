@@ -1708,3 +1708,37 @@ Next session: (1) fix the ACT lock-map write (parity surface), (2) count
 the vanilla leg's REAL even-mob AI-tick set vs the (tc+id) model — if the
 vanilla set is the Paper inactive-rotation slice, the engine's serverAiStep
 floor must gate on the same activation state before the cadence gate.
+
+## L97.3 (session 14:00Z): THE LOCK-MAP WRITES — vanilla lockedFlags maintained on EVERY engine path
+
+The L97.2 must-fix landed: every engine-side goal start/stop now replays its
+paired `lockedFlags` write. Vanilla's GoalSelector.update owns the map
+(javap bc 211-265: flag→goal put BEFORE start(); the !isRunning removeIf in
+goalCleanup) — WrappedGoal.start() itself never writes it, so the engine's
+bare wg.start() left the map EMPTY from the first engine start ever (L97.2
+PTRACE: goalSelector=[] while vanilla shows MOVE=Stroll=true).
+
+- aiApply (the engine path): ACT_GOAL_START → per-flag put before start;
+  ACT_GOAL_STOP → the paired two-arg remove before stop (a no-op when a
+  later start already replaced the value — the same order vanilla's walk
+  produces; the engine's displaced stops precede their starts, so the
+  remove→put sequence mirrors the vanilla walk exactly).
+- The floors: fullPassTick + the fast path now maintain the map too —
+  per-stop remove, the goalCleanup !isRunning removeIf (the mirror's port,
+  covers externally stopped goals the shadow walk never visits), and the
+  per-flag put in the update walk BEFORE start (displaced cur.stop() rides
+  above it, same as vanilla). The mirrors already wrote the map — unchanged.
+- New helpers: lockedOf(sel) (null-safe VH_GS_LOCKED.getObj) and
+  lockWrite(locked, wg, put) — the backing-set walk of the mirrors
+  (Paper's OptimizedSmallEnumSet), flag objects from the GOAL_FLAGS cache.
+- Zero-cost on the hot path: writes ride start/stop events (rare) + one
+  removeIf per selector tick over a 0-2 entry EnumMap; the engine's lock
+  table stays the decision-maker — the map is the parity surface, the
+  kill-switch guarantee and the A/B selector-state evidence.
+
+NEXT: the CI parity re-run now dumps a NON-EMPTY goalSelector map in BOTH
+legs' PTRACE — the A/B selector-state comparison becomes apples-to-apples
+for the first time. Then the L97.2 item (2): the vanilla leg's REAL
+even-mob AI-tick set vs the (tc+id) model (the Paper inactive-rotation
+hypothesis) decides whether the engine's serverAiStep floor must gate on
+the activation state before the cadence gate.

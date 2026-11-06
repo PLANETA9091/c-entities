@@ -7156,15 +7156,25 @@ public final class CeHooks {
             net.minecraft.util.profiling.ProfilerFiller profiler =
                     net.minecraft.util.profiling.Profiler.get();
             long disabled = disabledBacking(gs);
+            java.util.EnumMap locked = lockedOf(gs);
             // cleanup — vanilla conditions and short-circuit order
             profiler.push("goalCleanup");
             for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
                 if (g.isRunning()
                         && (((g.getFlags().getBackingSet() & disabled) != 0L)
                             || !g.canContinueToUse())) {
+                    lockWrite(locked, g, false);
                     g.stop();
                     gsFloorStops++;
                 }
+            }
+            // L97.3: the vanilla goalCleanup tail — entries whose goal is not
+            // running die (the mirror's removeIf port; covers externally
+            // stopped goals the loop above never visits)
+            if (locked != null) {
+                locked.entrySet().removeIf(
+                        e -> !((net.minecraft.world.entity.ai.goal.WrappedGoal)
+                                ((java.util.Map.Entry) e).getValue()).isRunning());
             }
             profiler.pop();
             // rebuild the lock table + running shadow (silent pass)
@@ -7212,6 +7222,9 @@ public final class CeHooks {
                                 gsFloorStops++;
                             }
                             lock[ord] = g;
+                            // L97.3: the vanilla map write — put BEFORE start
+                            // (javap bc 211-265), the displaced stop rides above
+                            if (locked != null) locked.put(goalFlags()[ord], g);
                         }
                         g.start();
                         gsFloorStarts++;
@@ -7298,6 +7311,7 @@ public final class CeHooks {
             net.minecraft.util.profiling.ProfilerFiller profiler =
                     net.minecraft.util.profiling.Profiler.get();
             long disabled = disabledBacking(gs);
+            java.util.EnumMap locked = lockedOf(gs);
             // cleanup — vanilla conditions and short-circuit order, over the
             // running shadow (same relative set order; isRunning re-checked
             // per entry so an externally stopped goal skips exactly where
@@ -7309,6 +7323,7 @@ public final class CeHooks {
                 if (!g.isRunning()) continue;
                 long fb = g.getFlags().getBackingSet();
                 if (((fb & disabled) != 0L) || !g.canContinueToUse()) {
+                    lockWrite(locked, g, false);
                     g.stop();
                     gsFloorStops++;
                     continue;
@@ -7316,6 +7331,14 @@ public final class CeHooks {
                 sh.goals[w++] = g;
             }
             sh.n = w;
+            // L97.3: the vanilla goalCleanup tail — entries whose goal is not
+            // running die (the mirror's removeIf port; covers externally
+            // stopped goals the shadow walk never visits)
+            if (locked != null) {
+                locked.entrySet().removeIf(
+                        e -> !((net.minecraft.world.entity.ai.goal.WrappedGoal)
+                                ((java.util.Map.Entry) e).getValue()).isRunning());
+            }
             profiler.pop();
             // lock table from the survivors
             net.minecraft.world.entity.ai.goal.WrappedGoal[] lock = AI_LOCK_TABLE.get();
@@ -7384,6 +7407,9 @@ public final class CeHooks {
                             gsFloorStops++;
                         }
                         lock[ord] = g;
+                        // L97.3: the vanilla map write — put BEFORE start
+                        // (javap bc 211-265), the displaced stop rides above
+                        if (locked != null) locked.put(goalFlags()[ord], g);
                     }
                     g.start();
                     gsFloorStarts++;
@@ -9475,6 +9501,16 @@ public final class CeHooks {
                                 + " id=" + entId(mob) + " START gi=" + p0
                                 + " cls=" + wg.getGoal().getClass().getSimpleName());
                     }
+                    // L97.3: vanilla GoalSelector.update puts flag→goal BEFORE
+                    // start() (javap bc 211-265); WrappedGoal.start() itself
+                    // never writes the map. The engine's internal lock table is
+                    // already right — replay it into the vanilla map, or the
+                    // vanilla-side cleanup (removeIf), the displaced
+                    // canBeReplacedForAllFlags reads and the A/B selector-state
+                    // dump all diverge from the first engine start (L97.2
+                    // PTRACE: goalSelector=[] while vanilla shows MOVE=Stroll).
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, true);
                     wg.start();
                     break;
                 }
@@ -9487,6 +9523,11 @@ public final class CeHooks {
                 case ACT_GOAL_STOP: {
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
                     if (wg == null) return;
+                    // L97.3: the paired map remove — two-arg (a no-op when a
+                    // later start already replaced the value), so the write is
+                    // exact whether or not WrappedGoal.stop() cleans itself.
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, false);
                     wg.stop();
                     break;
                 }
@@ -9532,6 +9573,43 @@ public final class CeHooks {
 
     private static int kindAt(AiCtx ctx, int gi) {
         return gi < ctx.tKind.length ? ctx.tKind[gi] : ctx.gKind[gi - ctx.tKind.length];
+    }
+
+    /** L97.3: the vanilla GoalSelector.lockedFlags EnumMap — vanilla's update
+     *  walk maintains it (javap bc 211-265: flag→goal put BEFORE start(); the
+     *  !isRunning removeIf in goalCleanup). The mirrors already write it
+     *  (gsMirrorTick); the floor and the engine path did NOT — the map stayed
+     *  empty from the first engine start (L97.2 PTRACE: goalSelector=[]),
+     *  breaking the A/B selector-state evidence and any vanilla reader.
+     *  Every engine-side start/stop now replays its paired map write.
+     *  Null-safe: a null selector (REFUSED ctx) or an unresolved RefField
+     *  just skips the write (the map is evidence + kill-switch surface). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static java.util.EnumMap lockedOf(Object gs) {
+        if (gs == null || VH_GS_LOCKED == null) return null;
+        return (java.util.EnumMap) VH_GS_LOCKED.getObj(gs);
+    }
+
+    /** The per-flag map write for a WrappedGoal — the backing-set walk the
+     *  mirrors use (Paper's OptimizedSmallEnumSet). put=false is the paired
+     *  remove (two-arg: a no-op when a later start already replaced the
+     *  value — the same walk order vanilla's update pass produces). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void lockWrite(java.util.EnumMap locked,
+            net.minecraft.world.entity.ai.goal.WrappedGoal wg, boolean put) {
+        if (locked == null) return;
+        long it = wg.getFlags().getBackingSet();
+        int fs = wg.getFlags().size();
+        for (int i = 0; i < fs; i++) {
+            int ord = Long.numberOfTrailingZeros(it);
+            it &= it - 1;
+            Object flag = goalFlags()[ord];
+            if (put) {
+                locked.put(flag, wg);
+            } else {
+                locked.remove(flag, wg);
+            }
+        }
     }
 
     private static net.minecraft.world.entity.ai.goal.WrappedGoal goalAt(AiCtx ctx, int gi) {
