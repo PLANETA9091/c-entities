@@ -2263,3 +2263,36 @@ next pack reads the advanced seed. The stroll then draws at the TRUE
 position, passes, starts, displaces the RLA — the vanilla end state.
 The RNG-neutral staged starts (stroll/LaP — no draws in their start
 bodies, javap) keep the resume-time transition.
+
+### L102 verdict (runs 42306860102 + 42306989378): the t=146/157 family is DEAD — the frontier moved to t=165/169/176
+
+- **The push-triggered shipped-config parity: 12/12 GREEN** (the engine
+  changes don't touch the shipped path — the push run's legs boot with
+  `mobAi=` EMPTY, vanilla AI: the run-baseline echo line confirms).
+- **The engine dispatch (mob_ai=1 + the ledger): the PD/PH frontier moved
+  +19..29 ticks** — mobs t=147 → 169, mixed 147 → 176, spread 146 → 165;
+  items bit-identical throughout. The traced mob 107 is BIT-IDENTICAL
+  through t=169 (the whole 107/139 family is fixed); the ledger's serve
+  chains show the exact vanilla shape: the RLA's 2% gate passes, the
+  L102 resolution runs the real start inline, the stroll's 1/60 gate
+  draws at the TRUE position, passes, and its start displaces the RLA
+  (kinds=4,6 with the displaced-stop record — the vanilla end state).
+- **The new frontier**: mobs t=169 changes exactly 7 entities
+  (31, 40, 89, 139, 189, 295, 299 — vanish=0 appear=0, a clean state
+  flip). 5 of 7 ids are ODD (no engine serve on their odd ticks) — the
+  event is in the shared/vanilla-run portion. The simultaneous
+  7-entity flip + the fill's t=140 start + the ~30-tick age ≈ **the
+  first sun-burn cohort** (burnUndead → isSunBurnTick nextFloat +
+  the RemoveBinomial armor wear — the L81b path): the burn gates are
+  the first RNG consumers whose VALUES can expose a residual within-tick
+  position shift. Next dispatch: trace_id=31 (a victim), PH_DUMP=160-185,
+  CE_MOB_LEDGER=1 — the burn/AITR/LHURT stream at the flip tick names it.
+- **MEASUREMENT DEBT (honest)**: the run-1 "+10..12 roll" reconciliation
+  was an artifact of a regex group bug (s1 parsed as dr) — the corrected
+  per-tick identity reads Σdr ≈ 2.1-2.7 × (OFF_SRC − ON_SRC) in BOTH
+  run-1 and run-3. The ledger's dr metric or the SRC proxy needs
+  calibration (the phantom candidates: the Lcg draws counter counting
+  the biased-loop's non-advancing iterations, or a double stamp). The
+  STATE evidence (PD/PH/PTRACE) is the ground truth and it improved
+  monotonically; the draw-count identity stays an open instrument bug,
+  not a parity fact.
