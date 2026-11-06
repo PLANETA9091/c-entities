@@ -2155,3 +2155,33 @@ mob in BOTH legs to name the vanilla skip condition (the L97.2 suspects
 stand: the activation-rotation cadence slice and the already-targeting
 short-circuit — targetSelector=[] in the trace rules out the lock-based
 skips).
+
+## L101 (session 21:33Z): CE_MOB_LEDGER — the per-mob serve ledger + PTRACE getTarget (the closing instruments, built)
+
+The L100c/L100d residual is LOCAL to the pair (107, 139) at t=157: the
+engine's staged continuation resumed a different goal for them while the
+GLOBAL stream stayed exact (GLV n=1426 bit-exact, kinds 5/6 exact,
+kinds 4/8 = +2/+8 rolls exactly the pair's gate draws). The class
+ledger cannot see per-mob resume positions; two instruments close that:
+
+**1. The per-mob serve ledger (CE_MOB_LEDGER).** goals.rs records EVERY
+ai_floor call — (id, tickCount, seed in, seed out, draws this call,
+started-kind bits, cursor, status) — 6 u64 per record into a 64k ring
+(one relaxed AtomicBool load when disarmed; done()/park() stamp
+ctx.lcg.draws). The serve chain of one mob reconstructs from the
+records: a fresh call (rs=0) opens, chained records follow, st=0
+(ST_DONE) closes. The s1->s0 gaps quantify each staged predicate's
+draws, the kinds name the START the engine emitted, and the cursor
+chain shows the resume positions. nativeMobLedgerTake(int arm) -> long[]
+(gl_take arm semantics) rides the gateLedgerPrint boundary under
+MOB_AI_ON; the env master switch CE_MOB_LEDGER (extra_env — no workflow
+change) keeps the shipped path at zero cost. natives_parity guards the
+new descriptor pair; core +mob_ledger_records_and_drains.
+
+**2. PTRACE tg=** — mob.getTarget() id in BOTH legs (the NearestAttackable
+lock state, the L97.2 short-circuit suspect) at the divergence tick.
+
+Analyzer: scripts/ledger_diff.py (serve chains + OFF/ON PTRACE
+selector/tg diffs for the victim ids). Dispatch: mob_ai=1, TRACE_ID=107,
+PH_DUMP=154-164, CE_MOB_LEDGER=1 — the MLEDGER stream covers exactly the
+window where the pair's stroll/RLA decision went wrong.
