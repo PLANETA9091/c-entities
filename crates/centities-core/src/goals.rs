@@ -869,32 +869,17 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // LCG position at mobs t=143 (+1 RemoveBinomial draw),
                 // the spawn rolls shifted next tick, the jockey rolls
                 // flipped at t=146 and the entity-id streams exploded.
-                // L97.7 (javap 26.3 GoalSelector.tick bc 277-282): the tick()
-                // body ends with tickRunningGoals(true) — the EVEN branch
-                // ticks EVERY running goal of THIS selector right after the
-                // update walk, and the serverAiStep even branch calls the
-                // selectors' tick() (bc 148-191 per L82). The L82 removal
-                // dropped the phase entirely — right about the ORDER being
-                // broken (the old hop served both selectors' bodies between
-                // them), wrong about the phase not existing. Without it
-                // RandomLookAroundGoal.tick() runs at half rate in the
-                // engine (vanilla ticks it on even via force=true AND on
-                // odd via the every-tick filter) and lookTime decays twice
-                // as slowly — the selector state diverges from the first
-                // RLA start (the t=157-era residual family).
-                // RandomStrollGoal has NO tick() override (javap 26.3 —
-                // start() owns the moveTo; Goal.tick() is empty for it),
-                // so its slot is skipped — the only classified goal whose
-                // even-tick body is provably nothing.
-                let mut j = 0usize;
-                while j < count {
-                    if ctx.running[sel][j] && ctx.kind(sel, j) != GK_STROLL {
-                        if !tick_ported(&mut ctx, &mut out, sel, j) {
-                            out.push(ACT_GOAL_TICK_V, ctx.global(sel, j), 0, 0, 0);
-                        }
-                    }
-                    j += 1;
-                }
+                // L97.8 (javap bc 277-282 + the bisect verdict): the
+                // even-tick tickRunningGoals(true) phase IS in GoalSelector.tick()
+                // — but porting it back moved the mobs SR first-desync from
+                // t=159 to t=145 (the bisect pair 42264781351/42264784950
+                // names D2 the guilty leg, D1 the clean one). The phase's
+                // RNG-visible shape differs from the engine's model in a way
+                // the t=144-145 stroll/RLA canUse stream exposes — the
+                // next session mines the SRF frames of that window before
+                // any re-port. The L96-era model (no even-tick tick phase)
+                // stays shipped: it holds the t=141-159 SR stream EXACT
+                // with the displaced-stop fix (D1) live.
                 if sel == SEL_TARGET {
                     sel = SEL_GOAL;
                     phase = PH_CLEANUP;
