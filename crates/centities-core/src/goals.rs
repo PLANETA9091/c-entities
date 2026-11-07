@@ -1736,6 +1736,31 @@ mod tests {
         b
     }
 
+    /// L103 empirical probe: the idle even-tick walk on the REAL fixture
+    /// pack (hurtby + 3 NA / spear, za, turtleegg, mtv, stroll, lap, rla),
+    /// fully native (no players -> the L83 fast No), noAction<100 so the
+    /// stroll gate draws. Counts the LCG draws via ML_DRAW_SWAPS.
+    #[test]
+    fn l103_idle_walk_draw_count() {
+        for seed in 1u64..200 {
+            let inb = build_in(seed, 100, 2, 42); // even tick, stroll gate reached
+            let before = ML_DRAW_SWAPS.load(Ordering::SeqCst);
+            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let st = ai_floor(&inb, &mut out);
+            let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst) - before;
+            if st == ST_DONE {
+                // diagnostic only: ML_DRAW_SWAPS is process-global and
+                // cargo runs tests in parallel — the delta is meaningful
+                // only in isolation (--test-threads=1). The contract
+                // shape (6 draws for this pack) is verified in CI runs
+                // of the ledger, not asserted here.
+                println!("seed {seed}: ST_DONE draws={draws} (isolated static shape = 6)");
+                return;
+            }
+        }
+        panic!("no ST_DONE seed in 1..200");
+    }
+
     /// drive the staged protocol the way CeHooks.aiRun does; `resolve`
     /// maps the request opcode to the continuation result
     fn drive_res(in_buf: &mut Vec<i32>, out: &mut Vec<i32>, resolve: &dyn Fn(i32) -> i32) -> i32 {
