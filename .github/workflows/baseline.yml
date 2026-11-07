@@ -182,7 +182,15 @@ jobs:
           # on reports/baseline/* (the L18 publish lost to the L17 one this
           # way; benchmarks are monotonic — the later run wins).
           git pull --rebase -X theirs origin main || git rebase --abort
-          git push || (git pull --rebase -X theirs origin main && git push)
+          # Push HEAD:main, not the current branch. Run 42396574161 (full-matrix
+          # workflow_dispatch on l104b-replay) failed here: the rebase onto main
+          # rewrote the branch onto a main base, so a plain `git push` went to
+          # origin/l104b-replay and was rejected non-fast-forward; the retry
+          # re-pulled main (a no-op) and hit the same rejection. After
+          # `pull --rebase origin main` HEAD is exactly origin/main + the
+          # results commit, so HEAD:main is always a fast-forward on main —
+          # both for push-event runs (checkout = main) and branch dispatches.
+          git push origin HEAD:main || (git pull --rebase -X theirs origin main && git push origin HEAD:main)
 
   # ubuntu-26 runners reclaim long JVM-heavy jobs at random ("runner
   # shutdown", exit 143) — the failure rate scales with leg DURATION, which
