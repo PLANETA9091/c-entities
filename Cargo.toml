@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/centities-core", "crates/centities-module", "crates/swarm-core"]
+members = ["crates/centities-core", "crates/centities-module", "crates/swarm-core", "crates/swarm-sim"]
 
 [workspace.package]
 version = "0.1.0"

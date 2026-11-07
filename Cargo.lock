@@ -165,6 +165,14 @@ name = "swarm-core"
 version = "0.1.0"
 
 [[package]]
+name = "swarm-sim"
+version = "0.1.0"
+dependencies = [
+ "centities-core",
+ "swarm-core",
+]
+
+[[package]]
 name = "typed-path"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

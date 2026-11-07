@@ -47,7 +47,10 @@ pub struct ChunkDelta {
 impl ChunkDelta {
     #[inline]
     pub fn new(cx: i32, cz: i32, delta: i32) -> Self {
-        Self { key: pack_chunk(cx, cz), delta }
+        Self {
+            key: pack_chunk(cx, cz),
+            delta,
+        }
     }
 }
 
@@ -116,7 +119,11 @@ impl SwarmLedger {
             let have = self.chunk_count(key) as i64;
             let next = have + d;
             if next < 0 {
-                return Err(SwarmError::NegativeChunk { key, have: have as u32, delta: d as i32 });
+                return Err(SwarmError::NegativeChunk {
+                    key,
+                    have: have as u32,
+                    delta: d as i32,
+                });
             }
             total_delta += d;
         }
@@ -127,7 +134,7 @@ impl SwarmLedger {
                 None => return Err(SwarmError::TotalOverflow),
             }
         } else {
-            let sub = (total_delta as i128).unsigned_abs() as u128;
+            let sub = (total_delta as i128).unsigned_abs();
             if (self.total as u128) < sub {
                 return Err(SwarmError::NegativeChunk {
                     key: 0,
@@ -146,20 +153,26 @@ impl SwarmLedger {
                 self.chunks.insert(key, next);
             }
         }
-        self.total = new_total as u64;
+        self.total = new_total;
         Ok(())
     }
 
     /// Spawn `n` into one chunk (materialization shortcut).
     #[inline]
     pub fn spawn(&mut self, key: u64, n: u32) -> Result<(), SwarmError> {
-        self.apply(&[ChunkDelta { key, delta: n as i32 }])
+        self.apply(&[ChunkDelta {
+            key,
+            delta: n as i32,
+        }])
     }
 
     /// Remove `n` from one chunk (dematerialization shortcut).
     #[inline]
     pub fn despawn(&mut self, key: u64, n: u32) -> Result<(), SwarmError> {
-        self.apply(&[ChunkDelta { key, delta: -(n as i32) }])
+        self.apply(&[ChunkDelta {
+            key,
+            delta: -(n as i32),
+        }])
     }
 
     /// Iterate occupied chunks (deterministic: sorted by packed key —
@@ -180,9 +193,7 @@ impl SwarmLedger {
 #[inline]
 pub fn chunk_slot_pos(key: u64, slot: u32) -> (i32, i32, i32) {
     let (cx, cz) = unpack_chunk(key);
-    let mut z = key
-        ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ 0xA076_1D64_78BD_642F;
+    let mut z = key ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA076_1D64_78BD_642F;
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -207,10 +218,19 @@ mod tests {
 
     #[test]
     fn pack_roundtrip_and_order() {
-        let pairs = [(0, 0), (-1, -1), (i32::MAX, i32::MIN), (30_000_000 / 16, -30_000_000 / 16)];
+        let pairs = [
+            (0, 0),
+            (-1, -1),
+            (i32::MAX, i32::MIN),
+            (30_000_000 / 16, -30_000_000 / 16),
+        ];
         for &(cx, cz) in &pairs {
             let k = pack_chunk(cx, cz);
-            assert_eq!(unpack_chunk(k), (cx, cz), "pack/unpack must be bijective at {cx},{cz}");
+            assert_eq!(
+                unpack_chunk(k),
+                (cx, cz),
+                "pack/unpack must be bijective at {cx},{cz}"
+            );
         }
         // distinct pairs → distinct keys (sampled)
         let k1 = pack_chunk(0, 1);
