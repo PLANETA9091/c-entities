@@ -33,13 +33,21 @@ pub mod tick;
 /// with (query_box / cell)^2, so finer cells cut the dense-case candidate
 /// set quadratically. Vanilla's largest entity (ender dragon) stays well
 /// inside the oversize path.
-pub const CELL: i32 = 16;
-pub const CELL_SHIFT: u32 = 4; // 16 == 1 << 4
+pub const CELL: i32 = 4;
+pub const CELL_SHIFT: u32 = 2; // 4 == 1 << 2 (L104c: 4x4 sub-chunk cells —
+// the farm profile's scan window is ~1.2x1.2 blocks while the scan unit was
+// the whole 16x16 chunk cell (~1100 rows at farm density): a ~180x over-scan.
+// 4 divides 16, so a cell still lies inside ONE chunk: the per-cell layout
+// order (sectionY, seq) and the chunk-constant key halves keep their
+// guarantees; multi-cell-per-chunk streams are re-ordered by the exact
+// vanilla key (query: conditional resort; push: flat stable sort).
 /// Query margin in blocks. Bounded below by the max f32 quantization error
 /// of cell-relative coordinates (~7.6e-6) with >100x headroom.
 pub const MARGIN: f32 = 1.0e-3;
 /// Entities whose AABB half-span exceeds this live in the oversize list.
-pub const MAX_HALF_SPAN: f64 = CELL as f64 / 2.0;
+/// DECOUPLED from CELL (was CELL/2 = 8): the cell grid may shrink without
+/// re-routing the 2..8 half-span boxes into the oversize path.
+pub const MAX_HALF_SPAN: f64 = 8.0;
 
 /// Blocked-SoA geometry (doc 21): one block of 8 candidates, six contiguous
 /// segments of 8 f32 (x0,y0,z0,x1,y1,z1). Same bytes-per-candidate as the
@@ -731,6 +739,8 @@ impl EntityIndex {
 
         // chunkZ-MAJOR cell walk: vanilla iterates regions/chunks Z outer,
         // X inner — the concatenated per-cell streams must follow it.
+        let mut seen_chunks: Vec<i64> = Vec::new();
+        let mut multi_cell_chunk = false;
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
                 let key = cell_key(world, cx, cz);
@@ -742,6 +752,21 @@ impl EntityIndex {
                 if n == 0 {
                     continue;
                 }
+                // L104c: two covered NON-EMPTY cells inside one chunk mean
+                // the plain concatenation can interleave (sectionY, seq)
+                // wrongly — flag the post-walk key resort. key_coords gives
+                // the CELL pair; >> CELL_SHIFT folds the 4x4 cell into its
+                // chunk (the packing matches pack_chunk's bijection).
+                {
+                    let (ccx, ccz) = key_coords(key);
+                    let ck = ((ccz >> CELL_SHIFT) as i64) << 32
+                        | ((ccx >> CELL_SHIFT) as i64 & 0xFFFF_FFFF);
+                    if seen_chunks.contains(&ck) {
+                        multi_cell_chunk = true;
+                    } else {
+                        seen_chunks.push(ck);
+                    }
+                }
                 // vanilla order for this cell's members (versioned; no-op
                 // when the layout is already current)
                 self.ensure_cell_order(cid as u32);
@@ -750,6 +775,26 @@ impl EntityIndex {
                 let (ox, oz) = cell_origin(cx, cz);
                 simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out);
             }
+        }
+        // L104c: with 4x4 cells one chunk hosts several covered cells and
+        // the chunkZ-major cell walk no longer IS the key order inside that
+        // chunk (the per-cell layouts order by (sectionY, seq) only). When
+        // any chunk contributed >= 2 non-empty cells, restore the exact
+        // global order by the same (ka, kb) key the oversize merge uses;
+        // the stable sort keeps the old concatenation order for the
+        // (i64::MAX, i64::MAX) unknown-key ties. The common small query
+        // (<= 1 covered cell per chunk) pays nothing.
+        if multi_cell_chunk {
+            let mut keyed: Vec<(i64, i64, i64)> = out
+                .iter()
+                .map(|&id| {
+                    let (ka, kb) = self.order_key_of(id).unwrap_or((i64::MAX, i64::MAX));
+                    (ka, kb, id)
+                })
+                .collect();
+            keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            out.clear();
+            out.extend(keyed.into_iter().map(|(_, _, id)| id));
         }
         let mut any_ov = false;
         for o in &self.oversize {

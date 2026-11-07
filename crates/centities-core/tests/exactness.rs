@@ -2,7 +2,7 @@
 //! entity whose true f64 AABB intersects the query box. Extra candidates are
 //! allowed (the Java shim re-checks exact f64 intersection).
 
-use centities_core::{Aabb, EntityIndex, MAX_HALF_SPAN};
+use centities_core::{Aabb, EntityIndex, MAX_HALF_SPAN, CELL, CELL_SHIFT};
 use std::collections::HashSet;
 
 /// xorshift64* — deterministic, no deps
@@ -318,11 +318,16 @@ fn packed_window_is_conservative() {
             probe.clear();
             // find the home cell by scanning the query result's cell — simpler:
             // re-derive from the center the same way upsert does
-            let cx = (b.center_x().floor() as i32) >> 4;
-            let cz = (b.center_z().floor() as i32) >> 4;
+            // L104c: the cell grid is CELL (4) — the test follows the
+            // production constants, not the old 16-block chunk cells
+            let cx = (b.center_x().floor() as i32) >> CELL_SHIFT;
+            let cz = (b.center_z().floor() as i32) >> CELL_SHIFT;
             (cx, cz)
         };
-        let (ox, _) = ((home.0 as i64 * 16) as f64, home.1 as i64 * 16);
+        let (ox, _) = (
+            (home.0 as i64 * CELL as i64) as f64,
+            home.1 as i64 * CELL as i64,
+        );
         // packed scan of that cell (cap high enough)
         let mut packed: Vec<i64> = Vec::new();
         // locate the cell id via a packed scan through cell_key lookup

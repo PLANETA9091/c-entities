@@ -108,6 +108,11 @@ pub struct PushCore {
     /// push_tick; the capacity is the worst row count seen — reused across
     /// calls, zero steady-state allocation)
     replay: Vec<CandRec>,
+    /// L104c: the flat prefiltered gather + the (ka, kb, id, hs) ordered
+    /// list (the exact vanilla key stable sort) — reused across calls,
+    /// zero steady-state allocation
+    merge_flat: Vec<i64>,
+    merge_ordered: Vec<(i64, i64, i64, u32)>,
 }
 
 impl PushCore {
@@ -130,6 +135,8 @@ impl PushCore {
             sorted_at: HashMap::new(),
             population: 0,
             replay: Vec::new(),
+            merge_flat: Vec::new(),
+            merge_ordered: Vec::new(),
         }
     }
 
@@ -378,7 +385,6 @@ pub fn push_tick(
     // f64 force accumulation see the same neighbors in the same sequence.
     // `query_cell` is a provable superset (f32 prefilter + margin); the
     // exact f64 intersect below restores the vanilla set.
-    let mut cell_hits: Vec<i64> = Vec::new();
 
     let ex = pidx.max_half_span() + crate::MARGIN as f64;
     let cx0 = ((sx0 - ex).floor() as i32) >> crate::CELL_SHIFT;
@@ -431,34 +437,67 @@ pub fn push_tick(
     let mut recs: Vec<CandRec> = std::mem::take(&mut pc.replay);
     recs.clear();
 
+    // L104c: with 4x4 cells the covered window can host several cells of
+    // ONE chunk, and the chunkZ-major cell-walk concatenation no longer IS
+    // the vanilla key order inside that chunk (each cell's layout orders by
+    // (sectionY, seq) only — chunkZ/chunkX are constant within a cell).
+    // Gather every covered cell's prefiltered rows into ONE flat list in
+    // the OLD concatenation order, then STABLE-sort it by the exact vanilla
+    // key — ka from the entity's CHUNK (position >> 4, the same shape as
+    // the per-cell sort closure), kb = (sectionY biased)<<40 | seq.
+    // Distinct keys reorder into vanilla's global EntityLookup scan order;
+    // the stable sort keeps the old concatenation order for the
+    // (i64::MAX, i64::MAX) unknown-slot ties. The per-candidate slot lookup
+    // moves here (once per row) and rides the ordered list — the row loop
+    // below no longer re-lookups.
+    let mut flat: Vec<i64> = std::mem::take(&mut pc.merge_flat);
+    let mut ordered: Vec<(i64, i64, i64, u32)> = std::mem::take(&mut pc.merge_ordered);
+    flat.clear();
+    ordered.clear();
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
+            let key = crate::cell_key_pub(world, cx, cz);
+            if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
+                pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
+                    Some(s) => {
+                        // px/pz are POSITIONS: >> 4 first (chunk coords,
+                        // ±2M), then the 22-bit bias — the same key shape
+                        // as CeHooks.ordKey (which reads the already-chunk-
+                        // sized moonrise section fields directly).
+                        let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                        let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                        let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
+                        let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
+                        ((czk << 22) | cxk, (syk << 40) | seq)
+                    }
+                    // unknown slot (index-only id): never a kernel candidate
+                    // (the pushable filter needs the mirror); park it last.
+                    None => (i64::MAX, i64::MAX),
+                });
+                pc.sorted_at.insert(key, tick);
+            }
+            pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut flat);
+        }
+    }
+    out.raw += flat.len() as u32;
+    for &id in flat.iter() {
+        let (ka, kb, hs) = match pc.slot_of(id) {
+            Some(s) => {
+                let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
+                let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
+                let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
+                ((czk << 22) | cxk, (syk << 40) | seq, s as u32)
+            }
+            None => (i64::MAX, i64::MAX, u32::MAX),
+        };
+        ordered.push((ka, kb, id, hs));
+    }
+    ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
     let mut crammed = false;
     'detect: {
-        for cz in cz0..=cz1 {
-            for cx in cx0..=cx1 {
-                let key = crate::cell_key_pub(world, cx, cz);
-                if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
-                    pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
-                        Some(s) => {
-                            // px/pz are POSITIONS: >> 4 first (chunk coords,
-                            // ±2M), then the 22-bit bias — the same key shape
-                            // as CeHooks.ordKey (which reads the already-chunk-
-                            // sized moonrise section fields directly).
-                            let czk = (((pc.pz[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
-                            let cxk = (((pc.px[s].floor() as i64) >> 4) + 2097152) & 0x3F_FFFF;
-                            let syk = (pc.sy[s] as i64 + 2097152) & 0x3F_FFFF;
-                            let seq = pc.seq[s] as i64 & 0xFFFF_FFFF;
-                            ((czk << 22) | cxk, (syk << 40) | seq)
-                        }
-                        // unknown slot (index-only id): never a kernel candidate
-                        // (the pushable filter needs the mirror); park it last.
-                        None => (i64::MAX, i64::MAX),
-                    });
-                    pc.sorted_at.insert(key, tick);
-                }
-                cell_hits.clear();
-                pidx.query_cell(world, cx, cz, sx0, sy0, sz0, sx1, sy1, sz1, &mut cell_hits);
-                out.raw += cell_hits.len() as u32;
-                for &id in cell_hits.iter() {
+        for &(_, _, id, hs_raw) in ordered.iter() {
                     if id == self_id {
                         // ADDENDUM-18f: self rows are RECORDED (stage 10) — the
                         // duplicated-self family (raw=2 with zero records) was
@@ -471,13 +510,16 @@ pub fn push_tick(
                         recs.push(CandRec { id, hs: 0, fl: 0, tag: 10 });
                         continue;
                     }
-                    let Some(hs) = pc.slot_of(id) else {
+                    if hs_raw == u32::MAX {
+                        // unknown slot (index-only id): never a kernel
+                        // candidate (the pushable filter needs the mirror)
                         if diag && out.diag.len() < 128 {
                             out.diag.push((9, id, [0.0; 6]));
                         }
                         recs.push(CandRec { id, hs: 0, fl: 0, tag: 9 });
                         continue;
-                    };
+                    }
+                    let hs = hs_raw as usize;
                     let fl = pc.flags[hs];
                     if fl & PF_PUSHABLE == 0 || fl & PF_SPECTATOR != 0 || fl & PF_NOPHYSICS != 0 {
                         if diag && out.diag.len() < 128 {
@@ -559,12 +601,12 @@ pub fn push_tick(
                         out.diag.push((tag, id, mb));
                     }
                     recs.push(CandRec { id, hs: hs as u32, fl, tag });
-                }
-            }
         }
     }
     let scan_raw = out.raw;
     pc.replay = recs;
+    pc.merge_flat = flat;
+    pc.merge_ordered = ordered;
     if crammed {
         out.reason = 2;
         return; // ok stays false -> the caller routes vanilla
