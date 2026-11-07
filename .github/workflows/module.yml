@@ -32,6 +32,11 @@ jobs:
         run: cargo test -p centities-core
       - name: Tests (release, fast)
         run: cargo test -p centities-core --release
+      - name: Swarm layer (core+sim, release)
+        run: |
+          cargo test -p swarm-core --release
+          cargo test -p swarm-sim --release
+          cargo run --release -p swarm-sim --example transition_bench
 
   module:
     runs-on: ubuntu-latest
