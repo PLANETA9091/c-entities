@@ -104,6 +104,10 @@ pub struct PushCore {
     /// per (cell, tick))
     pub sorted_at: HashMap<u64, u64>,
     pub population: u64,
+    /// L104b: the single-scan replay scratch (cleared and refilled every
+    /// push_tick; the capacity is the worst row count seen — reused across
+    /// calls, zero steady-state allocation)
+    replay: Vec<CandRec>,
 }
 
 impl PushCore {
@@ -125,6 +129,7 @@ impl PushCore {
             home_key: vec![0; PS_CAP],
             sorted_at: HashMap::new(),
             population: 0,
+            replay: Vec::new(),
         }
     }
 
@@ -407,21 +412,27 @@ pub fn push_tick(
     let mut base_dy = pc.dy[self_slot];
     let mut base_dz = pc.dz[self_slot];
 
-    for detect in [true, false] {
-        // ADDENDUM-18e: the diag pass tag (0=detect, 1=apply) rides bit 4 of
-        // every stage code this pass emits.
-        let dtag: u8 = if detect { 0 } else { 16 };
-        // per-pass reset: the detection pass's replay must not leak into the
-        // apply pass (pc.dx[self] stays unmutated until the tail write, so it
-        // is the correct base for both passes)
-        hits_count = 0;
-        non_pass = 0;
-        ddx = 0.0;
-        ddz = 0.0;
-        base_dx = pc.dx[self_slot];
-        base_dy = pc.dy[self_slot];
-        base_dz = pc.dz[self_slot];
-        ncol_self = ncol_self_0;
+    // L104b — SINGLE-SCAN REPLAY. The old structure walked the covered
+    // cells TWICE (a detect pass, then an apply pass). The detect pass
+    // mutates nothing it reads — the pc mirrors (box6/flags/px/pz/vid/
+    // ncol) are untouched until the tail write, and pidx's per-tick sort
+    // guard makes the second walk see the same sorted cells — so the
+    // apply pass's decisions are a pure function of the same snapshot.
+    // The second scan was provably redundant and doubled the kernel's
+    // scan cost at farm density (FARM profile: push stage 21.4 ms/tick,
+    // 73% of the whole tick). New structure: ONE scan records every raw
+    // row's final stage (the same codes the diag stream uses); the apply
+    // pass replays the records — same row order, same accumulations
+    // (hits_count/non_pass/ncol_self re-derive in the recorded order),
+    // the same diag stream (bit 4 set), and the force arithmetic runs as
+    // the exact same expressions on the same unchanged inputs. The
+    // scratch Vec rides PushCore and is reused across calls (zero
+    // steady-state allocation, like the HotRing contract).
+    let mut recs: Vec<CandRec> = std::mem::take(&mut pc.replay);
+    recs.clear();
+
+    let mut crammed = false;
+    'detect: {
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
                 let key = crate::cell_key_pub(world, cx, cz);
@@ -455,14 +466,16 @@ pub fn push_tick(
                         if diag && out.diag.len() < 128 {
                             let mut mb = [0.0; 6];
                             mb.copy_from_slice(&pc.box6[sc..sc + 6]);
-                            out.diag.push((dtag | 10, id, mb));
+                            out.diag.push((10, id, mb));
                         }
+                        recs.push(CandRec { id, hs: 0, fl: 0, tag: 10 });
                         continue;
                     }
                     let Some(hs) = pc.slot_of(id) else {
                         if diag && out.diag.len() < 128 {
-                            out.diag.push((dtag | 9, id, [0.0; 6]));
+                            out.diag.push((9, id, [0.0; 6]));
                         }
+                        recs.push(CandRec { id, hs: 0, fl: 0, tag: 9 });
                         continue;
                     };
                     let fl = pc.flags[hs];
@@ -471,8 +484,9 @@ pub fn push_tick(
                             let o = hs * 6;
                             let mut mb = [0.0; 6];
                             mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 1, id, mb));
+                            out.diag.push((1, id, mb));
                         }
+                        recs.push(CandRec { id, hs: hs as u32, fl, tag: 1 });
                         continue;
                     }
                     let o = hs * 6;
@@ -487,8 +501,9 @@ pub fn push_tick(
                         if diag && out.diag.len() < 128 {
                             let mut mb = [0.0; 6];
                             mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 2, id, mb));
+                            out.diag.push((2, id, mb));
                         }
+                        recs.push(CandRec { id, hs: hs as u32, fl, tag: 2 });
                         continue;
                     }
                     hits_count += 1;
@@ -502,128 +517,201 @@ pub fn push_tick(
                         if diag && out.diag.len() < 128 {
                             let mut mb = [0.0; 6];
                             mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 3, id, mb));
+                            out.diag.push((3, id, mb));
                         }
+                        recs.push(CandRec { id, hs: hs as u32, fl, tag: 3 });
                         continue;
                     }
                     // ---- vanilla loop body: numCollisions bookkeeping happens
                     // BEFORE doPush — an Entity.push early return (same vehicle,
-                    // noPhysics, eps) never undoes it (javap 295-319) ----
-                    if !detect {
-                        pc.ncol[hs] += 1;
-                        // ADDENDUM-18: the candidate's REAL counter hit rides
-                        // out.hits — the Java apply loop applies it (U.putInt)
-                        // for gated candidates too, exactly like vanilla's
-                        // pre-doPush `entityx.numCollisions++` (the increments
-                        // precede the push gates, so a gated candidate still
-                        // consumes its hit — the old emit-only loop lost every
-                        // gated hit and the entity's numCollisions grew ~10x
-                        // slower than vanilla: the OFF nc(78) trace 2..18 by
-                        // t=274 vs the kernel's flat 0-1, which let the
-                        // kernel's pass serve pairs vanilla's maxEntityCollisions
-                        // cap had already excluded — the mobs t=275 seed).
-                        if out.hits.len() < MAX_PUSH_PAIRS {
-                            out.hits.push(id);
-                        }
-                    }
+                    // noPhysics, eps) never undoes it (javap 295-319). The
+                    // counter hit rides the replay (the old apply pass's
+                    // `pc.ncol[hs] += 1` + the out.hits witness). ----
                     ncol_self += 1;
-                    // Entity.push pair gates (all live INSIDE push, after ncol++)
-                    if is_pass && pc.vid[hs] == self_id {
-                        if diag && out.diag.len() < 128 {
-                            let mut mb = [0.0; 6];
-                            mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 4, id, mb));
-                        }
-                        continue; // isPassengerOfSameVehicle
-                    }
-                    if self_nophys || fl & PF_NOPHYSICS != 0 {
-                        if diag && out.diag.len() < 128 {
-                            let mut mb = [0.0; 6];
-                            mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 5, id, mb));
-                        }
-                        continue;
-                    }
-                    if only_players_collide && !self_player && fl & PF_PLAYER == 0 {
-                        if diag && out.diag.len() < 128 {
-                            let mut mb = [0.0; 6];
-                            mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 6, id, mb));
-                        }
-                        continue;
-                    }
-                    if fl & PF_PLAYER != 0 && !player_collisions {
-                        if diag && out.diag.len() < 128 {
-                            let mut mb = [0.0; 6];
-                            mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 6, id, mb));
-                        }
-                        continue;
-                    }
-                    // ---- Entity.push force math (exact constants) ----
-                    let opx = pc.px[hs];
-                    let opz = pc.pz[hs];
-                    let mut dx = opx - spx;
-                    let mut dz = opz - spz;
-                    let d0 = abs_max(dx, dz);
-                    if d0 < PUSH_EPS {
+                    // Entity.push pair gates (all live INSIDE push, after ncol++);
+                    // the eps gate decides crammed-vs-force on the SAME unchanged
+                    // inputs — the recorded tag carries the verdict to the replay.
+                    let d0 = abs_max(pc.px[hs] - spx, pc.pz[hs] - spz);
+                    let tag: u8 = if is_pass && pc.vid[hs] == self_id {
+                        4
+                    } else if self_nophys || fl & PF_NOPHYSICS != 0 {
+                        5
+                    } else if only_players_collide && !self_player && fl & PF_PLAYER == 0 {
+                        6
+                    } else if fl & PF_PLAYER != 0 && !player_collisions {
+                        6
+                    } else if d0 < PUSH_EPS {
                         // vanilla crammed branch: 26.3 push(Entity) applies NO
                         // force here (the dd >= 0.01 gate has no else) — but the
                         // counters already moved. Route vanilla to keep the
-                        // RNG/counter semantics byte-exact (the L37e contract).
-                        if detect {
-                            out.reason = 2;
-                            return; // ok stays false, mirrors untouched
-                        }
-                        if diag && out.diag.len() < 128 {
-                            let mut mb = [0.0; 6];
-                            mb.copy_from_slice(&pc.box6[o..o + 6]);
-                            out.diag.push((dtag | 7, id, mb));
-                        }
-                        continue;
-                    }
-                    let d = d0.sqrt();
-                    dx /= d;
-                    dz /= d;
-                    let mut f = 1.0 / d;
-                    if f > 1.0 {
-                        f = 1.0;
-                    }
-                    dx *= f;
-                    dz *= f;
-                    dx *= PUSH_QUANTUM;
-                    dz *= PUSH_QUANTUM;
-                    // this.push(-dx, 0, -dz) when not a vehicle and pushable
-                    if !self_vehicle && self_pushable {
-                        base_dx += -dx;
-                        base_dz += -dz;
-                        ddx += -dx;
-                        ddz += -dz;
-                    }
-                    // other.push(dx, 0, dz) when other is not a vehicle — L42:
-                    // the force is EMITTED for the Java apply loop (the
-                    // candidate's delta write lands THIS TICK, mirroring
-                    // vanilla's doPush mutual push); the write's own probe event
-                    // (the value-carrying capture) re-syncs the mirror before
-                    // the next kernel read (every dispatch flushes first). The
-                    // old mirror+kadd mutation deferred the write to the
-                    // candidate's own kernel run — lost whenever that run
-                    // declined (the first-move divergence, doc 40 addendum 5).
-                    if !detect && fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
-                        out.pairs.push((id, dx, dz));
-                    }
+                        // RNG/counter semantics byte-exact (the L37e contract):
+                        // the replay never runs, ok stays false, the mirrors
+                        // are untouched, the vanilla body computes everything
+                        // including the RNG.
+                        crammed = true;
+                        break 'detect;
+                    } else {
+                        8
+                    };
                     if diag && out.diag.len() < 128 {
                         let mut mb = [0.0; 6];
                         mb.copy_from_slice(&pc.box6[o..o + 6]);
-                        out.diag.push((dtag | 8, id, mb));
+                        out.diag.push((tag, id, mb));
                     }
+                    recs.push(CandRec { id, hs: hs as u32, fl, tag });
                 }
             }
         }
-        if !detect {
-            break;
+    }
+    let scan_raw = out.raw;
+    pc.replay = recs;
+    if crammed {
+        out.reason = 2;
+        return; // ok stays false -> the caller routes vanilla
+    }
+
+    // ---- the apply pass: replay the recorded decisions (the old second
+    // scan, minus the scan). Per-pass reset first, exactly like the old
+    // apply pass: pc.dx[self] stays unmutated until the tail write, so it
+    // is the correct base. ----
+    hits_count = 0;
+    non_pass = 0;
+    ddx = 0.0;
+    ddz = 0.0;
+    base_dx = pc.dx[self_slot];
+    base_dy = pc.dy[self_slot];
+    base_dz = pc.dz[self_slot];
+    ncol_self = ncol_self_0;
+    let mut recs = std::mem::take(&mut pc.replay);
+    for r in recs.iter() {
+        let id = r.id;
+        let hs = r.hs as usize;
+        let fl = r.fl;
+        let is_pass = fl & PF_PASSENGER != 0;
+        match r.tag {
+            10 => {
+                if diag && out.diag.len() < 128 {
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[sc..sc + 6]);
+                    out.diag.push((16 | 10, id, mb));
+                }
+            }
+            9 => {
+                if diag && out.diag.len() < 128 {
+                    out.diag.push((16 | 9, id, [0.0; 6]));
+                }
+            }
+            1 | 2 => {
+                if diag && out.diag.len() < 128 {
+                    let o = hs * 6;
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[o..o + 6]);
+                    out.diag.push((16 | r.tag, id, mb));
+                }
+            }
+            3 => {
+                // the cap hit still consumed its intersect-pass bookkeeping
+                hits_count += 1;
+                if !is_pass {
+                    non_pass += 1;
+                }
+                if diag && out.diag.len() < 128 {
+                    let o = hs * 6;
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[o..o + 6]);
+                    out.diag.push((16 | 3, id, mb));
+                }
+            }
+            4 | 5 | 6 => {
+                hits_count += 1;
+                if !is_pass {
+                    non_pass += 1;
+                }
+                // numCollisions bookkeeping happens BEFORE the gate — a gated
+                // candidate still consumes its counter hit (javap 295-319)
+                pc.ncol[hs] += 1;
+                if out.hits.len() < MAX_PUSH_PAIRS {
+                    out.hits.push(id);
+                }
+                ncol_self += 1;
+                if diag && out.diag.len() < 128 {
+                    let o = hs * 6;
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[o..o + 6]);
+                    out.diag.push((16 | r.tag, id, mb));
+                }
+            }
+            8 => {
+                hits_count += 1;
+                if !is_pass {
+                    non_pass += 1;
+                }
+                pc.ncol[hs] += 1;
+                if out.hits.len() < MAX_PUSH_PAIRS {
+                    out.hits.push(id);
+                }
+                ncol_self += 1;
+                // ---- Entity.push force math (exact constants) ----
+                let o = hs * 6;
+                let opx = pc.px[hs];
+                let opz = pc.pz[hs];
+                let mut dx = opx - spx;
+                let mut dz = opz - spz;
+                let d0 = abs_max(dx, dz);
+                if d0 < PUSH_EPS {
+                    // unreachable in the replay (the scan already routed the
+                    // tick vanilla on the first crammed pair); kept defensive
+                    // so the stage map stays total.
+                    if diag && out.diag.len() < 128 {
+                        let mut mb = [0.0; 6];
+                        mb.copy_from_slice(&pc.box6[o..o + 6]);
+                        out.diag.push((16 | 7, id, mb));
+                    }
+                    continue;
+                }
+                let d = d0.sqrt();
+                dx /= d;
+                dz /= d;
+                let mut f = 1.0 / d;
+                if f > 1.0 {
+                    f = 1.0;
+                }
+                dx *= f;
+                dz *= f;
+                dx *= PUSH_QUANTUM;
+                dz *= PUSH_QUANTUM;
+                // this.push(-dx, 0, -dz) when not a vehicle and pushable
+                if !self_vehicle && self_pushable {
+                    base_dx += -dx;
+                    base_dz += -dz;
+                    ddx += -dx;
+                    ddz += -dz;
+                }
+                // other.push(dx, 0, dz) when other is not a vehicle — L42:
+                // the force is EMITTED for the Java apply loop (the
+                // candidate's delta write lands THIS TICK, mirroring
+                // vanilla's doPush mutual push); the write's own probe event
+                // (the value-carrying capture) re-syncs the mirror before
+                // the next kernel read (every dispatch flushes first).
+                if fl & PF_VEHICLE == 0 && out.pairs.len() < MAX_PUSH_PAIRS {
+                    out.pairs.push((id, dx, dz));
+                }
+                if diag && out.diag.len() < 128 {
+                    let mut mb = [0.0; 6];
+                    mb.copy_from_slice(&pc.box6[o..o + 6]);
+                    out.diag.push((16 | 8, id, mb));
+                }
+            }
+            _ => {
+                // stage 7 never records (the crammed row routes vanilla
+                // before the replay exists)
+            }
         }
     }
+    pc.replay = recs;
+    // the old apply pass re-scanned the same cells and re-counted the raw
+    // rows — the KPI's raw stays the double-pass count
+    out.raw = scan_raw.saturating_mul(2);
 
     // ADDENDUM-18g — THE R-C ROOT. Vanilla gates the ENTIRE counter body
     // on a non-empty roster: `if (!pushableEntities.isEmpty()) { ...;
@@ -678,6 +766,18 @@ fn abs_max(a: f64, b: f64) -> f64 {
     } else {
         bb
     }
+}
+
+/// L104b: one recorded candidate row of the single-scan replay (see
+/// push_tick). `tag` is the row's final stage code (the diag stream's
+/// low-nibble vocabulary: 10 self, 9 no-slot, 1 flags, 2 intersect,
+/// 3 cap, 4/5/6 gates, 8 served force; 7 never records — the crammed
+/// row routes vanilla before the replay exists).
+struct CandRec {
+    id: i64,
+    hs: u32,
+    fl: u8,
+    tag: u8,
 }
 
 /// Outputs of one kernel call (Java reads them back through statics).
