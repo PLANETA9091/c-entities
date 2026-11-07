@@ -53,7 +53,7 @@ jobs:
           # NOTE: unzip exits 11 when ONE pattern matches nothing — the
           # per-class CLS check below is the real guard, so the patterns
           # stay forgiving (|| true).
-          unzip -o -q "$MAPPED" 'net/minecraft/world/entity/ai/goal/*.class' 'net/minecraft/world/entity/Mob*.class' 'net/minecraft/world/entity/Entity*.class' 'net/minecraft/world/entity/LivingEntity.class' 'net/minecraft/world/entity/PathfinderMob.class' -d "$WORK" || true
+          unzip -o -q "$MAPPED" 'net/minecraft/world/entity/ai/goal/*.class' 'net/minecraft/world/entity/ai/goal/target/*.class' 'net/minecraft/world/entity/Mob*.class' 'net/minecraft/world/entity/Entity*.class' 'net/minecraft/world/entity/LivingEntity.class' 'net/minecraft/world/entity/PathfinderMob.class' 'net/minecraft/world/entity/monster/zombie/*.class' -d "$WORK" || true
           for C in ${{ inputs.classes || 'net.minecraft.world.entity.ai.goal.RandomLookAroundGoal net.minecraft.world.entity.ai.goal.GoalSelector net.minecraft.world.entity.ai.goal.WrappedGoal' }}; do
             NAME=${C##*.}
             CLS=$(find "$WORK" -name "$NAME.class" | head -1)
