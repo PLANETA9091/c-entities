@@ -68,6 +68,23 @@ public final class CeHooks {
     /** L37d: candidates dropped by the exact AABB re-check (the index's
      *  margin superset) — zero means the index was already exact. */
     public static volatile long marginExtra = 0;
+    // L104 BIG-BOX REFUSE: the fast path pays ~112 ns per candidate inside
+    // the Java resolve loop (ARENA load + live-box deref + AABB test), the
+    // Rust scan itself is ~12 ns/row, so a query returning thousands of
+    // rows (mob target / LookAtPlayer scans over 60-70-block boxes at
+    // spread density = ~1800-3200 candidates) costs ~350 us in fast while
+    // the vanilla section walk resolves the same volume at ~25-40 ns/cand.
+    // Above BIG_N_REFUSE rows the vanilla scan is cheaper BY CONSTRUCTION
+    // (it IS the vanilla cost) and order-exact by definition: refuse and
+    // let the caller run the vanilla body. The refusal also feeds the gate
+    // clean mirror samples — the big buckets' MIRR_EMA was rare/biased
+    // (run 340: b15 fast=330us vs mirror=2538us would imply a 9 s/tick
+    // vanilla tick, contradicting the measured 479 ms). Item merge scans
+    // (n <= ~300 at items-100k density) and the push kernel (Rust-side)
+    // stay on the fast path. Tunable: the bigbox counters in the hooks
+    // line + the harvest JFR name the n-distribution.
+    public static final int BIG_N_REFUSE = 1024;
+    public static volatile long bigboxRefused = 0, bigboxCand = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
@@ -1067,6 +1084,7 @@ public final class CeHooks {
                 + " resMs=" + resolveNanos / 1_000_000
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
                 + " marginExtra=" + marginExtra
+                + " bigbox=" + bigboxRefused + "/" + bigboxCand
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
@@ -2704,6 +2722,17 @@ public final class CeHooks {
             }
         }
         if (prof) queryNanos += System.nanoTime() - t1;
+
+        // L104: cap the resolve-loop work BEFORE paying it. The scan (and
+        // the flush-merged batch application, already done above) is cheap;
+        // the per-candidate Java resolve is not. n here is the index's
+        // margin-superset result size.
+        if (n > BIG_N_REFUSE) {
+            bigboxRefused++;
+            bigboxCand += n;
+            fastRefuse = "bigbox";
+            return null;
+        }
 
         ArrayList<Entity> out = useScratch
                 ? FQ_SCRATCH
