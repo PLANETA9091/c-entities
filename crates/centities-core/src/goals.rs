@@ -236,18 +236,21 @@ pub const GOAL_STRIDE: usize = 8;
 //   [32..34] getEyeY()
 //   [34..]  goal records: target selector first, then goal selector;
 //   then P * PSTRIDE player snapshot records (level.players() order)
-const IN_HEADER: usize = 34;
-const IN_PCOUNT: usize = 24;
-const IN_FOLLOW: usize = 25;
-const IN_MOBX: usize = 26;
-const IN_MOBY: usize = 28;
-const IN_MOBZ: usize = 30;
-const IN_EYEY: usize = 32;
-const IN_SEED_LO: usize = 12;
-const IN_SEED_HI: usize = 13;
-const IN_RES: usize = 14;
-const IN_RES_OP: usize = 15;
-const IN_RES_X: usize = 16;
+// L110+ — the layout constants are public: the native executor
+// (swarm-sim::mob) packs/unpacks the same wire format the Java packer
+// (CeHooks.aiPack) does, without re-declaring it.
+pub const IN_HEADER: usize = 34;
+pub const IN_PCOUNT: usize = 24;
+pub const IN_FOLLOW: usize = 25;
+pub const IN_MOBX: usize = 26;
+pub const IN_MOBY: usize = 28;
+pub const IN_MOBZ: usize = 30;
+pub const IN_EYEY: usize = 32;
+pub const IN_SEED_LO: usize = 12;
+pub const IN_SEED_HI: usize = 13;
+pub const IN_RES: usize = 14;
+pub const IN_RES_OP: usize = 15;
+pub const IN_RES_X: usize = 16;
 
 // output buffer (i32 units):
 //   [0] status (ST_*)
@@ -259,9 +262,9 @@ const IN_RES_X: usize = 16;
 //   [6] resume cursor (Java writes it into in[0] on resume)
 //   [7] fallback reason (FB_* — 0 when no fallback; diagnostics only)
 //   [8...] actions, 8 i32 each: [op, p0, p1, p2, p3, d0lo, d0hi, pad]
-const OUT_HEADER: usize = 8;
-const OUT_ACT: usize = 8;
-const MAX_ACTS: usize = 96;
+pub const OUT_HEADER: usize = 8;
+pub const OUT_ACT: usize = 8;
+pub const MAX_ACTS: usize = 96;
 
 /// fallback reason codes (out[7]) — the Java floor logs the first one so a
 /// classified-mob fallback is diagnosable from the CI log alone.
@@ -300,7 +303,7 @@ const PH_LOCK_REBUILD: i32 = 1;
 const PH_UPDATE: i32 = 2;
 const PH_TICK_RUNNING: i32 = 3;
 
-const MAX_GOALS: usize = 16;
+pub const MAX_GOALS: usize = 16;
 
 fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
     ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)

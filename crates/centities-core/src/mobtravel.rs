@@ -29,12 +29,14 @@
 /// public static float sin(double value) { return SIN[(int)(value * 10430.378F) & 0xFFFF]; }
 /// public static float cos(double value) { return SIN[(int)(value * 10430.378F + 16384.0F) & 0xFFFF]; }
 /// ```
-struct Mth {
+/// Public since L110: the native executor (swarm-sim::mob) runs the
+/// travel slice itself and needs the same bit-exact table.
+pub struct Mth {
     sin: Vec<f32>,
 }
 
 impl Mth {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut sin = vec![0f32; 65536];
         for (i, v) in sin.iter_mut().enumerate() {
             *v = (i as f64 * std::f64::consts::PI * 2.0 / 65536.0).sin() as f32;
@@ -43,14 +45,14 @@ impl Mth {
     }
 
     #[inline]
-    fn sin(&self, value: f64) -> f32 {
+    pub fn sin(&self, value: f64) -> f32 {
         // Java: SIN[(int)(value * 10430.378F) & 0xFFFF] — the f32 constant
         // WIDENS to f64 for the multiply, then narrows to int.
         self.sin[(((value * 10430.378f32 as f64) as i32) & 0xFFFF) as usize]
     }
 
     #[inline]
-    fn cos(&self, value: f64) -> f32 {
+    pub fn cos(&self, value: f64) -> f32 {
         self.sin[(((value * 10430.378f32 as f64 + 16384.0f32 as f64) as i32) & 0xFFFF) as usize]
     }
 }

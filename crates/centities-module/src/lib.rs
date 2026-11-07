@@ -14,7 +14,7 @@
 pub mod itemcore;
 #[doc(hidden)]
 pub mod patch;
-pub mod pushcore;
+pub use centities_core::pushcore;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;

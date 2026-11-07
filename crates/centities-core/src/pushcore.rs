@@ -145,7 +145,7 @@ impl PushCore {
         &mut self,
         id: i64,
         wid: u16,
-        b: &centities_core::Aabb,
+        b: &crate::Aabb,
         px: f64,
         pz: f64,
         dx: f64,
@@ -208,13 +208,13 @@ impl PushCore {
             if old_home != 0 {
                 self.sorted_at.remove(&old_home);
             }
-            let ccx = (((b.x0 + b.x1) * 0.5).floor() as i32) >> centities_core::CELL_SHIFT;
-            let ccz = (((b.z0 + b.z1) * 0.5).floor() as i32) >> centities_core::CELL_SHIFT;
-            let new_home = centities_core::cell_key_pub(wid, ccx, ccz);
+            let ccx = (((b.x0 + b.x1) * 0.5).floor() as i32) >> crate::CELL_SHIFT;
+            let ccz = (((b.z0 + b.z1) * 0.5).floor() as i32) >> crate::CELL_SHIFT;
+            let new_home = crate::cell_key_pub(wid, ccx, ccz);
             self.sorted_at.remove(&new_home);
-            let pcx = ((px.floor() as i32) >> centities_core::CELL_SHIFT) as i64;
-            let pcz = ((pz.floor() as i32) >> centities_core::CELL_SHIFT) as i64;
-            let pos_key = centities_core::cell_key_pub(wid, pcx as i32, pcz as i32);
+            let pcx = ((px.floor() as i32) >> crate::CELL_SHIFT) as i64;
+            let pcz = ((pz.floor() as i32) >> crate::CELL_SHIFT) as i64;
+            let pos_key = crate::cell_key_pub(wid, pcx as i32, pcz as i32);
             if pos_key != new_home {
                 self.sorted_at.remove(&pos_key);
             }
@@ -274,7 +274,7 @@ impl PushCore {
 #[allow(clippy::too_many_arguments)]
 pub fn push_tick(
     pc: &mut PushCore,
-    pidx: &mut centities_core::EntityIndex,
+    pidx: &mut crate::EntityIndex,
     world: u16,
     self_id: i64,
     self_slot: usize,
@@ -324,11 +324,11 @@ pub fn push_tick(
 
     // Density gate FIRST (before any scanning work): sum the covered
     // cells' pushable-row populations; sparse worlds route vanilla.
-    let ex_gate = pidx.max_half_span() + centities_core::MARGIN as f64;
-    let gx0 = ((sx0 - ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
-    let gx1 = ((sx1 + ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
-    let gz0 = ((sz0 - ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
-    let gz1 = ((sz1 + ex_gate).floor() as i32) >> centities_core::CELL_SHIFT;
+    let ex_gate = pidx.max_half_span() + crate::MARGIN as f64;
+    let gx0 = ((sx0 - ex_gate).floor() as i32) >> crate::CELL_SHIFT;
+    let gx1 = ((sx1 + ex_gate).floor() as i32) >> crate::CELL_SHIFT;
+    let gz0 = ((sz0 - ex_gate).floor() as i32) >> crate::CELL_SHIFT;
+    let gz1 = ((sz1 + ex_gate).floor() as i32) >> crate::CELL_SHIFT;
     let mut rows = 0usize;
     for cz in gz0..=gz1 {
         for cx in gx0..=gx1 {
@@ -375,11 +375,11 @@ pub fn push_tick(
     // exact f64 intersect below restores the vanilla set.
     let mut cell_hits: Vec<i64> = Vec::new();
 
-    let ex = pidx.max_half_span() + centities_core::MARGIN as f64;
-    let cx0 = ((sx0 - ex).floor() as i32) >> centities_core::CELL_SHIFT;
-    let cx1 = ((sx1 + ex).floor() as i32) >> centities_core::CELL_SHIFT;
-    let cz0 = ((sz0 - ex).floor() as i32) >> centities_core::CELL_SHIFT;
-    let cz1 = ((sz1 + ex).floor() as i32) >> centities_core::CELL_SHIFT;
+    let ex = pidx.max_half_span() + crate::MARGIN as f64;
+    let cx0 = ((sx0 - ex).floor() as i32) >> crate::CELL_SHIFT;
+    let cx1 = ((sx1 + ex).floor() as i32) >> crate::CELL_SHIFT;
+    let cz0 = ((sz0 - ex).floor() as i32) >> crate::CELL_SHIFT;
+    let cz1 = ((sz1 + ex).floor() as i32) >> crate::CELL_SHIFT;
     if diag {
         out.diag_walk[0] = cx0 as f64;
         out.diag_walk[1] = cx1 as f64;
@@ -424,7 +424,7 @@ pub fn push_tick(
         ncol_self = ncol_self_0;
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
-                let key = centities_core::cell_key_pub(world, cx, cz);
+                let key = crate::cell_key_pub(world, cx, cz);
                 if pc.sorted_at.get(&key).copied().unwrap_or(0) != tick {
                     pidx.sort_cell_by_keys(world, cx, cz, |id| match pc.slot_of(id) {
                         Some(s) => {
@@ -744,7 +744,7 @@ pub const MAX_PUSH_PAIRS: usize = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use centities_core::Aabb;
+    use crate::Aabb;
 
     // All test entities use the zombie box (0.6 x 1.95 x 0.6). Boxes
     // INTERSECT iff |dx| < 0.6 on X (strict) — tests place candidates
@@ -773,8 +773,8 @@ mod tests {
         pc
     }
 
-    fn idx_with(id: i64, x: f64, z: f64) -> centities_core::EntityIndex {
-        let mut idx = centities_core::EntityIndex::new();
+    fn idx_with(id: i64, x: f64, z: f64) -> crate::EntityIndex {
+        let mut idx = crate::EntityIndex::new();
         idx.upsert(id, 0, &zbox(x, z));
         idx
     }
@@ -878,7 +878,7 @@ mod tests {
     /// ids get pairs (ID order), all five counted for the audit.
     #[test]
     fn cap_limits_pairs_but_not_audit() {
-        let mut pidx = centities_core::EntityIndex::new();
+        let mut pidx = crate::EntityIndex::new();
         let mut pc = core_with(1, 0.0, 0.0);
         for k in 2..7i64 {
             let x = 0.05 * (k - 1) as f64; // 0.05..0.25 — all intersect
@@ -918,7 +918,7 @@ mod tests {
     /// nextInt(4) + hurtServer. The cap (maxEC=8) does NOT affect the count.
     #[test]
     fn cramming_flag_needs_vanilla_condition() {
-        let mut pidx = centities_core::EntityIndex::new();
+        let mut pidx = crate::EntityIndex::new();
         let mut pc = core_with(1, 0.0, 0.0);
         for k in 2..32i64 {
             let x = 0.01 * (k - 1) as f64; // 0.01..0.29 — all intersect
@@ -1025,7 +1025,7 @@ mod tests {
     /// LOWEST SEQs (the vanilla first-candidates), not the lowest ids.
     #[test]
     fn candidates_served_in_vanilla_order() {
-        let mut pidx = centities_core::EntityIndex::new();
+        let mut pidx = crate::EntityIndex::new();
         let mut pc = core_with(1, 0.0, 0.0);
         for k in (2..12i64).rev() {
             let x = 0.02 * (k - 1) as f64; // 0.02..0.18 — all intersect

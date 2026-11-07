@@ -23,6 +23,7 @@
 pub mod goals;
 pub mod itemtick;
 pub mod mobtravel;
+pub mod pushcore;
 pub mod sections;
 pub mod simd;
 pub mod tick;

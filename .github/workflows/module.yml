@@ -37,6 +37,10 @@ jobs:
           cargo test -p swarm-core --release
           cargo test -p swarm-sim --release
           cargo run --release -p swarm-sim --example transition_bench
+      - name: Swarm e2e — the 1e9-zombie tick budget (walk + farm)
+        run: |
+          cargo run --release -p swarm-sim --example swarm_e2e
+          cargo run --release -p swarm-sim --example swarm_e2e -- --farm
 
   module:
     runs-on: ubuntu-latest

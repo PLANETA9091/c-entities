@@ -79,7 +79,11 @@ fn main() {
     let bpe = (rss1.saturating_sub(rss0)) * 1024 / n;
     println!(
         "upsert: {:>9.0} ents/s ({} in {:.2}s)   RSS delta {} MB -> {:>3} B/entity",
-        n as f64 / up_dt, n, up_dt, rss1 / 1024, bpe
+        n as f64 / up_dt,
+        n,
+        up_dt,
+        rss1 / 1024,
+        bpe
     );
 
     // ---- 2. QUERY: the per-tick lookup pressure ------------------------
@@ -118,7 +122,14 @@ fn main() {
     let mut big_hits = 0usize;
     let t2 = Instant::now();
     for b in qboxes.iter().take(50_000) {
-        let big = Aabb::new(b.x0 - 14.0, 60.0, b.z0 - 14.0, b.x1 + 14.0, 67.0, b.z1 + 14.0);
+        let big = Aabb::new(
+            b.x0 - 14.0,
+            60.0,
+            b.z0 - 14.0,
+            b.x1 + 14.0,
+            67.0,
+            b.z1 + 14.0,
+        );
         idx.query(0, &big, &mut out);
         big_hits += out.len() as usize;
     }
@@ -141,7 +152,8 @@ fn main() {
     println!("--- 20 TPS verdict for n={} ---", n);
     println!(
         "push-only per tick: {:>6.1} ms single-core -> {:.1} cores to stay in 50 ms",
-        per_tick_push / 1e6, push_cores
+        per_tick_push / 1e6,
+        push_cores
     );
     println!(
         "RAM projection: {:.1} B/entity -> 1e9 zombies = {:.0} GB (the index wall; server RAM decides, not CPU)",

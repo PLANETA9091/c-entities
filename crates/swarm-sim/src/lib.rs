@@ -24,6 +24,8 @@ use centities_core::{Aabb, EntityIndex};
 use std::collections::{HashMap, HashSet};
 use swarm_core::{chunk_slot_pos, pack_chunk, ChunkDelta, SwarmError, SwarmLedger};
 
+pub mod mob;
+
 /// Zombie-ish live box for materialized entities (0.6 x 1.95).
 const BOX_W: f64 = 0.6;
 const BOX_H: f64 = 1.95;
@@ -396,8 +398,10 @@ impl SwarmEngine {
         // to the index side)
         let mut batch: Vec<ChunkDelta> = Vec::with_capacity(t.enter.len() + t.leave.len());
         for &k in &t.leave {
+            // n == 0 is LEGAL: the chunk may have entered with a zero
+            // ledger count (an empty chunk inside the boundary). Its
+            // leave-delta is then 0 — a ledger no-op.
             let n = self.ids_by_chunk.get(&k).map(|v| v.len()).unwrap_or(0) as i32;
-            debug_assert!(n > 0, "leaving chunk {k} had no materialized ids");
             batch.push(ChunkDelta { key: k, delta: n });
         }
         let mut enter_counts: Vec<(u64, u32)> = Vec::with_capacity(t.enter.len());
@@ -613,7 +617,7 @@ mod tests {
         }
         assert_eq!(ring.len(), 64);
         // map consistency: every surviving id resolves, every slot unique
-        let mut seen = vec![false; 64];
+        let mut seen = [false; 64];
         for id in ring.iter_ids() {
             let s = ring.slot_of(id).expect("id map broken");
             assert!(!seen[s], "two ids share slot {s}");
