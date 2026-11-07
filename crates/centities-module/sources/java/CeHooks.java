@@ -1116,6 +1116,7 @@ public final class CeHooks {
                 + "/" + pushCramming + "/" + pushSelfDelta
                 + "/" + pushPairs + "/" + pushPairMiss
                 + " ord=" + ordSkip + "/" + ordWork
+                + " l106=" + ordStructSkip + "/" + mViewBlew + "/" + (ORD_STRUCT_ON ? 1 : 0)
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
@@ -2313,6 +2314,27 @@ public final class CeHooks {
      *  inherent re-append ordering (the stamps must move). */
     public static long ordSkip = 0, ordWork = 0;
 
+    // === L106 (doc 41 grind, the query-family pack) ======================
+    // CE_L106=0 restores the pre-L106 behavior one knob for the whole pack:
+    //   1. STRUCTURAL ordSkip: the native resolve and the (chunkZ-major)
+    //      row scan serve candidates in the vanilla EntityLookup order by
+    //      construction — the per-query ordKey stamp + prescan (+ the rare
+    //      sort) is skipped (native) / kept only for PQ-carrying row queries
+    //      (row). ORDER_CHECK and the CI parity gate referee the claim.
+    //   2. VIEW HOIST: viewN/IN_ITEM_APPLY are loop-stable (the flush apply
+    //      runs before the resolve; the row path never applies) — one local
+    //      test replaces the per-candidate isViewAfter call. A predicate
+    //      that mutated view state mid-loop trips the vBlew net -> mirror.
+    //   3. COUNTER LOCALS: marginExtra/rowWinSkip/homeMiss accumulate in
+    //      locals and flush once per query (the putstatic per candidate was
+    //      a hot self-time line: rowQuery 3250 = 5.17%, spread-100k-mod).
+    //   4. Inline AABB.intersects in the row scan (javap-verified identical
+    //      6-compare test).
+    private static final boolean ORD_STRUCT_ON =
+            !"0".equals(System.getenv("CE_L106"));
+    public static long ordStructSkip = 0;
+    public static long mViewBlew = 0;
+
     /** L38 — the collide fast path (CE_COLLIDE=0 disables the weave).
      *  Byte-exact port of LivingEntity.canCollideWithBukkit (26.3):
      *  `isPushable() && collides != collidableExemptions.contains(uuid)` —
@@ -2744,6 +2766,18 @@ public final class CeHooks {
         candidatesSeen += n;
         long t2 = prof ? System.nanoTime() : 0L;
         int srcId = source == null ? -1 : entId(source);
+        // L106 view hoist: viewN/IN_ITEM_APPLY are stable across the resolve
+        // loop (the flush-merged apply ran BEFORE it, inside queryNative2;
+        // the loop itself never applies a batch; a predicate that mutated the
+        // view is caught by the vBlew check below and falls back to the
+        // mirror). One local test replaces the per-candidate isViewAfter
+        // call (2 static loads + a frame) on every candidate of every query.
+        final boolean vApply0 = IN_ITEM_APPLY;
+        final int vN0 = viewN;
+        final boolean vActive = vApply0 && vN0 > 0;
+        // L106 marginExtra in a local: the putstatic per rejected candidate
+        // was a hot self-time line on the spread-100k-mod profile.
+        int marginLocal = 0;
         for (int k = 0; k < n; k++) {
             int cid = (int) ids[k];
             if (cid == srcId) {
@@ -2791,13 +2825,13 @@ public final class CeHooks {
             AABB eb = e.getBoundingBox();
             // L44: an AFTER-scanner resync entry is seen at its PRE-body box
             // (the vanilla scan ran before that entry's body).
-            if (isViewAfter(cid)) {
+            if (vActive && isViewAfter(cid)) {
                 eb = viewBox(cid, eb);
             }
             if (!(eb.minX < box.maxX && eb.maxX > box.minX
                     && eb.minY < box.maxY && eb.maxY > box.minY
                     && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
-                marginExtra++;
+                marginLocal++;
                 // L41d: sample the first rejects' index-box vs LIVE-box —
                 // the Rust scan already filters all 3 axes against the
                 // INDEX box exactly, so an 84% rejection rate means the
@@ -2826,6 +2860,17 @@ public final class CeHooks {
             }
         }
         if (prof) resolveNanos += System.nanoTime() - t2;
+        // L106 flushes + safety nets.
+        marginExtra += marginLocal;
+        if (IN_ITEM_APPLY != vApply0 || viewN != vN0) {
+            // the loop mutated view state through a predicate (never seen in
+            // the wild; the flush apply ran before the loop) — the vActive
+            // decision may be stale for the tail candidates: refuse to the
+            // mirror, which re-runs the whole query exactly.
+            mViewBlew++;
+            fastRefuse = "viewblew";
+            return null;
+        }
         // "resolved" for the parity assert means "the id mapped to a LIVE
         // entity" — the source self-hit (srcSkip) is exactly that (the
         // vanilla exclusion skips the PUSH, not the resolution). The L12
@@ -2847,7 +2892,22 @@ public final class CeHooks {
         // the merge partner choice, the maxEntityCollisions cap and every
         // other order-sensitive consumer need the exact (chunkZ, chunkX,
         // sectionY, insertionSeq) sequence.
-        ordSortVanilla(out);
+        // L106 STRUCTURAL ORDER: the native resolve adds survivors in the
+        // Rust scan order, which IS the vanilla EntityLookup order by
+        // construction (lib.rs query(): chunkZ-major cell walk x
+        // ensure_cell_order per cell, oversize re-keyed in Rust; skips and
+        // the arena fallback preserve relative order; viewBox substitutes a
+        // box, never a position; the view-touch case refused above). The
+        // per-candidate ordKey stamping + prescan ran on EVERY query and cost
+        // ~4.5% self-time on spread-100k-mod (2488 3.03% + ordKey 1.45%) to
+        // conclude ordSkip 207789 : ordWork 9. CE_L106=0 restores the sort.
+        // ORDER_CHECK (below) still element-verifies against the mirror when
+        // enabled, and the CI parity gate is the referee.
+        if (!ORD_STRUCT_ON) {
+            ordSortVanilla(out);
+        } else {
+            ordStructSkip++;
+        }
         if (ORDER_CHECK) {
             orderChecks++;
             List<Entity> van = mirror(level, source, box, predicate);
@@ -3032,8 +3092,14 @@ public final class CeHooks {
         // zero-fresh window means the index says nothing about it (early
         // boot, regrowth, foreign world) and the query refuses.
         boolean freshSeen = false;
-        for (int cx = cx0; cx <= cx1; cx++) {
-            for (int cz = cz0; cz <= cz1; cz++) {
+        // L106: chunkZ-MAJOR collect (vanilla iterates chunks Z outer, X
+        // inner). The rows stream into MQ_ROWS in collection order and the
+        // scan loop preserves it — with the swap the served order matches the
+        // vanilla EntityLookup walk for every window, which is the second
+        // half of the structural ordSkip (the first half: each row is
+        // published from an ensure_cell_order'ed index cell).
+        for (int cz = cz0; cz <= cz1; cz++) {
+            for (int cx = cx0; cx <= cx1; cx++) {
                 int packed = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 long[] row = ROWS[packed];
                 if (row == null) {
@@ -3192,7 +3258,18 @@ public final class CeHooks {
                 : new ArrayList<>(Math.min(total, totalCap));
         out.clear();
         int srcId = source == null ? -1 : entId(source);
-        int stale = 0, homeMiss = 0;
+        int stale = 0;
+        // L106 view hoist (native-path twin): viewN/IN_ITEM_APPLY are stable
+        // across the scan (the row path never applies a batch; a predicate
+        // that mutated the view is caught by the vBlew check below and falls
+        // back to the mirror).
+        final boolean vApply0 = IN_ITEM_APPLY;
+        final int vN0 = viewN;
+        final boolean vActive = vApply0 && vN0 > 0;
+        // L106 counter locals: rowWinSkip/homeMiss putstatic per candidate
+        // sat on the hot self-time lines (rowQuery 3250 = 5.17% on
+        // spread-100k-mod).
+        int winSkipLocal = 0, homeMissLocal = 0;
         for (int r = 0; r < nr; r++) {
             long[] row = MQ_ROWS[r];
             int packed = MQ_CELL[r];
@@ -3243,11 +3320,11 @@ public final class CeHooks {
                 // L44: an AFTER-scanner resync entry's packed window rides its
                 // POST-move box — the vanilla scan view is the PRE-move box,
                 // so the window must not skip it.
-                if (winTrusted && isViewAfter(cid)) winTrusted = false;
+                if (vActive && winTrusted && isViewAfter(cid)) winTrusted = false;
                 if (winTrusted
                         && ((((int) (p >>> 48)) & 0xFFFF) < qLo
                             || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
-                    rowWinSkip++;
+                    winSkipLocal++;
                     // L44b: name the skipped candidates PER ROW (the packed
                     // interval vs the row's qLo/qHi pins the staleness)
                     if (MSQ_COLLECT && msqSkipN < 16) {
@@ -3268,7 +3345,7 @@ public final class CeHooks {
                 AABB eb = e.getBoundingBox();
                 // L44: an AFTER-scanner resync entry is seen at its PRE-body
                 // box (the vanilla scan ran before that entry's body).
-                boolean viewAfter = isViewAfter(cid);
+                boolean viewAfter = vActive && isViewAfter(cid);
                 if (viewAfter) {
                     eb = viewBox(cid, eb);
                 }
@@ -3288,18 +3365,25 @@ public final class CeHooks {
                 if (!viewAfter) {
                     double ecx = (eb.minX + eb.maxX) * 0.5;
                     if (ecx < x0 || ecx >= x0 + 16.0) {
-                        homeMiss++;
+                        homeMissLocal++;
                         if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
                         continue;
                     }
                     double ecz = (eb.minZ + eb.maxZ) * 0.5;
                     if (ecz < z0 || ecz >= z0 + 16.0) {
-                        homeMiss++;
+                        homeMissLocal++;
                         if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
                         continue;
                     }
                 }
-                if (eb.intersects(box)) {
+                // L106: AABB.intersects(AABB) IS this 6-compare test (javap
+                // 1.21.8: delegates to intersects(DDDDDD), which is exactly
+                // these comparisons) — inlined to drop the virtual dispatch
+                // and the second object deref (box fields are already live
+                // in registers here).
+                if (eb.minX < box.maxX && eb.maxX > box.minX
+                        && eb.minY < box.maxY && eb.maxY > box.minY
+                        && eb.minZ < box.maxZ && eb.maxZ > box.minZ) {
                     if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
                         MSQ_IDS[msqN++] = cid;
                     }
@@ -3342,7 +3426,16 @@ public final class CeHooks {
             }
         }
         rowStaleCand += stale;
-        rowHomeMiss += homeMiss;
+        rowHomeMiss += homeMissLocal;
+        rowWinSkip += winSkipLocal;
+        if (vApply0 != IN_ITEM_APPLY || vN0 != viewN) {
+            // L106 safety net: the scan mutated view state through a
+            // predicate (never seen in the wild) — refuse to the mirror,
+            // which re-runs the whole query exactly.
+            mViewBlew++;
+            fastRefuse = "viewblew";
+            return null;
+        }
         // L49: serve the covered pending entries collected above (see the
         // PQ block comment). Their box was chosen at collect time by the
         // exactness rule (PRE = the batch box for an untouched
@@ -3374,7 +3467,19 @@ public final class CeHooks {
         if (narrow) rowNarrow++;
         // L37: the row walk order (cells, rows, packed windows) is not the
         // vanilla EntityLookup order — same sort as the native path.
-        ordSortVanilla(out);
+        // L106 STRUCTURAL ORDER: the PQ appends are the ONLY reordering this
+        // path can produce. The collect loop is chunkZ-major (vanilla chunk
+        // walk) and each row is published from an ensure_cell_order'ed index
+        // cell, so with pqN == 0 the served order IS the vanilla order — the
+        // prescan agreed 207789 : 9 (ordSkip : ordWork, mobs-25k-mod) while
+        // paying the full ordKey stamp per candidate (~4.5% self-time).
+        // CE_L106=0 restores the unconditional sort; ORDER_CHECK/parity
+        // referee the claim.
+        if (pqN != 0 || !ORD_STRUCT_ON) {
+            ordSortVanilla(out);
+        } else {
+            ordStructSkip++;
+        }
         return out;
     }
 
