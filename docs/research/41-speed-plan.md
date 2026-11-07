@@ -2328,3 +2328,22 @@ SpearUseGoal's gate) and pin the +2 site. The fix is then local to
 can_use, and the engine gate should finally close: the shipped floors
 are proven (the push 18g family, L74's move band, L102's start order);
 only the per-mob stream position remains.
+
+## L104c (session 2026-11-08, live-mob directive): 4x4 sub-chunk cells + the exact-key stable sort — the farm scan's ~180x over-scan dies
+
+Owner directive: "мы должны ускорять живых мобов" — the dormancy/ledger track is far-field only; every landed lever now targets the TICKING mobs. The L104b FARM profile (local, release): push stage 12.87 ms/tick of a 19.81 ms tick — and inside it, the scan window is ~1.2x1.2 blocks (mob box + max_half_span + 1e-3 margin) while the scan UNIT was the whole 16x16 chunk cell (~1100 rows at farm density): a ~180x over-scan per push.
+
+The change (03dc0aa, branch l104c-subcells):
+1. **CELL 16 -> 4** (CELL_SHIFT 2). 4 divides 16, so a cell still lies inside ONE chunk — the per-cell layout order (sectionY, seq) and the chunk-constant key halves keep their guarantees (ensure_cell_order's assumption holds verbatim). Multi-cell-per-chunk streams are re-ordered by the exact vanilla key:
+   - **push**: the scan gathers every covered cell's prefiltered rows into ONE flat list in the OLD cz-major/cx-inner concatenation order, then STABLE-sorts by (ka, kb) — ka from the entity's CHUNK (position >> 4, the same shape as the sort closure), kb = (sectionY biased)<<40 | seq. Distinct keys -> vanilla's global EntityLookup scan order; the stable sort keeps the old concatenation order for the unknown-slot (MAX, MAX) ties. The per-candidate slot lookup moved into the ordering pass (once per row, carried into the row loop — net same lookup count). Real ORD_SEQ stamps are unique per entity → no ties in production; the (0,0)-stamp e2e ties reorder legitimately (the e2e pair count moved 1,059,317 -> 1,065,704 — a different valid permutation of the same physics under zero stamps; the CI parity gate with real stamps is the arbiter).
+   - **query()**: a conditional resort (the existing oversize-merge pattern) fires ONLY when >= 2 non-empty covered cells share a chunk — the common small query pays nothing. Detector: per-query seen-chunk set over key_coords >> CELL_SHIFT.
+2. **MAX_HALF_SPAN decoupled from CELL** (was CELL/2 = 8): now a plain 8.0 — the grid may shrink without re-routing the 2..8 half-span boxes into the oversize path.
+3. exactness.rs's packed-window test followed the production constants (was hardcoded >> 4 / * 16).
+
+Measured (local release, 2-core sandbox):
+- **FARM: tick 19.78 -> 14.01 ms avg (push 12.91 -> 7.12, -45%), headroom x2.5 -> x3.6** (worst 41.8 < 50). Combined with L104b: push stage 21.4 -> 7.12 ms/tick = **-67% over two sessions**, tick 27.9 -> 14.0 = **-50%**.
+- WALK: 5.12 ms avg, x9.8 (the density gate now honestly counts ~2.5-10-row windows and declines to vanilla — at CELL=4 the gate's covered-population sum hugs the query box 16x tighter; GATE_MIN=96 recalibration is a SEPARATE tuning lever, intentionally not touched in this change).
+- transition_bench: teleport worst 8.2 ms (was 2.5) — the 23k-op spike grew with the finer grid, still amortizable across ticks (< 50 ms).
+- Tests: exactness 9/9 (after the test-geometry fix), pushcore parity/diag fixtures green, swarm-sim 14 green, goals 35 green.
+
+Next levers (live mobs, ranked): (1) CI verdicts for L104b (42396574161, in progress) then L104c dispatch; (2) GATE_MIN recalibration for 4x4 cells (the WALK-sparse legs may regain kernel pushes at a lower threshold — the kernel's fixed JNI cost vs the now-16x-cheaper scan); (3) L103's decisive javap audit (the +1 contextual draw, suspects unchanged); (4) the query-bridge batch (spread-100k's 29.8% family).
