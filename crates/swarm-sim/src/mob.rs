@@ -372,11 +372,30 @@ pub struct AiStat {
 
 const OUT_LEN: usize = g::OUT_HEADER + g::MAX_ACTS * g::OUT_ACT;
 
+/// The out-buffer length the executor must provide to `ai_tick` (the
+/// wave2 shared-buffer contract — one allocation per EXECUTOR, not per mob).
+pub const fn out_len() -> usize {
+    OUT_LEN
+}
+
+/// Words the executor READS from the out buffer before the floor writes
+/// them: the RNG handoff pair on the fallback path (fallback() writes
+/// {0,5,7} only). Every other read word (0,1,2,5,6,7,8 + act slots) is
+/// write-before-read by the floor's exit discipline (done/park/fallback
+/// bodies + Out::push). Zeroing these nine words per mob reproduces the
+/// old fresh-`[0i32; OUT_LEN]` semantics bit-for-bit at 1/340th the cost.
+const OUT_RESET: usize = 9;
+
 impl MobAI {
-    /// Pack the aiPack wire format from the live state.
+    /// Pack the aiPack wire format into a CALLER buffer (wave2: zero
+    /// alloc — the executor owns one scratch, reused across all mobs and
+    /// rounds). Writes exactly `need` words; the caller may pass a longer
+    /// scratch (the tail is never read by the floor — its len check is a
+    /// minimum).
     #[allow(clippy::too_many_arguments)]
-    pub fn pack(
+    pub fn pack_into(
         &self,
+        b: &mut [i32],
         players: &[PlayerSnap],
         game_time: i32,
         cursor: i32,
@@ -385,9 +404,10 @@ impl MobAI {
         rx: f64,
         ry: f64,
         rz: f64,
-    ) -> Vec<i32> {
-        let mut b =
-            vec![0i32; g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE];
+    ) {
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        debug_assert!(b.len() >= need, "pack scratch too small");
+        let b = &mut b[..need];
         b[0] = cursor;
         let mut mf = MF_BASE;
         if self.target_player >= 0 {
@@ -408,17 +428,17 @@ impl MobAI {
         b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
         b[g::IN_RES] = res;
         b[g::IN_RES_OP] = req_op;
-        put_f64(&mut b, g::IN_RES_X, rx);
-        put_f64(&mut b, g::IN_RES_X + 2, ry);
-        put_f64(&mut b, g::IN_RES_X + 4, rz);
+        put_f64(b, g::IN_RES_X, rx);
+        put_f64(b, g::IN_RES_X + 2, ry);
+        put_f64(b, g::IN_RES_X + 4, rz);
         b[22] = 0; // lastHurtByMobTimestamp (the bench mob is never hurt)
         b[23] = game_time;
         b[g::IN_PCOUNT] = players.len() as i32;
         b[g::IN_FOLLOW] = FOLLOW_RANGE.to_bits() as i32;
-        put_f64(&mut b, g::IN_MOBX, self.x);
-        put_f64(&mut b, g::IN_MOBY, self.y);
-        put_f64(&mut b, g::IN_MOBZ, self.z);
-        put_f64(&mut b, g::IN_EYEY, self.y + EYE_Y);
+        put_f64(b, g::IN_MOBX, self.x);
+        put_f64(b, g::IN_MOBY, self.y);
+        put_f64(b, g::IN_MOBZ, self.z);
+        put_f64(b, g::IN_EYEY, self.y + EYE_Y);
         // goal records (mirror of aiPackSel's live state words)
         let base = g::IN_HEADER;
         for (i, rec) in self.goals.iter().enumerate() {
@@ -461,14 +481,34 @@ impl MobAI {
         let pb = base + N_GOALS * g::GOAL_STRIDE;
         for (i, p) in players.iter().enumerate() {
             let o = pb + i * g::PSTRIDE;
-            put_f64(&mut b, o, p.x);
-            put_f64(&mut b, o + 2, p.y);
-            put_f64(&mut b, o + 4, p.z);
-            put_f64(&mut b, o + 6, p.y + EYE_Y);
-            put_f64(&mut b, o + 8, 1.0); // visibility 100%
+            put_f64(b, o, p.x);
+            put_f64(b, o + 2, p.y);
+            put_f64(b, o + 4, p.z);
+            put_f64(b, o + 6, p.y + EYE_Y);
+            put_f64(b, o + 8, 1.0); // visibility 100%
             b[o + 10] = p.flags;
             b[o + 11] = p.id;
         }
+    }
+
+    /// Pack the aiPack wire format from the live state (exact-len Vec;
+    /// the parity-fixture and hot-path-test entry — the executor's hot
+    /// path uses `pack_into` with a shared scratch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack(
+        &self,
+        players: &[PlayerSnap],
+        game_time: i32,
+        cursor: i32,
+        res: i32,
+        req_op: i32,
+        rx: f64,
+        ry: f64,
+        rz: f64,
+    ) -> Vec<i32> {
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        let mut b = vec![0i32; need];
+        self.pack_into(&mut b, players, game_time, cursor, res, req_op, rx, ry, rz);
         b
     }
 
@@ -559,25 +599,61 @@ impl MobAI {
 
     /// One full AI tick: the aiRun round loop (cap 32) with the resolver
     /// in the request arm. Returns the accounting.
-    pub fn ai_tick(
+    ///
+    /// WAVE2 hot-path contract:
+    /// - `R: Resolver + ?Sized` — concrete resolvers monomorphize (no
+    ///   vtable in the inner loop); `&mut dyn Resolver` still works.
+    /// - `scratch` — the shared aiPack buffer (one per EXECUTOR); grown
+    ///   once, reused across every mob and round: zero steady-state
+    ///   allocation (the old code allocated + memset a fresh Vec PER
+    ///   ROUND).
+    /// - `out` — the shared floor-output buffer (one per EXECUTOR). The
+    ///   floor's write discipline (verified: done/park write {0..6},
+    ///   fallback writes {0,5,7}, Out::push writes full act slots, and
+    ///   every executor read word is write-before-read EXCEPT the RNG
+    ///   handoff pair on the fallback path) lets us reset just
+    ///   `out[..OUT_RESET]` per mob instead of memsetting 3 KiB per mob.
+    ///   `reused_out_buffer_matches_fresh_zero` gates this bit-for-bit.
+    pub fn ai_tick<R: Resolver + ?Sized>(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
-        r: &mut dyn Resolver,
+        r: &mut R,
+        scratch: &mut Vec<i32>,
+        out: &mut [i32],
     ) -> AiStat {
+        debug_assert!(out.len() >= OUT_LEN, "out buffer too small");
+        // the sub-phase ledger gate (1-in-SUB_EVERY mobs on sampled
+        // ticks; the guard drops at scope end)
+        let _sub = crate::ledger::begin_mob();
         self.tick_count = self.tick_count.wrapping_add(1);
         self.no_action = self.no_action.saturating_add(1);
         let mut stat = AiStat::default();
         let (mut cursor, mut res, mut req_op) = (0i32, 0i32, 0i32);
         let (mut rx, mut ry, mut rz) = (0f64, 0f64, 0f64);
-        let mut out = [0i32; OUT_LEN];
+        out[..OUT_RESET].fill(0);
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        if scratch.len() < need {
+            scratch.resize(need, 0);
+        }
         for _round in 0..32 {
-            let inb = self.pack(players, game_time, cursor, res, req_op, rx, ry, rz);
-            let st = g::ai_floor(&inb, &mut out);
+            {
+                let _p = crate::ledger::sg_pack();
+                self.pack_into(
+                    scratch, players, game_time, cursor, res, req_op, rx, ry, rz,
+                );
+            }
+            let st = {
+                let _f = crate::ledger::sg_floor();
+                g::ai_floor(scratch, out)
+            };
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
-            self.apply_actions(&out, players);
+            {
+                let _a = crate::ledger::sg_acts();
+                self.apply_actions(out, players);
+            }
             if st == g::ST_FALLBACK {
                 stat.status = st;
                 stat.fallback = out[7];
@@ -602,6 +678,7 @@ impl MobAI {
                 4 + gi_local // TARGET_SEL_COUNT — the zombie table's target half
             };
             stat.last_req = (req_op, gi);
+            let _rs = crate::ledger::sg_resolve();
             (res, rx, ry, rz) = match req_op {
                 g::REQ_LOS_SCAN => {
                     let n = out[8].max(0) as usize;
@@ -659,6 +736,7 @@ impl MobAI {
                 }
                 _ => (0, 0.0, 0.0, 0.0), // unknown ops: fail closed
             };
+            drop(_rs);
         }
         // the 32-round cap: the Java side falls back (mirror covers the
         // tick) — surface it in the accounting
@@ -679,7 +757,7 @@ impl MobAI {
             let d2 = ddx * ddx + ddz * ddz;
             if d2 > 2.25 {
                 // beyond melee reach: walk in
-                self.face(ddx, ddz);
+                self.face(ddx, ddz, d2);
                 zza = 0.98;
             }
         } else if self.nav_state == g::NAV_PATH_ACTIVE {
@@ -688,7 +766,7 @@ impl MobAI {
             if d2 < 0.25 {
                 self.nav_state = g::NAV_PATH_DONE;
             } else {
-                self.face(ddx, ddz);
+                self.face(ddx, ddz, d2);
                 zza = 0.98;
             }
         }
@@ -716,10 +794,13 @@ impl MobAI {
     }
 
     #[inline]
-    fn face(&mut self, ddx: f64, ddz: f64) {
+    fn face(&mut self, ddx: f64, ddz: f64, d2: f64) {
         // vanilla yaw: 0 = +Z, clockwise; input (0,0,zza) rotated by yaw
         // must point at the target: yaw = atan2(-nx, nz)
-        let len = (ddx * ddx + ddz * ddz).sqrt();
+        // wave2: the caller already computed d2 = ddx*ddx + ddz*ddz (the
+        // SAME product bits — deterministic ops) — sqrt it here instead of
+        // re-multiplying; bit-identical, two flops cheaper per moving mob.
+        let len = d2.sqrt();
         if len > 1e-9 {
             let (nx, nz) = (ddx / len, ddz / len);
             self.yaw = (-(nx).atan2(nz) * (180.0f64 / std::f64::consts::PI)) as f32;
@@ -860,7 +941,9 @@ mod tests {
         let mut m = MobAI::new(2, 777, 0.0, 0.0, 0.0);
         m.tick_count = 99; // packs 100; (100 + 2) even, > 1
         m.no_action = 41; // packs 42
-        let stat = m.ai_tick(&[], 0, &mut Zero);
+        let mut scratch = Vec::new();
+        let mut out = vec![0i32; out_len()];
+        let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out);
         assert_eq!(stat.status, g::ST_DONE, "stat {stat:?}");
         assert_eq!(stat.fallback, 0);
         let mut r = 777u64;
@@ -878,11 +961,15 @@ mod tests {
         // 300 mobs x 400 ticks of the idle stream: the protocol must
         // never fall back (a fallback would be a pack/resume bug)
         let mth = Mth::new();
+        // wave2: ONE buffer pair reused across all 300 mobs (reuse is the
+        // production shape — this doubles as a reuse-safety soak)
+        let mut scratch = Vec::new();
+        let mut out = vec![0i32; out_len()];
         for i in 0..300i64 {
             let mut m = MobAI::new(i + 1, 0x1000 + i as u64, i as f64, 0.0, -i as f64);
             m.tick_count = 99;
             for _ in 0..400 {
-                let stat = m.ai_tick(&[], 0, &mut Zero);
+                let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out);
                 assert_eq!(stat.status, g::ST_DONE, "mob {i} stat {stat:?}");
                 m.move_tick(&mth);
             }
@@ -900,9 +987,11 @@ mod tests {
         let mut b = MobAI::new(7, 0xFEED, 1000.0, 64.0, 1000.0);
         let mut w1 = FlatWorld::new(0xBEEF);
         let mut w2 = FlatWorld::new(0xBEEF);
+        let mut scratch = Vec::new();
+        let mut out = vec![0i32; out_len()];
         for _ in 0..600 {
-            a.ai_tick(&[], 0, &mut w1);
-            b.ai_tick(&[], 0, &mut w2);
+            a.ai_tick(&[], 0, &mut w1, &mut scratch, &mut out);
+            b.ai_tick(&[], 0, &mut w2, &mut scratch, &mut out);
             a.move_tick(&mth);
             b.move_tick(&mth);
         }
@@ -946,12 +1035,14 @@ mod tests {
         }
         let mut walked = false;
         let mut arrived = false;
+        let mut scratch = Vec::new();
+        let mut out = vec![0i32; out_len()];
         // seed scan: the first seed whose stroll gate fires early enough
         let mut mob: Option<MobAI> = None;
         for seed in 1..200u64 {
             let mut m = MobAI::new(1, seed, 0.0, 64.0, 0.0);
             for t in 0..90i32 {
-                m.ai_tick(&[], t, &mut East);
+                m.ai_tick(&[], t, &mut East, &mut scratch, &mut out);
                 if m.nav_state == g::NAV_PATH_ACTIVE {
                     mob = Some(m);
                     break;
@@ -963,7 +1054,7 @@ mod tests {
         }
         let mut m = mob.expect("no seed in 1..200 passes the stroll gate");
         for _ in 0..600 {
-            m.ai_tick(&[], 200, &mut East);
+            m.ai_tick(&[], 200, &mut East, &mut scratch, &mut out);
             let (x0, z0) = (m.x, m.z);
             m.move_tick(&mth);
             if (m.x - x0).abs() + (m.z - z0).abs() > 1e-4 {
@@ -1001,8 +1092,10 @@ mod tests {
         let mut saw_target = false;
         let mut lock_tick = 0i32;
         let mut d_start = 0.0f64;
+        let mut scratch = Vec::new();
+        let mut out = vec![0i32; out_len()];
         for tick in 0..400i32 {
-            m.ai_tick(&players, tick, &mut w);
+            m.ai_tick(&players, tick, &mut w, &mut scratch, &mut out);
             m.move_tick(&mth);
             if m.target_player >= 0 {
                 if !saw_target {
@@ -1041,5 +1134,56 @@ mod tests {
         assert_eq!(nf, 0.7016322f32, "nextFloat");
         assert_eq!(nd, 0.9207663615147803f64, "nextDouble");
         assert_eq!(s2, 149370390209998u64, "stream position after 4 advances");
+    }
+
+    /// THE wave2 reuse gate: a DIRTY shared out buffer (pre-filled with
+    /// garbage by a different mob's ticks, never re-zeroed by the caller)
+    /// must produce bit-identical results to the old fresh-zero-per-tick
+    /// semantics. This pins the floor's write-discipline contract: the
+    /// only words read before write are the fallback RNG handoff pair,
+    /// and `ai_tick` resets exactly those (out[..OUT_RESET]).
+    #[test]
+    fn reused_out_buffer_matches_fresh_zero() {
+        let mth = Mth::new();
+        let mk = |seed: u64| -> MobAI {
+            let mut m = MobAI::new(9, seed, 5.0, 64.0, -3.0);
+            m.goals = zombie_table();
+            m
+        };
+        let players = [PlayerSnap {
+            x: 15.0,
+            y: 64.0,
+            z: 3.0,
+            id: 1,
+            flags: g::PF_ALIVE,
+        }];
+        // twin A: the OLD semantics — fresh zero out buffer every tick
+        let mut a = mk(0xABCD_1234);
+        // twin B: the NEW semantics — one dirty buffer, reused forever
+        let mut b = mk(0xABCD_1234);
+        let mut scratch = Vec::new();
+        let mut dirty = vec![0x7BAD_C0DEi32; out_len() * 2]; // over-long + garbage
+        for tick in 0..400i32 {
+            let mut fresh = vec![0i32; out_len()];
+            let sa = a.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut fresh);
+            let sb = b.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut dirty);
+            assert_eq!(sa.rounds, sb.rounds, "tick {tick}: rounds diverged");
+            assert_eq!(sa.requests, sb.requests, "tick {tick}: requests diverged");
+            assert_eq!(sa.status, sb.status, "tick {tick}: status diverged");
+            assert_eq!(sa.fallback, sb.fallback, "tick {tick}: fallback diverged");
+            a.move_tick(&mth);
+            b.move_tick(&mth);
+            // bit-compare the whole AI-visible state every tick
+            assert_eq!(a.x.to_bits(), b.x.to_bits(), "tick {tick}: x diverged");
+            assert_eq!(a.z.to_bits(), b.z.to_bits(), "tick {tick}: z diverged");
+            assert_eq!(a.seed, b.seed, "tick {tick}: seed diverged");
+            assert_eq!(a.yaw.to_bits(), b.yaw.to_bits(), "tick {tick}: yaw diverged");
+            assert_eq!(a.nav_state, b.nav_state, "tick {tick}: nav diverged");
+            assert_eq!(a.target_player, b.target_player, "tick {tick}: target diverged");
+            for i in 0..N_GOALS {
+                assert_eq!(a.goals[i].running, b.goals[i].running, "tick {tick}: goal {i} running");
+                assert_eq!(a.goals[i].state, b.goals[i].state, "tick {tick}: goal {i} state");
+            }
+        }
     }
 }

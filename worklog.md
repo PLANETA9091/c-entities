@@ -275,3 +275,23 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
   после первого live-прогона).
 - Валидационная пачка main @ e61e688 в работе (parity/baseline/module/e2e);
   e2e @ 4f01f54 уже SUCCESS. Жатва — крон/следующий тик.
+
+## Task 31 — L112 wave2 arithmetic: ноль аллокаций, инкрементальный грид, честные часы (2026-11-09)
+
+- Директива «ещё жоще с аритметиками»: 8 ударов по нативному хот-пути
+  (exec/mob/store/profile), все bit-identical. Бенч 25k×400: p50 8.06 →
+  4.9–5.1 ms/tick (−38%), p99 11.4 → 10.5, chasing 3036 == 3036.
+  Док 43: docs/research/43-l112-wave2-arithmetic.md.
+- Часы: PhaseGuard платил Instant::now за КАЖДЫЙ scope (≈2 ms/tick
+  накладных внутри замера) → Option<Instant>. Грид: full-rebuild (25k
+  hash-вставок/тик) → инкрементальный ре-бакетинг (Horizon N1), 1.81 →
+  0.75 ms; strength reduction div_euclid(4.0) → *0.25 (bit-exact, свип-тест).
+  Пак: zero-alloc pack_into + shared scratch; out-буфер: 9-словный сброс
+  вместо 3KB memset (дисциплина записи пола верифицирована; гейт
+  reused_out_buffer_matches_fresh_zero — близнецы, грязный буфер,
+  400 тиков, полное побитовое сравнение).
+- Суб-леджер swarm_sim::ledger: pack/floor/reslv/acts, 1-из-289 моб-тиков,
+  проценты (первая версия завышала p99 до 22 мс — тень метра; починено).
+  Сплит: floor 42% | pack 28.9% | acts 20.4% | reslv 8.7% — карта волны 3
+  (delta-pack раундов 2+; арифметический рерайт walk без смены in→out).
+- Workspace-тесты зелёные (включая 10-минутный soak parity-крейта).

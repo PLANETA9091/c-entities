@@ -24,6 +24,7 @@ use centities_core::{Aabb, EntityIndex};
 use std::collections::{HashMap, HashSet};
 use swarm_core::{chunk_slot_pos, pack_chunk, ChunkDelta, SwarmError, SwarmLedger};
 
+pub mod ledger;
 pub mod mob;
 
 /// Zombie-ish live box for materialized entities (0.6 x 1.95).

@@ -28,6 +28,7 @@ use centities_core::goals as g;
 use centities_core::mobtravel::Mth;
 use centities_core::Aabb;
 use std::time::Instant;
+use swarm_sim::mob::out_len;
 use swarm_core::ChunkDelta;
 use swarm_sim::mob::{FlatWorld, MobAI, PlayerSnap};
 use swarm_sim::{HotRing, SwarmEngine};
@@ -122,6 +123,10 @@ fn main() {
 
         let ids: Vec<i64> = ring.iter_ids().collect();
         let mut chased = 0usize;
+        // wave2: the shared AI buffers — ONE pack scratch + ONE out buffer
+        // for the whole population per tick (zero steady-state allocation)
+        let mut ai_scratch: Vec<i32> = Vec::new();
+        let mut ai_out: Vec<i32> = vec![0i32; out_len()];
         for &id in &ids {
             let s = ring.slot_of(id).unwrap();
             mobs.entry(id).or_insert_with(|| {
@@ -133,7 +138,7 @@ fn main() {
                 let m = mobs.get_mut(&id).unwrap();
                 // 1. the selector walk (the parity-proven ai_floor)
                 let t = Instant::now();
-                let stat = m.ai_tick(&players, tick as i32, &mut world);
+                let stat = m.ai_tick(&players, tick as i32, &mut world, &mut ai_scratch, &mut ai_out);
                 stage[2] += t.elapsed().as_nanos();
                 debug_assert_eq!(stat.status, g::ST_DONE);
                 if m.target_player >= 0 {

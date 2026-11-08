@@ -22,6 +22,11 @@ pub static AI_NS: AtomicU64 = AtomicU64::new(0);
 pub static TRAVEL_NS: AtomicU64 = AtomicU64::new(0);
 pub static GRID_NS: AtomicU64 = AtomicU64::new(0);
 pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+// wave2 sub-phases INSIDE ai (pack / floor / resolve / acts) live in
+// swarm_sim::ledger — the executor's cadence switches them on 1-in-17
+// ticks through begin_tick(), and drain() reads them back. Splitting the
+// cells there keeps swarm-sim standalone (no centities-native dependency)
+// while the attribution rides the same sampled tick.
 static SAMPLE: AtomicU32 = AtomicU32::new(0);
 static ON: AtomicU32 = AtomicU32::new(0);
 /// total ticks seen since the last drain (for the per-tick math)
@@ -46,6 +51,9 @@ fn begin_tick() {
     if on == 1 {
         SAMPLED_TOTAL.fetch_add(1, Relaxed);
     }
+    // the wave2 AI sub-phase ledger rides the SAME cadence (one switch
+    // flip per tick; the swarm-sim guards check one relaxed bool)
+    swarm_sim::ledger::set_on(on == 1);
     ON.store(on, Relaxed);
 }
 
@@ -55,9 +63,13 @@ fn sampled() -> bool {
 }
 
 /// A scope guard for one sampled phase: drop adds the elapsed ns.
+/// WAVE2 FIX: `t0` is Option — the un-sampled guard used to pay a full
+/// `Instant::now()` (clocksource read, ~20-25ns) PER SCOPE PER MOB; at 4
+/// scopes x 25k mobs that was ~2ms/tick of pure clock-reading inside the
+/// measured wall time. Now the unsampled path is ONE relaxed load.
 pub struct PhaseGuard {
     cell: &'static AtomicU64,
-    t0: Instant,
+    t0: Option<Instant>,
     on: bool,
 }
 
@@ -65,14 +77,15 @@ impl Drop for PhaseGuard {
     #[inline]
     fn drop(&mut self) {
         if self.on {
-            let ns = self.t0.elapsed().as_secs() * 1_000_000_000
-                + self.t0.elapsed().subsec_nanos() as u64;
+            let t0 = self.t0.take().expect("sampled guard has t0");
+            let ns = t0.elapsed().as_secs() * 1_000_000_000
+                + t0.elapsed().subsec_nanos() as u64;
             self.cell.fetch_add(ns, Relaxed);
         }
     }
 }
 
-/// Begin a sampled phase. Cheap: one relaxed load + (rare) Instant::now.
+/// Begin a sampled phase. Cheap: one relaxed load + (sampled only) Instant::now.
 #[inline]
 pub fn phase(cell: &'static AtomicU64, tick_opener: bool) -> PhaseGuard {
     if tick_opener {
@@ -81,7 +94,7 @@ pub fn phase(cell: &'static AtomicU64, tick_opener: bool) -> PhaseGuard {
     let on = sampled();
     PhaseGuard {
         cell,
-        t0: Instant::now(),
+        t0: if on { Some(Instant::now()) } else { None },
         on,
     }
 }
@@ -102,7 +115,6 @@ pub fn grid_guard() -> PhaseGuard {
 pub fn apply_guard() -> PhaseGuard {
     phase(&APPLY_NS, false)
 }
-
 /// The rolled-up ledger snapshot.
 #[derive(Clone, Copy, Default)]
 pub struct Phases {
@@ -110,6 +122,10 @@ pub struct Phases {
     pub travel_ns: u64,
     pub grid_ns: u64,
     pub apply_ns: u64,
+    pub pack_ns: u64,
+    pub floor_ns: u64,
+    pub resolve_ns: u64,
+    pub acts_ns: u64,
     /// total ticks seen
     pub samples: u64,
     /// ticks actually measured (1-in-SAMPLE_EVERY)
@@ -118,11 +134,16 @@ pub struct Phases {
 
 /// Read + reset the ledger (the bench prints once per report window).
 pub fn drain() -> Phases {
+    let (pack_ns, floor_ns, resolve_ns, acts_ns) = swarm_sim::ledger::drain();
     Phases {
         ai_ns: AI_NS.swap(0, Relaxed),
         travel_ns: TRAVEL_NS.swap(0, Relaxed),
         grid_ns: GRID_NS.swap(0, Relaxed),
         apply_ns: APPLY_NS.swap(0, Relaxed),
+        pack_ns,
+        floor_ns,
+        resolve_ns,
+        acts_ns,
         samples: SAMPLE_TOTAL.swap(0, Relaxed),
         sampled: SAMPLED_TOTAL.swap(0, Relaxed),
     }
@@ -135,24 +156,56 @@ impl std::fmt::Display for Phases {
         // divide by the sampled count, that mean IS the per-tick estimate
         let n = (self.sampled.max(1)) as f64;
         let est = |ns: u64| ms(ns) / n;
-        write!(
+        writeln!(
             f,
-            "phase  | sampled total ms | est ms/tick (1-in-{}, {} of {} ticks measured)\n\
-             ai     | {:>8.1} | {:>7.2}\n\
-             travel | {:>8.1} | {:>7.2}\n\
-             grid   | {:>8.1} | {:>7.2}\n\
-             apply  | {:>8.1} | {:>7.2}",
+            "phase   | sampled total ms | est ms/tick (1-in-{}, {} of {} ticks measured)",
             SAMPLE_EVERY,
             self.sampled,
-            self.samples,
+            self.samples
+        )?;
+        writeln!(
+            f,
+            "ai      | {:>8.1} | {:>7.2}",
             ms(self.ai_ns),
-            est(self.ai_ns),
+            est(self.ai_ns)
+        )?;
+        // the sub-phase cells clock 1-in-(17*17) mob-ticks — their mean
+        // ms/tick is meaningless, but the SPLIT is the strike map: report
+        // each sub-phase's share of the sub total (incl. clock overhead).
+        let sub_total = self.pack_ns + self.floor_ns + self.resolve_ns + self.acts_ns;
+        let pct = |ns: u64| -> f64 {
+            if sub_total == 0 {
+                0.0
+            } else {
+                100.0 * ns as f64 / sub_total as f64
+            }
+        };
+        writeln!(
+            f,
+            "  ai split ({}% of mob-ticks clocked): pack {:>4.1}% | floor {:>4.1}% | reslv {:>4.1}% | acts {:>4.1}%",
+            100.0 / (SAMPLE_EVERY * swarm_sim::ledger::SUB_EVERY) as f64,
+            pct(self.pack_ns),
+            pct(self.floor_ns),
+            pct(self.resolve_ns),
+            pct(self.acts_ns)
+        )?;
+        writeln!(
+            f,
+            "travel  | {:>8.1} | {:>7.2}",
             ms(self.travel_ns),
-            est(self.travel_ns),
+            est(self.travel_ns)
+        )?;
+        writeln!(
+            f,
+            "grid    | {:>8.1} | {:>7.2}",
             ms(self.grid_ns),
-            est(self.grid_ns),
+            est(self.grid_ns)
+        )?;
+        write!(
+            f,
+            "apply   | {:>8.1} | {:>7.2}",
             ms(self.apply_ns),
-            est(self.apply_ns),
+            est(self.apply_ns)
         )
     }
 }
