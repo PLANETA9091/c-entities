@@ -211,3 +211,48 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
 - Дальше: L107b (exact-f64 в SIMD-скане, без per-candidate хэшей) — прицел: getBoundingBox
   10.64% + fastQuery-хвост; затем vtab*-локали (4.72%), SynchedEntityData.get (2.40%);
   dormancy far-field под F1–F6 остаётся терминальной целью −90% на живых мобах.
+
+## Task 29 — L110: the native pivot (Horizon study → zero-Java entity executor) (2026-11-08)
+
+- ДИРЕКТИВА ВЛАДЕЛЬЦА: перестройка всей архитектуры ускорения — изучить Horizon
+  (github.com/horizon-rust/horizon, Minecraft 26.3 в Rust), перенять портирование
+  энтити на Rust: НОЛЬ джавы в энтити, затем профайлер по RUST-функциям.
+- Horizon изучен (клон horizon-study, MIT; ~600 дифференциальных харнессов):
+  AoS Vec<Mob> ~3KB + FxHashMap id→slot + per-tick Seen-снапшот + 4.0-block XZ
+  SeenGrid (candidates = superset); плоский Attrs вместо AttributeMap; O(1)
+  BlockFacts-строки; одиночный тик в ванильном порядке; события отложены в
+  outbox, дрейн раз в тик; встроенный профайлер (sample 1-in-17).
+- НОВЫЙ КРЕЙТ centities-native (ветка l110-native, мерж @ 4f01f54):
+  MobStore (персистентный AoS-регистр в ванильном порядке + tombstone-компакт),
+  SeenGrid (порт Horizon, superset-гейт в тесте), WorldRes (targeting/lookat из
+  РЕАЛЬНОГО снапшота игроков O(P); BlockFacts-шов v0=OpenGround — N1 подложит
+  секции), NativeTick (grid→pack→approach→AI-цикл→travel→компакт, один вызов
+  на тик — JNI-трафик с per-mob-per-round схлопывается до нуля),
+  профайлер фаз (ai/travel/grid/apply, 1-in-17, atomics).
+- swarm-sim::Resolver: +2 опциональных предиката (lookat_query/find_target,
+  default false — семантика симуляции не тронута); floor сам выбирает цель
+  (ACT_REF_SET_PLAYER → target+approach) — цепочка таргет-джейла работает
+  end-to-end: 3080/25000 мобов в chase в bench.
+- BENCH: 25k зомби + игрок, весь тик в Rust: p50 8.79 / p90 9.48 / p99 12.28
+  ms/tick; фазы ai 6.10 / travel 2.12 / grid 2.06 / apply 0.11. Референс:
+  модуль ~242–260, ваниль ~494 (doc 41) — ~28×/56× архитектурный запас.
+  Бит-в-бит детерминизм по seed (тест). 9/9 тестов крейта; гейт workspace:
+  16 наборов зелёных (core/native/swarm-core/swarm-sim).
+- ПРОФАЙЛЕР: scripts/rust_perf_top.py (perf cycles:u → TOP-40 RUST-символов
+  по self-time, фоллбек в фазовый леджер) + workflow native-profile.yml
+  (summary + artifact). Первый диспетч 42489377148. С этого момента каждое
+  оптимизационное решение цитирует RUST-функцию (урок L107 про слепую JNI-зону
+  больше не применим — исполнитель Rust end-to-end).
+- МЕХАНИКА: workflow_dispatch требует workflow на default-ветке → мерж L110 в
+  main в чистом окне (аддитивен: шиппед-конфиг не тронут; rebase поверх
+  publisher-коммита 366ee31; пуш 4f01f54). Автопачка main @ 4f01f54:
+  parity 42489346664 / baseline 42489346666 / module 42489346842 / e2e
+  42489346854 — в работе.
+- ПАРИТЕТ+BASELINE НА ШИППЕД-КОНФИГ (жатва Task 28-валидации): parity
+  42481280688 PASS (7-й бит-в-бит) + baseline 42481280704 SUCCESS — конфигурация
+  main (L104+L104b+L106+L109) полностью валидирована ДО мержа L110.
+- СЛЕДУЮЩИЕ ФАЗЫ (doc 42 §6): N1 BlockFacts из секций (отмена OpenGround);
+  N2 мост L111 CE_NATIVE_MOB=1 (Java = COPY-слой: add/remove diff + игроки +
+  подписки секций, один JNI-вызов nativeMobBatch на тик, обратное применение —
+  Java-тела нативных мобов не стартуют вовсе); N3 event-outbox (звуки/дропы/
+  деспавн); N4 parity-транскрипты на границе исполнителя.
