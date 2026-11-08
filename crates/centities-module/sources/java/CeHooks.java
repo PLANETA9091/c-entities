@@ -68,6 +68,19 @@ public final class CeHooks {
     /** L37d: candidates dropped by the exact AABB re-check (the index's
      *  margin superset) — zero means the index was already exact. */
     public static volatile long marginExtra = 0;
+    // L109 (CE_L109=1): skip the L37d margin re-check in fastQuery for the
+    // common (non-view) case. The Rust scan already filters all 3 axes
+    // against the INDEX box exactly, and for every candidate whose probe is
+    // in the flush the index box IS the live box; the re-check dropped
+    // marginExtra 214/662M (0.00003%) across harvested runs — a pure
+    // per-candidate tax (getBoundingBox deref + 6 compares: the top-1
+    // spread hotspot, 10.64% self-time on main). The L108b stale-trust
+    // parity proved index-box decisions bit-identical to vanilla live-box
+    // decisions (12/12 legs, fill-done+50/+300/end). The vActive viewBox
+    // path is KEPT: after-scanner entries must still be seen at their
+    // pre-body box. CE_L109 unset/0 restores the trim.
+    private static final boolean L109_TRUST = "1".equals(System.getenv("CE_L109"));
+    public static volatile long l109Skip = 0, l109Trim = 0;
     // L104 BIG-BOX REFUSE: the fast path pays ~112 ns per candidate inside
     // the Java resolve loop (ARENA load + live-box deref + AABB test), the
     // Rust scan itself is ~12 ns/row, so a query returning thousands of
@@ -1084,6 +1097,7 @@ public final class CeHooks {
                 + " resMs=" + resolveNanos / 1_000_000
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
                 + " marginExtra=" + marginExtra
+                + " l109=" + l109Skip + "/" + l109Trim
                 + " bigbox=" + bigboxRefused + "/" + bigboxCand
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
@@ -2778,6 +2792,9 @@ public final class CeHooks {
         // L106 marginExtra in a local: the putstatic per rejected candidate
         // was a hot self-time line on the spread-100k-mod profile.
         int marginLocal = 0;
+        // L109 same trick: per-candidate volatile putstatic would eat the
+        // win; accumulate once after the loop.
+        int l109SkipLoc = 0, l109TrimLoc = 0;
         for (int k = 0; k < n; k++) {
             int cid = (int) ids[k];
             if (cid == srcId) {
@@ -2822,37 +2839,46 @@ public final class CeHooks {
             // pushed zombies outside the push box — THE item and mob
             // divergence in one). The vanilla test is
             // entity.getBoundingBox().intersects(box) on the LIVE box.
-            AABB eb = e.getBoundingBox();
             // L44: an AFTER-scanner resync entry is seen at its PRE-body box
             // (the vanilla scan ran before that entry's body).
-            if (vActive && isViewAfter(cid)) {
-                eb = viewBox(cid, eb);
-            }
-            if (!(eb.minX < box.maxX && eb.maxX > box.minX
-                    && eb.minY < box.maxY && eb.maxY > box.minY
-                    && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
-                marginLocal++;
-                // L41d: sample the first rejects' index-box vs LIVE-box —
-                // the Rust scan already filters all 3 axes against the
-                // INDEX box exactly, so an 84% rejection rate means the
-                // index box disagrees with the live box. The sample names
-                // which side is stale (the doc-41 exact-f64-query move).
-                if (MSQ_COLLECT && msqRejN < 32) {
-                    msqRej[msqRejN * 6] = eb.minX;
-                    msqRej[msqRejN * 6 + 1] = eb.maxX;
-                    msqRej[msqRejN * 6 + 2] = eb.minY;
-                    msqRej[msqRejN * 6 + 3] = eb.maxY;
-                    msqRej[msqRejN * 6 + 4] = eb.minZ;
-                    msqRej[msqRejN * 6 + 5] = eb.maxZ;
-                    msqRejIds[msqRejN] = cid;
-                    if (IBOX_ON) {
-                        java.util.Arrays.fill(iboxBuf, Double.NaN);
-                        nativeIndexBox(wid, cid, iboxBuf);
-                        System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
-                    }
-                    msqRejN++;
+            boolean viewAfter = vActive && isViewAfter(cid);
+            if (L109_TRUST && !viewAfter) {
+                // L109: the index box decided the scan; the live trim is the
+                // proven-redundant margin tax (see L109_TRUST). The vanilla
+                // predicate below still applies, as it must.
+                l109SkipLoc++;
+            } else {
+                AABB eb = e.getBoundingBox();
+                if (viewAfter) {
+                    eb = viewBox(cid, eb);
                 }
-                continue;
+                if (!(eb.minX < box.maxX && eb.maxX > box.minX
+                        && eb.minY < box.maxY && eb.maxY > box.minY
+                        && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
+                    marginLocal++;
+                    // L41d: sample the first rejects' index-box vs LIVE-box —
+                    // the Rust scan already filters all 3 axes against the
+                    // INDEX box exactly, so an 84% rejection rate means the
+                    // index box disagrees with the live box. The sample names
+                    // which side is stale (the doc-41 exact-f64-query move).
+                    if (MSQ_COLLECT && msqRejN < 32) {
+                        msqRej[msqRejN * 6] = eb.minX;
+                        msqRej[msqRejN * 6 + 1] = eb.maxX;
+                        msqRej[msqRejN * 6 + 2] = eb.minY;
+                        msqRej[msqRejN * 6 + 3] = eb.maxY;
+                        msqRej[msqRejN * 6 + 4] = eb.minZ;
+                        msqRej[msqRejN * 6 + 5] = eb.maxZ;
+                        msqRejIds[msqRejN] = cid;
+                        if (IBOX_ON) {
+                            java.util.Arrays.fill(iboxBuf, Double.NaN);
+                            nativeIndexBox(wid, cid, iboxBuf);
+                            System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
+                        }
+                        msqRejN++;
+                    }
+                    continue;
+                }
+                l109TrimLoc++;
             }
             // NOTE: the vanilla predicate still applies, as it must.
             if (predicate.test(e)) {
@@ -2862,6 +2888,10 @@ public final class CeHooks {
         if (prof) resolveNanos += System.nanoTime() - t2;
         // L106 flushes + safety nets.
         marginExtra += marginLocal;
+        if (L109_TRUST) {
+            l109Skip += l109SkipLoc;
+            l109Trim += l109TrimLoc;
+        }
         if (IN_ITEM_APPLY != vApply0 || viewN != vN0) {
             // the loop mutated view state through a predicate (never seen in
             // the wild; the flush apply ran before the loop) — the vActive
