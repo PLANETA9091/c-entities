@@ -37,6 +37,7 @@
 //! they change WHERE mobs walk, never the tick cost structure. The crate
 //! states this in its API (`WorldRes::open_ground_v0` is a named constructor).
 pub mod exec;
+pub mod facts;
 pub mod profile;
 pub mod store;
 pub mod world;
@@ -44,4 +45,5 @@ pub mod world;
 pub use exec::NativeTick;
 pub use profile::{drain, Phases};
 pub use store::{MobSlot, MobStore, SeenGrid};
+pub use facts::SectionFacts;
 pub use world::{BlockFacts, OpenGround, WorldRes};
