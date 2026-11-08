@@ -3,7 +3,7 @@
 //! query on every index shape; the scalar path is the reference (it is
 //! the pre-L5 f64-promoted compare, unchanged semantics).
 
-use centities_core::{Aabb, EntityIndex, TICK_UNKNOWN};
+use centities_core::{Aabb, EntityIndex};
 
 struct Rng(u64);
 impl Rng {
@@ -27,9 +27,9 @@ fn compare_paths(label: &str, idx: &mut EntityIndex, boxes: &[Aabb]) {
     let mut out_scalar: Vec<i64> = Vec::new();
     for (qi, b) in boxes.iter().enumerate() {
         centities_core::simd::set_simd_mode(2); // force AVX2
-        idx.query(0, b, &mut out_simd, TICK_UNKNOWN);
+        idx.query(0, b, &mut out_simd);
         centities_core::simd::set_simd_mode(1); // force scalar
-        idx.query(0, b, &mut out_scalar, TICK_UNKNOWN);
+        idx.query(0, b, &mut out_scalar);
         centities_core::simd::set_simd_mode(0); // auto
         assert_eq!(
             out_simd, out_scalar,

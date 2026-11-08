@@ -156,19 +156,9 @@ struct CeState {
 }
 
 pub(crate) fn new_state() -> CeState {
-    // L108b (CE_L108B=1): trust the exact f64 decision for STALE slots too.
-    // Explicit opt-in only — the contract change is refereed by the CI
-    // parity gate before any rollout (see EntityIndex::trust_stale_exact).
-    let trust_stale = std::env::var("CE_L108B").ok().as_deref() == Some("1");
-    let mut idx = centities_core::EntityIndex::new();
-    idx.set_trust_stale_exact(trust_stale);
-    let mut pidx = centities_core::EntityIndex::new();
-    // The push view is a secondary mirror — its slots never feed query()'s
-    // filter (query_cell is stamp-free), keep it stamp-blind.
-    pidx.set_trust_stale_exact(false);
     CeState {
-        idx,
-        pidx,
+        idx: centities_core::EntityIndex::new(),
+        pidx: centities_core::EntityIndex::new(),
         push: pushcore::PushCore::new(),
         items: None,
         p: Publisher {
@@ -3448,7 +3438,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     }
     push!(
         "queryNative",
-        "(IDDDDDD[JII[J[D[I[I[I)I",
+        "(IDDDDDD[JI[J[D[I[I)I",
         n_query
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -3462,17 +3452,15 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 f64,
                 jni::jlongArray,
                 i32,
-                i32,
                 jni::jlongArray,
                 jni::jdoubleArray,
-                jni::jintArray,
                 jni::jintArray,
                 jni::jintArray,
             ) -> i32
     );
     push!(
         "queryNative2",
-        "(IDDDDDDII[J[D[I[I[I)I",
+        "(IDDDDDDI[J[D[I[I)I",
         n_query2
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -3485,10 +3473,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 f64,
                 f64,
                 i32,
-                i32,
                 jni::jlongArray,
                 jni::jdoubleArray,
-                jni::jintArray,
                 jni::jintArray,
                 jni::jintArray,
             ) -> i32
@@ -3500,7 +3486,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeFlush",
-        "(I[J[D[I[D[D[I[I[I[II[J[D)V",
+        "(I[J[D[I[D[D[I[I[II[J[D)V",
         n_flush
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -3511,7 +3497,6 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 jni::jintArray,
                 jni::jdoubleArray,
                 jni::jdoubleArray,
-                jni::jintArray,
                 jni::jintArray,
                 jni::jintArray,
                 jni::jintArray,
@@ -4215,13 +4200,11 @@ unsafe fn locked_flush_query(
     x1: f64,
     y1: f64,
     z1: f64,
-    tick: i32,
     bn: usize,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
-    batch_tick: jni::jintArray,
     out: &mut Vec<i64>,
 ) -> bool {
     let mut g = match INDEX.lock() {
@@ -4238,18 +4221,10 @@ unsafe fn locked_flush_query(
             e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
             let mut syb: Vec<i32> = Vec::with_capacity(bn);
             let mut seqb: Vec<i32> = Vec::with_capacity(bn);
-            let mut tickb: Vec<i32> = Vec::with_capacity(bn);
             syb.resize(bn, 0);
             seqb.resize(bn, 0);
-            tickb.resize(bn, centities_core::TICK_UNKNOWN);
             e.get_int_array_region(batch_sy, 0, bn as i32, &mut syb);
             e.get_int_array_region(batch_seq, 0, bn as i32, &mut seqb);
-            // L107: absent/null batch_tick (an older Java side, or the knob
-            // off) degrades every entry to TICK_UNKNOWN — the fresh filter
-            // then never fires and the legacy Java trim stays authoritative.
-            if !batch_tick.is_null() {
-                e.get_int_array_region(batch_tick, 0, bn as i32, &mut tickb);
-            }
             BBOXBUF.with(|bx| {
                 let mut bx = bx.borrow_mut();
                 bx.clear();
@@ -4275,7 +4250,6 @@ unsafe fn locked_flush_query(
                             ),
                             syb[i],
                             seqb[i] as i64,
-                            tickb[i],
                         );
                         st.note_upsert(ev);
                     }
@@ -4288,7 +4262,6 @@ unsafe fn locked_flush_query(
         world as u16,
         &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
         out,
-        tick,
     );
     true
 }
@@ -4306,13 +4279,11 @@ pub extern "system" fn n_query(
     y1: f64,
     z1: f64,
     out: jni::jlongArray,
-    tick: i32,
     batch_n: i32,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
-    batch_tick: jni::jintArray,
 ) -> i32 {
     // FLUSH-MERGED QUERY (iteration 3): the caller's pending probe batch is
     // applied under the SAME lock acquisition right before the query — one
@@ -4320,8 +4291,6 @@ pub extern "system" fn n_query(
     // 4b.2a: after the apply, dirty cells' id rows are published into the
     // Java table (same lock, same thread) — Java then serves small queries
     // without ever entering this function.
-    // L107: `tick` = the caller's CUR_TICK (>0 arms the exact fresh filter;
-    // 0/negative = legacy trim everywhere), `batch_tick` = per-entry stamps.
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
         let e = JniEnv::from_raw(env);
@@ -4337,13 +4306,11 @@ pub extern "system" fn n_query(
                     x1,
                     y1,
                     z1,
-                    tick,
                     bn,
                     batch_ids,
                     batch_boxes,
                     batch_sy,
                     batch_seq,
-                    batch_tick,
                     &mut q,
                 ) {
                     Some(q.len() as i32)
@@ -4441,13 +4408,11 @@ pub extern "system" fn n_query2(
     x1: f64,
     y1: f64,
     z1: f64,
-    tick: i32,
     batch_n: i32,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
-    batch_tick: jni::jintArray,
 ) -> i32 {
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
@@ -4464,13 +4429,11 @@ pub extern "system" fn n_query2(
                     x1,
                     y1,
                     z1,
-                    tick,
                     bn,
                     batch_ids,
                     batch_boxes,
                     batch_sy,
                     batch_seq,
-                    batch_tick,
                     &mut q,
                 ) {
                     Some(q.len() as i32)
@@ -4535,7 +4498,6 @@ pub extern "system" fn n_flush(
     vid: jni::jintArray,
     sy: jni::jintArray,
     seq: jni::jintArray,
-    tick: jni::jintArray,
     dbn: i32,
     db_ids: jni::jlongArray,
     db_dv: jni::jdoubleArray,
@@ -4553,7 +4515,6 @@ pub extern "system" fn n_flush(
         let mut vid_buf: Vec<i32> = vec![0; n.max(0) as usize];
         let mut sy_buf: Vec<i32> = vec![0; n.max(0) as usize];
         let mut seq_buf: Vec<i32> = vec![0; n.max(0) as usize];
-        let mut tick_buf: Vec<i32> = vec![centities_core::TICK_UNKNOWN; n.max(0) as usize];
         if n > 0 {
             e.get_long_array_region(ids, 0, n, &mut id_buf);
             jni_get_double_array_region(&e, boxes, 0, n * 6, &mut box_buf);
@@ -4563,12 +4524,6 @@ pub extern "system" fn n_flush(
             e.get_int_array_region(vid, 0, n, &mut vid_buf);
             e.get_int_array_region(sy, 0, n, &mut sy_buf);
             e.get_int_array_region(seq, 0, n, &mut seq_buf);
-            // L107: per-entry freshness stamps (Java CUR_TICK at probe
-            // emission; NULL/absent buffer degrades to TICK_UNKNOWN — the
-            // filter then never marks anything fresh, the legacy trim stays).
-            if !tick.is_null() {
-                e.get_int_array_region(tick, 0, n, &mut tick_buf);
-            }
         }
         let mut db_buf: Vec<i64> = vec![0; dbn.max(0) as usize];
         let mut dbdv_buf: Vec<f64> = vec![0.0; dbn.max(0) as usize * 3];
@@ -4599,14 +4554,7 @@ pub extern "system" fn n_flush(
                         box_buf[o + 4],
                         box_buf[o + 5],
                     );
-                    let ev = st.idx.upsert_ord(
-                        id,
-                        wid,
-                        &b,
-                        sy_buf[i],
-                        seq_buf[i] as i64,
-                        tick_buf[i],
-                    );
+                    let ev = st.idx.upsert_ord(id, wid, &b, sy_buf[i], seq_buf[i] as i64);
                     st.note_upsert(ev);
                     if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
                         let evicted = st.push.upsert(

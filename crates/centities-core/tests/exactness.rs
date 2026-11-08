@@ -2,7 +2,7 @@
 //! entity whose true f64 AABB intersects the query box. Extra candidates are
 //! allowed (the Java shim re-checks exact f64 intersection).
 
-use centities_core::{Aabb, EntityIndex, MAX_HALF_SPAN, TICK_UNKNOWN};
+use centities_core::{Aabb, EntityIndex, MAX_HALF_SPAN};
 use std::collections::HashSet;
 
 /// xorshift64* — deterministic, no deps
@@ -37,7 +37,7 @@ fn brute_force(entities: &[(i64, u16, Aabb)], world: u16, q: &Aabb) -> HashSet<i
 fn assert_no_miss(index: &mut EntityIndex, entities: &[(i64, u16, Aabb)], world: u16, q: &Aabb) {
     index.check_invariants();
     let mut got = Vec::new();
-    index.query(world, q, &mut got, TICK_UNKNOWN);
+    index.query(world, q, &mut got);
     let got_set: HashSet<i64> = got.into_iter().collect();
     let want = brute_force(entities, world, q);
     let missed: Vec<i64> = want.difference(&got_set).copied().collect();
@@ -147,14 +147,14 @@ fn oversize_entities_are_found() {
     assert_eq!(idx.stats().oversize, 1);
 
     let mut out = Vec::new();
-    idx.query(0, &Aabb::new(90.0, 60.0, 90.0, 95.0, 70.0, 95.0), &mut out, TICK_UNKNOWN);
+    idx.query(0, &Aabb::new(90.0, 60.0, 90.0, 95.0, 70.0, 95.0), &mut out);
     assert!(out.contains(&7), "oversize entity missed");
 
     // shrinking back to normal size re-registers in the grid, no duplicates
     let small = Aabb::new(90.0, 60.0, 90.0, 95.0, 70.0, 95.0);
     idx.upsert(7, 0, &small);
     assert_eq!(idx.stats().oversize, 0);
-    idx.query(0, &Aabb::new(92.0, 60.0, 92.0, 93.0, 70.0, 93.0), &mut out, TICK_UNKNOWN);
+    idx.query(0, &Aabb::new(92.0, 60.0, 92.0, 93.0, 70.0, 93.0), &mut out);
     assert_eq!(out.iter().filter(|i| **i == 7).count(), 1);
 }
 
@@ -198,9 +198,9 @@ fn world_clear_and_multiple_worlds() {
     idx.check_invariants();
 
     let mut out = Vec::new();
-    idx.query(0, &Aabb::new(0.0, 60.0, 0.0, 128.0, 70.0, 128.0), &mut out, TICK_UNKNOWN);
+    idx.query(0, &Aabb::new(0.0, 60.0, 0.0, 128.0, 70.0, 128.0), &mut out);
     assert!(out.is_empty(), "world 0 must be empty after clear");
-    idx.query(1, &Aabb::new(0.0, 60.0, 0.0, 128.0, 70.0, 128.0), &mut out, TICK_UNKNOWN);
+    idx.query(1, &Aabb::new(0.0, 60.0, 0.0, 128.0, 70.0, 128.0), &mut out);
     assert_eq!(out, vec![2]);
     assert_eq!(idx.stats().entities, 1);
 }
@@ -235,7 +235,7 @@ fn query_expansion_is_bounded_and_correct() {
     idx.upsert(1, 0, &e);
 
     let mut out = Vec::new();
-    idx.query(0, &Aabb::new(70.0, 60.0, 70.0, 72.0, 70.0, 72.0), &mut out, TICK_UNKNOWN);
+    idx.query(0, &Aabb::new(70.0, 60.0, 70.0, 72.0, 70.0, 72.0), &mut out);
     assert!(out.is_empty());
 
     // L60 exact-contract: the query returns ONLY entities whose box
@@ -243,7 +243,7 @@ fn query_expansion_is_bounded_and_correct() {
     // (entity x1=65.0 < query x0=65.5 — a 0.5 gap — must NOT be pulled in
     // by the max_half_span margin; the walk expansion only guarantees the
     // CELL coverage, the scan bounds are the true box).
-    idx.query(0, &Aabb::new(65.5, 60.0, 65.5, 70.0, 70.0, 70.0), &mut out, TICK_UNKNOWN);
+    idx.query(0, &Aabb::new(65.5, 60.0, 65.5, 70.0, 70.0, 70.0), &mut out);
     assert!(!out.contains(&1), "margin leak: a 0.5-gap entity came back");
     // a genuinely touching-face query (65.0 is the entity's x1, and
     // vanilla's strict compare needs x1 > qx0) still finds it:
@@ -251,7 +251,6 @@ fn query_expansion_is_bounded_and_correct() {
         0,
         &Aabb::new(64.99, 60.0, 64.99, 70.0, 70.0, 70.0),
         &mut out,
-        TICK_UNKNOWN,
     );
     assert!(out.contains(&1), "border-crossing entity missed");
     assert!(idx.max_half_span() <= MAX_HALF_SPAN);
@@ -269,7 +268,7 @@ fn query_buffer_reuse() {
     let mut out = Vec::new();
     for i in 0..10_000 {
         let qx = (i % 320) as f64;
-        idx.query(0, &Aabb::new(qx, 60.0, 0.0, qx + 4.0, 70.0, 4.0), &mut out, TICK_UNKNOWN);
+        idx.query(0, &Aabb::new(qx, 60.0, 0.0, qx + 4.0, 70.0, 4.0), &mut out);
     }
 }
 
@@ -314,7 +313,6 @@ fn packed_window_is_conservative() {
                 0,
                 &Aabb::new(x0 - 0.01, 63.99, z0 - 0.01, x0 + 0.01, 64.01, z0 + 0.01),
                 &mut probe,
-                TICK_UNKNOWN,
             );
             assert!(probe.contains(&id0));
             probe.clear();
@@ -361,173 +359,4 @@ fn packed_window_is_conservative() {
             b.x1
         );
     }
-}
-
-/// L107 EXACT FRESH FILTER: a candidate upserted on the query's own tick is
-/// exact-decided in Rust (FRESH_BIT on hits, exact misses dropped); stale or
-/// unknown-stamp slots pass through untouched; the stream order is a stable
-/// compaction; a freed+reused slot cannot inherit a stamp.
-#[test]
-fn fresh_filter_exact_decides_this_tick_only() {
-    use centities_core::{Aabb, EntityIndex, FRESH_BIT, TICK_UNKNOWN};
-
-    let mut idx = EntityIndex::new();
-    // three neighbors around the origin, probed on tick 7
-    for (i, (x, z)) in [(0.0, 0.0), (2.0, 0.0), (10.0, 0.0)].iter().enumerate() {
-        idx.upsert_ord(
-            100 + i as i64,
-            0,
-            &Aabb::new(*x, 60.0, *z, *x + 1.0, 62.0, *z + 1.0),
-            3,
-            900 + i as i64,
-            7,
-        );
-    }
-    let b = Aabb::new(-1.0, 59.0, -1.0, 3.0, 63.0, 3.0); // hits 100, 101
-
-    // tick 7 (fresh): exact decision in Rust
-    let mut out = Vec::new();
-    idx.query(0, &b, &mut out, 7);
-    assert_eq!(out, vec![100 | FRESH_BIT, 101 | FRESH_BIT], "fresh hits carry the bit, exact order kept");
-
-    // the far entity (102) is outside the query box — dropped while fresh
-    let mut out2 = Vec::new();
-    idx.query(0, &Aabb::new(9.0, 59.0, -1.0, 12.0, 63.0, 3.0), &mut out2, 7);
-    assert_eq!(out2, vec![102 | FRESH_BIT]);
-
-    // tick 9 (stale stamps): legacy pass-through, no bits, superset kept
-    let mut out3 = Vec::new();
-    idx.query(0, &b, &mut out3, 9);
-    assert_eq!(out3, vec![100, 101], "stale slots keep the legacy trim path");
-
-    // TICK_UNKNOWN: the filter is off entirely
-    let mut out4 = Vec::new();
-    idx.query(0, &b, &mut out4, TICK_UNKNOWN);
-    assert_eq!(out4, vec![100, 101]);
-
-    // tick 0 (the Java knob-off sentinel): filter off
-    let mut out5 = Vec::new();
-    idx.query(0, &b, &mut out5, 0);
-    assert_eq!(out5, vec![100, 101]);
-
-    // movement re-probed on tick 9: the box moves and re-arms freshness —
-    // entity 100 walks away from the query box between tick 7 and 9
-    idx.upsert_ord(
-        100,
-        0,
-        &Aabb::new(50.0, 60.0, 50.0, 51.0, 62.0, 51.0),
-        3,
-        900,
-        9,
-    );
-    let mut out6 = Vec::new();
-    idx.query(0, &b, &mut out6, 9);
-    assert_eq!(
-        out6,
-        vec![101],
-        "re-probed 100 exact-dropped at its new position; stale 101 passes legacy without the bit"
-    );
-
-    // removal + slot reuse: entity 101 removed (slot recycled for 200,
-    // probed tick 11); a tick-11 query must not see 101 or a ghost stamp
-    assert!(matches!(idx.remove(101), centities_core::RemoveEv::Normal { .. }));
-    idx.upsert_ord(
-        200,
-        0,
-        &Aabb::new(1.0, 60.0, 1.0, 2.0, 62.0, 2.0),
-        3,
-        901,
-        11,
-    );
-    let mut out7 = Vec::new();
-    idx.query(0, &b, &mut out7, 11);
-    assert_eq!(out7, vec![200 | FRESH_BIT], "slot reuse: fresh 200 in, stale 101 gone, no inherited stamp");
-}
-
-#[test]
-fn trust_stale_exact_decides_all_slots() {
-    use centities_core::{Aabb, EntityIndex, FRESH_BIT};
-
-    let mut idx = EntityIndex::new();
-    // a static neighbor probed on tick 3, never moves again — its index box
-    // is exact at every later query (the L108b workload: most query
-    // candidates are stable entities whose stamps aged out)
-    idx.upsert_ord(300, 0, &Aabb::new(0.0, 60.0, 0.0, 1.0, 62.0, 1.0), 3, 900, 3);
-    // a walker probed on tick 3
-    idx.upsert_ord(301, 0, &Aabb::new(5.0, 60.0, 0.0, 6.0, 62.0, 1.0), 3, 901, 3);
-
-    let b = Aabb::new(-1.0, 59.0, -1.0, 7.0, 63.0, 1.0); // hits both at index boxes
-
-    // without the trust flag: stale slots keep the legacy pass-through
-    let mut out = Vec::new();
-    idx.query(0, &b, &mut out, 9);
-    assert_eq!(out, vec![300, 301], "no trust: stale slots pass unfresh");
-
-    // arm L108b: the exact decision applies to stale slots too
-    idx.set_trust_stale_exact(true);
-    let mut out2 = Vec::new();
-    idx.query(0, &b, &mut out2, 9);
-    assert_eq!(
-        out2,
-        vec![300 | FRESH_BIT, 301 | FRESH_BIT],
-        "trust: stale hits carry the bit"
-    );
-
-    // the stale exact miss dies: a neighbor whose index box misses the box
-    idx.upsert_ord(302, 0, &Aabb::new(50.0, 60.0, 50.0, 51.0, 62.0, 51.0), 3, 902, 3);
-    let mut out3 = Vec::new();
-    idx.query(0, &b, &mut out3, 9);
-    assert_eq!(
-        out3,
-        vec![300 | FRESH_BIT, 301 | FRESH_BIT],
-        "stale exact miss dropped under trust"
-    );
-
-    // the drift-shape case, mechanism check: 301's box moved away WITH a
-    // re-probe (the index reflects it) — the trusted decision follows the
-    // index box and exact-drops it; the UNPROBED drift variant is exactly
-    // what the CI parity referee pins (a wrong trusted answer breaks
-    // bit-identity there, and the site keeps the legacy fallback)
-    idx.upsert_ord(301, 0, &Aabb::new(100.0, 60.0, 100.0, 101.0, 62.0, 101.0), 3, 901, 9);
-    let mut out4 = Vec::new();
-    idx.query(0, &b, &mut out4, 9);
-    assert_eq!(
-        out4,
-        vec![300 | FRESH_BIT],
-        "re-probed walker exact-dropped at its new position"
-    );
-}
-
-#[test]
-fn slot_scratch_stays_aligned_across_cells_and_queries() {
-    use centities_core::{Aabb, EntityIndex, FRESH_BIT};
-
-    let mut idx = EntityIndex::new();
-    // two cells: (0,0) hosts 400 (fresh), (1,0) hosts 401 (stale, CELL=16
-    // puts x=17 in cell 1) — the chunkZ-major walk serves 400 before 401,
-    // and the append-only slot window must land the bits on the RIGHT ids
-    idx.upsert_ord(400, 0, &Aabb::new(0.0, 60.0, 0.0, 1.0, 62.0, 1.0), 3, 900, 5);
-    idx.upsert_ord(401, 0, &Aabb::new(17.0, 60.0, 0.0, 18.0, 62.0, 1.0), 3, 901, 2);
-    let b = Aabb::new(-1.0, 59.0, -1.0, 35.0, 63.0, 1.0);
-
-    // query 1 (tick 5): 400 fresh, 401 stale — bit on 400 only
-    let mut out = Vec::new();
-    idx.query(0, &b, &mut out, 5);
-    assert_eq!(out, vec![400 | FRESH_BIT, 401], "cross-cell stream keeps per-slot freshness");
-
-    // query 2 (tick 6): both stale — pass-through, no bits, no panic on the
-    // advanced window base
-    let mut out2 = Vec::new();
-    idx.query(0, &b, &mut out2, 6);
-    assert_eq!(out2, vec![400, 401], "second query: window base advanced safely");
-
-    // query 3: re-probe 400 on tick 7 — fresh again, 401 still stale
-    idx.upsert_ord(400, 0, &Aabb::new(0.5, 60.0, 0.5, 1.5, 62.0, 1.5), 3, 900, 7);
-    let mut out3 = Vec::new();
-    idx.query(0, &b, &mut out3, 7);
-    assert_eq!(
-        out3,
-        vec![400 | FRESH_BIT, 401],
-        "third query: freshness follows the latest probe"
-    );
 }

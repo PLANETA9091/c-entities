@@ -9,7 +9,7 @@
 //!
 //! Run: cargo run --release -p centities-core --example scale_bench -- [--n 15000000] [--dense]
 
-use centities_core::{Aabb, EntityIndex, TICK_UNKNOWN};
+use centities_core::{Aabb, EntityIndex};
 use std::time::Instant;
 
 fn rss_kb() -> usize {
@@ -100,12 +100,12 @@ fn main() {
     let mut sink = 0usize;
     // warmup
     for b in &qboxes[..10_000] {
-        idx.query(0, b, &mut out, TICK_UNKNOWN);
+        idx.query(0, b, &mut out);
         sink += out.len() as usize;
     }
     let t1 = Instant::now();
     for b in &qboxes {
-        idx.query(0, b, &mut out, TICK_UNKNOWN);
+        idx.query(0, b, &mut out);
         sink = sink.wrapping_add(out.len() as usize);
     }
     let q_dt = t1.elapsed().as_secs_f64();
@@ -130,7 +130,7 @@ fn main() {
             67.0,
             b.z1 + 14.0,
         );
-        idx.query(0, &big, &mut out, TICK_UNKNOWN);
+        idx.query(0, &big, &mut out);
         big_hits += out.len() as usize;
     }
     let q2_dt = t2.elapsed().as_secs_f64();

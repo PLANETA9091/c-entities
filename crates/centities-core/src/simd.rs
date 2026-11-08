@@ -101,17 +101,10 @@ pub(crate) fn scan_scalar(
     my0: f32,
     my1: f32,
     out: &mut Vec<i64>,
-    slots: &[u32],
-    slots_out: &mut Vec<u32>,
 ) {
     for i in 0..n {
         if exact_keep(bx, i, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
             out.push(ids[i]);
-            // L108a: parallel slot stream for the query path's freshness
-            // filter (empty for the push kernel — no per-survivor cost).
-            if !slots.is_empty() {
-                slots_out.push(slots[i]);
-            }
         }
     }
 }
@@ -154,8 +147,6 @@ mod avx2 {
         my0: f32,
         my1: f32,
         out: &mut Vec<i64>,
-        slots: &[u32],
-        slots_out: &mut Vec<u32>,
     ) {
         let vx0 = _mm256_set1_ps(px0);
         let vx1 = _mm256_set1_ps(px1);
@@ -197,9 +188,6 @@ mod avx2 {
                 let k = base + j;
                 if super::exact_keep(bx, k, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
                     out.push(ids[k]);
-                    if !slots.is_empty() {
-                        slots_out.push(slots[k]);
-                    }
                 }
             }
         }
@@ -229,8 +217,6 @@ pub(crate) fn scan_cells(
     my0: f32,
     my1: f32,
     out: &mut Vec<i64>,
-    slots: &[u32],
-    slots_out: &mut Vec<u32>,
 ) {
     // EPSF-expanded f32 prefilter bounds (superset proof at the top of the
     // file). Cell-relative XZ: only cells the expanded box touches are
@@ -260,11 +246,11 @@ pub(crate) fn scan_cells(
             unsafe {
                 avx2::scan_blocks(
                     bx, ids, n_blocks, lane_mask, px0, px1, pz0, pz1, py0, py1, ox, oz, qx0, qx1,
-                    qz0, qz1, my0, my1, out, slots, slots_out,
+                    qz0, qz1, my0, my1, out,
                 );
             }
             return;
         }
     }
-    scan_scalar(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out, slots, slots_out);
+    scan_scalar(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
 }
