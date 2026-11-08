@@ -153,3 +153,21 @@ Stage Summary:
 - main @ a2e66e0 = 789b78c (полный стек L104+L104b+L106+publish-fix) + results merged-baseline; паритет гейта merged-main PASS.
 - Оставшийся налог живых мобов (spread-мод профиль): query-семейство ~30% self-time — getBoundingBox 10.64 + fastQuery 7.43 + rowQuery 3.12 + getEntitiesOfClass 4.85 + vtab* 4.72 + SynchedEntityData 2.40.
 - СЛЕДУЮЩИЙ ФРОНТ L107: f64-боксы строк + Rust-скан строк (отказ deref getBoundingBox на отбраковке кандидатов; survivors only → Java), freshness-штампы против 214 дрейф-кейсов; далее vtab*-локали и SynchedEntityData.get (читается где? — локализовать в L107-JFR). Цель −90% на живых мобах остаётся главной.
+
+---
+Task ID: 23
+Agent: main (Z.ai)
+Task: L107 имплементация — exact-f64 row boxes + Rust fresh filter, ветка l107-rowboxes @ 20e6f6f
+
+Work Log:
+- Прицел (789b78c профиль): Entity.getBoundingBox 10.64% топ-1 — L37d live-box re-check deref'ит КАЖДОГО кандидата, а отбрасывает post-L60 только 0.00003% (marginExtra 214/662M, ран 352). Причина: индекс хранит f32 cell-relative боксы; точный f64 бокс УЖЕ едет в каждом batch-entry (B_BOX) — его просто не хранили.
+- РЕШЕНИЕ: (1) EntityIndex: slot_bb ([f64;6] absolute) + slot_tick (штамп зонда) на каждом upsert_ord; swap-remove вместе со слотом; clear(). (2) query() получает tick и на свежих слотах (штамп == тик запроса) гонит ТОЧНЫЙ 6-сравнительный AABB.intersects как стабильную in-place компакцию ПОСЛЕ oversize-merge: точный промах не доходит до Java вообще (deref умер), хит уходит с FRESH_BIT (1<<40) — Java скипает re-check (ванильный predicate остаётся). Stale-слоты/oversize/tick<=0/push-kernel query_cell не тронуты. (3) JNI: queryNative/queryNative2/nativeFlush несут per-entry B_TICK + query tick; off-thread nativeBoxDirect = TICK_UNKNOWN. (4) Java fastQuery: rawId/cid сплит, FRESH_BIT-скип для свежих; vActive-окна (viewBox) — полный legacy; rowQuery не тронут (L107b surface).
+- Контракт корректности: свежий штамп = зонд записал live box, flush-merged apply лёг до скана, однопоточный тик-цикл не мутирует между flush и сканом → точный тест = то же решение, что принял бы ванильный trim. Паритет-рефери; ORDER_CHECK цел (компакция сохраняет порядок — аргумент L106).
+- Knob CE_L107=0 возвращает всё (query tick=0); diag l107=<fresh>/<legacy>/<on> на hooks@.
+- Локально: cargo test core+swarm 82/0 — новый fresh_filter_exact_decides_this_tick_only (fresh/stale/re-probe/slot-reuse); javac (JDK21 из /tmp/my-project/work) — 58 ошибок, ВСЕ в известных чужих зонах (fastutil/paper-internals), зоны правок чисты.
+- CI: parity 42430389700 + baseline 42430395165 задиспатчены на l107-rowboxes (shipped config, полный матрикс); TTL-harvest cron 513615.
+- Попутный фикс: тест exactness/simd_parity/examples переведены на query(4-арг); TICK_UNKNOWN импорт (ветка компилируется).
+
+Stage Summary:
+- Ожидание: getBoundingBox 10.64% → вниз на долю stale-кандидатов; l107Fresh крупный (в плотных стопках большинство кандидатов зондируется текущим тиком), l107Legacy малый; mobs/spread/mixed внутрирановый dAB улучшается выше шума.
+- Дальше: при PASS обоих гейтов — мерж-пачка в main (чистое окно); L107b = f64-боксы в published rows (rowQuery-путь, ~3.12% + его доля getBoundingBox); затем vtab*/SynchedEntityData.get (4.72%/2.40%).
