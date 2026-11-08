@@ -443,3 +443,91 @@ fn fresh_filter_exact_decides_this_tick_only() {
     idx.query(0, &b, &mut out7, 11);
     assert_eq!(out7, vec![200 | FRESH_BIT], "slot reuse: fresh 200 in, stale 101 gone, no inherited stamp");
 }
+
+#[test]
+fn trust_stale_exact_decides_all_slots() {
+    use centities_core::{Aabb, EntityIndex, FRESH_BIT};
+
+    let mut idx = EntityIndex::new();
+    // a static neighbor probed on tick 3, never moves again — its index box
+    // is exact at every later query (the L108b workload: most query
+    // candidates are stable entities whose stamps aged out)
+    idx.upsert_ord(300, 0, &Aabb::new(0.0, 60.0, 0.0, 1.0, 62.0, 1.0), 3, 900, 3);
+    // a walker probed on tick 3
+    idx.upsert_ord(301, 0, &Aabb::new(5.0, 60.0, 0.0, 6.0, 62.0, 1.0), 3, 901, 3);
+
+    let b = Aabb::new(-1.0, 59.0, -1.0, 7.0, 63.0, 1.0); // hits both at index boxes
+
+    // without the trust flag: stale slots keep the legacy pass-through
+    let mut out = Vec::new();
+    idx.query(0, &b, &mut out, 9);
+    assert_eq!(out, vec![300, 301], "no trust: stale slots pass unfresh");
+
+    // arm L108b: the exact decision applies to stale slots too
+    idx.set_trust_stale_exact(true);
+    let mut out2 = Vec::new();
+    idx.query(0, &b, &mut out2, 9);
+    assert_eq!(
+        out2,
+        vec![300 | FRESH_BIT, 301 | FRESH_BIT],
+        "trust: stale hits carry the bit"
+    );
+
+    // the stale exact miss dies: a neighbor whose index box misses the box
+    idx.upsert_ord(302, 0, &Aabb::new(50.0, 60.0, 50.0, 51.0, 62.0, 51.0), 3, 902, 3);
+    let mut out3 = Vec::new();
+    idx.query(0, &b, &mut out3, 9);
+    assert_eq!(
+        out3,
+        vec![300 | FRESH_BIT, 301 | FRESH_BIT],
+        "stale exact miss dropped under trust"
+    );
+
+    // the drift-shape case, mechanism check: 301's box moved away WITH a
+    // re-probe (the index reflects it) — the trusted decision follows the
+    // index box and exact-drops it; the UNPROBED drift variant is exactly
+    // what the CI parity referee pins (a wrong trusted answer breaks
+    // bit-identity there, and the site keeps the legacy fallback)
+    idx.upsert_ord(301, 0, &Aabb::new(100.0, 60.0, 100.0, 101.0, 62.0, 101.0), 3, 901, 9);
+    let mut out4 = Vec::new();
+    idx.query(0, &b, &mut out4, 9);
+    assert_eq!(
+        out4,
+        vec![300 | FRESH_BIT],
+        "re-probed walker exact-dropped at its new position"
+    );
+}
+
+#[test]
+fn slot_scratch_stays_aligned_across_cells_and_queries() {
+    use centities_core::{Aabb, EntityIndex, FRESH_BIT};
+
+    let mut idx = EntityIndex::new();
+    // two cells: (0,0) hosts 400 (fresh), (1,0) hosts 401 (stale, CELL=16
+    // puts x=17 in cell 1) — the chunkZ-major walk serves 400 before 401,
+    // and the append-only slot window must land the bits on the RIGHT ids
+    idx.upsert_ord(400, 0, &Aabb::new(0.0, 60.0, 0.0, 1.0, 62.0, 1.0), 3, 900, 5);
+    idx.upsert_ord(401, 0, &Aabb::new(17.0, 60.0, 0.0, 18.0, 62.0, 1.0), 3, 901, 2);
+    let b = Aabb::new(-1.0, 59.0, -1.0, 35.0, 63.0, 1.0);
+
+    // query 1 (tick 5): 400 fresh, 401 stale — bit on 400 only
+    let mut out = Vec::new();
+    idx.query(0, &b, &mut out, 5);
+    assert_eq!(out, vec![400 | FRESH_BIT, 401], "cross-cell stream keeps per-slot freshness");
+
+    // query 2 (tick 6): both stale — pass-through, no bits, no panic on the
+    // advanced window base
+    let mut out2 = Vec::new();
+    idx.query(0, &b, &mut out2, 6);
+    assert_eq!(out2, vec![400, 401], "second query: window base advanced safely");
+
+    // query 3: re-probe 400 on tick 7 — fresh again, 401 still stale
+    idx.upsert_ord(400, 0, &Aabb::new(0.5, 60.0, 0.5, 1.5, 62.0, 1.5), 3, 900, 7);
+    let mut out3 = Vec::new();
+    idx.query(0, &b, &mut out3, 7);
+    assert_eq!(
+        out3,
+        vec![400 | FRESH_BIT, 401],
+        "third query: freshness follows the latest probe"
+    );
+}

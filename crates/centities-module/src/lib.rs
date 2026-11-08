@@ -156,9 +156,19 @@ struct CeState {
 }
 
 pub(crate) fn new_state() -> CeState {
+    // L108b (CE_L108B=1): trust the exact f64 decision for STALE slots too.
+    // Explicit opt-in only — the contract change is refereed by the CI
+    // parity gate before any rollout (see EntityIndex::trust_stale_exact).
+    let trust_stale = std::env::var("CE_L108B").ok().as_deref() == Some("1");
+    let mut idx = centities_core::EntityIndex::new();
+    idx.set_trust_stale_exact(trust_stale);
+    let mut pidx = centities_core::EntityIndex::new();
+    // The push view is a secondary mirror — its slots never feed query()'s
+    // filter (query_cell is stamp-free), keep it stamp-blind.
+    pidx.set_trust_stale_exact(false);
     CeState {
-        idx: centities_core::EntityIndex::new(),
-        pidx: centities_core::EntityIndex::new(),
+        idx,
+        pidx,
         push: pushcore::PushCore::new(),
         items: None,
         p: Publisher {
