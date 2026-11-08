@@ -121,3 +121,24 @@ round-0 full pack (the idle majority) is untouched; wave4 candidates:
 (1) per-mob RESIDENT pack (write the 96 static words once at add_mob,
 ~50 mutable words per tick), (2) the floor's internal walk arithmetic
 (pure function — parity-gated rewrite).
+
+## Wave3 tail strike: the stats buffer
+
+`tick()` returned a fresh `Vec<AiStat>` — 25k × ~48 B ≈ 1.2 MB allocated
+and dropped EVERY tick. The executor now owns `stats_buf` and `tick`
+returns a borrow (lifetime ends at the next tick call — the N2 bridge
+reads it before the next tick, same as it would have consumed the Vec).
+Median p50 4.78 → **4.73 ms/tick** (total **−41.3%** vs baseline).
+
+## Standing totals (25k×400, seed 0xC0FFEE, this box)
+
+| stage        | p50 ms/tick | vs baseline |
+|--------------|-------------|-------------|
+| baseline     | 8.06–8.15   | —           |
+| + wave2      | ~5.06       | −37%        |
+| + wave3      | ~4.78       | −41%        |
+| + stats reuse| ~4.73       | **−41.3%**  |
+
+chasing == 3036 at every stage (bit-identical endgame), workspace tests
+green at every stage, CI: parity/baseline lanes unchanged (native is
+additive; the shipped config stays L104+L104b+L106+L109).

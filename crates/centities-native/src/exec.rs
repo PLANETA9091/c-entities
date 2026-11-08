@@ -30,6 +30,9 @@ pub struct NativeTick {
     /// split stays until the L111 bridge replaces it with the real
     /// per-mob stream handoff)
     pub target_rng: u64,
+    /// WAVE3: the per-tick AI accounting buffer — ONE allocation per
+    /// executor (grown on demand), returned as a borrow from `tick`.
+    stats_buf: Vec<AiStat>,
     /// WAVE2: the shared aiPack scratch — ONE buffer for the whole
     /// population (grown on demand, reused across every mob and round;
     /// the old per-round `vec![0i32; ..]` was a malloc+memset per ROUND
@@ -52,6 +55,7 @@ impl NativeTick {
             target_rng: target_seed,
             pack_scratch: Vec::new(),
             out_buf: vec![0i32; swarm_sim::mob::out_len()],
+            stats_buf: Vec::new(),
         }
     }
 
@@ -78,8 +82,11 @@ impl NativeTick {
         }
     }
 
-    /// The whole managed tick. Returns the per-mob AI accounting.
-    pub fn tick(&mut self, game_time: i32) -> Vec<AiStat> {
+    /// The whole managed tick. Returns the per-mob AI accounting — a
+    /// borrow of the executor's REUSED stats buffer (wave3: the old code
+    /// allocated a fresh 25k-slot Vec — ~1.2 MB — every tick; the buffer
+    /// now persists, the borrow ends at the next tick call).
+    pub fn tick(&mut self, game_time: i32) -> &[AiStat] {
         // grid refresh (WAVE2: the Horizon N1 incremental re-bucket —
         // movers only; the profile shows the real share)
         {
@@ -128,7 +135,8 @@ impl NativeTick {
         // store (Horizon creatures.rs:1468). The resolver borrows the
         // snapshot (immutable) while the mob mutates — disjoint fields,
         // the borrow splits cleanly.
-        let mut stats: Vec<AiStat> = Vec::with_capacity(self.store.mobs.len());
+        let stats: &mut Vec<AiStat> = &mut self.stats_buf;
+        stats.clear();
         // disjoint field borrows: the snapshot is read-only during the
         // loop (it is only REPLACED between ticks through push_players),
         // the mobs mutate by slot.
@@ -171,7 +179,7 @@ impl NativeTick {
             }
         }
         self.store.game_time = game_time;
-        stats
+        &stats[..]
     }
 }
 
