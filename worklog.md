@@ -239,3 +239,33 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
   FAIL → parity-dumps покажут дрейфующие точки, они уходят в legacy-фолбэк точечно.
   Прицел прежний: getBoundingBox 10.64% + fastQuery-хвост; далее vtab* 4.72%,
   SynchedEntityData.get 2.40%; dormancy far-field под F1–F6 — терминальная цель −90%.
+
+## Task 25 — L108 отправлен в CI: слот-стрим вместо хеша + эксперимент stale-trust (2026-11-08)
+
+Реализация на ветке l108-slotfresh @ 9cd67ca (main b62c8c4 + cherry-pick L107 20e6f6f):
+
+- L108a (стоимость): scan_cells параллельно с id пушит глобальный слот выжившего в
+  append-only scratch (окно этой выборки = len − out.len(), сброс при >4M записей);
+  fresh-фильтр стал array-read'ом slot_tick[slot]/slot_bb[slot] — per-candidate
+  idmap.find (тот самый +108-145 нс warm / ×20-40 cold в CI) умер. Push-kernel (query_cell)
+  и tick<=0-вызовы идут с пустым slots-срезом — нулевой трафик при выключенном фильтре.
+  Oversize-merge (редкий) сохраняет хеш-путь фильтра.
+- L108b (эксперимент, CE_L108B=1, default OFF): точное 6-compare решение для ВСЕХ слотов.
+  Обоснование: запросы возвращают СТАБИЛЬНЫХ соседей (60% items + 20% stands + idle-зомби
+  в spread), их индексный бокс верен с последнего upsert'а; marginExtra ~0.00007%
+  говорит, что f32-индекс и живой бокс согласны почти всегда, а 214 sim-дрейфов —
+  артефакты штамп-границы, не стейл-стейта. Java НЕ тронута: stale-trusted хиты едут
+  тем же FRESH_BIT. Риск дрейфа отдан CI-паритету: PASS → trim умирает для
+  fastQuery-семейства (getBoundingBox 10.64% + intersects-хвост), FAIL → parity-dumps
+  пинуют дрейфующие точки. Row-путь остаётся с Java-trim — его exact-поверхность
+  (f64-ряды) следующий слой.
+- Инфра: baseline.yml получил инпут ce_extra_env (passthrough KEY=VAL в mod-ногу);
+  parity использует готовый extra_env. Модульный слой: new_state читает CE_L108B,
+  pidx сознательно stamp-blind.
+- Локальный гейт: cargo test core+swarm = 84/0 (+2 новых теста: trust_stale_exact_decides_all_slots,
+  slot_scratch_stays_aligned_across_cells_and_queries; fresh-семантика L107 не изменена).
+  jvmti-bindings E0277 ×14 — прекомпилационный фейл чистого дерева (сосед CRUSSTY в
+  песочнице отсутствует), модуль собирает только CI.
+- Диспетч: parity 42467398856 (extra_env CE_L108B=1) + baseline 42467400498
+  (ce_extra_env CE_L108B=1), оба на l108-slotfresh. Критерий жатвы: паритет бит-в-бит
+  ×12 ног + внутрирановый dAB против main-референса; при PASS — merge-окно в main.
