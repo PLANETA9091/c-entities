@@ -68,18 +68,23 @@ public final class CeHooks {
     /** L37d: candidates dropped by the exact AABB re-check (the index's
      *  margin superset) — zero means the index was already exact. */
     public static volatile long marginExtra = 0;
-    // L109 (CE_L109=1): skip the L37d margin re-check in fastQuery for the
-    // common (non-view) case. The Rust scan already filters all 3 axes
-    // against the INDEX box exactly, and for every candidate whose probe is
-    // in the flush the index box IS the live box; the re-check dropped
-    // marginExtra 214/662M (0.00003%) across harvested runs — a pure
-    // per-candidate tax (getBoundingBox deref + 6 compares: the top-1
-    // spread hotspot, 10.64% self-time on main). The L108b stale-trust
-    // parity proved index-box decisions bit-identical to vanilla live-box
-    // decisions (12/12 legs, fill-done+50/+300/end). The vActive viewBox
-    // path is KEPT: after-scanner entries must still be seen at their
-    // pre-body box. CE_L109 unset/0 restores the trim.
-    private static final boolean L109_TRUST = "1".equals(System.getenv("CE_L109"));
+    // L109 (CE_L109, SHIPPED default ON; CE_L109=0 restores the trim): skip
+    // the L37d margin re-check in fastQuery for the common (non-view) case.
+    // The Rust scan already filters all 3 axes against the INDEX box
+    // exactly, and for every candidate whose probe is in the flush the
+    // index box IS the live box; the re-check dropped marginExtra
+    // 214/662M (0.00003%) across harvested runs — a pure per-candidate tax
+    // (getBoundingBox deref + 6 compares: the top-1 spread hotspot, 11.86%
+    // self-time on main). The L108b stale-trust parity proved index-box
+    // decisions bit-identical to vanilla live-box decisions (12/12 legs),
+    // and the L109 parity re-proved it for the enforcement-free variant
+    // (6th bit-identical pass). The baseline verdict PASSED: spread dAB
+    // +3.6% vs +32.4% ref (dΔ −28.9 пп), getBoundingBox 11.86→3.25%,
+    // fastMs/cand DOWN (mobs −8.5%, spread −16.8%, items −43%). The
+    // vActive viewBox path is KEPT: after-scanner entries must still be
+    // seen at their pre-body box.
+    private static final boolean L109_TRUST =
+            !"0".equals(System.getenv("CE_L109"));
     public static volatile long l109Skip = 0, l109Trim = 0;
     // L104 BIG-BOX REFUSE: the fast path pays ~112 ns per candidate inside
     // the Java resolve loop (ARENA load + live-box deref + AABB test), the
