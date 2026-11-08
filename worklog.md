@@ -295,3 +295,18 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
   Сплит: floor 42% | pack 28.9% | acts 20.4% | reslv 8.7% — карта волны 3
   (delta-pack раундов 2+; арифметический рерайт walk без смены in→out).
 - Workspace-тесты зелёные (включая 10-минутный soak parity-крейта).
+
+## Task 31b — L112 wave3: delta-pack (scratch поддерживается, не пересобирается) (2026-11-09)
+
+- apply_actions/request-arm зеркалят КАЖДУЮ мутацию в packed-слова
+  (running, states, LOOKAT-слово через общий packed_lookat_state,
+  no_action, nav_state, mf). Раунды 2+ пишут ~11 слов вместо 134.
+- Debug-проба инварианта (полный pack == scratch, слово-в-слово, каждый
+  раунд) поймала 2 реальных дрифта при первом запуске (melee-state запись
+  в request-arm; resolver-start'ы) — починены repack_goal_words; теперь
+  КАЖДЫЙ debug-тест — гейт дельта-пака.
+- stats-буфер реюз: tick возвращает заём (1.2MB/тик больше не аллоцируется).
+- Итог сессии: p50 8.06 → 4.73 ms/tick (−41.3%), chasing 3036 бит-в-бит
+  на каждом этапе, workspace зелёный. Волна 4 (карта): per-mob резидентный
+  пак (~96 статичных слов пишутся один раз при add_mob), арифметика walk
+  пола (floor 42% — чистая функция, parity-гейты уже стоят).
