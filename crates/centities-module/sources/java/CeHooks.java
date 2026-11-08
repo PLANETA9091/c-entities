@@ -1117,7 +1117,6 @@ public final class CeHooks {
                 + "/" + pushPairs + "/" + pushPairMiss
                 + " ord=" + ordSkip + "/" + ordWork
                 + " l106=" + ordStructSkip + "/" + mViewBlew + "/" + (ORD_STRUCT_ON ? 1 : 0)
-                + " l107=" + l107Fresh + "/" + l107Legacy + "/" + (FRESH_FILTER_ON ? 1 : 0)
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
@@ -1871,8 +1870,6 @@ public final class CeHooks {
     // from the mirrored px/pz at sort time).
     private static final int[] B_SY = new int[BATCH_CAP];
     private static final int[] B_SEQ = new int[BATCH_CAP];
-    /** L107: per-entry freshness stamp (CUR_TICK at probe emission). */
-    private static final int[] B_TICK = new int[BATCH_CAP];
     // L12 delta-only batch (probeDelta events without a box change)
     private static final long[] DB_IDS = new long[BATCH_CAP];
     private static final double[] DB_DV = new double[BATCH_CAP * 3];
@@ -1903,8 +1900,6 @@ public final class CeHooks {
         // ORD_SEQ stamp live on plain Entity, not just LivingEntity.
         B_SY[bN] = e.moonrise$getSectionY();
         B_SEQ[bN] = ORD_SEQ[entId(e) & AMASK];
-        // L107: the freshness stamp — the Rust filter decides on it.
-        B_TICK[bN] = CUR_TICK;
         if (e instanceof net.minecraft.world.entity.LivingEntity le) {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
@@ -2000,7 +1995,7 @@ public final class CeHooks {
         if (bN > 0 || dbN > 0) {
             batchesFlushed++;
             batchEntries += bN;
-            nativeFlush(bN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID, B_SY, B_SEQ, B_TICK,
+            nativeFlush(bN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID, B_SY, B_SEQ,
                     dbN, DB_IDS, DB_DV);
             bN = 0;
             dbN = 0;
@@ -2340,25 +2335,6 @@ public final class CeHooks {
     public static long ordStructSkip = 0;
     public static long mViewBlew = 0;
 
-    // === L107 (doc-41 exact-f64-query move) ==============================
-    // CE_L107=0 restores the legacy Java live-box trim everywhere. The Rust
-    // index stores the exact live f64 box per slot + a freshness stamp (the
-    // probe's CUR_TICK, carried per batch entry in B_TICK). A candidate
-    // upserted on the CURRENT tick is exact-decided in Rust:
-    //   - an exact AABB miss never reaches Java (the per-candidate
-    //     getBoundingBox deref + 6-compare trim dies for it),
-    //   - a hit arrives with FRESH_BIT set and the resolve loop skips its
-    //     re-check (Rust ran the identical 6-compare on the identical box).
-    // Stale slots (last probe older than this tick) and the vActive windows
-    // (AFTER-scanner viewBox substitution changes the effective box) keep
-    // the UNCHANGED legacy path. Parity referees the freshness contract;
-    // ORDER_CHECK is untouched (a stable compaction preserves the stream).
-    private static final boolean FRESH_FILTER_ON =
-            !"0".equals(System.getenv("CE_L107"));
-    private static final long FRESH_BIT = 1L << 40;
-    public static long l107Fresh = 0;
-    public static long l107Legacy = 0;
-
     /** L38 — the collide fast path (CE_COLLIDE=0 disables the weave).
      *  Byte-exact port of LivingEntity.canCollideWithBukkit (26.3):
      *  `isPushable() && collides != collidableExemptions.contains(uuid)` —
@@ -2598,14 +2574,6 @@ public final class CeHooks {
     private static final boolean FQ_SCRATCH_ON =
             !"0".equals(System.getenv("CE_FQ_SCRATCH"));
 
-    /** L107: the query's freshness tick — CUR_TICK arms the Rust exact
-     *  fresh filter; 0 keeps the legacy Java trim everywhere (knob off,
-    *  early boot). Retry calls pass 0 explicitly (the batch was consumed;
-    *  the stamps are already applied — re-arming is harmless but pointless). */
-    private static int freshQueryTick() {
-        return FRESH_FILTER_ON ? CUR_TICK : 0;
-    }
-
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, Entity source,
             AABB box, Predicate<? super Entity> predicate) {
@@ -2693,7 +2661,7 @@ public final class CeHooks {
             // DIRECT OUT BUFFER path (doc 21): one JNI crossing, zero per-
             // query array ops; ids are read back via intrinsified getLong.
             n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    freshQueryTick(), bn, B_IDS, B_BOX, B_SY, B_SEQ, B_TICK);
+                    bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -2709,7 +2677,7 @@ public final class CeHooks {
                     // regrow that actually grows — latent since doc 21.
                     dbb = IDS_BUF;
                     n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                            0, 0, B_IDS, B_BOX, B_SY, B_SEQ, B_TICK);
+                            0, B_IDS, B_BOX, B_SY, B_SEQ);
                 }
             }
             if (n == -1) {
@@ -2752,7 +2720,7 @@ public final class CeHooks {
             // queries). batchN>0 only on the first attempt; retries must NOT
             // re-apply.
             n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    ids, freshQueryTick(), bn, B_IDS, B_BOX, B_SY, B_SEQ, B_TICK);
+                    ids, bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -2762,7 +2730,7 @@ public final class CeHooks {
                 ids = new long[n];
                 QBUF.set(ids);
                 n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                        ids, 0, 0, B_IDS, B_BOX, B_SY, B_SEQ, B_TICK);
+                        ids, 0, B_IDS, B_BOX, B_SY, B_SEQ);
             }
             if (n < 0) {
                 mNotReady++;
@@ -2811,13 +2779,7 @@ public final class CeHooks {
         // was a hot self-time line on the spread-100k-mod profile.
         int marginLocal = 0;
         for (int k = 0; k < n; k++) {
-            // L107: the out stream packs the FRESH_BIT over the plain entity
-            // id — a fresh candidate was exact-decided in Rust on its live
-            // f64 box this very tick, so the legacy trim below is redundant.
-            long rawId = ids[k];
-            int cid = (int) rawId;
-            final boolean freshCand =
-                    FRESH_FILTER_ON && !vActive && (rawId & FRESH_BIT) != 0L;
+            int cid = (int) ids[k];
             if (cid == srcId) {
                 // vanilla excludes exactly the source entity; a self-query
                 // (item merge scans around ITSELF) can legitimately return
@@ -2850,15 +2812,6 @@ public final class CeHooks {
                 }
             }
             resolved++;
-            if (freshCand) {
-                // L107 EXACT FRESH SKIP: the Rust scan ran the identical
-                // 6-compare AABB.intersects on this candidate's exact live
-                // f64 box (fresh stamp == this tick) and handed it over as a
-                // hit — the getBoundingBox deref + re-check is provably
-                // redundant. The vanilla predicate still applies, as it must.
-                l107Fresh++;
-            } else {
-            l107Legacy++;
             // L37d EXACT AABB RE-CHECK. The Rust index is a MARGIN SUPERSET:
             // EntityIndex.query expands the scan bounds by
             // max_half_span + MARGIN (the big-entity safety net), so a
@@ -2901,7 +2854,6 @@ public final class CeHooks {
                 }
                 continue;
             }
-            } // end L107 legacy trim
             // NOTE: the vanilla predicate still applies, as it must.
             if (predicate.test(e)) {
                 out.add(e);
@@ -3708,12 +3660,12 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            long[] out, int tick, int batchN, long[] batchIds, double[] batchBoxes,
-            int[] batchSy, int[] batchSeq, int[] batchTick);
+            long[] out, int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     public static native void nativeFlush(
             int n, long[] ids, double[] boxes,
             int[] pf, double[] pxz, double[] dv, int[] vid,
-            int[] sy, int[] seq, int[] tick,
+            int[] sy, int[] seq,
             int dbn, long[] dbIds, double[] dbDv);
     /** L12 push kernel: compute one `LivingEntity.pushEntities()` natively.
      *  Returns a packed long: bit0 = ok (vanilla body suppressed), bit1 =
@@ -3750,8 +3702,8 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative2(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            int tick, int batchN, long[] batchIds, double[] batchBoxes,
-            int[] batchSy, int[] batchSeq, int[] batchTick);
+            int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     /** Registers a direct buffer as the query out-buffer; returns the
      *  capacity in longs, or 0 on any failure (legacy path stays armed). */
     public static native int nativeSetOutBuffer(java.nio.ByteBuffer buf);
@@ -9744,7 +9696,7 @@ public final class CeHooks {
                                 int qn = queryNative(worldId(lvl),
                                         area.minX, area.minY, area.minZ,
                                         area.maxX, area.maxY, area.maxZ,
-                                        qout, 0, 0, B_IDS, B_BOX, B_SY, B_SEQ, B_TICK);
+                                        qout, 0, B_IDS, B_BOX, B_SY, B_SEQ);
                                 if (qn >= 0) {
                                     net.minecraft.world.entity.LivingEntity best = null;
                                     double bd = -1.0;

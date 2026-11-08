@@ -1,5 +1,5 @@
 //! L5 micro-bench: dense-cell scan throughput (contiguous SoA).
-use centities_core::{Aabb, EntityIndex, TICK_UNKNOWN};
+use centities_core::{Aabb, EntityIndex};
 use std::time::Instant;
 
 fn main() {
@@ -18,12 +18,12 @@ fn main() {
     let mut out = Vec::new();
     // warmup
     for _ in 0..2000 {
-        idx.query(0, &q, &mut out, TICK_UNKNOWN);
+        idx.query(0, &q, &mut out);
     }
     let t = Instant::now();
     let n = 200_000u32;
     for _ in 0..n {
-        idx.query(0, &q, &mut out, TICK_UNKNOWN);
+        idx.query(0, &q, &mut out);
     }
     let dt = t.elapsed();
     println!(
