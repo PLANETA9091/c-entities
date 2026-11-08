@@ -51,17 +51,17 @@ def parse_perf_report(out, top):
             "-s", "symbol,dso", "--percent-limit", "0.1"])
     rows = []
     for line in r.stdout.splitlines():
-        # 12.34%  centities_core::goals::ai_floor  [centities_native.xxx]
-        m = re.match(r"\s*([0-9.]+)%\s+(\S+?)\s*(?:\[.+?\])?\s*$", line)
-        if m:
-            sym = m.group(2)
-            if "::" in sym or sym.startswith("_ZN"):
-                rows.append((float(m.group(1)), sym))
-        else:
-            m2 = re.match(r"\s*([0-9.]+)%\s+(.*)$", line)
-            if m2 and "::" in m2.group(2):
-                sym = m2.group(2).split()[0]
-                rows.append((float(m2.group(1)), sym))
+        # perf report --stdio rows: "  12.34%  symbol  [dso]"
+        m = re.match(r"\s*([0-9.]+)%\s+(.+?)\s*(?:\[.+?\])?\s*$", line)
+        if not m:
+            continue
+        try:
+            pct = float(m.group(1))
+        except ValueError:
+            continue
+        sym = m.group(2).strip().split()[0] if m.group(2).strip() else ""
+        if "::" in sym or sym.startswith("_ZN"):
+            rows.append((pct, sym))
     agg = {}
     for pct, sym in rows:
         agg[sym] = agg.get(sym, 0.0) + pct

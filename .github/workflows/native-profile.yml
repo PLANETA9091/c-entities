@@ -34,6 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout CRUSSTY (path deps cplug-abi, cplug-sdk)
+        run: |
+          git clone https://github.com/PLANETA9091/CRUSSTY.git ../CRUSSTY
+          git -C ../CRUSSTY checkout c315a1b  # pinned: the guard-API revision c-entities builds against (op-5 EARLY_RETURN_GUARD2)
+
       - name: Install Rust (stable, minimal)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
