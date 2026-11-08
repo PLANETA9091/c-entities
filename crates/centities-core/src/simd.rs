@@ -130,6 +130,7 @@ mod avx2 {
     pub(crate) unsafe fn scan_blocks(
         bx: &[f32],
         ids: &[i64],
+        mut keys: Option<(&[i64], &mut Vec<i64>)>,
         n_blocks: usize,
         last_lane_mask: u32,
         px0: f32,
@@ -188,6 +189,9 @@ mod avx2 {
                 let k = base + j;
                 if super::exact_keep(bx, k, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
                     out.push(ids[k]);
+                    if let Some((ks, ok)) = keys.as_mut() {
+                        ok.push(ks[k]);
+                    }
                 }
             }
         }
@@ -221,6 +225,9 @@ mod avx2 {
             let k = base + j;
             if super::exact_keep(bx, k, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
                 out.push(ids[k]);
+                if let Some((ks, ok)) = keys.as_mut() {
+                    ok.push(ks[k]);
+                }
             }
         }
     }
@@ -277,12 +284,66 @@ pub(crate) fn scan_cells(
             // the movemask, and padded lanes reject themselves.
             unsafe {
                 avx2::scan_blocks(
-                    bx, ids, n_blocks, lane_mask, px0, px1, pz0, pz1, py0, py1, ox, oz, qx0, qx1,
-                    qz0, qz1, my0, my1, out,
+                    bx, ids, None, n_blocks, lane_mask, px0, px1, pz0, pz1, py0, py1, ox, oz,
+                    qx0, qx1, qz0, qz1, my0, my1, out,
                 );
             }
             return;
         }
     }
     scan_scalar(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+}
+
+/// Quad-tile variant: pushes the survivor's vanilla order key next to every
+/// id so the multi-tile merge needs no idmap probes (doc 37).
+pub(crate) fn scan_cells_keys(
+    bx: &[f32],
+    ids: &[i64],
+    keys: &[i64],
+    n: usize,
+    ox: f64,
+    oz: f64,
+    qx0: f64,
+    qx1: f64,
+    qz0: f64,
+    qz1: f64,
+    my0: f32,
+    my1: f32,
+    out: &mut Vec<i64>,
+    out_keys: &mut Vec<i64>,
+) {
+    const EPSF: f32 = 1.0e-2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2() {
+            let px0 = ((qx0 - ox) as f32) - EPSF;
+            let px1 = ((qx1 - ox) as f32) + EPSF;
+            let pz0 = ((qz0 - oz) as f32) - EPSF;
+            let pz1 = ((qz1 - oz) as f32) + EPSF;
+            let py0 = my0 - EPSF;
+            let py1 = my1 + EPSF;
+            let n_blocks = (n + 7) >> 3;
+            let rem = n - ((n_blocks - 1) << 3);
+            let lane_mask: u32 = if rem >= 8 {
+                u32::MAX
+            } else {
+                (1u32 << rem) - 1
+            };
+            // SAFETY: as scan_cells — AVX2 detected, in-bounds blocked-SoA,
+            // tail lanes masked, padded lanes self-reject.
+            unsafe {
+                avx2::scan_blocks(
+                    bx, ids, Some((keys, out_keys)), n_blocks, lane_mask, px0, px1, pz0, pz1,
+                    py0, py1, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out,
+                );
+            }
+            return;
+        }
+    }
+    for i in 0..n {
+        if exact_keep(bx, i, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
+            out.push(ids[i]);
+            out_keys.push(keys[i]);
+        }
+    }
 }

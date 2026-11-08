@@ -394,6 +394,36 @@ struct Oversize {
     seq: i64,
 }
 
+/// Cells below this member count scan whole (a 2x2 split cannot amortize).
+const QUAD_MIN: usize = 16;
+
+/// Quadrant sub-partition of one cell (doc 37). Cells with QUAD_MIN+
+/// members carry a 4x4 XZ split of their blocked-SoA population: sub-store
+/// q holds the members whose stored-f32 box CENTER falls in the 4x4-block
+/// tile (xb = q&3, zb = q>>2; ranges xb*4..xb*4+4 cell-relative). Each
+/// sub-store is a self-contained blocked-SoA run in the same (sy,seq)
+/// order as the parent layout (stable partition), so a query scanning one
+/// sub-store emits the vanilla-ordered survivors directly and a
+/// multi-store query merges through the per-candidate kb keys carried in
+/// `keys` — no idmap probes in the merge (it was 283 ns/query through
+/// order_key_of; the 4-way keyed merge is ~30 ns).
+///
+/// SKIP PROOF (no false negatives): a member of tile q has f64 center c
+/// in [xb*4, xb*4+4) and stored half-span <= mh[q] (+f32 rounding,
+/// covered by the doc-21 EPSF=1e-2 slack, 1000x above ULP(24)). If the
+/// query box margin-expanded by mh[q]+EPSF is disjoint from the tile
+/// range, every member's exact f64 test fails on that axis — the member
+/// cannot survive, so skipping the tile drops nothing.
+struct Quad {
+    mh: [f64; 16],    // per-tile max stored half-span (f64 from f32s)
+    nb: [u32; 16],    // candidates per tile
+    off: [u32; 16],   // id offset into ids/keys
+    boff: [u32; 16],  // block offset into bx
+    ids: Vec<i64>,    // tile-major, (sy,seq) order inside each tile
+    keys: Vec<i64>,   // per-candidate kb sort key ((sy biased)<<40 | seq)
+    bx: Vec<f32>,     // blocked-SoA, tile-major
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub entities: usize,
@@ -437,6 +467,11 @@ pub struct EntityIndex {
                          // order version (bumped on change), high32 = the
                          // version the layout was last sorted to. One load
                          // + one compare per query cell (was two loads).
+    cell_quad: Vec<Option<Box<Quad>>>, // 4x4 XZ sub-partition (doc 37)
+    // scratch for the multi-tile keyed merge (reused, never reallocs hot)
+    merge_ids: Vec<i64>,
+    merge_keys: Vec<i64>,
+    merge_segs: Vec<(usize, usize, usize, usize)>, // (out0, out1, key0, key1)
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
     cell_ids: Vec<Vec<i64>>,
     cell_box: Vec<Vec<f32>>,   // blocked-SoA: blocks of 48 f32 (simd.rs)
@@ -459,6 +494,10 @@ impl EntityIndex {
             sy: Vec::new(),
             seq: Vec::new(),
             cell_vers: vec![0], // cell 0 unused
+            cell_quad: vec![None],
+            merge_ids: Vec::new(),
+            merge_keys: Vec::new(),
+            merge_segs: Vec::new(),
             cell_ids: vec![Vec::new()], // cell 0 unused
             cell_box: vec![Vec::new()],
             cell_slots: vec![Vec::new()],
@@ -641,6 +680,11 @@ impl EntityIndex {
         self.cell_slots.truncate(1);
         self.cell_vers.truncate(1);
         self.cell_vers[0] = 0;
+        self.cell_quad.truncate(1);
+        self.cell_quad[0] = None;
+        self.merge_ids.clear();
+        self.merge_keys.clear();
+        self.merge_segs.clear();
         self.cellmap = CellMap::new(1 << 12);
         self.idmap = IdMap::new(1 << 12);
         self.oversize.clear();
@@ -703,10 +747,101 @@ impl EntityIndex {
                 // vanilla order for this cell's members (versioned; no-op
                 // when the layout is already current)
                 self.ensure_cell_order(cid as u32);
-                let ids = &self.cell_ids[cid];
-                let bx = &self.cell_box[cid];
                 let (ox, oz) = cell_origin(cx, cz);
-                simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+                // QUADRANT SUB-PARTITION (doc 37): dense cells scan only the
+                // 2x2 XZ sub-stores the margin-expanded box can touch — a
+                // provable superset skip (Quad doc), survivors in the same
+                // (sy,seq) order as the parent layout
+                let mut cell_sources = 0usize;
+                match self.cell_quad[cid].as_ref() {
+                    Some(q) => {
+                        const QEPS: f64 = 1.0e-2; // doc-21 slack (f32 storage)
+                        let rel_x0 = qx0 - ox;
+                        let rel_x1 = qx1 - ox;
+                        let rel_z0 = qz0 - oz;
+                        let rel_z1 = qz1 - oz;
+                        self.merge_segs.clear();
+                        for qb in 0..16 {
+                            let nq = q.nb[qb] as usize;
+                            if nq == 0 {
+                                continue;
+                            }
+                            let mh = q.mh[qb] + QEPS;
+                            let xl = ((qb & 3) * 4) as f64;
+                            let zl = ((qb >> 2) * 4) as f64;
+                            // skip only when provably disjoint (Quad doc:
+                            // center-bucketing + mh expansion + EPSF slack)
+                            if rel_x1 + mh < xl
+                                || rel_x0 - mh > xl + 4.0
+                                || rel_z1 + mh < zl
+                                || rel_z0 - mh > zl + 4.0
+                            {
+                                continue;
+                            }
+                            let before = out.len();
+                            let kbefore = self.merge_keys.len();
+                            let s = q.off[qb] as usize;
+                            let bo = q.boff[qb] as usize * BLOCK_F32;
+                            simd::scan_cells_keys(
+                                &q.bx[bo..],
+                                &q.ids[s..],
+                                &q.keys[s..],
+                                nq,
+                                ox,
+                                oz,
+                                qx0,
+                                qx1,
+                                qz0,
+                                qz1,
+                                my0,
+                                my1,
+                                out,
+                                &mut self.merge_keys,
+                            );
+                            if out.len() != before {
+                                self.merge_segs
+                                    .push((before, out.len(), kbefore, self.merge_keys.len()));
+                                cell_sources += 1;
+                            }
+                        }
+                        // multi-tile merge: the emitting segments are each
+                        // (sy,seq)-ascending; interleave them by key. The
+                        // keys ride with the tile stores — no idmap probes
+                        // (the order_key_of sort cost ~283 ns/query).
+                        if cell_sources > 1 {
+                            let base_out = self.merge_segs[0].0;
+                            self.merge_ids.clear();
+                            loop {
+                                let mut picked = usize::MAX;
+                                let mut bestk = i64::MAX;
+                                for si in 0..self.merge_segs.len() {
+                                    let (o0, o1, k0, _k1) = self.merge_segs[si];
+                                    if o0 < o1 {
+                                        let k = self.merge_keys[k0];
+                                        if k < bestk {
+                                            bestk = k;
+                                            picked = si;
+                                        }
+                                    }
+                                }
+                                if picked == usize::MAX {
+                                    break;
+                                }
+                                let (o0, o1, k0, k1) = self.merge_segs[picked];
+                                self.merge_ids.push(out[o0]);
+                                self.merge_segs[picked] = (o0 + 1, o1, k0 + 1, k1);
+                            }
+                            for (i, &id) in self.merge_ids.iter().enumerate() {
+                                out[base_out + i] = id;
+                            }
+                        }
+                    }
+                    None => {
+                        let ids = &self.cell_ids[cid];
+                        let bx = &self.cell_box[cid];
+                        simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+                    }
+                }
             }
         }
         let mut any_ov = false;
@@ -718,8 +853,9 @@ impl EntityIndex {
         }
         if any_ov {
             // Oversize entities live in vanilla sections interleaved with
-            // the cell population; restore the exact global order. Rare —
-            // the oversize list is empty in every bench scenario.
+            // the cell population; restore the exact global order (rare —
+            // the oversize list is empty in every bench scenario). Multi-tile
+            // quad merges already restore the vanilla order per cell.
             let mut keyed: Vec<(i64, i64, i64)> = out
                 .iter()
                 .map(|&id| {
@@ -794,6 +930,119 @@ impl EntityIndex {
         }
         let v = self.cell_vers[c] & 0xFFFF_FFFF;
         self.cell_vers[c] = v | (v << 32);
+        // (re)build the 2x2 XZ quadrant sub-stores for dense cells — the
+        // amortized tail of the same lazy versioned rebuild the scan order
+        // uses; small cells scan whole (a split cannot amortize there)
+        if n >= QUAD_MIN {
+            self.build_quad(c);
+        } else {
+            self.cell_quad[c] = None;
+        }
+    }
+
+    /// Build the quadrant sub-stores of cell `c` from its CURRENT (sy,seq)
+    /// sorted layout: stable partition by stored-f32 box center, so each
+    /// 4x4-block tile run keeps the parent's vanilla order. O(n) copies.
+    fn build_quad(&mut self, c: usize) {
+        let bx = &self.cell_box[c];
+        let ids = &self.cell_ids[c];
+        let slots = &self.cell_slots[c];
+        let n = ids.len();
+        debug_assert!(n >= QUAD_MIN);
+        let mut cnt = [0usize; 16];
+        let mut mh = [0.0f64; 16];
+        // pass 1: tile + per-tile max stored half-span
+        for p in 0..n {
+            let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            let x0 = bx[base] as f64;
+            let z0 = bx[base + 16] as f64;
+            let x1 = bx[base + 24] as f64;
+            let z1 = bx[base + 40] as f64;
+            // linear band index floor(center/4): the f32-sum x0+x1 is twice
+            // the stored center, so band = floor(sum/8); clamp covers the
+            // center==16.0 rounding edge (homedy keeps the f64 center in
+            // [0,16), the f32 sum can round a 15.99… center to exactly 16)
+            let tx = (((x0 + x1) * 0.125) as usize).min(3);
+            let tz = (((z0 + z1) * 0.125) as usize).min(3);
+            let qb = tx | (tz << 2);
+            let hx = (x1 - x0) * 0.5;
+            let hz = (z1 - z0) * 0.5;
+            let h = if hx > hz { hx } else { hz };
+            if h > mh[qb] {
+                mh[qb] = h;
+            }
+            cnt[qb] += 1;
+        }
+        // pass 2: tile-major blocked-SoA sub-stores (exact f32 copies) with
+        // the per-candidate vanilla order key for the no-probe merge
+        let mut off = [0u32; 16];
+        let mut boff = [0u32; 16];
+        let mut run_id = 0usize;
+        let mut run_blk = 0usize;
+        for q in 0..16 {
+            off[q] = run_id as u32;
+            boff[q] = run_blk as u32;
+            run_id += cnt[q];
+            run_blk += (cnt[q] + 7) >> 3;
+        }
+        let mut qids = vec![0i64; run_id];
+        let mut qkeys = vec![0i64; run_id];
+        let mut qbx = vec![0.0f32; run_blk * BLOCK_F32];
+        let mut wr = [0usize; 16];
+        for p in 0..n {
+            let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            let x0 = bx[base];
+            let y0 = bx[base + 8];
+            let z0 = bx[base + 16];
+            let x1 = bx[base + 24];
+            let y1 = bx[base + 32];
+            let z1 = bx[base + 40];
+            let cx2 = x0 as f64 + x1 as f64;
+            let cz2 = z0 as f64 + z1 as f64;
+            let tx = ((cx2 * 0.125) as usize).min(3);
+            let tz = ((cz2 * 0.125) as usize).min(3);
+            let qb = tx | (tz << 2);
+            let slot = slots[p] as usize;
+            let kb = ((((self.sy[slot] as i64) + 2097152) & 0x3F_FFFF) << 40)
+                | (self.seq[slot] & 0xFFFF_FFFF);
+            let i = wr[qb];
+            wr[qb] += 1;
+            let dbase = (boff[qb] as usize + (i >> 3)) * BLOCK_F32 + (i & 7);
+            qbx[dbase] = x0;
+            qbx[dbase + 8] = y0;
+            qbx[dbase + 16] = z0;
+            qbx[dbase + 24] = x1;
+            qbx[dbase + 32] = y1;
+            qbx[dbase + 40] = z1;
+            let didx = off[qb] as usize + i;
+            qids[didx] = ids[p];
+            qkeys[didx] = kb;
+        }
+        // self-rejecting pad for the free lanes of each tile's tail block
+        for q in 0..16 {
+            let rem = cnt[q] & 7;
+            if rem != 0 {
+                let tb = (boff[q] as usize + ((cnt[q] + 7) >> 3) - 1) * BLOCK_F32;
+                for l in rem..8 {
+                    qbx[tb + l] = PAD_X0;
+                    qbx[tb + 24 + l] = PAD_X1;
+                }
+            }
+        }
+        self.cell_quad[c] = Some(Box::new(Quad {
+            mh,
+            nb: [
+                cnt[0] as u32, cnt[1] as u32, cnt[2] as u32, cnt[3] as u32,
+                cnt[4] as u32, cnt[5] as u32, cnt[6] as u32, cnt[7] as u32,
+                cnt[8] as u32, cnt[9] as u32, cnt[10] as u32, cnt[11] as u32,
+                cnt[12] as u32, cnt[13] as u32, cnt[14] as u32, cnt[15] as u32,
+            ],
+            off,
+            boff,
+            ids: qids,
+            keys: qkeys,
+            bx: qbx,
+        }));
     }
 
     /// Physically rebuild one cell's blocked-SoA arrays in the given slot
@@ -1001,6 +1250,7 @@ impl EntityIndex {
         self.cell_slots.push(Vec::new());
         self.cell_keys.push(key);
         self.cell_vers.push(0);
+        self.cell_quad.push(None);
         let id = (self.cell_keys.len() - 1) as u32;
         self.cellmap.insert(key, id);
         self.stats.cells += 1;

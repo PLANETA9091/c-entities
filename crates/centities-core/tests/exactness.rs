@@ -343,3 +343,170 @@ fn packed_window_is_conservative() {
         );
     }
 }
+
+/// DOC 37 quadrant sub-partition: dense cells (>= QUAD_MIN members) carry a
+/// 2x2 XZ split. Contract under mutation storm:
+///   1. no-miss vs brute force (the skip is a provable superset),
+///   2. the emitted order equals the (sy,seq) reference stream exactly —
+///      single-quadrant hits stream directly, multi-quadrant hits merge,
+///   3. scalar and AVX2 scans produce IDENTICAL sequences on the quad path.
+#[test]
+fn quadrant_dense_cells_no_miss_and_order() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut idx = EntityIndex::new();
+    // live entities with their ACTUAL ord stamps (re-upsert re-stamps)
+    let mut live: Vec<(i64, u16, Aabb, i64)> = Vec::new();
+    let mut seq: i64 = 0;
+
+    let mut up = |idx: &mut EntityIndex,
+                  live: &mut Vec<(i64, u16, Aabb, i64)>,
+                  seq: &mut i64,
+                  id: i64,
+                  x: f64,
+                  z: f64| {
+        let b = Aabb::new(x - 0.3, 64.0, z - 0.3, x + 0.3, 65.8, z + 0.3);
+        *seq += 1;
+        let ev = idx.upsert_ord(id, 0, &b, 4, *seq);
+        let _ = ev;
+        // vanilla re-append semantics: a re-upserted entity takes a NEW
+        // ORD_SEQ stamp and moves to the END of the scan order
+        if let Some(p) = live.iter().position(|e| e.0 == id) {
+            live.remove(p);
+        }
+        live.push((id, 0, b, *seq));
+    };
+
+    // dense cluster: 500 mobs in a 30x30 area -> 4 cells, each well above
+    // QUAD_MIN, boxes cross the quadrant mid-lines constantly
+    let mut id: i64 = 1;
+    for _ in 0..500 {
+        let x = rng.f64in(92.0, 122.0);
+        let z = rng.f64in(92.0, 122.0);
+        up(&mut idx, &mut live, &mut seq, id, x, z);
+        id += 1;
+    }
+    // half the cluster must carry quads: both dense (>=16) cells kinds
+    idx.check_invariants();
+
+    let mut verify = |idx: &mut EntityIndex, live: &[(i64, u16, Aabb, i64)], q: &Aabb| {
+        // brute force hit set
+        let want: HashSet<i64> = live
+            .iter()
+            .filter(|(_, w, b, _)| *w == 0 && b.intersects(q))
+            .map(|(id, _, _, _)| *id)
+            .collect();
+        // reference ORDER: the full vanilla EntityLookup key —
+        // (chunkZ, chunkX, sectionY, insertion seq), the same key shape the
+        // index sorts by. sy=4 for every entity here; cell coords from the
+        // box center (>> CELL_SHIFT=4).
+        const B: i64 = 1 << 20;
+        const M: i64 = 0x3F_FFFF;
+        let mut want_ord: Vec<(i64, i64, i64)> = live
+            .iter()
+            .filter(|(id, _, _, _)| want.contains(id))
+            .map(|(id, _, b, sq)| {
+                let cx = (b.center_x().floor() as i64) >> 4;
+                let cz = (b.center_z().floor() as i64) >> 4;
+                let ka = (((cz + B) & M) << 22) | ((cx + B) & M);
+                let kb = (((4i64 + B) & M) << 40) | (sq & 0xFFFF_FFFF);
+                (ka, kb, *id)
+            })
+            .collect();
+        want_ord.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let want_ord: Vec<i64> = want_ord.into_iter().map(|(_, _, id)| id).collect();
+        // AVX2 run
+        centities_core::simd::set_simd_mode(2);
+        let mut got_avx2 = Vec::new();
+        idx.query(0, q, &mut got_avx2);
+        // scalar run
+        centities_core::simd::set_simd_mode(1);
+        let mut got_scalar = Vec::new();
+        idx.query(0, q, &mut got_scalar);
+        centities_core::simd::set_simd_mode(0);
+        assert_eq!(
+            got_avx2, got_scalar,
+            "scalar/AVX2 divergence on quad path for {q:?}"
+        );
+        let got_set: HashSet<i64> = got_avx2.iter().copied().collect();
+        let missed: Vec<i64> = want.difference(&got_set).copied().collect();
+        if !missed.is_empty() {
+            for m in &missed {
+                let (_, _, mb, _) = live.iter().find(|e| e.0 == *m).unwrap();
+                let cellx = (mb.center_x().floor() as i64) >> 4;
+                let cellz = (mb.center_z().floor() as i64) >> 4;
+                let ox = (cellx * 16) as f64;
+                let oz = (cellz * 16) as f64;
+                let rx0 = mb.x0 - ox;
+                let rz0 = mb.z0 - oz;
+                let rx1 = mb.x1 - ox;
+                let rz1 = mb.z1 - oz;
+                let cx2 = (rx0 as f32 as f64) + (rx1 as f32 as f64);
+                let cz2 = (rz0 as f32 as f64) + (rz1 as f32 as f64);
+                let tx = ((cx2 * 0.125) as usize).min(3);
+                let tz = ((cz2 * 0.125) as usize).min(3);
+                let qb = tx | (tz << 2);
+                let hx = (rx1 as f32 as f64 - rx0 as f32 as f64) * 0.5;
+                let hz = (rz1 as f32 as f64 - rz0 as f32 as f64) * 0.5;
+                println!(
+                    "MISSED {m}: box=({:.4},{:.4})..({:.4},{:.4}) cell=({cellx},{cellz}) tile={qb} hx={hx:.4} hz={hz:.4} rel=({rx0:.4},{rz0:.4})..({rx1:.4},{rz1:.4})",
+                    mb.x0, mb.z0, mb.x1, mb.z1
+                );
+                println!("  query rel: ({:.4},{:.4})..({:.4},{:.4})", q.x0 - ox, q.z0 - oz, q.x1 - ox, q.z1 - oz);
+                let xl = ((qb & 3) * 4) as f64;
+                let zl = ((qb >> 2) * 4) as f64;
+                println!(
+                    "  tile range x[{xl},{:.0}] z[{zl},{:.0}]; query+mh must overlap tile: x1+mh<xl? z1+mh<zl? x0-mh>xl+4? z0-mh>zl+4?",
+                    xl + 4.0,
+                    zl + 4.0
+                );
+            }
+            panic!("quad path missed {missed:?} for query {q:?}");
+        }
+        // the query returns a margin-expanded SUPERSET (the Java shim
+        // re-checks exact f64 intersection); the order contract binds the
+        // exact-hit subsequence: filtered extras must reproduce the
+        // vanilla (chunkZ, chunkX, sy, seq) stream exactly
+        let common: Vec<i64> = got_avx2
+            .iter()
+            .copied()
+            .filter(|id| want.contains(id))
+            .collect();
+        assert_eq!(
+            common, want_ord,
+            "quad path order diverged from the vanilla key reference"
+        );
+    };
+
+    // mutation storm with interleaved verification queries
+    for round in 0..4000u64 {
+        let op = rng.next() % 100;
+        if op < 60 {
+            let pick = rng.i64in(1, 700);
+            let x = rng.f64in(88.0, 126.0);
+            let z = rng.f64in(88.0, 126.0);
+            up(&mut idx, &mut live, &mut seq, pick, x, z);
+        } else if op < 80 && !live.is_empty() {
+            let i = (rng.next() as usize) % live.len();
+            let (rid, _, _, _) = live.remove(i);
+            idx.remove(rid);
+        } else {
+            let qx = rng.f64in(86.0, 128.0);
+            let qz = rng.f64in(86.0, 128.0);
+            let w = rng.f64in(0.5, 24.0);
+            let q = Aabb::new(qx, 60.0, qz, qx + w, 70.0, qz + w);
+            verify(&mut idx, &live, &q);
+        }
+        if round % 500 == 499 {
+            idx.check_invariants();
+        }
+    }
+    // final sweep: wide, boundary-hugging, and degenerate boxes
+    for _ in 0..300 {
+        let qx = rng.f64in(84.0, 130.0);
+        let qz = rng.f64in(84.0, 130.0);
+        let w = rng.f64in(0.0, 48.0);
+        let q = Aabb::new(qx, 60.0, qz, qx + w, 70.0, qz + w);
+        verify(&mut idx, &live, &q);
+    }
+    idx.check_invariants();
+}
