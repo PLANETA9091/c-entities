@@ -87,3 +87,37 @@ floor 42% | pack 28.9% | acts 20.4% | reslv 8.7%.
   5.71 vs real total p50 5.12) — the honest per-phase ms/tick needs the
   perf lane (blocked: no root in this sandbox; CI native-profile keeps
   the perf attempt per commit).
+
+## Wave3 (same session): delta-pack — the scratch maintained, not rebuilt
+
+The wave2 split said pack 28.9% — but the real cost hides in the round-0
+FULL pack every mob pays (idle mobs: 1 round = full pack; they are the
+majority). Wave3 makes the scratch a MAINTAINED mirror instead of a
+rebuilt snapshot:
+
+- `apply_actions(out, players, packed: Some(scratch))` mirrors EVERY
+  mutation into the packed word(s) it owns (running, goal states, the
+  LOOKAT state word via the shared `packed_lookat_state`, no_action,
+  nav_state, mf-has-target).
+- The request arm mirrors the mutations that live OUTSIDE apply:
+  `repack_goal_words(gi)` after the resolver's start_vanilla and the
+  melee canUse lastCanUseCheck write; `scratch[1] = MF_BASE` when the
+  cc-chain drops the target.
+- Rounds 2+ (`cursor != 0`) write ONLY the round-variable words:
+  cursor/mf/no_action/nav_state/seed/res-op/xyz — ~11 words instead of
+  134 (12× fewer).
+
+**The invariant probe** (debug builds only): every delta round packs a
+fresh FULL probe and asserts word-for-word equality — the FIRST run of
+the probe caught two real drifts (the melee state write and the
+resolver-start mutations), fixed, and now every debug test is a delta
+gate. Release keeps only the ~11-word delta.
+
+Result (8-run medians, same box/seed): p50 5.06 → **4.78 ms/tick**
+(total now **−41%** vs the 8.06 baseline; chasing still 3036,
+bit-identical). Split after wave3: pack 28.5% | floor 42.4% |
+reslv 8.3% | acts 20.8% — the pack share barely moved because the
+round-0 full pack (the idle majority) is untouched; wave4 candidates:
+(1) per-mob RESIDENT pack (write the 96 static words once at add_mob,
+~50 mutable words per tick), (2) the floor's internal walk arithmetic
+(pure function — parity-gated rewrite).

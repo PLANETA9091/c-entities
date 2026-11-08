@@ -387,6 +387,49 @@ pub const fn out_len() -> usize {
 const OUT_RESET: usize = 9;
 
 impl MobAI {
+    /// The packed LOOKAT state word (wave3: shared by pack_into AND the
+    /// apply-mirror — one formula, no drift): live state bits 0..30, the
+    /// has-lookat bit 31, the within-look-range bit 30.
+    #[inline]
+    fn packed_lookat_state(&self, gi: usize, players: &[PlayerSnap]) -> i32 {
+        let rec = &self.goals[gi];
+        let mut st = (rec.state as u32 & 0x3FFF_FFFF) as i32;
+        if self.lookat_player >= 0 {
+            st |= 1 << 31;
+            if let Some(p) = players.get(self.lookat_player as usize) {
+                let dx = self.x - p.x;
+                let dy = self.y - p.y;
+                let dz = self.z - p.z;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                let range = LOOK_DIST as f64;
+                if d2 <= range * range {
+                    st |= 1 << 30;
+                }
+            }
+        }
+        st
+    }
+    /// WAVE3: re-derive the packed words the REQUEST ARM can mutate
+    /// (outside apply_actions): the goal's running/state pair, no_action,
+    /// nav_state. Called after the resolver's start_vanilla and the
+    /// melee canUse state write — resolver-agnostic (repacks from LIVE
+    /// state, which is what a fresh pack would read).
+    #[inline]
+    fn repack_goal_words(&self, gi: usize, b: &mut [i32], players: &[PlayerSnap]) {
+        let o = g::IN_HEADER + gi * g::GOAL_STRIDE;
+        b[o + 4] = self.goals[gi].running as i32;
+        b[o + 5] = match self.goals[gi].kind {
+            g::GK_LOOKAROUND
+            | g::GK_ZOMBIE_ATTACK
+            | g::GK_HURT_BY
+            | g::GK_MOVE_THROUGH_VILLAGE => self.goals[gi].state,
+            g::GK_LOOKAT_PLAYER => self.packed_lookat_state(gi, players),
+            _ => 0,
+        };
+        b[4] = self.no_action;
+        b[11] = self.nav_state;
+    }
+
     /// Pack the aiPack wire format into a CALLER buffer (wave2: zero
     /// alloc — the executor owns one scratch, reused across all mobs and
     /// rounds). Writes exactly `need` words; the caller may pass a longer
@@ -453,25 +496,7 @@ impl MobAI {
                 | g::GK_ZOMBIE_ATTACK
                 | g::GK_HURT_BY
                 | g::GK_MOVE_THROUGH_VILLAGE => rec.state,
-                g::GK_LOOKAT_PLAYER => {
-                    let mut st = (rec.state as u32 & 0x3FFF_FFFF) as i32;
-                    if self.lookat_player >= 0 {
-                        // alive bit + within-range bit (the open ground:
-                        // every player is alive; range = lookDistance)
-                        st |= 1 << 31;
-                        if let Some(p) = players.get(self.lookat_player as usize) {
-                            let dx = self.x - p.x;
-                            let dy = self.y - p.y;
-                            let dz = self.z - p.z;
-                            let d2 = dx * dx + dy * dy + dz * dz;
-                            let range = LOOK_DIST as f64;
-                            if d2 <= range * range {
-                                st |= 1 << 30;
-                            }
-                        }
-                    }
-                    st
-                }
+                g::GK_LOOKAT_PLAYER => self.packed_lookat_state(i, players),
                 _ => 0,
             };
             b[o + 6] = rec.cfg2;
@@ -513,18 +538,36 @@ impl MobAI {
     }
 
     /// Apply the emitted actions to the live state (the aiApply mirror).
-    fn apply_actions(&mut self, out: &[i32], players: &[PlayerSnap]) {
+    /// WAVE3: `packed` — the shared aiPack scratch; EVERY mutation here
+    /// mirrors into the packed word(s) it owns, so the next round's
+    /// delta-pack can skip the full rebuild: the invariant
+    /// "scratch == what pack_into would write" holds by construction
+    /// (single write site per field). The twin gate
+    /// (reused_out_buffer_matches_fresh_zero) pins this bit-for-bit.
+    fn apply_actions(
+        &mut self,
+        out: &[i32],
+        players: &[PlayerSnap],
+        mut packed: Option<&mut [i32]>,
+    ) {
         let n = out[5].max(0) as usize;
         for a in 0..n {
             let b = g::OUT_HEADER + a * g::OUT_ACT;
             let op = out[b];
             let p0 = out[b + 1] as usize;
             let p1 = out[b + 2];
+            // the packed-word mirror (goal record base + the two live
+            // words every mutation can touch)
+            let gw = p0 * g::GOAL_STRIDE;
             match op {
                 g::ACT_GOAL_START => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = true;
                         self.no_action = 0;
+                        if let Some(b) = packed.as_deref_mut() {
+                            b[g::IN_HEADER + gw + 4] = 1;
+                            b[4] = self.no_action;
+                        }
                         // the start BODIES the executor runs itself (the
                         // engine emitted the transition, vanilla runs
                         // start() inline — aiApply: lockWrite + wg.start()):
@@ -533,6 +576,10 @@ impl MobAI {
                             // adjustedTickDelay(40), no RNG (javap 26.3)
                             g::GK_LOOKAT_PLAYER => {
                                 self.goals[p0].state = 40;
+                                if let Some(b) = packed.as_deref_mut() {
+                                    b[g::IN_HEADER + gw + 5] =
+                                        self.packed_lookat_state(p0, players);
+                                }
                             }
                             // RandomStrollGoal.start(): navigation.moveTo(
                             //   wantedPos, speedModifier) — the position the
@@ -541,6 +588,9 @@ impl MobAI {
                                 self.nav_state = g::NAV_PATH_ACTIVE;
                                 self.nav_x = self.pend_x;
                                 self.nav_z = self.pend_z;
+                                if let Some(b) = packed.as_deref_mut() {
+                                    b[11] = self.nav_state;
+                                }
                             }
                             _ => {}
                         }
@@ -550,10 +600,16 @@ impl MobAI {
                 g::ACT_GOAL_STOP | g::ACT_GOAL_STOP_D => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = false;
+                        if let Some(b) = packed.as_deref_mut() {
+                            b[g::IN_HEADER + gw + 4] = 0;
+                        }
                         if self.goals[p0].kind == g::GK_STROLL
                             && self.nav_state == g::NAV_PATH_ACTIVE
                         {
                             self.nav_state = g::NAV_NONE;
+                            if let Some(b) = packed.as_deref_mut() {
+                                b[11] = self.nav_state;
+                            }
                         }
                     }
                 }
@@ -561,11 +617,17 @@ impl MobAI {
                 g::ACT_LOOK_TICK_AROUND => {
                     if p0 < N_GOALS {
                         self.goals[p0].state = p1;
+                        if let Some(b) = packed.as_deref_mut() {
+                            b[g::IN_HEADER + gw + 5] = p1;
+                        }
                     }
                 }
                 g::ACT_LOOK_TICK_AT => {
                     if p0 < N_GOALS {
                         self.goals[p0].state = p1;
+                        if let Some(b) = packed.as_deref_mut() {
+                            b[g::IN_HEADER + gw + 5] = self.packed_lookat_state(p0, players);
+                        }
                     }
                 }
                 g::ACT_REF_SET_PLAYER => {
@@ -576,6 +638,10 @@ impl MobAI {
                                 if p1 < 0 {
                                     self.goals[p0].state &= !((1 << 31) | (1 << 30));
                                 }
+                                if let Some(b) = packed.as_deref_mut() {
+                                    b[g::IN_HEADER + gw + 5] =
+                                        self.packed_lookat_state(p0, players);
+                                }
                             }
                             g::GK_NEAREST_TARGET => {
                                 self.target_player = p1;
@@ -584,6 +650,15 @@ impl MobAI {
                                         self.approach_x = p.x;
                                         self.approach_z = p.z;
                                     }
+                                }
+                                // the mf word rides target_player
+                                if let Some(b) = packed.as_deref_mut() {
+                                    b[1] = MF_BASE
+                                        | if self.target_player >= 0 {
+                                            g::MF_HAS_TARGET
+                                        } else {
+                                            0
+                                        };
                                 }
                             }
                             _ => {}
@@ -639,9 +714,66 @@ impl MobAI {
         for _round in 0..32 {
             {
                 let _p = crate::ledger::sg_pack();
-                self.pack_into(
-                    scratch, players, game_time, cursor, res, req_op, rx, ry, rz,
-                );
+                if cursor == 0 {
+                    self.pack_into(
+                        scratch, players, game_time, cursor, res, req_op, rx, ry, rz,
+                    );
+                } else {
+                    // WAVE3 delta-pack: rounds 2+ rewrite ONLY the round-
+                    // variable words. Everything else is either static per
+                    // tick (id/tick_count/counts/game_time/positions/
+                    // players/goal cfg words) or mirrored into the scratch
+                    // by apply_actions at the exact mutation site (running,
+                    // states, no_action, nav_state, mf) — the invariant
+                    // "scratch == what pack_into would write" holds by
+                    // construction. DEBUG probe below fails any drift.
+                    let b: &mut [i32] = scratch;
+                    b[0] = cursor;
+                    b[1] = MF_BASE
+                        | if self.target_player >= 0 {
+                            g::MF_HAS_TARGET
+                        } else {
+                            0
+                        };
+                    b[4] = self.no_action;
+                    b[11] = self.nav_state;
+                    b[g::IN_SEED_LO] = self.seed as i32;
+                    b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
+                    b[g::IN_RES] = res;
+                    b[g::IN_RES_OP] = req_op;
+                    put_f64(b, g::IN_RES_X, rx);
+                    put_f64(b, g::IN_RES_X + 2, ry);
+                    put_f64(b, g::IN_RES_X + 4, rz);
+                    #[cfg(debug_assertions)]
+                    {
+                        // the wave3 invariant probe: a fresh FULL pack must
+                        // equal the delta-maintained scratch, word for word
+                        // (the round-variable words differ ONLY where the
+                        // resolution result landed — which this fresh pack
+                        // also carries)
+                        let mut probe = scratch.to_vec();
+                        self.pack_into(
+                            &mut probe,
+                            players,
+                            game_time,
+                            cursor,
+                            res,
+                            req_op,
+                            rx,
+                            ry,
+                            rz,
+                        );
+                        let need =
+                            g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+                        for i in 0..need {
+                            assert_eq!(
+                                scratch[i],
+                                probe[i],
+                                "delta-pack drift at word {i} (round {cursor:x})"
+                            );
+                        }
+                    }
+                }
             }
             let st = {
                 let _f = crate::ledger::sg_floor();
@@ -652,7 +784,7 @@ impl MobAI {
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
             {
                 let _a = crate::ledger::sg_acts();
-                self.apply_actions(out, players);
+                self.apply_actions(out, players, Some(scratch));
             }
             if st == g::ST_FALLBACK {
                 stat.status = st;
@@ -696,6 +828,10 @@ impl MobAI {
                 g::REQ_START_VANILLA => {
                     if gi < N_GOALS {
                         r.start_vanilla(self, gi);
+                        // wave3: the resolver mutated live state (running,
+                        // state, no_action, nav_state) — re-derive the
+                        // packed words from it
+                        self.repack_goal_words(gi, scratch, players);
                     }
                     (1, 0.0, 0.0, 0.0)
                 }
@@ -708,6 +844,7 @@ impl MobAI {
                         // executor's (aiPackSel reads it live)
                         if pass && kind == g::GK_ZOMBIE_ATTACK {
                             self.goals[gi].state = game_time;
+                            self.repack_goal_words(gi, scratch, players);
                         }
                         (pass as i32, 0.0, 0.0, 0.0)
                     } else {
@@ -722,6 +859,8 @@ impl MobAI {
                             // the target/attack chain drops; the
                             // engine's next walk stops the goals
                             self.target_player = -1;
+                            // wave3: mf rides target_player
+                            scratch[1] = MF_BASE;
                         }
                         (cont as i32, 0.0, 0.0, 0.0)
                     } else {
