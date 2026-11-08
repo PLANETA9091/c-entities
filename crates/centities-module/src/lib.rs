@@ -318,6 +318,11 @@ fn publish(env: &JniEnv, st: &mut CeState) {
         let Some(key) = st.idx.cell_key_of(cell) else {
             continue;
         };
+        // PARITY ORDER: the published row is served by rowQuery in row
+        // order — bring the cell's physical layout to the vanilla
+        // (chunkZ, chunkX, sectionY, seq) order first (versioned no-op
+        // when the layout is already current).
+        st.idx.ensure_order(cell);
         let slot = row_slot(key);
         // L4c windowed rows: entries carry a conservative packed x-interval
         // (id + xLo + xHi, 1/1024-block units, cell-relative) so the Java row
@@ -2918,7 +2923,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     }
     push!(
         "queryNative",
-        "(IDDDDDD[JI[J[D)I",
+        "(IDDDDDD[JI[J[D[I[I)I",
         n_query
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -2934,11 +2939,13 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 i32,
                 jni::jlongArray,
                 jni::jdoubleArray,
+                jni::jintArray,
+                jni::jintArray,
             ) -> i32
     );
     push!(
         "queryNative2",
-        "(IDDDDDDI[J[D)I",
+        "(IDDDDDDI[J[D[I[I)I",
         n_query2
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -2953,6 +2960,8 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 i32,
                 jni::jlongArray,
                 jni::jdoubleArray,
+                jni::jintArray,
+                jni::jintArray,
             ) -> i32
     );
     push!(
@@ -3481,6 +3490,8 @@ unsafe fn locked_flush_query(
     bn: usize,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
+    batch_sy: jni::jintArray,
+    batch_seq: jni::jintArray,
     out: &mut Vec<i64>,
 ) -> bool {
     let mut g = match INDEX.lock() {
@@ -3495,22 +3506,25 @@ unsafe fn locked_flush_query(
             b.clear();
             b.resize(bn, 0);
             e.get_long_array_region(batch_ids, 0, bn as i32, &mut b);
-            for l in b.iter() {
-                if *l < 0 {
-                    let ev = st.idx.remove(*l & 0xFFFF_FFFF);
-                    st.note_remove(ev);
-                }
-            }
+            let mut syb: Vec<i32> = Vec::with_capacity(bn);
+            let mut seqb: Vec<i32> = Vec::with_capacity(bn);
+            syb.resize(bn, 0);
+            seqb.resize(bn, 0);
+            e.get_int_array_region(batch_sy, 0, bn as i32, &mut syb);
+            e.get_int_array_region(batch_seq, 0, bn as i32, &mut seqb);
             BBOXBUF.with(|bx| {
                 let mut bx = bx.borrow_mut();
                 bx.clear();
                 bx.resize(bn * 6, 0.0);
                 jni_get_double_array_region(e, batch_boxes, 0, (bn * 6) as i32, &mut bx);
                 for (i, l) in b.iter().enumerate() {
-                    if *l >= 0 {
+                    if *l < 0 {
+                        let ev = st.idx.remove(*l & 0xFFFF_FFFF);
+                        st.note_remove(ev);
+                    } else {
                         let wid = ((*l >> 32) & 0xFFFF) as u16;
                         let o = i * 6;
-                        let ev = st.idx.upsert(
+                        let ev = st.idx.upsert_ord(
                             *l & 0xFFFF_FFFF,
                             wid,
                             &centities_core::Aabb::new(
@@ -3521,6 +3535,8 @@ unsafe fn locked_flush_query(
                                 bx[o + 4],
                                 bx[o + 5],
                             ),
+                            syb[i],
+                            seqb[i] as i64,
                         );
                         st.note_upsert(ev);
                     }
@@ -3553,6 +3569,8 @@ pub extern "system" fn n_query(
     batch_n: i32,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
+    batch_sy: jni::jintArray,
+    batch_seq: jni::jintArray,
 ) -> i32 {
     // FLUSH-MERGED QUERY (iteration 3): the caller's pending probe batch is
     // applied under the SAME lock acquisition right before the query — one
@@ -3578,6 +3596,8 @@ pub extern "system" fn n_query(
                     bn,
                     batch_ids,
                     batch_boxes,
+                    batch_sy,
+                    batch_seq,
                     &mut q,
                 ) {
                     Some(q.len() as i32)
@@ -3678,6 +3698,8 @@ pub extern "system" fn n_query2(
     batch_n: i32,
     batch_ids: jni::jlongArray,
     batch_boxes: jni::jdoubleArray,
+    batch_sy: jni::jintArray,
+    batch_seq: jni::jintArray,
 ) -> i32 {
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
@@ -3697,6 +3719,8 @@ pub extern "system" fn n_query2(
                     bn,
                     batch_ids,
                     batch_boxes,
+                    batch_sy,
+                    batch_seq,
                     &mut q,
                 ) {
                     Some(q.len() as i32)
@@ -3817,7 +3841,7 @@ pub extern "system" fn n_flush(
                         box_buf[o + 4],
                         box_buf[o + 5],
                     );
-                    let ev = st.idx.upsert(id, wid, &b);
+                    let ev = st.idx.upsert_ord(id, wid, &b, sy_buf[i], seq_buf[i] as i64);
                     st.note_upsert(ev);
                     if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
                         let evicted = st.push.upsert(

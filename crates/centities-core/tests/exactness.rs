@@ -34,7 +34,7 @@ fn brute_force(entities: &[(i64, u16, Aabb)], world: u16, q: &Aabb) -> HashSet<i
 }
 
 /// The no-miss check: every brute-force hit must be in the index result.
-fn assert_no_miss(index: &EntityIndex, entities: &[(i64, u16, Aabb)], world: u16, q: &Aabb) {
+fn assert_no_miss(index: &mut EntityIndex, entities: &[(i64, u16, Aabb)], world: u16, q: &Aabb) {
     index.check_invariants();
     let mut got = Vec::new();
     index.query(world, q, &mut got);
@@ -92,8 +92,8 @@ fn exactness_random_small_world() {
                 qy + rng.f64in(0.0, 40.0),
                 qz + rng.f64in(0.0, 40.0),
             );
-            assert_no_miss(&idx, &entities, 0, &q);
-            assert_no_miss(&idx, &entities, 1, &q);
+            assert_no_miss(&mut idx, &entities, 0, &q);
+            assert_no_miss(&mut idx, &entities, 1, &q);
         }
         if round % 5_000 == 0 {
             for _ in 0..50 {
@@ -101,8 +101,8 @@ fn exactness_random_small_world() {
                 let qz = rng.f64in(-320.0, 300.0);
                 let w = rng.f64in(0.1, 130.0);
                 let q = Aabb::new(qx, -64.0, qz, qx + w, 320.0, qz + w);
-                assert_no_miss(&idx, &entities, 0, &q);
-                assert_no_miss(&idx, &entities, 1, &q);
+                assert_no_miss(&mut idx, &entities, 0, &q);
+                assert_no_miss(&mut idx, &entities, 1, &q);
             }
         }
     }
@@ -135,7 +135,7 @@ fn boundary_and_cluster_exactness() {
         let qz = 64.0 * ((rng.next() % 64) as f64) - 1_000.0;
         let w = 0.25 * ((rng.next() % 8) as f64);
         let q = Aabb::new(qx - w, 60.0, qz - w, qx + w, 70.0, qz + w);
-        assert_no_miss(&idx, &entities, 0, &q);
+        assert_no_miss(&mut idx, &entities, 0, &q);
     }
 }
 
@@ -181,7 +181,7 @@ fn remove_storm_keeps_exactness() {
         let qx = rng.f64in(-520.0, 500.0);
         let qz = rng.f64in(-520.0, 500.0);
         let q = Aabb::new(qx, 60.0, qz, qx + 8.0, 70.0, qz + 8.0);
-        assert_no_miss(&idx, &entities, 0, &q);
+        assert_no_miss(&mut idx, &entities, 0, &q);
     }
     assert_eq!(idx.stats().entities, 5_000);
 }
@@ -224,7 +224,7 @@ fn far_lands_coordinates_are_exact() {
         let qx = rng.f64in(29_998_900.0, 29_999_984.0);
         let qz = rng.f64in(-29_999_984.0, -29_998_900.0);
         let q = Aabb::new(qx, 60.0, qz, qx + 16.0, 70.0, qz + 16.0);
-        assert_no_miss(&idx, &entities, 0, &q);
+        assert_no_miss(&mut idx, &entities, 0, &q);
     }
 }
 

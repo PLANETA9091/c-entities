@@ -800,12 +800,17 @@ public final class CeHooks {
         int o = bN * 6;
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
+        // PARITY ORDER (doc 36b): the exact (sectionY, insertion seq) stamps
+        // travel with EVERY entry — items merge-scan through the same index
+        // and their ties are order-sensitive (vanilla EntityLookup order:
+        // chunkZ, chunkX, sectionY, seq). moonrise$getSectionY and the
+        // ORD_SEQ stamp live on plain Entity, not just LivingEntity.
+        B_SY[bN] = e.moonrise$getSectionY();
+        B_SEQ[bN] = ORD_SEQ[e.getId() & AMASK];
         if (e instanceof net.minecraft.world.entity.LivingEntity le) {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
             B_PXZ[bN * 2 + 1] = le.getZ();
-            B_SY[bN] = le.moonrise$getSectionY();
-            B_SEQ[bN] = ORD_SEQ[le.getId() & AMASK];
             Vec3 dv = le.getDeltaMovement();
             B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
             Entity veh = le.isPassenger() ? le.getVehicle() : null;
@@ -814,8 +819,6 @@ public final class CeHooks {
             B_PF[bN] = 0;
             B_PXZ[bN * 2] = 0.0;
             B_PXZ[bN * 2 + 1] = 0.0;
-            B_SY[bN] = 0;
-            B_SEQ[bN] = 0;
             B_DV[bN * 3] = 0.0; B_DV[bN * 3 + 1] = 0.0; B_DV[bN * 3 + 2] = 0.0;
             B_VID[bN] = 0;
         }
@@ -1343,7 +1346,7 @@ public final class CeHooks {
             // DIRECT OUT BUFFER path (doc 21): one JNI crossing, zero per-
             // query array ops; ids are read back via intrinsified getLong.
             n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    bn, B_IDS, B_BOX);
+                    bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -1359,7 +1362,7 @@ public final class CeHooks {
                     // regrow that actually grows — latent since doc 21.
                     dbb = IDS_BUF;
                     n = queryNative2(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                            0, B_IDS, B_BOX);
+                            0, B_IDS, B_BOX, B_SY, B_SEQ);
                 }
             }
             if (n == -1) {
@@ -1398,7 +1401,7 @@ public final class CeHooks {
             // queries). batchN>0 only on the first attempt; retries must NOT
             // re-apply.
             n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                    ids, bn, B_IDS, B_BOX);
+                    ids, bn, B_IDS, B_BOX, B_SY, B_SEQ);
             if (n >= 0 && bn > 0) {
                 bN = 0;
                 batchesFlushed++;
@@ -1408,7 +1411,7 @@ public final class CeHooks {
                 ids = new long[n];
                 QBUF.set(ids);
                 n = queryNative(wid, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                        ids, 0, B_IDS, B_BOX);
+                        ids, 0, B_IDS, B_BOX, B_SY, B_SEQ);
             }
             if (n < 0) {
                 mNotReady++;
@@ -1996,7 +1999,8 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            long[] out, int batchN, long[] batchIds, double[] batchBoxes);
+            long[] out, int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     public static native void nativeFlush(
             int n, long[] ids, double[] boxes,
             int[] pf, double[] pxz, double[] dv, int[] vid,
@@ -2032,7 +2036,8 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static native int queryNative2(
             int world, double x0, double y0, double z0, double x1, double y1, double z1,
-            int batchN, long[] batchIds, double[] batchBoxes);
+            int batchN, long[] batchIds, double[] batchBoxes,
+            int[] batchSy, int[] batchSeq);
     /** Registers a direct buffer as the query out-buffer; returns the
      *  capacity in longs, or 0 on any failure (legacy path stays armed). */
     public static native int nativeSetOutBuffer(java.nio.ByteBuffer buf);
