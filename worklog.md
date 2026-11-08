@@ -165,7 +165,7 @@ Work Log:
 - Контракт корректности: свежий штамп = зонд записал live box, flush-merged apply лёг до скана, однопоточный тик-цикл не мутирует между flush и сканом → точный тест = то же решение, что принял бы ванильный trim. Паритет-рефери; ORDER_CHECK цел (компакция сохраняет порядок — аргумент L106).
 - Knob CE_L107=0 возвращает всё (query tick=0); diag l107=<fresh>/<legacy>/<on> на hooks@.
 - Локально: cargo test core+swarm 82/0 — новый fresh_filter_exact_decides_this_tick_only (fresh/stale/re-probe/slot-reuse); javac (JDK21 из /tmp/my-project/work) — 58 ошибок, ВСЕ в известных чужих зонах (fastutil/paper-internals), зоны правок чисты.
-- CI: parity 42430389700 + baseline 42430395165 задиспатчены на l107-rowboxes (shipped config, полный матрикс); TTL-harvest cron 513615.
+- CI: parity 42430389700 + baseline 42430395165 задиспатчены на l107-rowboxes (shipped config, полный матрикс); TTL-harvest cron 513542.
 - Попутный фикс: тест exactness/simd_parity/examples переведены на query(4-арг); TICK_UNKNOWN импорт (ветка компилируется).
 
 Stage Summary:
