@@ -37,6 +37,9 @@
 use centities_core::goals as g;
 use centities_core::mobtravel::{self, Mth};
 
+// re-export for the executor consumers (centities-native)
+pub use centities_core::mobtravel::Mth as TravelMth;
+
 // the vanilla zombie table shape (the parity fixture order):
 // target selector: HurtBy(1), Nearest(Player,2), Nearest(3), Nearest(5)
 // goal selector: SpearUse(2), ZombieAttack(3), ZombieAttack(4),
@@ -201,6 +204,20 @@ pub trait Resolver {
     /// REQ_START_VANILLA: the start body's side effects (the engine's
     /// lock transition already applied via the park round's actions).
     fn start_vanilla(&mut self, mob: &mut MobAI, gi: usize);
+    /// REQ_LOOKAT_QUERY: the getNearestPlayer predicate — true = a
+    /// candidate exists (the floor picks it from the packed players;
+    /// bit-exact distance/tie logic stays in the floor, the resolver owns
+    /// the conditions: alive, range, LoS). Default false — the swarm sim
+    /// has no players.
+    fn lookat_query(&mut self, _mob: &MobAI, _players: &[PlayerSnap]) -> bool {
+        false
+    }
+    /// REQ_FIND_TARGET: the NearestAttackableTargetGoal predicate — true =
+    /// at least one targetable candidate within follow range. Same
+    /// contract as lookat_query. Default false.
+    fn find_target(&mut self, _mob: &MobAI, _players: &[PlayerSnap]) -> bool {
+        false
+    }
 }
 
 /// The flat open-ground world: nothing occludes, stroll targets are
@@ -634,7 +651,13 @@ impl MobAI {
                         (0, 0.0, 0.0, 0.0)
                     }
                 }
-                _ => (0, 0.0, 0.0, 0.0), // LOOKAT_QUERY / FIND_TARGET: no candidates
+                g::REQ_LOOKAT_QUERY => {
+                    (r.lookat_query(self, players) as i32, 0.0, 0.0, 0.0)
+                }
+                g::REQ_FIND_TARGET => {
+                    (r.find_target(self, players) as i32, 0.0, 0.0, 0.0)
+                }
+                _ => (0, 0.0, 0.0, 0.0), // unknown ops: fail closed
             };
         }
         // the 32-round cap: the Java side falls back (mirror covers the
