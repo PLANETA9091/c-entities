@@ -112,7 +112,6 @@ jobs:
            sleep 50; echo stop) | timeout 280 \
             java -Xms1G -Xmx4G \
             "-agentpath:$PWD/libcrussty_runtime.so=modules=$PWD/modules;versions=$PWD/versions;kernel=paperclip-26.3.jar" \
-            -Dcentities.mobAi=1 \
             -jar versions/paperclip-26.3.jar --nogui > e2e.log 2>&1 || true
           echo "## e2e markers" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -141,10 +140,12 @@ jobs:
           grep -q  "\[c-entities\] precomputed TrackedEntity.moonrise\$tick no-op gate" e2e.log || fail "L15c tracker-tick gate not precomputed"
           grep -q  "\[c-entities\] tracker-tick gate ARMED"              e2e.log || fail "L15c tracker-tick gate never armed"
           grep -q  "\[c-entities\] patched Sensing O(1)-clear floor"     e2e.log || fail "L26 sensing floor not applied (the boot-load retransform gap)"
-          # L22a: the native (Rust) goal engine — armed at precompute, live
-          # on the first classified zombie (the real no_ai-less summon).
-          grep -q  "precomputed + armed the Mob AI floor"                e2e.log || fail "L22a mob AI floor not armed (handles/classification probe failed)"
-          grep -q  "Mob AI floor disabled\|mob AI floor handle probe failed\|vanilla serverAiStep kept" e2e.log && fail "L22a mob AI floor was declined" || true
+          # L22a: the native (Rust) goal engine is OPT-IN since the shipped
+          # config went vanilla AI (doc 40 fix 3, 3d298d1): the shipped soak
+          # must see the DECLINED marker ("mob AI floor disabled") and an
+          # explicitly-requested soak (-Dcentities.mobAi=1) the ARMED marker.
+          # Neither = the arming probe itself broke (handles/classification).
+          grep -qE "precomputed \+ armed the Mob AI floor|mob AI floor disabled \(centities\.mobAi\)" e2e.log || fail "L22a mob AI floor neither armed nor correctly declined (handles/classification probe failed)"
           grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
@@ -209,7 +210,20 @@ jobs:
           [ "$GS_LIVE" = "1" ] || fail "goal pipeline dead (neither the gs bridge nor the AI floor requests moved)"
           echo "$LAST_HOOKS" | grep -Eq "froz=[0-9]+/[1-9]"      || fail "frozen gate never served a provable no-op"
           echo "$LAST_HOOKS" | grep -Eq "conv=[0-9]+/[1-9]"      || fail "conv gate never served a provable no-op"
-          echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        || fail "tracker-tick gate never served a provable no-op"
+          # L15c moonrise$tick per-TE gate: with the L30 loop fusing the
+          # no-tracking case at the LOOP level (ttlc=hits>0), the fused
+          # entities never reach moonrise$tick — the per-TE gate only sees
+          # the declines (the fuse's ttlDecl= sites) whose chunks are
+          # LOADED (chunk != null — the guard's own first condition), so
+          # the gate's no-op is a boot-window corner, not a steady-state
+          # proof. The no-op proof is EITHER the per-TE gate (tt=calls/
+          # gates>0) OR the L30/L63 loop cache (ttlc=hits/fills with
+          # hits>0) — the loop is the mechanism that actually serves the
+          # no-ops in a no-player world.
+          TT_LIVE=0
+          echo "$LAST_HOOKS" | grep -Eq "tt=[0-9]+/[1-9]"        && TT_LIVE=1
+          echo "$LAST_HOOKS" | grep -Eq "ttlc=[0-9]+/[1-9]"      && TT_LIVE=1
+          [ "$TT_LIVE" = "1" ] || fail "tracker-tick gate never served a provable no-op"
           # L36 liveness: at least ONE of the three idle-control guards
           # (nav/move/look) must have served a proven no-op for the soaked
           # zombies (fields: navCalls/navIdleHits/moveCalls/moveIdleHits/
@@ -221,11 +235,14 @@ jobs:
           echo "$LAST_HOOKS" | grep -Eq "idle=([0-9]+/){4}[0-9]+/[1-9]"  && IDLE_LIVE=1
           [ "$IDLE_LIVE" = "1" ] || fail "no idle-control guard served a provable no-op (idle=...)"
           # L22a liveness: mob=ticks/fallbacks/requests/classified/refused/on.
-          # The real (no_ai-less) zombie must be classified, floor-ticked,
-          # and served WITHOUT a single engine fallback (a fallback would
-          # mean the Rust engine refused the mob — behavior stays exact via
-          # the mirror, but the gain is gone and the engagement claim fails).
-          echo "$LAST_HOOKS" | grep -Eq "mob=[0-9]+/0/[0-9]+/[1-9]" || fail "mob AI floor never classified a zombie (mob=...)"
+          # ONLY meaningful when the engine is explicitly armed — the shipped
+          # soak (mobAi=0) proves the goal pipeline through the L15 gs bridge
+          # (GS_LIVE above). A fallback would mean the Rust engine refused
+          # the mob — behavior stays exact via the mirror, but the gain is
+          # gone and the engagement claim fails.
+          if grep -q "precomputed + armed the Mob AI floor" e2e.log; then
+            echo "$LAST_HOOKS" | grep -Eq "mob=[0-9]+/0/[0-9]+/[1-9]" || fail "mob AI floor never classified a zombie (mob=...)"
+          fi
           if [ "$LIVE" != "1" ]; then
             sleep 45
             LAST_HOOKS=$(grep "hooks@" e2e.log | tail -1)

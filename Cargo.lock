@@ -28,6 +28,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "centities-native"
+version = "0.1.0"
+dependencies = [
+ "centities-core",
+ "swarm-sim",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -159,6 +167,18 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "swarm-core"
+version = "0.1.0"
+
+[[package]]
+name = "swarm-sim"
+version = "0.1.0"
+dependencies = [
+ "centities-core",
+ "swarm-core",
+]
 
 [[package]]
 name = "typed-path"

@@ -14,7 +14,7 @@
 pub mod itemcore;
 #[doc(hidden)]
 pub mod patch;
-pub mod pushcore;
+pub use centities_core::pushcore;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
@@ -43,7 +43,18 @@ const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
 const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNavigation";
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
 const LOOK_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/LookControl";
+/// L62a: the empty-equipment floor target — EnchantmentHelper.tickEffects
+/// early-return prefix (op-5 guard2 on the static; the baseTick
+/// enchantment walk; 47.5% of the mobs leg's ImmutableList$ListItr
+/// leaves). NOT a ReplaceBody: a replay into the woven static recurses
+/// (the L62a parity lesson, 2026-11-02).
+const ENCH_HELPER_CLASS: &str = "net/minecraft/world/item/enchantment/EnchantmentHelper";
 const HOOKS_CLASS: &str = "dev/planeta9091/centities/CeHooks";
+/// L38f: LivingEntity.die(DamageSource) — the cramming-audit freshness feed
+/// (javap-verified 26.3 descriptor).
+const DIE_DESC: &str = "(Lnet/minecraft/world/damagesource/DamageSource;)V";
+/// The probe bridge signature shared by every Entity-receiver prefix probe.
+const PROBE_ENTITY_DESC: &str = "(Lnet/minecraft/world/entity/Entity;)V";
 
 // ---------------------------------------------------------------------------
 // 4b.2a — zero-JNI steady state: the native side publishes every changed
@@ -180,6 +191,10 @@ impl CeState {
         use centities_core::UpsertEv as E;
         match ev {
             E::Same | E::OversizeSame => {}
+            // L44c: a same-cell box change altered the packed row data — the
+            // cell's row must be republished before the next row query (the
+            // window pre-filter reads the publish-time intervals).
+            E::BoxChanged { cell } => self.mark_dirty(cell),
             E::New {
                 cell,
                 from_oversize,
@@ -330,18 +345,37 @@ fn publish(env: &JniEnv, st: &mut CeState) {
         // See EntityIndex::cell_scan_packed for the conservativeness contract.
         let (count, overflow) = st.idx.cell_scan_packed(cell, &mut st.p.ids, ROW_CAP);
         if overflow {
-            // sticky dense: kill any published row (Java sees the sentinel)
+            // sticky dense: kill any published row (Java sees the sentinel).
+            // A cell that went dense BEFORE its first publish has a NULL slot
+            // — the row path's null contract ("never occupied = empty cell")
+            // would then answer an EMPTY candidate list for a cell holding
+            // thousands of entities: every merge scan inside the pile
+            // returned n=0, the merge survivors flipped (items t=159 971/1873,
+            // mixed t=152 469/964 — run 40889274763), and the merges were
+            // silently dropped. The sentinel MUST be visible: allocate the
+            // row array when absent (the Java side reads count=0x7FF >
+            // ROW_CAP -> rowBig -> the native path).
             if st.p.dense.len() <= ci {
                 st.p.dense.resize(ci + 1, false);
             }
             st.p.dense[ci] = true;
-            let row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
-            if !row.is_null() {
-                st.p.buf.resize(2 + ROW_CAP, 0);
-                st.p.buf[0] = key as i64;
-                st.p.buf[1] = (st.p.seq << 11) | ROW_SENTINEL;
-                env.set_long_array_region(row as jni::jlongArray, 0, 2, &st.p.buf[..2]);
+            let mut row = env.get_object_array_element(info.rows as jni::jobjectArray, slot);
+            if row.is_null() {
+                match env.new_long_array((2 + ROW_CAP) as i32) {
+                    Some(narr) => {
+                        env.set_object_array_element(info.rows as jni::jobjectArray, slot, narr);
+                        row = narr;
+                    }
+                    None => {
+                        st.p.info = None; // OOM: publishing off for good
+                        return;
+                    }
+                }
             }
+            st.p.buf.resize(2 + ROW_CAP, 0);
+            st.p.buf[0] = key as i64;
+            st.p.buf[1] = (st.p.seq << 11) | ROW_SENTINEL;
+            env.set_long_array_region(row as jni::jlongArray, 0, 2, &st.p.buf[..2]);
             continue;
         }
         st.p.buf.resize(2 + ROW_CAP, 0);
@@ -393,6 +427,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(LEVEL_CLASS, |_n, b| patch_level(b));
     cplug_sdk::hooks::register_bytes(ENTITY_CLASS, |_n, b| patch_entity(b));
     cplug_sdk::hooks::register_bytes(LOOKUP_CLASS, |_n, b| patch_lookup(b));
+    cplug_sdk::hooks::register_bytes(CHUNK_SLICES_CLASS, |_n, b| patch_chunk_slices(b));
     cplug_sdk::hooks::register_bytes(ITEM_ENTITY_CLASS, |_n, b| patch_item(b));
     cplug_sdk::hooks::register_bytes(SERVER_LEVEL_CLASS, |_n, b| patch_serverlevel(b));
     cplug_sdk::hooks::register_bytes(LIVING_ENTITY_CLASS, |_n, b| patch_livingentity(b));
@@ -407,6 +442,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
     cplug_sdk::hooks::register_bytes(LOOK_CONTROL_CLASS, |_n, b| patch_lookcontrol(b));
+    cplug_sdk::hooks::register_bytes(ENCH_HELPER_CLASS, |_n, b| patch_ench(b));
 
     // When the first ServerLevel exists: define bridge + natives, then
     // retransform the targets and arm.
@@ -576,9 +612,7 @@ fn precompute_idle_controls(loader: jni::jobject) {
                     pc.insert(cls, b);
                 }
                 woven.store(true, Ordering::Release);
-                cplug_sdk::log::info(&format!(
-                    "[c-entities] precomputed {label} idle guard"
-                ));
+                cplug_sdk::log::info(&format!("[c-entities] precomputed {label} idle guard"));
             }
             _ => {
                 declined.store(true, Ordering::Release);
@@ -717,6 +751,24 @@ fn arm_module() {
                         ));
                     }
                 }
+                // PARITY ORDER (doc 36b): ChunkEntitySlices loads with the
+                // first chunks — usually BEFORE the arm; the stash/serve
+                // path applies the append-order probe at the verifier.
+                if !SLICES_WOVEN.load(Ordering::Acquire)
+                    && !SLICES_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(CHUNK_SLICES_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_chunk_slices(loader as jni::jobject);
+                    if SLICES_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(CHUNK_SLICES_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred ChunkEntitySlices weave applied, rc={rc}"
+                        ));
+                    }
+                }
                 // L15 deferred weaves: the GoalSelector/ConversionTracker
                 // classes load with the first mobs — usually AFTER the arm.
                 if !GOAL_WOVEN.load(Ordering::Acquire)
@@ -747,6 +799,23 @@ fn arm_module() {
                         let rc = cplug_sdk::retransform_class(MOB_CLASS);
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred Mob AI floor applied, rc={rc}"
+                        ));
+                    }
+                }
+                // L62a deferred weave: EnchantmentHelper loads with the first
+                // mob baseTick (post-arm on most boots).
+                if !ENCH_WOVEN.load(Ordering::Acquire)
+                    && !ENCH_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(ENCH_HELPER_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_ench(loader as jni::jobject);
+                    if ENCH_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(ENCH_HELPER_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred EnchantmentHelper floor applied, rc={rc}"
                         ));
                     }
                 }
@@ -877,6 +946,27 @@ fn arm_module() {
                 if set_java_bool("setConvGateOn", true) {
                     CONV_ARMED.store(true, Ordering::Release);
                     cplug_sdk::log::info("[c-entities] conv gate ARMED (verified live)");
+                }
+            }
+            // L62 arming: the equipment floors flip ON only when their bridges
+            // are proven live (enchCalls/equipCalls move — the bridges bump
+            // them on every entry even disarmed; the gates move after).
+            if ENCH_WOVEN.load(Ordering::Acquire)
+                && !ENCH_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::EnchChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setEnchTickGateOn", true) {
+                    ENCH_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] enchTick floor ARMED (verified live)");
+                }
+            }
+            if EQUIP_WOVEN.load(Ordering::Acquire)
+                && !EQUIP_ARMED.load(Ordering::Acquire)
+                && snap.get(&Counter::EquipChecks).copied().unwrap_or(0) > 0
+            {
+                if set_java_bool("setEquipGateOn", true) {
+                    EQUIP_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] equip floor ARMED (verified live)");
                 }
             }
             if TT_WOVEN.load(Ordering::Acquire)
@@ -1028,8 +1118,31 @@ fn precompute_level(loader: jni::jobject) {
         );
         return;
     };
+    // Three bodies, chained (the goal_tick chain pattern): getEntities,
+    // getEntitiesOfClass, then the EntityTypeTest funnel. A refusal of a
+    // LATER spec must keep the EARLIER ones (degrade one weave at a time —
+    // the refused path routes vanilla); dropping all on a later-spec
+    // failure would silently disable the whole Level fast path.
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec())
+        let one = cplug_sdk::asm::replace_body(env, loader, &bytes, &level_spec());
+        let one = match one {
+            Some(b) if !b.is_empty() => {
+                match cplug_sdk::asm::replace_body(env, loader, &b, &level_class_spec()) {
+                    Some(b2) if !b2.is_empty() => Some(b2),
+                    _ => Some(b), // second refused — keep the first weave
+                }
+            }
+            other => other,
+        };
+        match one {
+            Some(b) if !b.is_empty() => {
+                match cplug_sdk::asm::replace_body(env, loader, &b, &level_test_spec()) {
+                    Some(b3) if !b3.is_empty() => Some(b3),
+                    _ => Some(b), // third refused — keep the first two weaves
+                }
+            }
+            other => other,
+        }
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
@@ -1038,7 +1151,9 @@ fn precompute_level(loader: jni::jobject) {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
                 pc.insert(LEVEL_CLASS, b);
             }
-            cplug_sdk::log::info("[c-entities] precomputed Level.getEntities rewrite");
+            cplug_sdk::log::info(
+                "[c-entities] precomputed Level.getEntities + getEntitiesOfClass rewrite",
+            );
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
@@ -1133,6 +1248,7 @@ static TTL_DECLINED: AtomicBool = AtomicBool::new(false);
 static TTL_ARMED: AtomicBool = AtomicBool::new(false);
 /// L33: the LivingEntity.tickEffects empty-map early-out weave state.
 static EFF_WOVEN: AtomicBool = AtomicBool::new(false);
+static COLLIDE_WOVEN: AtomicBool = AtomicBool::new(false);
 static EFF_DECLINED: AtomicBool = AtomicBool::new(false);
 static EFF_ARMED: AtomicBool = AtomicBool::new(false);
 /// L18: the Entity.setSharedFlag no-op-write gate weave is prepared.
@@ -1157,8 +1273,34 @@ static SENSING_ARMED: AtomicBool = AtomicBool::new(false);
 static FLAGR_WOVEN: AtomicBool = AtomicBool::new(false);
 static FLAGR_DECLINED: AtomicBool = AtomicBool::new(false);
 static FLAGR_ARMED: AtomicBool = AtomicBool::new(false);
+/// L62: the empty-equipment floors (EnchantmentHelper.tickEffects +
+/// LivingEntity.detectEquipmentUpdates) weave state.
+static ENCH_WOVEN: AtomicBool = AtomicBool::new(false);
+static ENCH_DECLINED: AtomicBool = AtomicBool::new(false);
+static ENCH_ARMED: AtomicBool = AtomicBool::new(false);
+static EQUIP_WOVEN: AtomicBool = AtomicBool::new(false);
+static EQUIP_DECLINED: AtomicBool = AtomicBool::new(false);
+static EQUIP_ARMED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
+    // L39: resolve the merge-mirror offsets (despawnRate/count/DATA_ITEM) —
+    // failure keeps the MH-based predicate (mergePredTest falls back).
+    let _ = cplug_sdk::jni_util::with_attached(|env| {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, "initMergeMirror", "()V") else {
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+        }
+        true
+    });
     let stash = STASH
         .lock()
         .ok()
@@ -1443,28 +1585,20 @@ fn precompute_livingentity(loader: jni::jobject) {
         if !eff_ok {
             return base;
         }
-        match base {
-            Some(b) => match cplug_sdk::asm::insert_early_return_guard(
-                env,
-                loader,
-                &b,
-                &eff_spec,
-            ) {
-                Some(b2) => {
-                    EFF_WOVEN.store(true, Ordering::Release);
-                    Some(b2)
+        let base = match base {
+            Some(b) => {
+                match cplug_sdk::asm::insert_early_return_guard(env, loader, &b, &eff_spec) {
+                    Some(b2) => {
+                        EFF_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
+                    }
+                    None => Some(b),
                 }
-                None => Some(b),
-            },
+            }
             None => {
                 // no base guard survived; the eff guard alone is still worth
                 // applying — vanilla keeps the other two bodies.
-                match cplug_sdk::asm::insert_early_return_guard(
-                    env,
-                    loader,
-                    &bytes,
-                    &eff_spec,
-                ) {
+                match cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &eff_spec) {
                     Some(b2) => {
                         EFF_WOVEN.store(true, Ordering::Release);
                         Some(b2)
@@ -1472,6 +1606,127 @@ fn precompute_livingentity(loader: jni::jobject) {
                     None => None,
                 }
             }
+        };
+        // L38 chain: the collide fast path (CE_COLLIDE=0 disables). An
+        // OPTIONAL ReplaceBody — a refusal keeps the guards above.
+        if std::env::var("CE_COLLIDE").as_deref() == Ok("0") {
+            return base;
+        }
+        let collide_spec = cplug_sdk::asm::ReplaceBody {
+            method_name: "canCollideWithBukkit",
+            method_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+            bridge_owner: HOOKS_CLASS,
+            bridge_name: "canCollideWithBukkit$",
+            bridge_desc:
+                "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/Entity;)Z",
+            args: &[
+                cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+                cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            ],
+        };
+        let guarded: Option<Vec<u8>> = match base {
+            Some(b) => match cplug_sdk::asm::replace_body(env, loader, &b, &collide_spec) {
+                Some(b2) if !b2.is_empty() => {
+                    COLLIDE_WOVEN.store(true, Ordering::Release);
+                    Some(b2)
+                }
+                _ => Some(b),
+            },
+            None => match cplug_sdk::asm::replace_body(env, loader, &bytes, &collide_spec) {
+                Some(b2) if !b2.is_empty() => {
+                    COLLIDE_WOVEN.store(true, Ordering::Release);
+                    Some(b2)
+                }
+                _ => None,
+            },
+        };
+        // L62b chain: the detectEquipmentUpdates empty-equipment ReplaceBody
+        // (the per-mob equipment-change scan — 39.3% of the mobs leg's
+        // ImmutableList$ListItr leaves). OPTIONAL: a refusal keeps every
+        // guard above. The bridge's decline path replays the protected trio
+        // via the handles proven here; arming stays verifier-gated.
+        let equip_ok = read_java_flag("EQUIP_FLAG_ON") == Some(true)
+            && prove_handles("initEquipHandles", "EQUIP_HANDLES_OK") == Some(true);
+        if !equip_ok {
+            EQUIP_DECLINED.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] equipUpdates floor declined (flag/handles) — vanilla kept",
+            );
+        }
+        let equip_spec = cplug_sdk::asm::ReplaceBody {
+            method_name: "detectEquipmentUpdates",
+            method_desc: "()V",
+            bridge_owner: HOOKS_CLASS,
+            bridge_name: "equipUpdates$",
+            bridge_desc: "(Lnet/minecraft/world/entity/LivingEntity;)V",
+            args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
+        };
+        let guarded = if equip_ok {
+            match guarded {
+                Some(b) => match cplug_sdk::asm::replace_body(env, loader, &b, &equip_spec) {
+                    Some(b2) if !b2.is_empty() => {
+                        EQUIP_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
+                    }
+                    _ => Some(b),
+                },
+                None => match cplug_sdk::asm::replace_body(env, loader, &bytes, &equip_spec) {
+                    Some(b2) if !b2.is_empty() => {
+                        EQUIP_WOVEN.store(true, Ordering::Release);
+                        Some(b2)
+                    }
+                    _ => None,
+                },
+            }
+        } else {
+            guarded
+        };
+        // L38f chain: the die-probe feed for the push view (doc 40). The
+        // cramming audit reads hits/nonPass from the mirror; a dying mob's
+        // flags are stale for its whole ~20-tick deathTime animation (no
+        // box/delta events) unless THIS prefix recomputes them — at the
+        // die() entry hp is already <= 0 (hurtServer deducted it before
+        // calling die, javap-verified), so the refresh clears PF_PUSHABLE
+        // and the corpse leaves the kernel's view in the same tick.
+        // INDEPENDENT of the guards above: applied to whatever survived
+        // them (or to the original bytes), optional on refusal.
+        match guarded {
+            Some(b) => match patch::insert_static_call_at_start(
+                b.clone(),
+                "die",
+                DIE_DESC,
+                HOOKS_CLASS,
+                "probeDie",
+                PROBE_ENTITY_DESC,
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => Some(weave_lhurt_probe(b2)),
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] LivingEntity.die probe refused: {e}"
+                    ));
+                    Some(b)
+                }
+            },
+            None => match patch::insert_static_call_at_start(
+                bytes.to_vec(),
+                "die",
+                DIE_DESC,
+                HOOKS_CLASS,
+                "probeDie",
+                PROBE_ENTITY_DESC,
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => Some(weave_lhurt_probe(b2)),
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] LivingEntity.die probe refused: {e}"
+                    ));
+                    None
+                }
+            },
         }
     });
     match patched {
@@ -1507,6 +1762,142 @@ fn patch_livingentity(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_livingentity_inner(bytes))
         .ok()
         .flatten()
+}
+
+/// L81 hunt: the LivingEntity.hurtServer prefix probe — names EVERY
+/// living-entity hurt (damage type + amount) inside the PH_DUMP window.
+/// The LRF armor-draw diff (RemoveBinomial) proved the kernel's cramming
+/// audit diverges from vanilla's live list in BOTH directions (mobs t=143
+/// ON-extra hurt, mixed t=146 / spread t=145 OFF-extra); this probe is the
+/// ON leg's hurt ledger against the OFF leg's LRF draw stream. Chained
+/// AFTER the die-probe weave: applied to whatever bytes survived it,
+/// optional on refusal (hunt-only instrument — the module ships without
+/// needing it). Window-gated hook body: zero hot-path cost outside
+/// PH_DUMP.
+fn weave_lhurt_probe(b: Vec<u8>) -> Vec<u8> {
+    const HURT_DESC: &str =
+        "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/damagesource/DamageSource;F)Z";
+    const PROBE_LHURT_DESC: &str =
+        "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/damagesource/DamageSource;F)V";
+    match patch::insert_static_call_at_start(
+        b.clone(),
+        "hurtServer",
+        HURT_DESC,
+        HOOKS_CLASS,
+        "probeLHurt",
+        PROBE_LHURT_DESC,
+        // hurtServer is an INSTANCE method: slot 0 = this (LivingEntity),
+        // slot 1 = ServerLevel (not passed), slot 2 = DamageSource,
+        // slot 3 = the float amount. The e2e's JVMTI_ERROR_FAILS_VERIFICATION
+        // (run 41651515234) was THIS map reading (0,1,2) with 'F' on the
+        // DamageSource slot — ALOAD of a reference into the bridge's float
+        // param fails verification and the module's fail-closed stop killed
+        // the server at the deferred retransform.
+        &[(0, b'L'), (2, b'L'), (3, b'F')],
+    ) {
+        Ok(b2) => b2,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] LivingEntity.hurtServer probe refused: {e}"
+            ));
+            b
+        }
+    }
+}
+
+/// L62a: EnchantmentHelper byte hook — the stash/serve pattern.
+fn patch_ench(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_ench_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_ench_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The floor is
+        // woven by the verifier (precompute_ench).
+        let mut st = STASH.lock().ok()?;
+        st.entry(ENCH_HELPER_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(ENCH_HELPER_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched EnchantmentHelper tickEffects floor");
+            Some(b)
+        }
+        _ if !ENCH_WOVEN.load(Ordering::Acquire) && !ENCH_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(ENCH_HELPER_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] EnchantmentHelper bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// L62a: the deferred weave — the empty-equipment early-return PREFIX on
+/// EnchantmentHelper.tickEffects (op-5 guard2: a STATIC method, so locals
+/// 0+1 are its two parameters — ServerLevel, LivingEntity). The vanilla
+/// body stays intact behind the check; the L62a lesson (2026-11-02, parity
+/// mobs-ON mass removal) outlaws the ReplaceBody+replay shape here: a
+/// replay into the woven static re-enters the guard and recurses until
+/// StackOverflowError. No Unsafe handles are needed (the gate is
+/// public-API only), so the weave applies right after the knob check; the
+/// GATE arming stays verifier-gated on the enchCalls liveness.
+fn precompute_ench(loader: jni::jobject) {
+    let stash = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(ENCH_HELPER_CLASS));
+    let Some(bytes) = stash else {
+        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+        cplug_sdk::log::info("[c-entities] precompute Ench floor: original bytes not seen at boot");
+        return;
+    };
+    if read_java_flag("ENCH_FLAG_ON") != Some(true) {
+        ENCH_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] enchTick floor declined (centities.enchTick) — vanilla kept",
+        );
+        return;
+    }
+    let spec = cplug_sdk::asm::EarlyReturnGuard2 {
+        method_name: "tickEffects",
+        method_desc:
+            "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)V",
+        check_class: HOOKS_CLASS,
+        check_name: "enchGate$",
+        check_desc:
+            "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/LivingEntity;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard2(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(ENCH_HELPER_CLASS, b.clone());
+            }
+            ENCH_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] precomputed EnchantmentHelper tickEffects floor (op-5 prefix)",
+            );
+        }
+        _ => {
+            ENCH_DECLINED.store(true, Ordering::Release);
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute EnchantmentHelper floor — vanilla kept",
+            );
+        }
+    }
 }
 
 /// L14 tracker fast gate: boot-time hook stashes the original bytes; the
@@ -1576,6 +1967,38 @@ fn patch_goalselector(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// L22a: Mob byte hook — same stash/serve pattern as GoalSelector.
+/// L81b hunt: the Mob.burnUndead prefix probe — names every sunlight-burn
+/// event inside the PH_DUMP window. javap 26.3: burnUndead consumes the
+/// ENTITY random twice (the isSunBurnTick nextFloat roll in aiStep + the
+/// nextInt(2) here) and one LEVEL.random draw per enchanted damageable
+/// piece (hurtAndBreak -> processDurabilityChange -> RemoveBinomial) —
+/// ALL without hurtServer, which is why the L81 LHURT ledger printed
+/// nothing on a leg whose LRC/LRF showed identical burn draws. The
+/// engine hunt's t=143 +1 Level.random draw rides this path (a burn-roll
+/// flip after an ENTITY-random split), so this probe + the OFF leg's
+/// RemoveBinomial lines localize the flipping mob. Chained into BOTH
+/// serve paths (the engine cache inside precompute_mob and the shipped
+/// declined arm of patch_mob_inner). Window-gated hook body, optional on
+/// refusal.
+fn weave_burn_probe(b: Vec<u8>) -> Vec<u8> {
+    match patch::insert_static_call_at_start(
+        b.clone(),
+        "burnUndead",
+        "()V",
+        HOOKS_CLASS,
+        "probeBurn",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(b2) => b2,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!("[c-entities] Mob.burnUndead probe refused: {e}"));
+            b
+        }
+    }
+}
+
 fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_mob_inner(bytes))
         .ok()
@@ -1583,6 +2006,10 @@ fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    eprintln!(
+        "[c-entities] MOB-HOOK pass (dbg) bridge_ready={}",
+        BRIDGE_READY.load(Ordering::Acquire)
+    );
     if !BRIDGE_READY.load(Ordering::Acquire) {
         let mut st = STASH.lock().ok()?;
         st.entry(MOB_CLASS).or_insert_with(|| bytes.to_vec());
@@ -1601,7 +2028,30 @@ fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             cplug_sdk::log::info("[c-entities] Mob bytes stashed post-arm — verifier will decide");
             None
         }
-        _ => None,
+        _ => {
+            // The AI floor is declined (the SHIPPED config): the Mob class
+            // serves vanilla. The L81b burn probe STILL weaves — the engine
+            // hunt needs the burn ledger in BOTH configs. NO idempotency
+            // flag: JVMTI hands the hook the ORIGINAL bytes on every pass
+            // (the 697 comment), so each pass gets exactly one insert — the
+            // flag would only kill the re-application on the LIVE class
+            // after the boot retransform landed on the doomed bootstrap
+            // object (the smoke-8 lesson: the arm line + rc=0 + a dump with
+            // the probe, and ZERO executions — the live class was vanilla).
+            let b2 = weave_burn_probe(bytes.to_vec());
+            eprintln!(
+                "[c-entities] MOB-HOOK declined-arm woven delta={}",
+                b2.len() as isize - bytes.len() as isize
+            );
+            if b2.len() != bytes.len() {
+                if let Ok(dir) = std::env::var("CE_DUMP_CLASSES") {
+                    let _ = std::fs::write(format!("{dir}/Mob.patched.class"), &b2);
+                }
+                Some(b2)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -2005,6 +2455,28 @@ fn set_java_bool(setter: &str, value: bool) -> bool {
     .unwrap_or(false)
 }
 
+/// Set an int static setter on CeHooks (the stamp-scheme fallback switch).
+fn set_java_int(setter: &str, value: i32) -> bool {
+    cplug_sdk::jni_util::with_attached(|env| -> bool {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, setter, "(I)V") else {
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[jni::jvalue { i: value }]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            return false;
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
 fn goal_tick_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
     cplug_sdk::asm::ReplaceBody {
         method_name: "tick",
@@ -2041,6 +2513,20 @@ fn frozen_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
             cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'I' },
         ],
+    }
+}
+
+/// L68: the Entity.getTicksFrozen memo read — the body becomes
+/// `CeHooks.getTicksFrozen$`; the jar-wide scan proves the setter is the
+/// accessor's only writer, so the slot memo is an exact read.
+fn frozen_get_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getTicksFrozen",
+        method_desc: "()I",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getTicksFrozen$",
+        bridge_desc: "(Lnet/minecraft/world/entity/Entity;)I",
+        args: &[cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' }],
     }
 }
 
@@ -2159,7 +2645,7 @@ fn precompute_mob(loader: jni::jobject) {
     match patched {
         Some(Some(b)) if !b.is_empty() => {
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(MOB_CLASS, b);
+                pc.insert(MOB_CLASS, weave_burn_probe(b));
             }
             MOB_WOVEN.store(true, Ordering::Release);
             if set_java_bool("setMobAiOn", true) {
@@ -2264,6 +2750,29 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
             "[c-entities] frozen gate disabled/refused (centities.frozenGate) — vanilla write kept",
         );
         bytes.to_vec()
+    };
+    // L68: the getTicksFrozen memo read chains onto the same Entity bytes,
+    // gated by the SAME frozen knob — the memo protocol is atomic (the
+    // setter's only-writer proof), so one knob bisects the whole layer.
+    let gated = if read_java_flag("FROZEN_FLAG_ON") == Some(true)
+        && prove_handles("initFrozenHandles", "FROZEN_HANDLES_OK") == Some(true)
+    {
+        match cplug_sdk::jni_util::with_attached(|env| {
+            cplug_sdk::asm::replace_body(env, loader, &gated, &frozen_get_spec())
+        }) {
+            Some(Some(b)) if !b.is_empty() => {
+                cplug_sdk::log::info("[c-entities] precomputed getTicksFrozen memo read");
+                b
+            }
+            _ => {
+                cplug_sdk::log::info(
+                    "[c-entities] getTicksFrozen replace refused — vanilla read kept",
+                );
+                gated
+            }
+        }
+    } else {
+        gated
     };
     // L18: the shared-flags gate chains onto the same Entity bytes. The
     // flag gate is OPTIONAL like the frozen one — a refusal keeps vanilla
@@ -2627,7 +3136,10 @@ fn precompute_chunkmap(loader: jni::jobject) {
         );
         return;
     }
-    let Some(bytes) = STASH.lock().ok().and_then(|s| s.get(CHUNKMAP_CLASS).cloned())
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|s| s.get(CHUNKMAP_CLASS).cloned())
     else {
         cplug_sdk::log::info(
             "[c-entities] ChunkMap not stashed yet — tracker-loop floor deferred to the verifier",
@@ -2665,8 +3177,7 @@ fn patch_chunkmap_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         // Boot load: stash the original bytes, stay vanilla. The floor is
         // woven at arm time (precompute_chunkmap).
         let mut st = STASH.lock().ok()?;
-        st.entry(CHUNKMAP_CLASS)
-            .or_insert_with(|| bytes.to_vec());
+        st.entry(CHUNKMAP_CLASS).or_insert_with(|| bytes.to_vec());
         return None;
     }
     let pre = PRECOMPUTED.lock().ok()?.get(CHUNKMAP_CLASS).cloned();
@@ -2678,8 +3189,7 @@ fn patch_chunkmap_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         _ if !TTL_WOVEN.load(Ordering::Acquire) && !TTL_DECLINED.load(Ordering::Acquire) => {
             let mut st = STASH.lock().ok()?;
-            st.entry(CHUNKMAP_CLASS)
-                .or_insert_with(|| bytes.to_vec());
+            st.entry(CHUNKMAP_CLASS).or_insert_with(|| bytes.to_vec());
             cplug_sdk::log::info(
                 "[c-entities] ChunkMap bytes stashed post-arm — verifier will decide",
             );
@@ -2737,6 +3247,8 @@ enum Counter {
     DeltaChecks,
     SenseChecks,
     FlagRChecks,
+    EnchChecks,
+    EquipChecks,
 }
 
 /// Read the Java-side woven-code counters (probes that fire = the patch is
@@ -2776,6 +3288,9 @@ fn read_hook_counters() -> std::collections::HashMap<Counter, i64> {
             (Counter::DeltaChecks, ("deltaCalls", "J")),
             (Counter::SenseChecks, ("senseCalls", "J")),
             (Counter::FlagRChecks, ("flagrCalls", "J")),
+            // L62 liveness counters (every bridge entry — proven before arming).
+            (Counter::EnchChecks, ("enchCalls", "J")),
+            (Counter::EquipChecks, ("equipCalls", "J")),
         ] {
             if let Some(fid) = e.get_static_field_id(cls, n, sig) {
                 fids.insert(c, fid);
@@ -3029,7 +3544,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativePush",
-        "(IIIIIIII)J",
+        "(IIIIIIIIII)J",
         n_push
             as extern "system" fn(
                 *mut jni::JNIEnv,
@@ -3042,12 +3557,26 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 i32,
                 i32,
                 i32,
+                i32,
+                i32,
             ) -> i64
     );
     push!(
         "nativePushNcol",
-        "(I)I",
-        n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> i32
+        "(II)I",
+        n_push_ncol as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i32) -> i32
+    );
+    push!(
+        "nativeIndexBox",
+        "(IJ[D)I",
+        n_index_box
+            as extern "system" fn(
+                *mut jni::JNIEnv,
+                jni::jclass,
+                i32,
+                i64,
+                jni::jdoubleArray,
+            ) -> i32
     );
     push!(
         "nativeMobAiFloor",
@@ -3059,6 +3588,17 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
                 jni::jintArray,
                 jni::jintArray,
             ) -> i32
+    );
+    push!(
+        "nativeGlTake",
+        "(I)[I",
+        n_gl_take as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jintArray
+    );
+    push!(
+        "nativeMobLedgerTake",
+        "(I)[J",
+        n_mob_ledger_take
+            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jlongArray
     );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
@@ -3088,6 +3628,59 @@ fn level_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
             cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
             cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+        ],
+    }
+}
+
+// L86: the class-typed funnel — Level.getEntitiesOfClass(Class, AABB,
+// Predicate). The EntityGetter 2-arg default dispatches here through the
+// override (invokeinterface on a Level receiver), so ONE weave covers both
+// overloads. This is the targeting cluster's funnel (HurtByTargetGoal.
+// alertOthers, findTarget's non-player branch): the vanilla body AABB-tests
+// every entity in the section range (the profile's ~14% AABB.intersects +
+// getBoundingBox + ListItr cluster); the bridge serves the spatial answer
+// from the Rust index (exact vanilla order, doc 36b) and applies the class
+// + predicate filters on the survivors.
+fn level_class_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getEntitiesOfClass",
+        method_desc: "(Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getEntitiesOfClass",
+        bridge_desc: "(Lnet/minecraft/world/level/Level;Ljava/lang/Class;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;)Ljava/util/List;",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+        ],
+    }
+}
+
+// L87: the DEEPEST EntityTypeTest funnel — Level.getEntities(typeTest,
+// AABB, Predicate, List, int). Both the 3-arg and 4-arg overloads
+// delegate here; class-shaped tests reach EntityLookup.getEntities(Class,
+// ...) DIRECTLY through this route, bypassing the L86 weave (spread:
+// 2.36% caller entry). The bridge (CeHooks.getEntitiesTest$) refuses the
+// EntityType-indexed shape (no type partition in the Rust index) and
+// serves the entity-typed + class-typed shapes with the exact tryCast
+// combining predicate (javap-verified lambdas), the limit semantics
+// (first `limit` matches in scan order — the index order IS the vanilla
+// scan order) and the PlatformHooks.addToGetEntities tail.
+fn level_test_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "getEntities",
+        method_desc: "(Lnet/minecraft/world/level/entity/EntityTypeTest;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;Ljava/util/List;I)V",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "getEntitiesTest$",
+        bridge_desc: "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/level/entity/EntityTypeTest;Lnet/minecraft/world/phys/AABB;Ljava/util/function/Predicate;Ljava/util/List;I)V",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 4, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 5, ty: b'I' },
         ],
     }
 }
@@ -3202,11 +3795,13 @@ fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         &[(1, b'L')],
     ) {
         Ok(b2) => {
-            // L37: the moveEntity re-append probe. REQUIRED for the arm —
-            // without it the ORD_SEQ stamps go stale on every section-
-            // crossing move and the vanilla-order sort (merge partners,
-            // maxEntityCollisions cap) silently diverges. A refused patch
-            // keeps the whole module vanilla (exact, just slower).
+            // L37: the moveEntity re-append probe. KEPT as the fail-safe
+            // stamp for the LEGACY scheme (probeMoveSection no-ops when the
+            // slices scheme below landed) — without SOME re-append probe the
+            // ORD_SEQ stamps go stale on every section-crossing move and the
+            // vanilla-order sort (merge partners, maxEntityCollisions cap)
+            // silently diverges. A refused patch keeps the whole module
+            // vanilla (exact, just slower).
             match patch::insert_static_call_at_start(
                 b2,
                 "moveEntity",
@@ -3238,6 +3833,118 @@ fn patch_lookup_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+const CHUNK_SLICES_CLASS: &str =
+    "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/ChunkEntitySlices";
+
+/// PARITY ORDER (doc 36b): the ChunkEntitySlices.addEntity PREFIX probe —
+/// the exact vanilla re-append point. Woven INSTEAD of relying on the
+/// moveEntity prefix for the seq stamp: between removeEntity and addEntity
+/// the entity is invisible to vanilla scans, so the probe's pre-write of the
+/// moonrise fields + the seq bump make the order key consistent with the
+/// live structure with NO observation window (the moveEntity-prefix scheme
+/// sorted a stale-section/fresh-seq key across the whole remove+add+setSection
+/// span — the residual parity divergence). probeMoveSection stays woven as
+/// the fail-safe but no-ops when this scheme is live.
+fn patch_chunk_slices(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_chunk_slices_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+static SLICES_WOVEN: AtomicBool = AtomicBool::new(false);
+static SLICES_DECLINED: AtomicBool = AtomicBool::new(false);
+
+fn patch_chunk_slices_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(CHUNK_SLICES_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    // retransform serve: the verifier precomputed the weave
+    if let Some(b) = PRECOMPUTED.lock().ok()?.get(CHUNK_SLICES_CLASS).cloned() {
+        if !b.is_empty() {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched ChunkEntitySlices add-order probe");
+            return Some(b);
+        }
+    }
+    if SLICES_DECLINED.load(Ordering::Acquire) {
+        return None;
+    }
+    match patch::insert_static_call_at_start(
+        bytes.to_vec(),
+        "addEntity",
+        "(Lnet/minecraft/world/entity/Entity;I)Z",
+        HOOKS_CLASS,
+        "probeSectionAppend",
+        "(Lnet/minecraft/world/entity/Entity;I)V",
+        &[(1, b'L'), (2, b'I')],
+    ) {
+        Ok(b) => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            SLICES_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] patched ChunkEntitySlices.addEntity append-order probe",
+            );
+            Some(b)
+        }
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            SLICES_DECLINED.store(true, Ordering::Release);
+            // the moveEntity fallback must own the stamps now
+            set_java_int("setSectionStampScheme", 0);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] ChunkEntitySlices.addEntity probe refused: {e} — moveEntity stamp scheme kept"
+            ));
+            None
+        }
+    }
+}
+
+/// Deferred weave: the ChunkEntitySlices class loads with the FIRST chunks —
+/// usually BEFORE the arm (the boot hook stashed the bytes). Precompute the
+/// weave from the stash; the verifier retransforms the class afterwards.
+fn precompute_chunk_slices(loader: jni::jobject) {
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(CHUNK_SLICES_CLASS))
+    else {
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        patch::insert_static_call_at_start(
+            bytes,
+            "addEntity",
+            "(Lnet/minecraft/world/entity/Entity;I)Z",
+            HOOKS_CLASS,
+            "probeSectionAppend",
+            "(Lnet/minecraft/world/entity/Entity;I)V",
+            &[(1, b'L'), (2, b'I')],
+        )
+    });
+    match patched {
+        Some(Ok(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CHUNK_SLICES_CLASS, b);
+            }
+            SLICES_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] precomputed ChunkEntitySlices add-order probe (deferred)",
+            );
+        }
+        _ => {
+            SLICES_DECLINED.store(true, Ordering::Release);
+            set_java_int("setSectionStampScheme", 0);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute ChunkEntitySlices probe — moveEntity stamp scheme kept",
+            );
+        }
+    }
+    let _ = loader;
 }
 
 fn patch_entity(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -3437,14 +4144,20 @@ fn entity_probes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     // both overloads write the field directly). Waking a NON-resting entity
     // is a no-op (one array read + branch, ~3ns — the common case for every
     // mob/stacked item), so the probe is free outside the rest guard.
+    // L42: the Vec3 overload's probe is VALUE-CARRYING — the 26.3 body
+    // assigns the argument, so the probe batches the post-write field value
+    // (the old field-read capture batched the PRE-write value and left the
+    // push mirror's delta permanently stale — the first-move divergence).
+    // The DDD overload DELEGATES to the Vec3 one, so its probe stays
+    // wake-only: the inner value event lands after it and wins the drain.
     let d1 = patch::insert_static_call_at_start(
         boxed,
         "setDeltaMovement",
         "(Lnet/minecraft/world/phys/Vec3;)V",
         HOOKS_CLASS,
         "probeDelta",
-        "(Lnet/minecraft/world/entity/Entity;)V",
-        &[(0, b'L')],
+        "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/Vec3;)V",
+        &[(0, b'L'), (1, b'L')],
     )?;
     patch::insert_static_call_at_start(
         d1,
@@ -3917,12 +4630,26 @@ pub extern "system" fn n_push(
     max_ec: i32,
     cramming: i32,
     cur_tick: i32,
+    real_ncol: i32,
+    diag: i32,
 ) -> i64 {
     let res = with_state(|st| {
         drain_direct(st);
         let slot = match st.push.slot_of(self_id as i64) {
             Some(s) if st.push.flags[s] & pushcore::PF_PUSHABLE != 0 => s,
-            _ => return 0i64, // mirror: vanilla body runs
+            _ => {
+                // ADDENDUM-18: decline reason 4 (arena/flags miss) rides bits
+                // 54..56; the KPX line reads PUSH_RAW/PUSH_DROWS for the
+                // scan-stage witnesses.
+                PUSH_OUT.with(|o| {
+                    let mut o = o.borrow_mut();
+                    o.raw = 0;
+                    o.drows = 0;
+                    o.reason = 4;
+                    o.diag.clear(); // the KPI reader must see no stale records
+                });
+                return (4i64) << 54;
+            }
         };
         PUSH_OUT.with(|o| {
             let mut o = o.borrow_mut();
@@ -3940,6 +4667,8 @@ pub extern "system" fn n_push(
                 cramming,
                 pushcore::GATE_MIN,
                 cur_tick as u64,
+                real_ncol,
+                diag != 0,
                 &mut o,
             );
             if o.ok {
@@ -3948,43 +4677,286 @@ pub extern "system" fn n_push(
                     | (((o.non_passengers.max(0) as i64) & 0xF_FFFF) << 2)
                     | (((o.ncol.max(0) as i64) & 0xFFFF_FFFF) << 22)
             } else {
-                0i64
+                // ADDENDUM-18: the decline reason (1=density gate,
+                // 2=crammed route) rides bits 54..56 so the KPX line can
+                // name it without a second JNI crossing.
+                ((o.reason as i64) & 0x7) << 54
             }
         })
     })
     .unwrap_or(0i64);
-    if res & 1 == 1 {
-        // write the delta statics OUTSIDE the state borrow (server-thread
-        // confined statics, no race)
-        let (dx, dy, dz) = PUSH_OUT.with(|o| {
-            let o = o.borrow();
-            (o.dx, o.dy, o.dz)
-        });
+    // ADDENDUM-18: the scan-stage witnesses ride the statics for BOTH the
+    // served and the declined passes (the Java KPX/KPH lines read them).
+    PUSH_OUT.with(|o| {
+        let o = o.borrow();
+        let (raw, drows, n_diag, sb, walk, diag_ids, diag_stages, diag_boxes) = (
+            o.raw as i32,
+            o.drows as i32,
+            if diag != 0 { o.diag.len() as i32 } else { 0 },
+            o.diag_sb,
+            o.diag_walk,
+            if diag != 0 {
+                o.diag.iter().map(|d| d.1).collect::<Vec<i64>>()
+            } else {
+                Vec::new()
+            },
+            if diag != 0 {
+                o.diag.iter().map(|d| d.0 as i64).collect::<Vec<i64>>()
+            } else {
+                Vec::new()
+            },
+            if diag != 0 {
+                o.diag
+                    .iter()
+                    .flat_map(|d| d.2.iter().copied())
+                    .collect::<Vec<f64>>()
+            } else {
+                Vec::new()
+            },
+        );
         unsafe {
             let e = JniEnv::from_raw(env);
-            for (name, v) in [("PUSH_SDX", dx), ("PUSH_SDY", dy), ("PUSH_SDZ", dz)] {
-                if let Some(fid) = e.get_static_field_id(cls, name, "D") {
-                    let raw = e.raw();
-                    let vt = *raw;
-                    ((*vt).SetStaticDoubleField)(raw, cls, fid, v);
+            let raw_env = e.raw();
+            let vt = *raw_env;
+            for (name, v) in [
+                ("PUSH_RAW", raw),
+                ("PUSH_DROWS", drows),
+                ("PUSH_DIAG_N", n_diag),
+            ] {
+                if let Some(fid) = e.get_static_field_id(cls, name, "I") {
+                    ((*vt).SetStaticIntField)(raw_env, cls, fid, v);
+                }
+            }
+            if diag != 0 {
+                // ADDENDUM-18e: the per-candidate intersect diag — the self's
+                // mirror box + (id, stage, mirror box6) per raw candidate.
+                // In-place region writes (the static-final JIT-fold pattern).
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_SB", "[D") {
+                    let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw_env,
+                            arr as jni::jdoubleArray,
+                            0,
+                            6,
+                            sb.as_ptr(),
+                        );
+                    }
+                }
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_WALK", "[D") {
+                    let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw_env,
+                            arr as jni::jdoubleArray,
+                            0,
+                            6,
+                            walk.as_ptr(),
+                        );
+                    }
+                }
+                if n_diag > 0 {
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_IDS", "[J") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetLongArrayRegion)(
+                                raw_env,
+                                arr as jni::jlongArray,
+                                0,
+                                n_diag,
+                                diag_ids.as_ptr(),
+                            );
+                        }
+                    }
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_STAGES", "[J") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetLongArrayRegion)(
+                                raw_env,
+                                arr as jni::jlongArray,
+                                0,
+                                n_diag,
+                                diag_stages.as_ptr(),
+                            );
+                        }
+                    }
+                    if let Some(fid) = e.get_static_field_id(cls, "PUSH_DIAG_MB", "[D") {
+                        let arr = ((*vt).GetStaticObjectField)(raw_env, cls, fid);
+                        if !arr.is_null() {
+                            ((*vt).SetDoubleArrayRegion)(
+                                raw_env,
+                                arr as jni::jdoubleArray,
+                                0,
+                                diag_boxes.len() as i32,
+                                diag_boxes.as_ptr(),
+                            );
+                        }
+                    }
                 }
             }
             if e.exception_check() {
                 e.exception_clear();
             }
         }
+    });
+    if res & 1 == 1 {
+        // write the delta statics OUTSIDE the state borrow (server-thread
+        // confined statics, no race)
+        let (dx, dy, dz, npairs, ids, ds, nhits, hit_ids) = PUSH_OUT.with(|o| {
+            let o = o.borrow();
+            (
+                o.dx,
+                o.dy,
+                o.dz,
+                o.pairs.len(),
+                o.pairs.iter().map(|p| p.0).collect::<Vec<i64>>(),
+                o.pairs
+                    .iter()
+                    .flat_map(|p| [p.1, p.2])
+                    .collect::<Vec<f64>>(),
+                o.hits.len(),
+                o.hits.iter().copied().collect::<Vec<i64>>(),
+            )
+        });
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            let raw = e.raw();
+            let vt = *raw;
+            for (name, v) in [("PUSH_SDX", dx), ("PUSH_SDY", dy), ("PUSH_SDZ", dz)] {
+                if let Some(fid) = e.get_static_field_id(cls, name, "D") {
+                    ((*vt).SetStaticDoubleField)(raw, cls, fid, v);
+                }
+            }
+            // L42: the pushed-pair outputs. PUSH_PAIR_N rides EVERY ok call
+            // (zero pairs -> 0, no stale replay into the next dispatch); the
+            // arrays are written IN PLACE (SetLongArrayRegion on the field's
+            // EXISTING array) — the Java arrays are `static final` and the
+            // JIT constant-folds the array REFERENCE, so replacing the field
+            // value with a fresh array (SetStaticObjectField) would leave
+            // every compiled reader on the original never-updated object
+            // (the first CI run: 210/223 pairs missed their ARENA resolve
+            // because the loop read all-zero ids).
+            if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_N", "I") {
+                ((*vt).SetStaticIntField)(raw, cls, fid, npairs as i32);
+            }
+            // ADDENDUM-18: the pre-break candidate hits (superset of the
+            // pairs) — the Java apply loop does the REAL numCollisions
+            // increment for EVERY hit, gated candidates included.
+            if let Some(fid) = e.get_static_field_id(cls, "PUSH_HIT_N", "I") {
+                ((*vt).SetStaticIntField)(raw, cls, fid, nhits as i32);
+            }
+            if nhits > 0 {
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_HIT_IDS", "[J") {
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetLongArrayRegion)(
+                            raw,
+                            arr as jni::jlongArray,
+                            0,
+                            nhits as i32,
+                            hit_ids.as_ptr(),
+                        );
+                    }
+                }
+            }
+            if npairs > 0 {
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_IDS", "[J") {
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetLongArrayRegion)(
+                            raw,
+                            arr as jni::jlongArray,
+                            0,
+                            npairs as i32,
+                            ids.as_ptr(),
+                        );
+                    }
+                }
+                if let Some(fid) = e.get_static_field_id(cls, "PUSH_PAIR_D", "[D") {
+                    let arr = ((*vt).GetStaticObjectField)(raw, cls, fid);
+                    if !arr.is_null() {
+                        ((*vt).SetDoubleArrayRegion)(
+                            raw,
+                            arr as jni::jdoubleArray,
+                            0,
+                            (npairs * 2) as i32,
+                            ds.as_ptr(),
+                        );
+                    }
+                }
+            }
+            if e.exception_check() {
+                e.exception_clear();
+            }
+        }
+        // NOTE: no PUSH_PAIR_N reset on the declined path — the Java consume
+        // zeroes it after the apply loop, and every ok call rewrites it
+        // unconditionally; a GetStaticFieldID here would tax the hot
+        // mirror-route dispatches.
     }
     res
 }
 
-/// The numCollisions mirror value for `id`, or -1 (mirror miss). The Java
-/// decline path uses this to re-sync the field before running vanilla.
-pub extern "system" fn n_push_ncol(_env: *mut jni::JNIEnv, _cls: jni::jclass, id: i32) -> i32 {
+/// The numCollisions mirror value for `id`, or -1 (mirror miss). L41c: the
+/// value is returned ONLY when the kernel computed this entity's push in
+/// `cur_tick` — the mirror ncol of an entity the kernel never ran for is
+/// stale garbage (the vanilla body updates the real field every tick; the
+/// mirror never sees those writes), and resyncing it RESET the vanilla
+/// maxEntityCollisions cap (the mobs legs: pushNative=0, every dispatch
+/// declined, and the resync zeroed numCollisions every tick).
+pub extern "system" fn n_push_ncol(
+    _env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    id: i32,
+    cur_tick: i32,
+) -> i32 {
     with_state(|st| match st.push.slot_of(id as i64) {
-        Some(s) => st.push.ncol[s],
+        Some(s) => {
+            if st.push.ncol_tick[s] == cur_tick as u32 && cur_tick > 0 {
+                st.push.ncol[s]
+            } else {
+                -1
+            }
+        }
         None => -1,
     })
     .unwrap_or(-1)
+}
+
+/// L53-diag: the INDEX box of (world, id) — the marginExtra sample's Rust
+/// side. Writes 6 doubles (x0,y0,z0,x1,y1,z1) into `out` and returns 1,
+/// or returns 0 when the id is not indexed (the Java sampler pairs this
+/// with the LIVE box it already captured; a 0 names a vanished candidate).
+/// Read-only: takes the INDEX lock briefly, never mutates, never creates
+/// the state (an unarmed module answers 0 — no side effects).
+pub extern "system" fn n_index_box(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    world: i32,
+    id: i64,
+    out: jni::jdoubleArray,
+) -> i32 {
+    let g = match INDEX.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let st = match g.as_ref() {
+        Some(s) => s,
+        None => return 0,
+    };
+    let b = st.idx.box_of(world as u16, id);
+    drop(g);
+    if let Some(b6) = b {
+        unsafe {
+            let e = JniEnv::from_raw(env);
+            let env = e.raw();
+            let vtable = *env;
+            ((*vtable).SetDoubleArrayRegion)(env, out, 0, 6, b6.as_ptr());
+        }
+        1
+    } else {
+        0
+    }
 }
 
 // bridge class bytes (compiled by build.rs against the paper jar)
@@ -4113,5 +5085,67 @@ pub extern "system" fn n_mob_ai_floor(
                 st
             })
         })
+    }
+}
+
+/// nativeGlTake(int on) -> int[] — the L89 gate ledger read+reset.
+/// Java calls it once per level-tick at the entity-loop boundary: the return
+/// carries the ledger collected while armed (27 ints: evals/no/staged per
+/// class 0..8), `on != 0` arms the counting for the NEXT tick. Null when the
+/// interval was not armed.
+pub extern "system" fn n_gl_take(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    on: i32,
+) -> jni::jintArray {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let mut buf = [0u32; 36];
+        if !centities_core::goals::gl_take(&mut buf, on != 0) {
+            return std::ptr::null_mut();
+        }
+        let arr = ((*vt).NewIntArray)(raw, 36);
+        if arr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let tmp: [i32; 36] = std::array::from_fn(|i| buf[i] as i32);
+        ((*vt).SetIntArrayRegion)(raw, arr, 0, 36, tmp.as_ptr());
+        arr
+    }
+}
+
+/// nativeMobLedgerTake(int arm) -> long[] — the doc-41 L101 per-mob serve
+/// ledger read+drain (CE_MOB_LEDGER). Each record is 6 longs (see
+/// centities-core::goals::ml_record): [0] id | tickCount<<32, [1] seed in,
+/// [2] seed out, [3] draws | kinds<<32, [4] cursor | status<<56, [5] seq.
+/// `arm != 0` keeps the ledger armed for the next interval; the plugin
+/// dumps per tick inside LRC_WINDOW and disarms with one final arm=0 call.
+pub extern "system" fn n_mob_ledger_take(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    arm: i32,
+) -> jni::jlongArray {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let recs = centities_core::goals::mob_ledger_take(arm != 0).unwrap_or_default();
+        const W: usize = 7; // u64 fields per record (see ml_record)
+        let n = recs.len() * W;
+        let arr = ((*vt).NewLongArray)(raw, n.max(1) as i32);
+        if arr.is_null() {
+            return std::ptr::null_mut();
+        }
+        if n > 0 {
+            let flat: Vec<i64> = recs
+                .iter()
+                .flat_map(|r| r.iter().copied())
+                .map(|v| v as i64)
+                .collect();
+            ((*vt).SetLongArrayRegion)(raw, arr, 0, n as i32, flat.as_ptr());
+        }
+        arr
     }
 }

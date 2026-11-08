@@ -29,12 +29,14 @@
 /// public static float sin(double value) { return SIN[(int)(value * 10430.378F) & 0xFFFF]; }
 /// public static float cos(double value) { return SIN[(int)(value * 10430.378F + 16384.0F) & 0xFFFF]; }
 /// ```
-struct Mth {
+/// Public since L110: the native executor (swarm-sim::mob) runs the
+/// travel slice itself and needs the same bit-exact table.
+pub struct Mth {
     sin: Vec<f32>,
 }
 
 impl Mth {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut sin = vec![0f32; 65536];
         for (i, v) in sin.iter_mut().enumerate() {
             *v = (i as f64 * std::f64::consts::PI * 2.0 / 65536.0).sin() as f32;
@@ -43,14 +45,14 @@ impl Mth {
     }
 
     #[inline]
-    fn sin(&self, value: f64) -> f32 {
+    pub fn sin(&self, value: f64) -> f32 {
         // Java: SIN[(int)(value * 10430.378F) & 0xFFFF] — the f32 constant
         // WIDENS to f64 for the multiply, then narrows to int.
         self.sin[(((value * 10430.378f32 as f64) as i32) & 0xFFFF) as usize]
     }
 
     #[inline]
-    fn cos(&self, value: f64) -> f32 {
+    pub fn cos(&self, value: f64) -> f32 {
         self.sin[(((value * 10430.378f32 as f64 + 16384.0f32 as f64) as i32) & 0xFFFF) as usize]
     }
 }
@@ -237,6 +239,29 @@ pub fn travel_in_air_open_ground(
         compute_modified_friction(0.98f32, air_drag_modifier)
     };
     (dm.0 * h as f64, d * i as f64, dm.2 * h as f64)
+}
+
+/// L74: the 26.3 `Entity.move` setPos condition, mirrored from the
+/// decompiled bytecode:
+///
+/// ```java
+/// Vec3 movement = this.collide(delta);
+/// double movementLength = movement.lengthSqr();
+/// if (movementLength > 1.0E-7 || delta.lengthSqr() - movementLength < 1.0E-7)
+///     { addMovementThisTick; setPos(pos + movement); recordMovement; }
+/// ```
+///
+/// `movement` is the y-clipped vector `(dmX, 0.0, dmZ)` on the proven-open
+/// ground; the sums keep the EXACT vanilla association
+/// (`Vec3.lengthSqr() = (x*x + y*y) + z*z`). A near-stationary mob
+/// (`dm_horiz² ≤ 1e-7` with the gated `dmY = -g*vf` making the second term
+/// ~6.1e-3) does NOT setPos in vanilla — the writeback must skip it too.
+pub fn move_sets_position(delta: (f64, f64, f64)) -> bool {
+    let movement = (delta.0, 0.0f64, delta.2);
+    let movement_length =
+        (movement.0 * movement.0 + movement.1 * movement.1) + movement.2 * movement.2;
+    let delta_length = (delta.0 * delta.0 + delta.1 * delta.1) + delta.2 * delta.2;
+    movement_length > 1.0e-7 || delta_length - movement_length < 1.0e-7
 }
 
 #[cfg(test)]
@@ -448,5 +473,33 @@ mod tests {
             // sanity: finite and the y tail is delta.y - gravity dragged
             assert!(out.0.is_finite() && out.1.is_finite() && out.2.is_finite());
         }
+    }
+
+    /// L74: the move() setPos condition — a near-stationary falling mob
+    /// (the decelerating coaster / wall-residue band, |dm_horiz| ≤
+    /// sqrt(1e-7) ≈ 3.1623e-4) does NOT setPos in vanilla; a walking mob
+    /// does. The threshold itself is pinned at both sides of the band.
+    #[test]
+    fn move_setpos_condition_near_stationary_band() {
+        // the gated falling delta: dmY = -g*vf = -0.08*0.98 = -0.0784
+        let y = -0.0784f64;
+        // NOTE: the threshold compares the COMPUTED movement.lengthSqr()
+        // (dmX*dmX + 0.0) + dmZ*dmZ — an f64 squaring of the actual delta,
+        // not a mathematical ideal (sqrt(1e-7)² re-rounds to 1.000000000
+        // 0000002e-7 > 1e-7!). The pins below use exactly representable
+        // squares on both sides of the threshold.
+        // 3.16e-4² = 9.9856e-8 < 1e-7 → vanilla does NOT move
+        assert!(!move_sets_position((3.16e-4, y, 0.0)));
+        assert!(!move_sets_position((0.0, y, 3.16e-4)));
+        // 3.17e-4² = 1.004889e-7 > 1e-7 → moves
+        assert!(move_sets_position((3.17e-4, y, 0.0)));
+        // the T382 drift magnitudes (1e-4 .. 5e-4 horizontal): no move
+        assert!(!move_sets_position((1.0e-4, y, 3.0e-4)));
+        // zero horizontal delta: never moves (the standing fixed point)
+        assert!(!move_sets_position((0.0, y, 0.0)));
+        // a walking zombie (~0.03-0.09/tick): moves
+        assert!(move_sets_position((0.0332, y, -0.0382)));
+        // a full-block jump delta: moves
+        assert!(move_sets_position((0.3, y, -0.7)));
     }
 }

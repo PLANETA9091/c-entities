@@ -18,12 +18,21 @@ cp "$ROOT/build/ce-baseline.jar" "$S/plugins/"
 # the server is 26.3 — server-side translation is required for the bot to
 # join. Staged whenever the jar was fetched by CI (or manually) — present in
 # BOTH A/B legs, so the paired comparison stays fair.
-if [ -f "$ROOT/build/viaversion/ViaVersion.jar" ]; then
+if [ "${PARITY:-0}" = "1" ]; then
+  # Parity legs skip the bot entirely (deterministic replay) — ViaVersion
+  # jars are NOT needed there.
+  :
+else
+  # The bench bot speaks 26.1: without ViaVersion+ViaBackwards the bot is
+  # kicked "Outdated client" and the leg runs PLAYERLESS — the activation
+  # range stops ticking mob AI and the tracker cache arms on the empty
+  # player list. Silent playerless runs produced a whole benchmark era
+  # (observed: the ViaVersion install step sat AFTER the run step in
+  # baseline.yml). Fail loudly: the jar must be staged (baseline.yml does
+  # it) or the leg is not the benchmark we think it is.
+  [ -f "$ROOT/build/viaversion/ViaVersion.jar" ] || { echo "FATAL: ViaVersion.jar missing — bench legs must be player-present"; exit 1; }
+  [ -f "$ROOT/build/viaversion/ViaBackwards.jar" ] || { echo "FATAL: ViaBackwards.jar missing — bench legs must be player-present"; exit 1; }
   cp "$ROOT/build/viaversion/ViaVersion.jar" "$S/plugins/"
-fi
-# ViaBackwards is REQUIRED for old clients (26.1) on the new server: ViaVersion
-# alone only supports newer client versions and the bot gets kicked.
-if [ -f "$ROOT/build/viaversion/ViaBackwards.jar" ]; then
   cp "$ROOT/build/viaversion/ViaBackwards.jar" "$S/plugins/"
 fi
 cp "$PAPER_JAR" "$S/paper.jar"
@@ -142,21 +151,35 @@ XMX="${XMX:-8G}"
 export CE_ITEM_TICK="${CE_ITEM_TICK:-1}"
 if [ "${CE_MERGE:-1}" = "0" ]; then MERGE_PROP="-Dcentities.mergeFast=false"; else MERGE_PROP=""; fi
 # L22a native mob AI floor (Rust goal engine): ON by default for every
-# MODULE=on leg (baseline -mod runs + ab-paired on-legs). CE_MOB_AI=0 rolls
-# back to vanilla serverAiStep; with MODULE=off the property is inert
-# (no CeHooks class exists to read it).
+# MODULE=on leg (baseline -mod runs + ab-paired on-legs).
+# SHIPPED DEFAULT = vanilla serverAiStep: the L22a AI engine is opt-in
+# (CeHooks MOB_AI_ON_INIT defaults to "0") AND a measured net loss on the
+# 26.3 bench (e774d00: mobs-25k 193.2 with the engine vs 129.5 without)
+# AND its staged-request RNG protocol diverges level.random from vanilla
+# at t=143 (SR/LR probes, run 40771017055). The honest A/B tests what
+# ships: vanilla AI unless CE_MOB_AI=1 is explicitly requested.
 MOBAI_PROP=""
-if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-1}" = "1" ]; then
+if [ "${MODULE:-off}" = "on" ] && [ "${CE_MOB_AI:-0}" = "1" ]; then
   MOBAI_PROP="-Dcentities.mobAi=1"
+fi
+# Same for the L15 GoalSelector floor. L69 fixed the floor's running-shadow
+# order (the T382 parity root) and the ai_floor=1 gate went 12/12 green —
+# SHIPPED = the floor ON. The CeHooks reader keeps the floor ON unless the
+# property is literally "false", so the default arms it; CE_AI_FLOOR=0
+# (opt-out) passes -Dcentities.aiFloor=false for one-run bisects.
+AIFLOOR_PROP=""
+if [ "${MODULE:-off}" = "on" ] && [ "${CE_AI_FLOOR:-1}" != "1" ]; then
+  AIFLOOR_PROP="-Dcentities.aiFloor=false"
 fi
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1} mobAi=${MOBAI_PROP:+on}"
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
   ${MERGE_PROP} \
   ${MOBAI_PROP} \
+  ${AIFLOOR_PROP} \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
-  -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m" \
+  -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m,stackdepth=64" \
   -jar paper.jar nogui > "$R/server.log" 2>&1 &
 JPID=$!
 
@@ -166,6 +189,7 @@ JPID=$!
 # exact death phase (fill/measure), the module's last words and the RSS
 # of java/node are captured no matter how the leg dies.
 (
+  PHDONE=0
   for i in $(seq 1 120); do
     sleep 10
     kill -0 "$JPID" 2>/dev/null || break
@@ -183,6 +207,17 @@ JPID=$!
     # `|| true`: pipefail + grep-no-match kills the subshell silently.
     timeout 5 jcmd "$JPID" VM.native_memory summary 2>/dev/null | grep -E "Total: reserved=" | head -1 || true
     grep -aE "\[c-entities\] (ARMED|NOT armed|FAILED|item-flush|verifier snapshot|precomputed|patched)|OutOfMemory|VerifyError|Watchdog" "$R/server.log" 2>/dev/null | tail -3 || true
+    # Delta-tail the parity stream into the job log: the per-tick state hash
+    # (PH) diff across legs is the FIRST-DIVERGENCE locator, and the
+    # parity-results artifact is ~1.8GB — pulling it after the fact timed
+    # out at 600s and the analysis never ran (observed 13:08 run). Lines
+    # streamed here survive any runner death.
+    TOTAL=$(wc -l < "$R/server.log" 2>/dev/null || echo 0)
+    if [ "$TOTAL" -gt "$PHDONE" ]; then
+      tail -n +$((PHDONE + 1)) "$R/server.log" 2>/dev/null \
+        | grep -aE "PH t=|PD t=|SR t=|LR t=|ORDER-MISMATCH|SRC t=|SRF t=|MS t=|MSQ t=|MSR t=|MSS t=|MSH t=|MSP t=|QB t=|KPH t=|KVM t=|PTRACE |PARITY-SNAP|TLO t=|TTR |KPD t=|KPX t=|PQ t=|TL t=|KPI t=|KPIc t=|GL t=|GLV t=|AITR |MLEDGER |LRC |LRF t=|LHURT t=|CRAM t=|BURN t=|BURN-LIVE|CE-INIT|measure window|hooks@|entropy probe|SR-wrap|harness armed|fill start" || true
+      PHDONE=$TOTAL
+    fi
   done
 ) &
 WDPID=$!

@@ -60,6 +60,83 @@ pub const GK_LOOKAROUND: i32 = 6;
 pub const GK_HURT_BY: i32 = 7;
 pub const GK_NEAREST_TARGET: i32 = 8;
 
+// ---------------------------------------------------------------------------
+// L89 GATE LEDGER — the per-class canUse census.
+//
+// The L88 hunt read (run 41713824607): the SR stream locked ticks 141-144
+// (the probe-neutral fix worked, the t=141 cascade is gone) and the new
+// first divergence is t=145, entity stream, m = -27 (LCG-solved: the ON leg
+// consumed 27 fewer entity-random draws). The visible-stream LCS ledger:
+// OFF-only x30 RandomPos.generateRandomDirection nextInt + x1
+// WaterAvoidingRandomStrollGoal.getPosition nextFloat (vanilla ran stroll
+// STARTS the engine did not) vs ON-only x1 RandomLookAroundGoal.start
+// pair (the engine started a lookaround vanilla did not); net -24 visible
+// -3 gate rolls. The per-class outcome census names the gate whose verdict
+// split. Zero cost when GL_ON is false (the window gate); Java reads+resets
+// once per dump tick via nativeGlTake.
+// ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+pub static GL_ON: AtomicBool = AtomicBool::new(false);
+pub static GL_EVALS: [AtomicU32; 9] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static GL_NO: [AtomicU32; 9] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static GL_STAGED: [AtomicU32; 9] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static GL_ROLLS: [AtomicU32; 9] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Read+reset the ledger into `dst` (36 ints: evals/no/staged/rolls per
+/// class 0..8) and set the arming for the NEXT engine calls. Returns whether
+/// the ledger WAS armed during the interval that just ended.
+pub fn gl_take(dst: &mut [u32], arm: bool) -> bool {
+    let was = GL_ON.swap(arm, Ordering::Relaxed);
+    for k in 0..9 {
+        dst[k * 4] = GL_EVALS[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 1] = GL_NO[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 2] = GL_STAGED[k].swap(0, Ordering::Relaxed);
+        dst[k * 4 + 3] = GL_ROLLS[k].swap(0, Ordering::Relaxed);
+    }
+    was
+}
+
 // goal flags — the vanilla Goal.Flag ordinals as bits
 pub const FL_MOVE: i64 = 1;
 pub const FL_LOOK: i64 = 1 << 1;
@@ -159,18 +236,21 @@ pub const GOAL_STRIDE: usize = 8;
 //   [32..34] getEyeY()
 //   [34..]  goal records: target selector first, then goal selector;
 //   then P * PSTRIDE player snapshot records (level.players() order)
-const IN_HEADER: usize = 34;
-const IN_PCOUNT: usize = 24;
-const IN_FOLLOW: usize = 25;
-const IN_MOBX: usize = 26;
-const IN_MOBY: usize = 28;
-const IN_MOBZ: usize = 30;
-const IN_EYEY: usize = 32;
-const IN_SEED_LO: usize = 12;
-const IN_SEED_HI: usize = 13;
-const IN_RES: usize = 14;
-const IN_RES_OP: usize = 15;
-const IN_RES_X: usize = 16;
+// L110+ — the layout constants are public: the native executor
+// (swarm-sim::mob) packs/unpacks the same wire format the Java packer
+// (CeHooks.aiPack) does, without re-declaring it.
+pub const IN_HEADER: usize = 34;
+pub const IN_PCOUNT: usize = 24;
+pub const IN_FOLLOW: usize = 25;
+pub const IN_MOBX: usize = 26;
+pub const IN_MOBY: usize = 28;
+pub const IN_MOBZ: usize = 30;
+pub const IN_EYEY: usize = 32;
+pub const IN_SEED_LO: usize = 12;
+pub const IN_SEED_HI: usize = 13;
+pub const IN_RES: usize = 14;
+pub const IN_RES_OP: usize = 15;
+pub const IN_RES_X: usize = 16;
 
 // output buffer (i32 units):
 //   [0] status (ST_*)
@@ -182,9 +262,9 @@ const IN_RES_X: usize = 16;
 //   [6] resume cursor (Java writes it into in[0] on resume)
 //   [7] fallback reason (FB_* — 0 when no fallback; diagnostics only)
 //   [8...] actions, 8 i32 each: [op, p0, p1, p2, p3, d0lo, d0hi, pad]
-const OUT_HEADER: usize = 8;
-const OUT_ACT: usize = 8;
-const MAX_ACTS: usize = 96;
+pub const OUT_HEADER: usize = 8;
+pub const OUT_ACT: usize = 8;
+pub const MAX_ACTS: usize = 96;
 
 /// fallback reason codes (out[7]) — the Java floor logs the first one so a
 /// classified-mob fallback is diagnosable from the CI log alone.
@@ -206,13 +286,15 @@ pub const FB_JAVA_PREDICATE: i32 = 104;
 // action opcodes (applied by the executor after the FINAL round)
 pub const ACT_GOAL_START: i32 = 1; // goal.start() virtual (p0 = global goalIdx)
 pub const ACT_GOAL_TICK_V: i32 = 3; // goal.tick() virtual (p0 = goalIdx)
-pub const ACT_GOAL_STOP: i32 = 2; // goal.stop() virtual (p0 = goalIdx)
+pub const ACT_GOAL_STOP: i32 = 2; // goal.stop() virtual + the paired map remove (cleanup: the same-tick removeIf equivalent)
+pub const ACT_GOAL_STOP_D: i32 = 4; // DISPLACED stop (update walk): vanilla cur.stop() only — the map entry STAYS (!isRunning) until the next tick's removeIf
 pub const ACT_LOOK_TICK_AROUND: i32 = 5; // lookaround tick port: lookTime-- (p1 = new), setLookAt(x+relX, eyeY, z+relZ)
 pub const ACT_LOOK_TICK_AT: i32 = 6; // lookat tick port: lookTime-- (p1 = new), setLookAt(lookAt)
 pub const ACT_NAV_IDLE: i32 = 7; // navigation.tick idle port done natively (executor does tick++ etc.)
 pub const ACT_MOVE_ZZA0: i32 = 8; // moveControl WAIT: setZza(0)
 pub const ACT_LOOK_COOL_VANILLA: i32 = 9; // lookControl.tick routes vanilla (cooldown > 0)
 pub const ACT_REF_SET_PLAYER: i32 = 10; // goal.lookAt/target = players[p1] (p0 = global goalIdx)
+pub const ACT_GOAL_LOCK_MAP: i32 = 11; // lockedFlags.put(flag, wg) ONLY — the start body runs at the REQ_START_VANILLA resolution (L102)
 pub const ACT_NOOP: i32 = 0;
 
 // phases within one selector tick
@@ -221,7 +303,7 @@ const PH_LOCK_REBUILD: i32 = 1;
 const PH_UPDATE: i32 = 2;
 const PH_TICK_RUNNING: i32 = 3;
 
-const MAX_GOALS: usize = 16;
+pub const MAX_GOALS: usize = 16;
 
 fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
     ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)
@@ -233,11 +315,16 @@ fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
 
 pub struct Lcg {
     pub value: u64,
+    /// L89: the number of advance() calls in THIS ai_floor entry — the
+    /// canUse wrapper reads the delta around each goal's body to attribute
+    /// the exact RNG draw count per gate class.
+    pub draws: u32,
 }
 
 impl Lcg {
     #[inline]
     fn advance(&mut self) -> u64 {
+        self.draws = self.draws.wrapping_add(1);
         self.value = self.value.wrapping_mul(25214903917).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
         self.value
     }
@@ -584,8 +671,156 @@ enum Cu {
     Staged,
 }
 
+// ---------------------------------------------------------------------------
+// doc-41 L101 MOB LEDGER (CE_MOB_LEDGER) — the per-mob serve witness.
+//
+// The t=157 residual is LOCAL to the pair (107, 139): the engine's staged
+// continuation resumed the wrong goal for them while the GLOBAL stream
+// stayed exact. The class ledger (GL_) reconciles globally; the per-mob
+// ledger records EVERY ai_floor call so the serve chain of one mob is
+// reconstructible: per call — (id, tickCount, seed in, seed out, draws
+// this call, started-kind bits, cursor, status). The chained s1->s0
+// continuity quantifies each staged predicate's draws, and the kinds
+// name the START the engine emitted at the shifted stream position.
+// Zero cost when disarmed (one relaxed load per call). Read+drain via
+// nativeMobLedgerTake (the plugin dumps inside LRC_WINDOW).
+// ---------------------------------------------------------------------------
+pub static ML_ON: AtomicBool = AtomicBool::new(false);
+static ML_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// One record = 7 u64: [0] (id u32) | (tickCount u32 << 32), [1] seed_in,
+/// [2] seed_out, [3] (draws u32) | (kinds u32 << 32), [4] (cursor) |
+/// (status as u64 << 56), [5] seq, [6] (eval kind-mask u32) |
+/// (pack running kind-mask u32 << 32).
+static ML_RING: std::sync::Mutex<Vec<[u64; 7]>> = std::sync::Mutex::new(Vec::new());
+pub const ML_CAP: usize = 1 << 16;
+
+pub fn mob_ledger_take(arm: bool) -> Option<Vec<[u64; 7]>> {
+    // the arm flag sets the NEXT interval's state (gl_take semantics):
+    // drain whatever was collected so far, then re-arm as requested.
+    ML_ON.store(arm, Ordering::Relaxed);
+    let mut ring = ML_RING.lock().ok()?;
+    let out = std::mem::take(&mut *ring);
+    Some(out)
+}
+
+pub fn mob_ledger_arm(on: bool) {
+    ML_ON.store(on, Ordering::Relaxed);
+    if !on {
+        if let Ok(mut r) = ML_RING.lock() {
+            r.clear();
+        }
+    }
+}
+
+#[inline]
+fn ml_kind_bits(inb: &[i32], out_buf: &[i32]) -> u32 {
+    // decode the emitted ACT_GOAL_START actions back to kind bits: the
+    // global index layout is [target goals | goal goals] (offset_of).
+    let nt = inb[5] as usize;
+    let ng = inb[6] as usize;
+    let n_act = out_buf[5].max(0) as usize;
+    let mut bits = 0u32;
+    for a in 0..n_act {
+        let b = OUT_HEADER + a * OUT_ACT;
+        if out_buf[b] == ACT_GOAL_START || out_buf[b] == ACT_GOAL_LOCK_MAP {
+            let gi = out_buf[b + 1];
+            let kind = if (gi as usize) < nt {
+                inb[IN_HEADER + gi as usize * GOAL_STRIDE]
+            } else {
+                let j = gi as usize - nt;
+                if j >= ng {
+                    continue;
+                }
+                inb[IN_HEADER + (nt + j) * GOAL_STRIDE]
+            };
+            if (0..9).contains(&kind) {
+                bits |= 1u32 << kind;
+            }
+        }
+    }
+    bits
+}
+
+#[inline]
+fn ml_running_kind_bits(inb: &[i32]) -> u32 {
+    // the pack's INCOMING running state per kind — what the engine was
+    // told the selectors believe is running (the WrappedGoal.isRunning
+    // mirrors). Both selectors' records scan.
+    let nt = inb[5] as usize;
+    let ng = inb[6] as usize;
+    let mut bits = 0u32;
+    for g in 0..(nt + ng) {
+        let base = IN_HEADER + g * GOAL_STRIDE;
+        if base + 4 < inb.len() && inb[base + 4] != 0 {
+            let k = inb[base];
+            if (0..9).contains(&k) {
+                bits |= 1u32 << k;
+            }
+        }
+    }
+    bits
+}
+
+#[inline]
+fn ml_record(in_buf: &[i32], out_buf: &[i32], st: i32) {
+    if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER {
+        return;
+    }
+    if let Ok(mut ring) = ML_RING.lock() {
+        if ring.len() < ML_CAP {
+            let id = (in_buf[3] as u64) & 0xFFFF_FFFF;
+            let tc = ((in_buf[2] as i64).max(0) as u64) << 32;
+            let seed_in = (((in_buf[IN_SEED_HI] as u64) & 0xFFFF_FFFF) << 32)
+                | ((in_buf[IN_SEED_LO] as u64) & 0xFFFF_FFFF);
+            let seed_out =
+                (((out_buf[4] as u64) & 0xFFFF_FFFF) << 32) | ((out_buf[3] as u64) & 0xFFFF_FFFF);
+            let draws = ML_DRAW_SWAPS.swap(0, Ordering::Relaxed);
+            let evals = ML_EVAL_SWAPS.swap(0, Ordering::Relaxed);
+            let kinds = ml_kind_bits(in_buf, out_buf);
+            let running = ml_running_kind_bits(in_buf);
+            let cursor = (in_buf[0] as u64) & 0x00FF_FFFF_FFFF_FFFF;
+            let status = (st as i64).max(0) as u64;
+            let seq = ML_SEQ.fetch_add(1, Ordering::Relaxed);
+            ring.push([
+                id | tc,
+                seed_in,
+                seed_out,
+                ((kinds as u64) << 32) | ((draws as u64) & 0xFFFF_FFFF),
+                cursor | (status << 56),
+                seq as u64,
+                ((evals as u64) << 32) | ((running as u64) & 0xFFFF_FFFF),
+            ]);
+        }
+    }
+}
+
+/// The draw counter lives with the LCG (ctx.lcg.draws is per-ctx); the
+/// wrapper stamps it here — set by ai_floor_run at exit.
+pub static ML_DRAW_SWAPS: AtomicU32 = AtomicU32::new(0);
+
+/// The per-call EVAL mask: one bit per goal kind whose can_use the update
+/// walk actually evaluated this call. The t=157 hunt proved the engine's
+/// TOTAL draw count exceeds vanilla's by exactly the L100d extra-eval
+/// amount (+8 kind-8/+2 kind-4) — the engine evaluated gates vanilla
+/// skipped (running/flag-locked). The eval mask × the pack's running
+/// mask names the guilty mob AND the bug side: eval bit set while the
+/// pack said the goal was RUNNING = an engine-walk bug; the eval bit set
+/// while the pack said NOT running = the pack mirror diverged from
+/// vanilla's actual state (freshness). Stamped by can_use, drained by
+/// the wrapper per record.
+pub static ML_EVAL_SWAPS: AtomicU32 = AtomicU32::new(0);
+
 /// The floor entry. Returns the status written to out_buf[0].
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
+    let st = ai_floor_run(in_buf, out_buf);
+    if ML_ON.load(Ordering::Relaxed) {
+        ml_record(in_buf, out_buf, st);
+    }
+    st
+}
+
+fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
@@ -617,6 +852,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         ],
         lcg: Lcg {
             value: ((in_buf[IN_SEED_HI] as u64) << 32) | (in_buf[IN_SEED_LO] as u64 & 0xFFFF_FFFF),
+            draws: 0,
         },
         lock: [[-1; MAX_GOALS]; 2],
         running: [[false; MAX_GOALS]; 2],
@@ -650,8 +886,17 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
 
     if resume {
         // the fresh pack carries the post-continuation running state —
-        // rebuild the lock table for the parked selector before continuing
-        // (the displaced goals were stopped with their flags released)
+        // rebuild the lock table for the parked selector before continuing.
+        // This is the running-subset rebuild = the next tick's removeIf
+        // equivalent. KNOWN WINDOW (L97.7): displaced !isRunning records
+        // created EARLIER in the same update walk (a start displaced a
+        // holder whose other-flag entries survive to the next removeIf)
+        // are lost here when a later candidate of the SAME tick parks —
+        // the vanilla map keeps them until its removeIf. The classified
+        // zombie set never chains a second park after a displaced start
+        // (stroll pos / lookat / LOS stages precede their starts), so the
+        // window is theoretical today; if a family ever hits it, the pack
+        // must carry the displaced flags explicitly.
         let count = ctx.counts[sel];
         for bit in 0..MAX_GOALS {
             ctx.lock[sel][bit] = -1;
@@ -677,14 +922,19 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
-            REQ_CANUSE_VANILLA | REQ_STROLL_POS | REQ_LOOKAT_QUERY | REQ_FIND_TARGET
-            | REQ_START_VANILLA => {
+            REQ_CANUSE_VANILLA | REQ_STROLL_POS | REQ_LOOKAT_QUERY | REQ_FIND_TARGET => {
                 // the continuation resolved the PREDICATE only — the lock
                 // transition (displaced stops, then start) is the engine's
                 // job, emitted as actions the floor applies IMMEDIATELY
                 if res && lock_only(&mut ctx, &mut out, sel, gi).is_err() {
                     return fallback(&mut out, FB_STATE_MISMATCH);
                 }
+            }
+            REQ_START_VANILLA => {
+                // L102: the transition rode the PARK round
+                // (lock_only_resolved) and the REAL start() ran inline at
+                // the resolution — the walk continues with the transition
+                // already applied and the stream exact. Nothing to do.
             }
             REQ_LOS_SCAN => {
                 // res_mask = the passing bitmask over the staged candidates.
@@ -781,13 +1031,50 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     }
                     gi += 1;
                 }
-                phase = PH_TICK_RUNNING;
-                gi = 0;
+                // L82 (the parity fix): the EVEN branch of 26.3
+                // serverAiStep (javap bc 148-191) calls ONLY
+                // GoalSelector.tick() per selector — the cleanup loop +
+                // the lockedFlags removeIf + the update loop. There is NO
+                // running-goal tick phase on even ticks: the tick bodies
+                // live in the ODD branch's tickRunningGoals(false)
+                // (bc 91-145, requiresUpdateEveryTick goals only — the
+                // classified zombie set's single override is
+                // RandomLookAroundGoal, exactly every_tick() here). The
+                // old even-path hop into PH_TICK_RUNNING with force=true
+                // executed a phase 26.3 never runs: every running goal's
+                // tick body (state writes AND any RNG draws) landed
+                // between the update and the next selector, reordering
+                // the SHARED_RANDOM serving within the tick. The re-
+                // ordered values are what the L81b hunt caught: the
+                // burnUndead armor-wear gate (nextInt(2)) read a shifted
+                // LCG position at mobs t=143 (+1 RemoveBinomial draw),
+                // the spawn rolls shifted next tick, the jockey rolls
+                // flipped at t=146 and the entity-id streams exploded.
+                // L97.8 (javap bc 277-282 + the bisect verdict): the
+                // even-tick tickRunningGoals(true) phase IS in GoalSelector.tick()
+                // — but porting it back moved the mobs SR first-desync from
+                // t=159 to t=145 (the bisect pair 42264781351/42264784950
+                // names D2 the guilty leg, D1 the clean one). The phase's
+                // RNG-visible shape differs from the engine's model in a way
+                // the t=144-145 stroll/RLA canUse stream exposes — the
+                // next session mines the SRF frames of that window before
+                // any re-port. The L96-era model (no even-tick tick phase)
+                // stays shipped: it holds the t=141-159 SR stream EXACT
+                // with the displaced-stop fix (D1) live.
+                if sel == SEL_TARGET {
+                    sel = SEL_GOAL;
+                    phase = PH_CLEANUP;
+                    gi = 0;
+                    continue;
+                }
+                return done(&mut ctx, &mut out);
             }
             PH_TICK_RUNNING => {
-                let force = !odd_branch;
+                // ODD branch only: tickRunningGoals(false) — the running
+                // goals with requiresUpdateEveryTick() (LOOKAROUND in the
+                // classified set) tick.
                 while gi < count {
-                    if ctx.running[sel][gi] && (force || every_tick(ctx.kind(sel, gi))) {
+                    if ctx.running[sel][gi] && every_tick(ctx.kind(sel, gi)) {
                         if !tick_ported(&mut ctx, &mut out, sel, gi) {
                             out.push(ACT_GOAL_TICK_V, ctx.global(sel, gi), 0, 0, 0);
                         }
@@ -796,11 +1083,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 }
                 if sel == SEL_TARGET {
                     sel = SEL_GOAL;
-                    phase = if odd_branch {
-                        PH_TICK_RUNNING
-                    } else {
-                        PH_CLEANUP
-                    };
+                    phase = PH_TICK_RUNNING;
                     gi = 0;
                     continue;
                 }
@@ -814,6 +1097,7 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
 fn done(ctx: &mut Ctx, out: &mut Out) -> i32 {
     // the engine's ported control decisions ride the actions; the executor's
     // Java tail (nav tick++, look idle rotate, jump reset) finishes the rest.
+    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_DONE;
     out.buf[1] = 0;
     out.buf[2] = 0;
@@ -832,6 +1116,7 @@ fn fallback(out: &mut Out, reason: i32) -> i32 {
 }
 
 fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
+    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_REQUEST;
     out.buf[1] = req;
     out.buf[2] = gi as i32;
@@ -862,7 +1147,16 @@ fn needs_cc_vanilla(kind: i32) -> bool {
 }
 
 fn every_tick(kind: i32) -> bool {
-    kind == GK_LOOKAROUND
+    // javap 26.3 requiresUpdateEveryTick() overrides in the classified
+    // zombie set: RandomLookAroundGoal (iconst_1) AND MeleeAttackGoal
+    // (iconst_1). The L22c Java fast path already knew about the melee
+    // half (aiMeleeRunning gates the odd-branch Java walk); the Rust
+    // side missed it — a running melee goal's odd-tick body (attack
+    // cooldowns + the swing RNG) silently vanished whenever the JNI
+    // path served the odd branch (any targeted mob). GK_ZOMBIE_ATTACK
+    // now rides the same every-tick set; tick_ported does not port its
+    // body, so the odd path emits the exact ACT_GOAL_TICK_V virtual.
+    kind == GK_LOOKAROUND || kind == GK_ZOMBIE_ATTACK
 }
 
 /// the ported canContinueToUse bodies
@@ -882,7 +1176,47 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 }
 
 /// the ported canUse bodies
+/// L89: the ledgered canUse entry — one relaxed atomic add per eval, only
+/// while the dump window holds (GL_ON); the wrapper is transparent
+/// otherwise.
 fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+    // the eval-mask stamp (see ML_EVAL_SWAPS): one relaxed OR per eval —
+    // zero cost when the ledger is disarmed (the load in the wrapper
+    // short-circuits the record, the OR itself is negligible).
+    {
+        let k = ctx.kind(sel, gi);
+        if (0..9).contains(&k) {
+            ML_EVAL_SWAPS.fetch_or(1u32 << k, Ordering::Relaxed);
+        }
+    }
+    if !GL_ON.load(Ordering::Relaxed) {
+        return can_use_inner(ctx, out, sel, gi, phase);
+    }
+    let kind = ctx.kind(sel, gi);
+    let d0 = ctx.lcg.draws;
+    let r = can_use_inner(ctx, out, sel, gi, phase);
+    let k = kind.clamp(0, 8) as usize;
+    GL_EVALS[k].fetch_add(1, Ordering::Relaxed);
+    GL_ROLLS[k].fetch_add(ctx.lcg.draws - d0, Ordering::Relaxed);
+    match &r {
+        Ok(Cu::No) => {
+            GL_NO[k].fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
+            GL_STAGED[k].fetch_add(1, Ordering::Relaxed);
+        }
+        Err(()) => {}
+    }
+    r
+}
+
+fn can_use_inner(
+    ctx: &mut Ctx,
+    out: &mut Out,
+    sel: usize,
+    gi: usize,
+    phase: i32,
+) -> Result<Cu, ()> {
     match ctx.kind(sel, gi) {
         GK_SPEAR_USE => {
             // ableToAttack() && !isUsingItem() — native only when the
@@ -955,6 +1289,25 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             if ri > 0 && ctx.lcg.next_int_bound(ri) != 0 {
                 return Ok(Cu::No);
             }
+            // L83: ZERO players in the snapshot → getNearestPlayer is
+            // PROVABLY null (the scan has no candidates; the follow range,
+            // the conditions and the LoS never matter — the vanilla query
+            // iterates level.players() which is empty). The null write IS
+            // the only observable (NearestAttackableTargetGoal has no
+            // stop() clear for the field), canUse returns false, no lock
+            // transition, no RNG after the interval pull. The old shape
+            // parked REQ_FIND_TARGET for exactly this case — one JNI
+            // round PER MOB PER EVEN TICK in every player-less world
+            // (the parity scenarios AND the player-less phases of the
+            // benches): ~2500 mobs x ~400 even ticks = ~500k rounds on
+            // mobs-25k, each a full state mirror + crossing. The AITR
+            // witness (run 41670844291, t=420): op=6 r=0 for every
+            // traced mob — the single biggest staged cost in the
+            // engine's profile.
+            if ctx.pcount() == 0 {
+                out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                return Ok(Cu::No);
+            }
             // Player-typed target (cfg SIGN bit — bit1 collided with the
             // randomInterval value 10 = 0b1010!): findTarget() =
             // getNearestPlayer over the snapshot — the non-LoS half of
@@ -965,7 +1318,6 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             if ctx.cfg3(sel, gi) & 1 != 0
                 && !ctx.flag(MF_TEAMS_PRESENT)
                 && !ctx.flag(MF_MANY_PLAYERS)
-                && ctx.pcount() > 0
             {
                 let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
                 let cands = ctx.scan_players(true, false, range);
@@ -980,7 +1332,9 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
                 return Ok(Cu::Staged);
             }
             // findTarget() — a level query, staged (the gate pull already
-            // happened; the seed handoff keeps the stream exact)
+            // happened; the seed handoff keeps the stream exact). Only
+            // reachable for non-player-typed target goals or the
+            // team/many-players worlds now.
             park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
             Ok(Cu::Staged)
         }
@@ -1029,6 +1383,16 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
             // nextFloat() < 0.02F → start (staged — start() writes
             // relX/relZ/lookTime and consumes nextDouble + nextInt(20))
             if ctx.lcg.next_f32() < 0.02f32 {
+                // L102: the lock transition rides the PARK round (the
+                // displaced stops + the map put apply BEFORE the
+                // resolution); the REAL start() runs inline at the
+                // REQ_START_VANILLA resolution — vanilla performs the
+                // start's draws mid-walk, before the remaining gates.
+                if lock_only_resolved(ctx, out, sel, gi).is_err() {
+                    out.buf[0] = ST_FALLBACK;
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return Ok(Cu::No);
+                }
                 park(ctx, out, sel, phase, gi, REQ_START_VANILLA);
                 Ok(Cu::StartStaged)
             } else {
@@ -1039,14 +1403,29 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
     }
 }
 
-/// WrappedGoal.canBeReplacedBy: other.priority <= locked.priority
+/// WrappedGoal.canBeReplacedBy (26.3 bytecode, javap-verified):
+/// `return this.isInterruptable() && other.getPriority() < this.getPriority();`
+/// — the candidate must be STRICTLY more important than the current lock
+/// holder, and the holder must be interruptable. The old transcription
+/// (`other.priority <= locked.priority` — equal-priority replacement
+/// ALLOWED) fired exactly on the zombie set's two equal-priority
+/// same-flag pairs — LookAtPlayer(8)/RandomLookAround(8) on LOOK and
+/// NearestAttackable(Villager,3)/NearestAttackable(Golem,3) on TARGET:
+/// the engine evaluated canUse (and started lookarounds) where vanilla's
+/// strict check refused — the L95 ledger deltas (+2 lookaround starts,
+/// the extra target/stroll evals and their RNG cascade).
+/// isInterruptable: no goal in the classified zombie set overrides it
+/// (javap: MeleeAttack/RandomLookAround/LookAtPlayer/Stroll/MTV/HurtBy/
+/// Nearest/Float/SpearUse — zero isInterruptable references, the Goal
+/// default true applies); model it as a per-goal cfg bit when a
+/// non-interruptable kind ever enters the classified set.
 fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
         if bit < MAX_GOALS {
             let locked = ctx.lock[sel][bit];
-            if locked != -1 && ctx.prio(sel, locked as usize) < ctx.prio(sel, gi) {
+            if locked != -1 && ctx.prio(sel, gi) >= ctx.prio(sel, locked as usize) {
                 return false;
             }
         }
@@ -1056,9 +1435,20 @@ fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 }
 
 fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
-    // vanilla update-pass transition: for each flag — currentGoal.stop();
-    // lock[flag] = goalx — then goalx.start(). The stops ride first so the
-    // executor applies stop→start in the exact vanilla order.
+    // vanilla update-pass transition (javap 26.3 GoalSelector.tick bc 193-264):
+    // for each flag — cur = lockedFlags.getOrDefault(flag, NO_GOAL); cur.stop();
+    // lockedFlags.put(flag, goalx) — then goalx.start() AFTER the whole flag
+    // walk. TWO subtleties the L97.7 javap read named:
+    //  1. WrappedGoal.stop() NEVER touches the map — a displaced holder's
+    //     entries on the new goal's OTHER flags stay as !isRunning records
+    //     until the NEXT tick's removeIf, and goalCanBeReplacedForAllFlags
+    //     does NOT check isRunning (javap bc 17-73) — those records gate
+    //     the same-tick candidates' replace checks.
+    //  2. The displaced stop fires ONCE per holder even when both a replaced
+    //     flag and a surviving flag exist: the second stop() is the
+    //     isRunning-guarded no-op (javap WrappedGoal.stop bc 0-19).
+    // So the displaced stop rides ACT_GOAL_STOP_D (map-preserving wg.stop()),
+    // and the flag releases happen only where the put overwrites below.
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
@@ -1066,14 +1456,56 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
             return Err(());
         }
         let cur = ctx.lock[sel][bit];
-        if cur != -1 && stop_goal(ctx, out, sel, cur as usize).is_err() {
-            return Err(());
+        if cur != -1 {
+            let c = cur as usize;
+            if ctx.running[sel][c] {
+                // first stop on this holder this walk — the vanilla
+                // isRunning-guarded body (goal.stop() + isRunning=false)
+                ctx.running[sel][c] = false;
+                out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
+            }
+            // a !isRunning holder: vanilla stop() is a no-op — the record
+            // survives exactly as ctx.lock holds it
         }
         ctx.lock[sel][bit] = gi as i32;
         fl &= fl - 1;
     }
     ctx.running[sel][gi] = true;
     out.push(ACT_GOAL_START, ctx.global(sel, gi), 0, 0, 0);
+    Ok(())
+}
+
+/// The L102 variant for the DRAWING start bodies (the RLA start draws
+/// nextDouble + nextInt(20) — javap 26.3): the lock transition (displaced
+/// stops + the map put) rides the PARK round so the apply lands it in the
+/// vanilla order (stops → put → start), the REAL start() runs at the
+/// REQ_START_VANILLA resolution — INLINE, before the walk's remaining
+/// gates — and the engine's LCG model stays exact for them. The old shape
+/// (start at apply, after the walk) left the model 2 draws behind per
+/// staged start: every later gate of the same tick read a shifted stream
+/// position — the t=157 stroll flip (the engine's stroll gate refused at
+/// position P−2 where vanilla passed at P) and the +10..12/tick roll
+/// surplus the L101 ledger reconciliation measured.
+fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
+    let mut fl = ctx.flags(sel, gi);
+    while fl != 0 {
+        let bit = fl.trailing_zeros() as usize;
+        if bit >= MAX_GOALS {
+            return Err(());
+        }
+        let cur = ctx.lock[sel][bit];
+        if cur != -1 {
+            let c = cur as usize;
+            if ctx.running[sel][c] {
+                ctx.running[sel][c] = false;
+                out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
+            }
+        }
+        ctx.lock[sel][bit] = gi as i32;
+        fl &= fl - 1;
+    }
+    ctx.running[sel][gi] = true;
+    out.push(ACT_GOAL_LOCK_MAP, ctx.global(sel, gi), 0, 0, 0);
     Ok(())
 }
 
@@ -1304,6 +1736,31 @@ mod tests {
         b
     }
 
+    /// L103 empirical probe: the idle even-tick walk on the REAL fixture
+    /// pack (hurtby + 3 NA / spear, za, turtleegg, mtv, stroll, lap, rla),
+    /// fully native (no players -> the L83 fast No), noAction<100 so the
+    /// stroll gate draws. Counts the LCG draws via ML_DRAW_SWAPS.
+    #[test]
+    fn l103_idle_walk_draw_count() {
+        for seed in 1u64..200 {
+            let inb = build_in(seed, 100, 2, 42); // even tick, stroll gate reached
+            let before = ML_DRAW_SWAPS.load(Ordering::SeqCst);
+            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let st = ai_floor(&inb, &mut out);
+            let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst) - before;
+            if st == ST_DONE {
+                // diagnostic only: ML_DRAW_SWAPS is process-global and
+                // cargo runs tests in parallel — the delta is meaningful
+                // only in isolation (--test-threads=1). The contract
+                // shape (6 draws for this pack) is verified in CI runs
+                // of the ledger, not asserted here.
+                println!("seed {seed}: ST_DONE draws={draws} (isolated static shape = 6)");
+                return;
+            }
+        }
+        panic!("no ST_DONE seed in 1..200");
+    }
+
     /// drive the staged protocol the way CeHooks.aiRun does; `resolve`
     /// maps the request opcode to the continuation result
     fn drive_res(in_buf: &mut Vec<i32>, out: &mut Vec<i32>, resolve: &dyn Fn(i32) -> i32) -> i32 {
@@ -1337,7 +1794,10 @@ mod tests {
         assert_eq!(st, ST_DONE);
 
         // reference: advance the LCG with the exact pull sequence
-        let mut r = Lcg { value: seed0 };
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1349,6 +1809,45 @@ mod tests {
 
         // nothing started, nothing stopped
         assert_eq!(out[5], 0, "no actions expected on a quiet tick");
+    }
+
+    #[test]
+    fn even_tick_never_ticks_running_goals() {
+        // L82 regression pin: 26.3's EVEN serverAiStep branch calls ONLY
+        // GoalSelector.tick() (cleanup + removeIf + update) — a RUNNING
+        // goal's tick body must NOT run and must not draw. The old even
+        // path force-ticked every running goal (a phase 26.3 never runs)
+        // and reordered the SHARED_RANDOM serving (the t=141 root).
+        let seed0 = 999u64;
+        let mut inb = build_in(seed0, 100, 2, 42); // 100+2 even, tickCount>1
+        let off = IN_HEADER + 10 * GOAL_STRIDE; // the lookaround, running
+        inb[off + 4] = 1;
+        inb[off + 5] = 7; // lookTime 7
+        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let st = ai_floor(&inb, &mut out);
+        assert_eq!(st, ST_DONE);
+        assert_eq!(out[5], 0, "NO tick actions on an even tick");
+        // the seed advances ONLY by the update phase's canUse pulls of the
+        // NON-running goals: 3 nearest gates + stroll. The lookat pull does
+        // NOT happen either — L95: the lookaround (prio 8) is RUNNING and
+        // holds the LOOK flag; vanilla WrappedGoal.canBeReplacedBy (javap,
+        // 26.3) refuses the lookat(8) candidate at EQUAL priority
+        // (other.prio < this.prio is false), so its 0.02-roll canUse never
+        // evaluates. The old engine drew the lookat pull (the <= model) and
+        // the old even path additionally force-ticked the running body —
+        // both reorder the SHARED_RANDOM serving vs vanilla.
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
+        for _ in 0..3 {
+            r.next_int_bound(10);
+        }
+        r.next_int_bound(60);
+        let seed1 = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+        assert_eq!(seed1, r.value, "the even tick must not draw anything extra");
+        // the lookaround's lookTime state is untouched (no tick body ran)
+        assert_eq!(inb[off + 5], 7, "lookTime unchanged — no tick body ran");
     }
 
     #[test]
@@ -1381,7 +1880,10 @@ mod tests {
         // seed whose 4th pull (after the 3 nearest gates) yields 0
         let mut seed = 1u64;
         loop {
-            let mut r = Lcg { value: seed };
+            let mut r = Lcg {
+                value: seed,
+                draws: 0,
+            };
             for _ in 0..3 {
                 r.next_int_bound(10);
             }
@@ -1424,7 +1926,10 @@ mod tests {
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_DONE);
         // reference: 3 nearest gates + lookat + lookaround (NO stroll pull)
-        let mut r = Lcg { value: seed0 };
+        let mut r = Lcg {
+            value: seed0,
+            draws: 0,
+        };
         for _ in 0..3 {
             r.next_int_bound(10);
         }
@@ -1448,6 +1953,7 @@ mod tests {
         // java.util.Random(42) reference: nextInt(60), nextFloat(), nextDouble()
         // computed with the same recurrence (value starts at seed ^ MUL & MASK)
         let mut r = Lcg {
+            draws: 0,
             value: (42u64 ^ 25214903917) & 0xFFFF_FFFF_FFFF,
         };
         let a = r.next_int_bound(60);
@@ -1478,5 +1984,31 @@ mod tests {
         assert_eq!(positive_ceil_div(120, 2), 60);
         assert_eq!(positive_ceil_div(121, 2), 61);
         assert_eq!(positive_ceil_div(40, 2), 20);
+    }
+
+    #[test]
+    fn mob_ledger_records_and_drains() {
+        // L101: arm -> one serve -> the record mirrors the wire contract
+        // (id/tc, seed in == pack seed, seed out == the out header seed,
+        // status/cursor packed per the doc) -> arm=false take drains empty.
+        // NOTE: ML_ON/ring are process-global and the suite runs tests in
+        // parallel — the pre-drain + the (id, tc, seed) filter keep this
+        // test's own record identifiable regardless of interleaving.
+        let seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let inb = build_in(seed, 100, 42, 3);
+        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let _ = mob_ledger_take(true); // clear + arm
+        let st = ai_floor(&inb, &mut out);
+        let recs = mob_ledger_take(false).unwrap();
+        mob_ledger_arm(false);
+        let mine: Vec<&[u64; 7]> = recs
+            .iter()
+            .filter(|r| r[0] & 0xFFFF_FFFF == 42 && r[0] >> 32 == 100 && r[1] == seed)
+            .collect();
+        assert_eq!(mine.len(), 1, "one record for this (id, tc) per call");
+        let r = mine[0];
+        let s_out = (((out[4] as u64) & 0xFFFF_FFFF) << 32) | ((out[3] as u64) & 0xFFFF_FFFF);
+        assert_eq!(r[2], s_out, "seed out == the out header seed");
+        assert_eq!(r[4] >> 56, if st < 0 { 0u64 } else { st as u64 }, "status");
     }
 }

@@ -23,6 +23,7 @@
 pub mod goals;
 pub mod itemtick;
 pub mod mobtravel;
+pub mod pushcore;
 pub mod sections;
 pub mod simd;
 pub mod tick;
@@ -343,7 +344,16 @@ impl IdMap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpsertEv {
     /// Box update within the same home cell (row id list unchanged).
+    /// L44c: DEPRECATED as a no-dirty event — same-cell box changes now
+    /// return `BoxChanged` so the caller republishes the cell's row: the
+    /// row's packed x-intervals must track the index boxes, or the window
+    /// pre-filter false-skips candidates (observed: mixed t=158, item 1088
+    /// skipped with a TWO-move-stale interval while vanilla's scan of 964
+    /// merged it — the row froze at the last New/Moved republish).
     Same,
+    /// Same-cell box update that changed the packed row data: the cell's
+    /// row must be republished before the next row-path query trusts it.
+    BoxChanged { cell: u32 },
     /// Entity gained a normal home cell (new insert, or came back from the
     /// oversize list). `from_oversize` also means the oversize population
     /// changed (Java's OVERSIZE_POP must be refreshed).
@@ -547,6 +557,23 @@ impl EntityIndex {
         let ncx = (b.center_x().floor() as i32) >> CELL_SHIFT;
         let ncz = (b.center_z().floor() as i32) >> CELL_SHIFT;
 
+        // (0,0) stamps = UNKNOWN (the off-thread nativeBoxDirect / DirEv
+        // paths and tests carry no order keys): substitute the entity's
+        // stored stamps so the unknown upsert neither clobbers them nor
+        // churns the cell order version. Two (0,0) stamps of a stored-never
+        // entity also stay (0,0) and never bump — the documented contract.
+        let (sy, seq) = if sy == 0 && seq == 0 {
+            match self.idmap.find(id) {
+                Some(slot) => (self.sy[slot as usize], self.seq[slot as usize]),
+                None => match self.oversize.iter().find(|o| o.id == id) {
+                    Some(o) => (o.sy, o.seq),
+                    None => (0, 0),
+                },
+            }
+        } else {
+            (sy, seq)
+        };
+
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
             let key = self.cell_keys[home as usize];
@@ -568,13 +595,20 @@ impl EntityIndex {
                 if self.sy[slot as usize] != sy || self.seq[slot as usize] != seq {
                     self.sy[slot as usize] = sy;
                     self.seq[slot as usize] = seq;
-                    let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
                 }
-                return UpsertEv::Same;
+                // L44c (from the L110 line) + doc 37: EVERY same-cell update
+                // invalidates the row AND the tile layout — the stored center
+                // may have crossed a tile boundary or grown a tile's mh, so
+                // the order version bumps unconditionally (the bump used to
+                // hide inside the stamp-changed condition, leaving tile
+                // membership stale on box-only updates).
+                let v = &mut self.cell_vers[home as usize];
+                *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
+                return UpsertEv::BoxChanged { cell: home };
             }
             // moved cell (or world): O(1) swap-remove + push
             self.cell_remove(home, self.cpos[slot as usize] as usize);
-            let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
+let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             let new_home = self.cell_id(world, ncx, ncz);
             self.cell_add(new_home, slot as usize, b, ncx, ncz);
             self.homes[slot as usize] = new_home;
@@ -719,15 +753,28 @@ impl EntityIndex {
     /// across the chunkZ-major cell walk is bit-identical to vanilla's.
     pub fn query(&mut self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
         out.clear();
+        // L60 SCAN-BOUNDS SPLIT. `ex` expands ONLY the cell WALK (which
+        // cells host a box that can reach the query: a homed entity's box
+        // reaches <= max_half_span from its center cell). The per-cell SCAN
+        // bounds are the TRUE query box — scan_cells' internal EPSF (1e-2)
+        // already proves the f32 prefilter a superset of the exact f64
+        // check (the cell-relative rounding is <= 7.6e-6). Feeding the
+        // ex-expanded bounds into the scan made every merge scan pull the
+        // max_half_span-neighbourhood and hand the Java marginExtra trim
+        // ~80% false survivors (MSIB run 41295493035: reject 2067 at
+        // z-dist 20.6 from a 1.25-wide query — the world's max_half_span
+        // ratchet: one giant box poisons every query forever). The answer
+        // is UNCHANGED (the Java live-box trim already exactified it) —
+        // only the wasted scan/trim work dies.
         let ex = self.max_half_span + MARGIN as f64;
-        let qx0 = b.x0 - ex;
-        let qx1 = b.x1 + ex;
-        let qz0 = b.z0 - ex;
-        let qz1 = b.z1 + ex;
-        let cx0 = (qx0.floor() as i32) >> CELL_SHIFT;
-        let cx1 = (qx1.floor() as i32) >> CELL_SHIFT;
-        let cz0 = (qz0.floor() as i32) >> CELL_SHIFT;
-        let cz1 = (qz1.floor() as i32) >> CELL_SHIFT;
+        let wx0 = b.x0 - ex;
+        let wx1 = b.x1 + ex;
+        let wz0 = b.z0 - ex;
+        let wz1 = b.z1 + ex;
+        let cx0 = (wx0.floor() as i32) >> CELL_SHIFT;
+        let cx1 = (wx1.floor() as i32) >> CELL_SHIFT;
+        let cz0 = (wz0.floor() as i32) >> CELL_SHIFT;
+        let cz1 = (wz1.floor() as i32) >> CELL_SHIFT;
         let my0 = (b.y0 - MARGIN as f64) as f32;
         let my1 = (b.y1 + MARGIN as f64) as f32;
 
@@ -756,10 +803,14 @@ impl EntityIndex {
                 match self.cell_quad[cid].as_ref() {
                     Some(q) => {
                         const QEPS: f64 = 1.0e-2; // doc-21 slack (f32 storage)
-                        let rel_x0 = qx0 - ox;
-                        let rel_x1 = qx1 - ox;
-                        let rel_z0 = qz0 - oz;
-                        let rel_z1 = qz1 - oz;
+                        // L60 split: the skip test and the exact test must
+                        // use the SAME bounds — the raw query box (the walk
+                        // expansion wx* hosts candidates; the scan judges
+                        // them raw)
+                        let rel_x0 = b.x0 - ox;
+                        let rel_x1 = b.x1 - ox;
+                        let rel_z0 = b.z0 - oz;
+                        let rel_z1 = b.z1 - oz;
                         self.merge_segs.clear();
                         for qb in 0..16 {
                             let nq = q.nb[qb] as usize;
@@ -789,10 +840,10 @@ impl EntityIndex {
                                 nq,
                                 ox,
                                 oz,
-                                qx0,
-                                qx1,
-                                qz0,
-                                qz1,
+                                b.x0,
+                                b.x1,
+                                b.z0,
+                                b.z1,
                                 my0,
                                 my1,
                                 out,
@@ -839,7 +890,7 @@ impl EntityIndex {
                     None => {
                         let ids = &self.cell_ids[cid];
                         let bx = &self.cell_box[cid];
-                        simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+                        simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out);
                     }
                 }
             }
@@ -1204,9 +1255,7 @@ impl EntityIndex {
                 kb,
             ));
         }
-        rows.sort_unstable_by(|a, b| {
-            (a.3, a.4).cmp(&(b.3, b.4))
-        });
+        rows.sort_by(|a, b| (a.3, a.4).cmp(&(b.3, b.4)));
         let mut blocks: Vec<f32> = Vec::with_capacity(((n + 7) >> 3) * BLOCK_F32);
         let mut chunk: [f32; 6] = [0.0; 6];
         for (i, (_id, slot, b6, _, _)) in rows.iter().enumerate() {
@@ -1375,6 +1424,41 @@ impl EntityIndex {
     }
 
     // ---- 4b.2a Java-row publish helpers (module-side publisher) ----
+
+    /// The INDEX box of (world, id) — the L53 marginExtra sample's Rust
+    /// side (the Java side captures the LIVE boxes of the query rejects;
+    /// pairing the two names which side is stale for the doc-41 exact-f64
+    /// move). Returns the f32 cell-layout values widened to f64 (x/z
+    /// de-quantized back to world space with the same cell origins the
+    /// scan uses) — exactly what the SIMD filter compares against — or
+    /// the oversize entry's exact f64 box.
+    pub fn box_of(&self, world: u16, id: i64) -> Option<[f64; 6]> {
+        if let Some(slot) = self.idmap.find(id) {
+            let s = slot as usize;
+            if self.worlds[s] != world || self.homes[s] == 0 {
+                return None;
+            }
+            let home = self.homes[s] as usize;
+            let p = self.cpos[s] as usize;
+            let box_ = &self.cell_box[home];
+            let (cx, cz) = key_coords(self.cell_keys[home]);
+            let ox = cx as f64 * CELL as f64;
+            let oz = cz as f64 * CELL as f64;
+            let base = (p >> 3) * BLOCK_F32 + (p & 7);
+            return Some([
+                box_[base] as f64 + ox,
+                box_[base + 8] as f64,
+                box_[base + 16] as f64 + oz,
+                box_[base + 24] as f64 + ox,
+                box_[base + 32] as f64,
+                box_[base + 40] as f64 + oz,
+            ]);
+        }
+        self.oversize
+            .iter()
+            .find(|o| o.id == id && o.world == world)
+            .map(|o| [o.b.x0, o.b.y0, o.b.z0, o.b.x1, o.b.y1, o.b.z1])
+    }
 
     /// The cell key of `cell`, or None if out of range.
     #[inline]

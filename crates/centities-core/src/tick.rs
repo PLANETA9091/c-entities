@@ -238,9 +238,29 @@ pub fn tick_item(
     scratch: &mut Scratch,
 ) -> TickOutcome {
     let mut out = TickOutcome(0);
+    // L53-diag: the Rust-side mirror state for the traced id (CE_RTRACE_ID).
+    // Pairs with the bridge's DTRACE: the store's tc/on_ground/delta AT the
+    // body's gate — the move-gate phase question needs the STORE view.
+    static RTICK_ID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let rtick = *RTICK_ID.get_or_init(|| {
+        std::env::var("CE_RTRACE_ID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
+    });
+    if rtick >= 0 && id == rtick {
+        eprintln!(
+            "[ce] RTICK id={} st_tc={} st_onG={} st_dx={:e} st_dy={:e}",
+            id, st.tick_count, st.on_ground, st.dx, st.dy
+        );
+    }
 
-    // NOTE: the dispatcher (tickNonPassenger) increments tickCount BEFORE the
-    // tick; the module injects the incremented value — no mirror ++ here.
+    // NOTE: the dispatcher increments tickCount AFTER the tick body (trace-
+    // proven, run 40728505667 item 35 t=353: vanilla gated CLOSED on
+    // (212+35)%4=3 while the post-tick trace shows tc=213 — the gate
+    // decision reads the PRE-increment value). The ingest stores the POST
+    // value (es.tick_count + 1, mirrored for the writeback); every vanilla
+    // cadence below must therefore read the PRE value: tc_pre = tc - 1.
 
     // ===== read-only phase =====
     let box_now = Aabb6::item_box(st.x, st.y, st.z);
@@ -278,6 +298,13 @@ pub fn tick_item(
     }
 
     // move gate (pre-move delta = post-gravity delta in vanilla)
+    // (st.tick_count + id) % 4 — st.tick_count is the ingest POST value
+    // (collect pre-baseTick field + 1), which EQUALS the tickCount the
+    // vanilla gate reads (Entity.baseTick increments BEFORE the gate).
+    // The previous `.wrapping_sub(1)` (PRE convention) fired the gate one
+    // tick late for every grounded idle item — run 40754993404 item 29:
+    // vanilla moved at field-tc 15,15.. the module at 16,16.. (parity
+    // PTRACE diff, both legs tc identical, positions one tick apart).
     let dy_g = st.dy - ITEM_GRAVITY;
     let delta_pre_gravity = (st.dx, st.dy, st.dz);
     let mv0 = (st.dx, dy_g, st.dz);
@@ -556,7 +583,12 @@ pub fn tick_item(
         }
     }
 
-    // merge cadence
+    // merge cadence — EMPIRICAL (runs 40723397672 vs 40733281619): the
+    // all-post convention held the items splits at 23/23, all-pre exploded
+    // them to 574/574 — the merge cadence reads the POST-increment value
+    // (the activation's commonTick++ lands before tick()). The %4 MOVE
+    // gate below stays on the PRE value (trace-proven zeroing at
+    // body-tc where (body+id)%4==0, runs 40728505667/40728510142).
     let floor_changed = mth_floor(st.xo) != mth_floor(st.x)
         || mth_floor(st.yo) != mth_floor(st.y)
         || mth_floor(st.zo) != mth_floor(st.z);
@@ -607,6 +639,20 @@ pub fn tick_item_inactive(st: &mut ItemState) -> TickOutcome {
     }
     if st.age >= st.despawn_rate {
         out.set(TickOutcome::DESPAWN);
+    }
+    // L53: ON_GROUND is an ABSOLUTE bit (the final onGround state) — the
+    // phase-3 commit applies it verbatim (entry.on_ground = bits & B_ON_GROUND).
+    // The inactive body runs NO physics (vanilla inactiveTick never touches
+    // onGround), but omitting the bit here clobbered the STORE to FALSE on
+    // every inactive tick; the next active tick's move gate (!st.on_ground)
+    // then opened and ran a SPURIOUS move — gravity+collide+FRICTION — that
+    // vanilla's (tc+id)%4 skip tick never does. Young items (tc<200, active
+    // every tick, the absolute bit always set) hid the bug; the tc=200
+    // activation crossings made 19/20 ticks inactive and the items-353 wave
+    // was born (801 items at T389, vx/vz only — one extra friction step per
+    // inactive->active pair).
+    if st.on_ground {
+        out.set(TickOutcome::ON_GROUND);
     }
     out
 }

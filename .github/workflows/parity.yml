@@ -33,8 +33,8 @@ on:
         description: 'CE_ITEM_TICK (1=shipped, 0=vanilla item tick in ON leg)'
         default: '1'
       mob_ai:
-        description: 'CE_MOB_AI (1=shipped, 0=vanilla AI in ON leg)'
-        default: '1'
+        description: 'CE_MOB_AI (1=experimental engine, 0=shipped vanilla AI)'
+        default: '0'
       merge:
         description: 'CE_MERGE (1=shipped, 0=vanilla merge in ON leg)'
         default: '1'
@@ -42,13 +42,25 @@ on:
         description: 'CE_PUSH (1=shipped, 0=vanilla pushes via -Dcentities.pushNative=false)'
         default: '1'
       ai_floor:
-        description: 'CE_AI_FLOOR (1=shipped, 0=vanilla GoalSelector via -Dcentities.aiFloor=false)'
+        description: 'CE_AI_FLOOR (1=shipped L15 floor, L69-exact; 0=vanilla GoalSelector bisect)'
+        default: '1'
+      collide:
+        description: 'CE_COLLIDE (1=shipped, 0=vanilla canCollideWithBukkit body in ON leg)'
+        default: '1'
+      merge_mirror:
+        description: 'CE_MERGE_MIRROR (1=shipped, 0=MH-based isMergable predicate)'
         default: '1'
       trace_id:
         description: 'PARITY_TRACE_ID: per-tick trace of this entity id in BOTH legs (−1 = off)'
         default: '-1'
+      ph_dump:
+        description: 'PH_DUMP: ticks for per-entity PD dumps (e.g. 140-158; empty = off)'
+        default: ''
       extra_jvm:
         description: 'extra JVM flags appended to EXTRA_JVM (e.g. -Dcentities.x=y)'
+        default: ''
+      extra_env:
+        description: 'extra KEY=VAL pairs exported to the legs (space-separated, e.g. "CE_RTRACE_ID=1408 CE_TL_TRACE=1")'
         default: ''
   push:
     branches: [main]
@@ -97,8 +109,25 @@ jobs:
           if [ "$([ "${{ inputs.ai_floor }}" = "0" ] && echo 0 || echo 1)" = "0" ]; then
             BISECT_JVM="$BISECT_JVM -Dcentities.aiFloor=false"
           fi
+          # L64b: the ai_floor input was DEAD — run-baseline.sh (which the
+          # parity legs exec) passes -Dcentities.aiFloor=false on its OWN
+          # unless the CE_AI_FLOOR env is 1, so exporting only the JVM-flag
+          # absence never armed the L15 floor (run 41467393454: input=1,
+          # gs=0 everywhere, GoalChecks=0). Export the env the script reads.
+          echo "CE_AI_FLOOR=$([ "${{ inputs.ai_floor }}" = "0" ] && echo 0 || echo 1)" >> "$GITHUB_ENV"
           EJ="${{ inputs.extra_jvm || '' }}"
           echo "EXTRA_JVM=-XX:+UnlockExperimentalVMOptions -XX:hashCode=5$BISECT_JVM $EJ" >> "$GITHUB_ENV"
+          # env-knobs read natively (Rust precompute / CeHooks statics)
+          CC="$([ "${{ inputs.collide }}" = "0" ] && echo 0 || echo 1)"
+          MM="$([ "${{ inputs.merge_mirror }}" = "0" ] && echo 0 || echo 1)"
+          echo "CE_COLLIDE=$CC" >> "$GITHUB_ENV"
+          echo "CE_MERGE_MIRROR=$MM" >> "$GITHUB_ENV"
+          # the diag env-knobs (CE_RTRACE_ID / CE_TL_TRACE / ...): word-
+          # split the space-separated KEY=VAL list and export each pair —
+          # the legs' java process inherits GITHUB_ENV like every other knob
+          for KV in ${{ inputs.extra_env || '' }}; do
+            echo "$KV" >> "$GITHUB_ENV"
+          done
 
       - name: Paired parity runs (off/on per scenario)
         run: |
@@ -106,19 +135,28 @@ jobs:
           # NOTE: "0" is FALSY in GitHub expressions (string "0" coerces to
           # number 0) — `inputs.x || '1'` silently turned knob=0 into 1
           # (observed: both bisect runs logged itemTick=1). Compare strings.
+          # EMPTY (push trigger) resolves to the INPUT's default, NOT to 1:
+          # mob_ai ships OFF (default '0') — the old line armed the
+          # experimental engine on every push-triggered parity run, which
+          # then NPE'd mid-classification (VH_GS_DISABLED is initialized by
+          # the L15 GoalSelector init, absent when aiFloor ships off) and
+          # desynced the ON leg from the half-applied mirror tick. The
+          # honest shipped-config A/B is engine=0 unless explicitly asked.
           IT="$([ "${{ inputs.item_tick }}" = "0" ] && echo 0 || echo 1)"
-          MA="$([ "${{ inputs.mob_ai }}" = "0" ] && echo 0 || echo 1)"
+          MA="$([ "${{ inputs.mob_ai }}" = "1" ] && echo 1 || echo 0)"
           MG="$([ "${{ inputs.merge }}" = "0" ] && echo 0 || echo 1)"
           TR="${{ inputs.trace_id }}"
-          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR"
+          PD="${{ inputs.ph_dump }}"
+          echo "bisect knobs: CE_ITEM_TICK=$IT CE_MOB_AI=$MA CE_MERGE=$MG TRACE_ID=$TR PH_DUMP=$PD CE_COLLIDE=${CE_COLLIDE:-1} CE_MERGE_MIRROR=${CE_MERGE_MIRROR:-1}"
           run_leg() { # name scale items stands area module
             echo "=== parity leg $1 (module=$6) ==="
             RUN_NAME="$1" SCALE="$2" PCT_ITEMS="$3" PCT_STANDS="$4" AREA="$5" \
             TILE_HOPPERS=0 TILE_FURNACES=0 \
             FILL_TICKS="$FILL_TICKS" WARMUP_TICKS="$WARMUP_TICKS" MEASURE_TICKS="$MEASURE_TICKS" \
-            PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" \
+            PARITY=1 PARITY_SEED="$PARITY_SEED" PARITY_TRACE_ID="$TR" PH_DUMP="$PD" \
             MODULE="$6" RUN_TIMEOUT='900' XMX='4G' \
             CE_ITEM_TICK="$IT" CE_MOB_AI="$MA" CE_MERGE="$MG" \
+            CE_COLLIDE="${CE_COLLIDE:-1}" CE_MERGE_MIRROR="${CE_MERGE_MIRROR:-1}" \
             bash scripts/run-baseline.sh
           }
           # Scenario set: every entity family the perf benches use, at a

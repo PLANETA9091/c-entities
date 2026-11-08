@@ -14,6 +14,9 @@ on:
       measure:
         description: 'MEASURE_TICKS'
         default: '400'
+      extra_env:
+        description: 'extra KEY=VAL pairs exported to the leg (space-separated, e.g. "CE_MOB_AI=1 CE_AI_FLOOR=1")'
+        default: ''
 
 permissions:
   contents: read
@@ -36,6 +39,12 @@ jobs:
           node-version: '20'
       - name: Fetch Paper 26.3 (paperclip)
         run: bash scripts/fetch-paper.sh 26.3 server/paper.jar
+      - name: Export extra env knobs
+        if: ${{ inputs.extra_env != '' }}
+        run: |
+          for KV in ${{ inputs.extra_env }}; do
+            echo "$KV" >> "$GITHUB_ENV"
+          done
       - name: Build ce-baseline plugin
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
@@ -65,7 +74,7 @@ jobs:
           esac
           MEAS="${{ inputs.measure }}"
           if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
-          RUN_NAME="prof-$SC" \
+          RUN_NAME="prof-$SC-on" \
           SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
           AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
           MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \

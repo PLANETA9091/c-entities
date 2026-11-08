@@ -23,6 +23,18 @@ use crate::HOOKS_CLASS_GLOBAL;
 const STORE_CAP: usize = 1 << 17;
 const STORE_MASK: u64 = (STORE_CAP - 1) as u64;
 
+/// The L55-diag traced id (CE_RTRACE_ID) — shared by the FTICK flush print
+/// and the CMT commit witness. Cached: the env is fixed for the process.
+fn rtrace_id() -> i64 {
+    static RT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *RT.get_or_init(|| {
+        std::env::var("CE_RTRACE_ID")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ItemEntry {
     tag: u64, // (id >> 17) | 1 — validity check against slot aliasing
@@ -395,6 +407,9 @@ const B_MOVED: i32 = 1;
 const B_ON_GROUND: i32 = 1 << 1;
 const B_IMPULSE: i32 = 1 << 2;
 const B_MERGE: i32 = 1 << 5;
+/// Diagnostic: the merge cadence saw a floor change (rate 2, not 40) —
+/// rides ONLY to feed the MS telemetry line (mv=1); the applier ignores it.
+const B_MERGE2: i32 = 1 << 6;
 const B_DESPAWN: i32 = 1 << 7;
 const B_VOID: i32 = 1 << 8;
 const B_LAND: i32 = 1 << 9;
@@ -416,6 +431,13 @@ const B_DELTA_SAME: i32 = 1 << 14;
 /// (probes, section changes, the 256-tick belt) clear the rest mode; the
 /// next full native tick re-proves it.
 const B_REST_CAND: i32 = 1 << 15;
+/// L78 TAIL_NONE: the Java applier's ENTIRE post-counter tail is a provable
+/// no-op for this entry (DELTA_SAME + no event bits + the out-fd/pd/onGround
+/// equal their pre-states; for inactive entries — no DESPAWN/VOID/LAND + the
+/// out-pd equals the pre-pd). The applier skips straight to the next entry
+/// after the counters — the skipped compares are exactly the ones the tails
+/// would skip themselves.
+const B_TAIL_NONE: i32 = 1 << 16;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -545,7 +567,11 @@ unsafe fn n_item_tick_impl(
                             // L7 outI layout: [age, pickupDelay, bits, tickCount] —
                             // the applier mirrors the dispatcher's tickCount++/totalEntityAge++
                             // for entries whose vanilla dispatcher was suppressed.
-                            oi.resize(n * 4, 0);
+                            // L79 COMPACT APPLY: outI grows to n*4 + 1 + n —
+                            // outI[n*4] = cn, then the batch indices whose Java
+                            // post-counter tail is NOT the proven TAIL_NONE
+                            // no-op (the applier's loop B walks only those).
+                            oi.resize(n * 5 + 1, 0);
                             ((*vt).GetLongArrayRegion)(raw, ids, 0, n as i32, idv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, in_i, 0, (n * 4) as i32, iv.as_mut_ptr());
@@ -664,8 +690,19 @@ unsafe fn n_item_tick_impl(
                                     zo: if has_cd { d[dbo + 2] } else { 0.0 },
                                     on_ground: (f & F_ON_GROUND) != 0,
                                     fall_dist: if has_cd { d[dbo + 6] as f32 } else { 0.0 },
-                                    // dispatcher-incremented; the core does NOT ++
-                                    tick_count: iv[k * 4],
+                                    // Batch tc semantics: PRE when the body was
+                                    // suppressed (IF_NATIVE — the dispatcher's ++
+                                    // runs after the tick body, trace-proven run
+                                    // 40728505667), POST when the vanilla body
+                                    // already ran (IF_RESYNC / IF_FORCE_VANILLA).
+                                    // The store convention is POST; tick_item's
+                                    // vanilla cadences read the PRE value via
+                                    // tc-1, so both paths must land on POST.
+                                    tick_count: if (f & F_NATIVE) != 0 {
+                                        iv[k * 4].wrapping_add(1)
+                                    } else {
+                                        iv[k * 4]
+                                    },
                                     age: iv[k * 4 + 1],
                                     pickup_delay: iv[k * 4 + 2],
                                     despawn_rate: iv[k * 4 + 3],
@@ -838,6 +875,25 @@ unsafe fn n_item_tick_impl(
                                                 let id = id_c[j];
                                                 let f = f_c[j] & 0x3F;
                                                 let st = &mut st_c[j];
+                                                // L53-diag: the flush-level view of the
+                                                // traced id (CE_RTRACE_ID): the batch
+                                                // flags + the store state AT the tick.
+                                                static RTICK_ID: std::sync::OnceLock<i64> =
+                                                    std::sync::OnceLock::new();
+                                                let rtick = *RTICK_ID.get_or_init(|| {
+                                                    let v = std::env::var("CE_RTRACE_ID")
+                                                        .ok()
+                                                        .and_then(|v| v.parse::<i64>().ok())
+                                                        .unwrap_or(-1);
+                                                    eprintln!("[ce] RTICK init: env={} -> {}", std::env::var("CE_RTRACE_ID").unwrap_or_else(|_| "<absent>".into()), v);
+                                                    v
+                                                });
+                                                if rtick >= 0 && id == rtick {
+                                                    eprintln!(
+                                                        "[ce] FTICK id={} f={:#x} inactive={} tc={} onG={} dx={:e} dy={:e}",
+                                                        id, f, (f & F_INACTIVE) != 0, st.tick_count, st.on_ground, st.dx, st.dy
+                                                    );
+                                                }
                                                 // L16: pre-tick delta snapshot for
                                                 // the DELTA_SAME mask below; the
                                                 // rest of the state snapshots feed
@@ -888,6 +944,7 @@ unsafe fn n_item_tick_impl(
                                                     ob |= B_DELTA_SAME;
                                                 }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
+                                                if outcome.has(TickOutcome::MERGE2) { ob |= B_MERGE2; }
                                                 if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
                                                 if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
                                                 if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
@@ -963,6 +1020,10 @@ unsafe fn n_item_tick_impl(
                             // 1 = ok commit, 2 = abort, 3 = abort + clear streak.
                             // Physics fields are read back from od/oi (written by
                             // phase 2) instead of a fat per-item record.
+                            // L79: the compact index list lives at oi[n4+1..];
+                            // the count lands at oi[n4] after the loop.
+                            let n4 = n * 4;
+                            let mut cn: usize = 0;
                             for k in 0..n {
                                 let flg = world.c_flag[k];
                                 if flg == 0 {
@@ -1006,12 +1067,71 @@ unsafe fn n_item_tick_impl(
                                     entry.age = oi[k * 4];
                                     entry.pickup_delay = oi[k * 4 + 1];
                                     entry.tick_count = oi[k * 4 + 3];
+                                    // L78 TAIL_NONE: the pre-fd/ong must be read
+                                    // BEFORE the overwrite below — they are the
+                                    // same pre-states the Java tails compare
+                                    // against (the store mirrors the entity at
+                                    // batch time; mid-batch mutation rides the
+                                    // removed/merge paths which never reach this
+                                    // commit).
+                                    let l78_pre_fd = entry.fall_dist;
+                                    let l78_pre_ong = entry.on_ground;
                                     entry.fall_dist = od[k * 8 + 6] as f32;
-                                    entry.on_ground = (oi[k * 4 + 2] & B_ON_GROUND) != 0;
+                                    // L55-diag: the commit-side witness for the
+                                    // traced id — the outcome bit AND the entry's
+                                    // pre/post on_ground at the SAME line. The
+                                    // belt dust (addendum 14) showed the store's
+                                    // on_ground false at a t=412 ingest with no
+                                    // body commit in the t=411 window; this names
+                                    // the writing commit (or proves the t=410
+                                    // rotation's own commit wrote FALSE while the
+                                    // writeback left the Java entity TRUE).
+                                    let cmt_pre_ong = entry.on_ground;
+                                    let cmt_out_ong = (oi[k * 4 + 2] & B_ON_GROUND) != 0;
+                                    let cmt_aborts = entry.aborts;
+                                    entry.on_ground = cmt_out_ong;
+                                    if rtrace_id() == id {
+                                        eprintln!(
+                                            "[ce] CMT id={} tc={} out_onG={} pre_onG={} aborts_in={}",
+                                            id, entry.tick_count, cmt_out_ong, cmt_pre_ong, cmt_aborts
+                                        );
+                                    }
                                     entry.aborts = 0;
                                     if (f & F_NATIVE) == 0 {
                                         // collector-carried entries refresh despawnRate
                                         entry.despawn_rate = iv[k * 4 + 3];
+                                    }
+                                    // L78 TAIL_NONE — see the B_TAIL_NONE doc.
+                                    // The pre-fd/ong were captured above BEFORE
+                                    // the store overwrite (l78_pre_fd/ong).
+                                    let bits_now = oi[k * 4 + 2];
+                                    let inactive_k = (fv[k] & F_INACTIVE) != 0;
+                                    let out_pd = oi[k * 4 + 1];
+                                    let pre_pd = iv[k * 4 + 2];
+                                    let tail_none = if inactive_k {
+                                        (bits_now & (B_DESPAWN | B_VOID | B_LAND)) == 0
+                                            && out_pd == pre_pd
+                                    } else {
+                                        (bits_now & B_DELTA_SAME) != 0
+                                            && (bits_now
+                                                & (B_MOVED | B_IMPULSE | B_MERGE
+                                                    | B_DESPAWN | B_VOID | B_LAND))
+                                                == 0
+                                            && (od[k * 8 + 6] as f32) == l78_pre_fd
+                                            && out_pd == pre_pd
+                                            && ((bits_now & B_ON_GROUND) != 0) == l78_pre_ong
+                                    };
+                                    if tail_none {
+                                        oi[k * 4 + 2] = bits_now | B_TAIL_NONE;
+                                    } else if (f & F_NATIVE) != 0 {
+                                        // L79 COMPACT APPLY: the applier's loop B
+                                        // runs the full tail for exactly these —
+                                        // the !TAIL_NONE set, the same predicate
+                                        // the 12/12 L78 gate proved (non-NATIVE
+                                        // entries never reach the Java tail: the
+                                        // applier's IF_NATIVE gate continues first).
+                                        oi[n4 + 1 + cn] = k as i32;
+                                        cn += 1;
                                     }
                                 }
                                 // state extremes (garbage-detector diagnostics)
@@ -1031,8 +1151,9 @@ unsafe fn n_item_tick_impl(
                                 }
                             }
 
+                            oi[n4] = cn as i32;
                             ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 8) as i32, od.as_ptr());
-                            ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n * 4) as i32, oi.as_ptr());
+                            ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n4 + 1 + cn) as i32, oi.as_ptr());
                             {
                                 let dt = t0.elapsed().as_nanos() as u64;
                                 FLUSH_NANOS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);

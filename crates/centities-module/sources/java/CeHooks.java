@@ -68,6 +68,41 @@ public final class CeHooks {
     /** L37d: candidates dropped by the exact AABB re-check (the index's
      *  margin superset) — zero means the index was already exact. */
     public static volatile long marginExtra = 0;
+    // L109 (CE_L109, SHIPPED default ON; CE_L109=0 restores the trim): skip
+    // the L37d margin re-check in fastQuery for the common (non-view) case.
+    // The Rust scan already filters all 3 axes against the INDEX box
+    // exactly, and for every candidate whose probe is in the flush the
+    // index box IS the live box; the re-check dropped marginExtra
+    // 214/662M (0.00003%) across harvested runs — a pure per-candidate tax
+    // (getBoundingBox deref + 6 compares: the top-1 spread hotspot, 11.86%
+    // self-time on main). The L108b stale-trust parity proved index-box
+    // decisions bit-identical to vanilla live-box decisions (12/12 legs),
+    // and the L109 parity re-proved it for the enforcement-free variant
+    // (6th bit-identical pass). The baseline verdict PASSED: spread dAB
+    // +3.6% vs +32.4% ref (dΔ −28.9 пп), getBoundingBox 11.86→3.25%,
+    // fastMs/cand DOWN (mobs −8.5%, spread −16.8%, items −43%). The
+    // vActive viewBox path is KEPT: after-scanner entries must still be
+    // seen at their pre-body box.
+    private static final boolean L109_TRUST =
+            !"0".equals(System.getenv("CE_L109"));
+    public static volatile long l109Skip = 0, l109Trim = 0;
+    // L104 BIG-BOX REFUSE: the fast path pays ~112 ns per candidate inside
+    // the Java resolve loop (ARENA load + live-box deref + AABB test), the
+    // Rust scan itself is ~12 ns/row, so a query returning thousands of
+    // rows (mob target / LookAtPlayer scans over 60-70-block boxes at
+    // spread density = ~1800-3200 candidates) costs ~350 us in fast while
+    // the vanilla section walk resolves the same volume at ~25-40 ns/cand.
+    // Above BIG_N_REFUSE rows the vanilla scan is cheaper BY CONSTRUCTION
+    // (it IS the vanilla cost) and order-exact by definition: refuse and
+    // let the caller run the vanilla body. The refusal also feeds the gate
+    // clean mirror samples — the big buckets' MIRR_EMA was rare/biased
+    // (run 340: b15 fast=330us vs mirror=2538us would imply a 9 s/tick
+    // vanilla tick, contradicting the measured 479 ms). Item merge scans
+    // (n <= ~300 at items-100k density) and the push kernel (Rust-side)
+    // stay on the fast path. Tunable: the bigbox counters in the hooks
+    // line + the harvest JFR name the n-distribution.
+    public static final int BIG_N_REFUSE = 1024;
+    public static volatile long bigboxRefused = 0, bigboxCand = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
@@ -116,13 +151,17 @@ public final class CeHooks {
      *  <= 8 blocks (mob collision ~0.6-1.9, item merge scans ~1-2.5) pays a
      *  packed-x-window scan of ~3-4ns/entry that skips 75-96% of the row
      *  WITHOUT a deref, so the per-candidate Java cost applies only to the
-     *  overlap fraction. Valid rows are each <= ROW_CAP (510) entries and a
-     *  narrow box covers <= 4x4 = 16 rows, so 8192 is a belt, not the real
-     *  bound; the EMA still prices the bucket and flips to the mirror when
-     *  the row scan loses. Wide shapes (targeting/sensor scans 7-35 blocks)
-     *  keep the flat 512 cap — their window pass fraction is near 100%, so
-     *  the scan cost there is per-CANDIDATE, not per-ENTRY. */
-    private static final int ROW_TOTAL_CAP_NARROW = 8192;
+     *  overlap fraction. Valid rows are each <= ROW_CAP (510) entries and —
+     *  since L41b — a narrow box stages up to 6x6 = 36 rows (the raw 4x4
+     *  plus the 1-cell single-homing expansion), so 18432 = 36x510 + slack
+     *  is the belt; the EMA still prices the bucket and flips to the mirror
+     *  when the row scan loses. The old 8192 (4x4 sizing) refused the
+     *  expanded dense windows wholesale (the mobs legs: rowBig exploded to
+     *  ~11k refusals, the row path's serving collapsed). Wide shapes
+     *  (targeting/sensor scans 7-35 blocks) keep the flat 512 cap — their
+     *  window pass fraction is near 100%, so the scan cost there is
+     *  per-CANDIDATE, not per-ENTRY. */
+    private static final int ROW_TOTAL_CAP_NARROW = 18432;
 
     // Row-path diagnostics: hits and every distinct miss reason.
     public static volatile long rowFast = 0;
@@ -130,6 +169,7 @@ public final class CeHooks {
     public static volatile long rowPending = 0, rowBig = 0, rowNoPub = 0, rowOv = 0;
     public static volatile long rowEmpty = 0, rowHomeMiss = 0, rowStaleCand = 0;
     public static volatile long rowWinSkip = 0; // L4c: candidates skipped by the packed x-window
+    public static volatile long mViewRefuse = 0; // L44: native queries refused (view-exactness)
     public static volatile long rowNarrow = 0;  // L35: narrow-shape serves (raised cap)
 
     // ------------------------------------------------------------------
@@ -238,7 +278,9 @@ public final class CeHooks {
 
     private static volatile java.lang.invoke.MethodHandle MH_TRY_MERGE;
     private static volatile java.lang.invoke.MethodHandle MH_IS_MERGABLE;
+    private static volatile java.lang.invoke.MethodHandle MH_MERGEWN;
     private static volatile boolean MH_FAILED = false;
+    private static volatile boolean MWN_FAILED = false;
 
     /** Lazy private-access handles: ItemEntity.tryToMerge(ItemEntity)V and
      *  ItemEntity.isMergable()Z. Runs once, on the server thread, from the
@@ -273,6 +315,56 @@ public final class CeHooks {
         }
     }
 
+    /** Lazy private-access handle: ItemEntity.mergeWithNeighbours()V — the
+     *  EXACT vanilla merge body, run when the fast scan refuses (index
+     *  unsure) or when the bisect knob turns the fast path off. Without it
+     *  the flush's return-value-ignored call DROPPED every refused merge:
+     *  104,383 dropped merges in one spread leg (run 40719262186,
+     *  mirror=104383) — each refusal meant vanilla would have merged and
+     *  the ON leg silently did not. */
+    private static synchronized boolean initMergeWn(Object sample) {
+        if (MWN_FAILED) return false;
+        if (MH_MERGEWN != null) return true;
+        try {
+            Class<?> ie = sample.getClass();
+            java.lang.reflect.Method mw = ie.getDeclaredMethod("mergeWithNeighbours");
+            mw.setAccessible(true);
+            MH_MERGEWN = java.lang.invoke.MethodHandles.lookup().unreflect(mw)
+                    .asType(java.lang.invoke.MethodType.methodType(void.class, ie));
+            return true;
+        } catch (Throwable t) {
+            MWN_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "mergeWn: " + t;
+            return false;
+        }
+    }
+
+    /** Runs the exact vanilla merge body (mergeWithNeighbours). Returns
+     *  false only if the handle could not be bound (the merge is then
+     *  dropped, as before — the kill-switch counters will show it). */
+    public static boolean runVanillaMerge(ItemEntity e) {
+        try {
+            if (MH_MERGEWN == null && !initMergeWn(e)) return false;
+            MH_MERGEWN.invokeExact(e);
+            // L47b: did the flush-time vanilla merge replay actually merge?
+            // The mirror body's live world is post-apply (view-stale) — this
+            // pin pairs with KPH/PD: a KVM removed=0 at the divergence tick
+            // while OFF's PD dropped the id means the replay saw the POST
+            // world and skipped the merge vanilla made.
+            if (phDumpTickNow()) {
+                System.out.println("[ce-baseline] KVM t=" + CUR_TICK
+                        + " self=" + entId(e)
+                        + " removed=" + (e.isRemoved() ? 1 : 0));
+            }
+            return true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "runVanillaMerge: " + t;
+            return false;
+        }
+    }
+
     /** Vanilla predicate + class filter: other instanceof ItemEntity,
      *  other != self, other.isMergable().
      *
@@ -287,12 +379,357 @@ public final class CeHooks {
      *  same call; off-thread callers take the mirror and never reach it). */
     private static ItemEntity MERGE_SELF; // server-thread confined
 
+    // === L44: the merge-scan VIEW (the pre-body boxes of resync entries) ===
+    // Vanilla runs each item's merge scan DURING its body: entities whose
+    // bodies FOLLOW the scanner's are seen at their PRE-move boxes. The
+    // flush runs AFTER the whole entity phase, so a resync (vanilla-routed)
+    // item's LIVE box is already POST-move — one physics step past the
+    // vanilla view. For falling young items that step is 0.1-0.3 blocks and
+    // the merge box's 0.25-tall Y window makes it decisive (items t=159:
+    // 1827's spawn box y=-58.997 WAS inside 971's scan window, its post-body
+    // y=-58.84 is 0.153 above it — exact numbers, run 41083916822 PTRACE).
+    // The batch captures each resync entry's PRE-body state at itemSkip;
+    // pass 1 overwrites IB_CD with the POST-body state for the tick
+    // compute. IB_PRE keeps the capture; the apply pass exposes it to the
+    // query paths as the VIEW for scanners positioned before that entry.
+    private static double[] IB_PRE = new double[1024 * 6];
+    private static final int[] VIEW_IDS = new int[256];
+    private static final double[] VIEW_BOX = new double[256 * 6];
+    private static final int[] VIEW_KIDX = new int[256];
+    private static int viewN = 0;
+    // L57: the id -> view-index map as a tiny open-addressing int table
+    // (the view holds <= 256 entries, rebuilt every flush; the boxed
+    // HashMap.get was 4.96% self-time on the fresh mixed-150k profile —
+    // boxing + hashing per candidate x2 lookups). Empty slot = 0 (entity
+    // ids start at 1); the load factor never exceeds 256/2048.
+    private static final int VTAB_CAP = 2048;
+    private static final int VTAB_MASK = VTAB_CAP - 1;
+    private static final int[] VTAB_KEY = new int[VTAB_CAP];
+    private static final int[] VTAB_VAL = new int[VTAB_CAP];
+
+    private static int vtabHash(int id) {
+        return (id * 0x9E3779B9) >>> 11 & VTAB_MASK; // Fibonacci spread
+    }
+
+    private static void vtabPut(int id, int vi) {
+        int s = vtabHash(id);
+        while (VTAB_KEY[s] != 0 && VTAB_KEY[s] != id) {
+            s = s + 1 & VTAB_MASK;
+        }
+        VTAB_KEY[s] = id;
+        VTAB_VAL[s] = vi;
+    }
+
+    /** The view index for the id, or -1. Zero allocations, zero boxing. */
+    private static int vtabGet(int id) {
+        int s = vtabHash(id);
+        int k;
+        while ((k = VTAB_KEY[s]) != 0) {
+            if (k == id) return VTAB_VAL[s];
+            s = s + 1 & VTAB_MASK;
+        }
+        return -1;
+    }
+
+    private static void vtabClear() {
+        java.util.Arrays.fill(VTAB_KEY, 0);
+    }
+
+    private static int MS_KIDX = 0; // the current scanner's batch index
+
+    /** The merge-scan view box for a candidate: the PRE-body box when the
+     *  candidate is a resync entry whose body runs AFTER the scanner in the
+     *  entity order, else the live box (vanilla's per-body timing). */
+    private static AABB viewBox(int cid, AABB live) {
+        int vi = vtabGet(cid);
+        if (vi < 0 || VIEW_KIDX[vi] <= MS_KIDX) return live;
+        return new AABB(VIEW_BOX[vi * 6], VIEW_BOX[vi * 6 + 1], VIEW_BOX[vi * 6 + 2],
+                VIEW_BOX[vi * 6 + 3], VIEW_BOX[vi * 6 + 4], VIEW_BOX[vi * 6 + 5]);
+    }
+
+    /** True when the candidate is an AFTER-scanner view entry (its live box
+     *  is one physics step past the vanilla view — the window must deref it
+     *  and the home re-check must not drop it). */
+    private static boolean isViewAfter(int cid) {
+        // L48: the view holds only the RARE resync / force-vanilla
+        // population: an empty view (the steady state) skips straight to
+        // false without touching the table. L57: the lookup is a flat int
+        // probe (vtabGet) — the boxed HashMap.get boxed the id and hashed
+        // per candidate x2 (4.96% self-time, mixed-150k 41236766183).
+        if (viewN == 0 || !IN_ITEM_APPLY) return false;
+        int vi = vtabGet(cid);
+        return vi >= 0 && VIEW_KIDX[vi] > MS_KIDX;
+    }
+
+    /** True when any AFTER-scanner view entry's PRE box intersects the query
+     *  box: the native resolve (index boxes = POST-move) would answer with
+     *  the wrong view, so the caller must not trust it. */
+    private static boolean viewTouches(AABB box) {
+        if (!IN_ITEM_APPLY) return false; // the view is apply-pass-only state
+        for (int v = 0; v < viewN; v++) {
+            if (VIEW_KIDX[v] <= MS_KIDX) continue;
+            if (VIEW_BOX[v * 6] <= box.maxX && VIEW_BOX[v * 6 + 3] >= box.minX
+                    && VIEW_BOX[v * 6 + 1] <= box.maxY && VIEW_BOX[v * 6 + 4] >= box.minY
+                    && VIEW_BOX[v * 6 + 2] <= box.maxZ && VIEW_BOX[v * 6 + 5] >= box.minZ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean mergePredTest(Entity o) {
-        if (!(o instanceof ItemEntity) || o == MERGE_SELF) return false;
-        return isMergableFast((ItemEntity) o);
+        if (!(o instanceof ItemEntity)) return false;
+        ItemEntity ie = (ItemEntity) o;
+        if (ie == MERGE_SELF) return false;
+        if (MERGP_ON) return isMergableMirror(ie);
+        return isMergableFast(ie);
+    }
+
+    // ---- L39 mirror merge predicate --------------------------------------
+    // Byte-exact port of ItemEntity.isMergable (26.3):
+    //   isAlive() && pickupDelay != 32767 && age != -32768
+    //   && age < despawnRate && item.getCount() < item.getMaxStackSize()
+    // with the three DEEP reads served by Unsafe hops instead of the method
+    // chain: item = entityData.items[IDX_ITEM].value (the synched-data walk
+    // SynchedEntityData.getItem was 2.91% of the items profile),
+    // despawnRate/count by field offset. getMaxStackSize is pre-resolved
+    // (L41) when provably exact — see mergeMaxStack.
+    // The predicate runs per candidate per merge scan (~2500 scans/tick at
+    // items-100k) — the L29 pattern applied to the merge family.
+    public static volatile boolean MERGP_ON = false;
+    private static volatile long O_IE_DESPAWN = -1, O_STACK_COUNT = -1;
+    private static volatile int IDX_ITEM = -1;
+
+    /** Resolves the three mirror offsets (ItemEntity.despawnRate,
+     *  ItemStack.count, the DATA_ITEM accessor id). Runs once at arm. */
+    public static void initMergeMirror() {
+        try {
+            java.lang.reflect.Field f;
+            f = ItemEntity.class.getDeclaredField("despawnRate");
+            f.setAccessible(true);
+            O_IE_DESPAWN = U.objectFieldOffset(f);
+            f = net.minecraft.world.item.ItemStack.class.getDeclaredField("count");
+            f.setAccessible(true);
+            O_STACK_COUNT = U.objectFieldOffset(f);
+            f = ItemEntity.class.getDeclaredField("DATA_ITEM");
+            f.setAccessible(true);
+            Object fa = U.getObject(U.staticFieldBase(f), U.staticFieldOffset(f));
+            if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
+                IDX_ITEM = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
+            }
+            MERGP_ON = O_IE_DESPAWN >= 0 && O_STACK_COUNT >= 0 && IDX_ITEM >= 0
+                    && !"0".equals(System.getenv("CE_MERGE_MIRROR"));
+            initMergeMaxStack();
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initMergeMirror: " + t;
+            MERGP_ON = false;
+        }
+    }
+
+    // ---- L41 merge max-stack pre-resolution -------------------------------
+    // ItemInstance.getMaxStackSize() (26.3) = getOrDefault(MAX_STACK_SIZE,1)
+    // = getComponents().getOrDefault(...): a DataComponents walk per PAIR —
+    // ItemInstance.getMaxStackSize was 8.29% of the items-100k profile.
+    // The walk is EXACTLY prototype.get(type) whenever the stack's
+    // PatchedDataComponentMap.patch is the shared fastutil EMPTY singleton:
+    //   * the ctor assigns Reference2ObjectMaps.emptyMap() — javap-verified
+    //     `getstatic EMPTY_MAP; areturn` (the global immutable instance);
+    //   * getFromPatchAndPrototype: patch.get(type) == null ->
+    //     prototype.get(type) — for the empty patch ALWAYS the prototype;
+    //   * ensureMapOwnership() REPLACES the patch object (new
+    //     Reference2ObjectArrayMap) BEFORE the first mutation — the
+    //     singleton is never mutated in place, and copy() shares it
+    //     only under copyOnWrite (the first set detaches). So
+    //     patch == EMPTY_MAP is a STABLE, permanent property.
+    // The prototype is the item-type's immutable default map: its
+    // MAX_STACK_SIZE answer is a per-type constant cached by identity
+    // (LAST_PROTO two-slot, server-thread confined like MERGE_SELF).
+    // Any patched stack (NBT components, plugin mutation, a fromPatch
+    // build with its own empty map) fails the singleton check and takes
+    // the exact virtual walk. Bit-exact under every mutation pattern.
+    // EMPTY-stack semantics stay vanilla: getComponents() returns
+    // DataComponentMap.EMPTY for count==0 -> max 1 -> 0 < 1 -> mergeable;
+    // the call site guards it before reaching here.
+    private static volatile long O_STACK_COMPONENTS = -1, O_PCM_PATCH = -1, O_PCM_PROTO = -1;
+    private static volatile Object EMPTY_PATCH;
+    private static volatile Object MSSTYPE;
+    private static Object LAST_PROTO;
+    private static int LAST_PROTO_MAX;
+
+    private static void initMergeMaxStack() {
+        try {
+            java.lang.reflect.Field f;
+            f = net.minecraft.world.item.ItemStack.class.getDeclaredField("components");
+            f.setAccessible(true);
+            O_STACK_COMPONENTS = U.objectFieldOffset(f);
+            Class<?> pcm = Class.forName(
+                    "net.minecraft.core.component.PatchedDataComponentMap", false,
+                    CeHooks.class.getClassLoader());
+            f = pcm.getDeclaredField("patch");
+            f.setAccessible(true);
+            O_PCM_PATCH = U.objectFieldOffset(f);
+            f = pcm.getDeclaredField("prototype");
+            f.setAccessible(true);
+            O_PCM_PROTO = U.objectFieldOffset(f);
+            f = net.minecraft.core.component.DataComponents.class.getDeclaredField(
+                    "MAX_STACK_SIZE");
+            f.setAccessible(true);
+            MSSTYPE = U.getObject(U.staticFieldBase(f), U.staticFieldOffset(f));
+            EMPTY_PATCH = it.unimi.dsi.fastutil.objects.Reference2ObjectMaps.EMPTY_MAP;
+        } catch (Throwable t) {
+            // any miss leaves the offsets -1 -> mergeMaxStack always walks
+            O_STACK_COMPONENTS = -1;
+            lastError = System.nanoTime();
+            lastErrorText = "initMergeMaxStack: " + t;
+        }
+    }
+
+    /** The max-stack answer for a NON-EMPTY stack: the prototype constant
+     *  when the patch map is the shared empty singleton, the exact walk
+     *  otherwise. */
+    private static int mergeMaxStack(Object st) {
+        long o1 = O_STACK_COMPONENTS, o2 = O_PCM_PATCH, o3 = O_PCM_PROTO;
+        Object mst = MSSTYPE;
+        if (o1 >= 0 && o2 >= 0 && o3 >= 0 && mst != null) {
+            Object map = U.getObject(st, o1);
+            if (map != null) {
+                Object patch = U.getObject(map, o2);
+                if (patch == EMPTY_PATCH) {
+                    Object proto = U.getObject(map, o3);
+                    if (proto == LAST_PROTO) return LAST_PROTO_MAX;
+                    try {
+                        Object v = ((net.minecraft.core.component.DataComponentMap) proto)
+                                .get((net.minecraft.core.component.DataComponentType<?>) mst);
+                        Integer iv = (Integer) v;
+                        LAST_PROTO_MAX = iv == null ? 1 : iv;
+                        LAST_PROTO = proto;
+                        return LAST_PROTO_MAX;
+                    } catch (Throwable quiet) {
+                        // fall through to the exact walk
+                    }
+                }
+            }
+        }
+        return ((net.minecraft.world.item.ItemStack) st).getMaxStackSize();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean isMergableMirror(ItemEntity e) {
+        if (e.isRemoved()) return false;                 // Entity.isAlive
+        if (e.pickupDelay == 32767 || e.age == -32768) return false;
+        int despawn = U.getInt(e, O_IE_DESPAWN);
+        if (e.age >= despawn) return false;
+        // item = entityData.items[IDX_ITEM].value — the L29 3-hop pattern
+        Object ed = U.getObject(e, O_ED);
+        if (ed == null) return isMergableFast(e);        // belt: pre-init data
+        Object[] items = (Object[]) U.getObject(ed, O_ED_ITEMS);
+        if (items == null || IDX_ITEM >= items.length) return isMergableFast(e);
+        Object di = items[IDX_ITEM];
+        if (di == null) return isMergableFast(e);
+        Object st = U.getObject(di, O_DI_VALUE);
+        if (!(st instanceof net.minecraft.world.item.ItemStack stack)) {
+            return isMergableFast(e);
+        }
+        int count = U.getInt(st, O_STACK_COUNT);
+        if (count == 0) return true;   // EMPTY-map semantics: max 1, 0 < 1
+        return count < mergeMaxStack(st);
     }
 
     private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
+
+    // MSQ — the merge-scan query telemetry at PH_DUMP ticks (CUR_TICK
+    // space): the PRE-PREDICATE candidate ids of MERGE_SELF's scan, the
+    // path that served it (row/native/mirror), and the raw candidate
+    // count the index returned. A vanilla scan that finds a partner
+    // while the module's scan prints cands=0 names the exact query-path
+    // false negative (run 40889274763: MS t=475 self=971 n=0 — vanilla's
+    // scan of 971 found 1873, the tie absorbed 971, the leg diverged).
+    private static final int[] MSQ_IDS = new int[256];
+    private static int msqN = 0;
+    private static boolean MSQ_COLLECT = false;
+    private static String msqPath = null;
+    private static long msqWin0 = 0, msqHome0 = 0, msqStale0 = 0;
+    // Per-scan diagnostics set by the CALLER (server-thread confined):
+    // MS_SRC 1 = the native-flush apply loop (the Rust cadence decided),
+    // 0 = the vanilla-body guard (vanilla's own gate opened). MS_MV 1 = the
+    // Rust cadence saw a floor change (rate 2), 2 = same floor (rate 40),
+    // 0 = unknown (guard path). Both are read+cleared by the MS print.
+    private static int MS_SRC = 0;
+    private static int MS_MV = 0;
+    // L41d marginExtra samples: the LIVE boxes of the first 8 rejects (the
+    // index box lives in the Rust mirror — the Rust side can be extended to
+    // dump its side; the live boxes alone already show the pile's spread).
+    private static final double[] msqRej = new double[192];
+    private static final int[] msqRejIds = new int[32];
+    private static int msqRejN = 0;
+    // L53: the INDEX boxes of the same rejects (the Rust side, CE_FQ_IBOX=1)
+    // — pairing idxMin vs liveMin names the stale side per reject id (the
+    // doc-41 exact-f64-query open question: 84% of the SIMD survivors fail
+    // the live re-check — a stale index or a margin-geometry tax?). NaN in
+    // slot 0 = the id was not indexed at sample time (a vanished candidate).
+    private static final boolean IBOX_ON =
+            "1".equals(System.getenv("CE_FQ_IBOX"));
+    private static final double[] msqRejIdx = new double[192];
+    private static final double[] iboxBuf = new double[6];
+    // L53-diag: the per-tick DISPATCH DECISION trace for PARITY_TRACE_ID —
+    // pairs the plugin's PTRACE (the entity's fields) with the ENGINE's own
+    // decision (the path taken inside itemDispatch + the port's activation
+    // verdict + the tc/at the gate saw). The OFF leg runs the module disarmed
+    // (no DTRACE lines) — the vanilla side's tc/activation are visible in
+    // the PTRACE's tc/at fields.
+    private static final int DTRACE_ID = dtraceId();
+
+    private static int dtraceId() {
+        try {
+            return (int) Long.parseLong(System.getenv("PARITY_TRACE_ID"));
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static void dtrace(ItemEntity e, String path, boolean active) {
+        if (DTRACE_ID >= 0 && entId(e) == DTRACE_ID) {
+            System.out.println("[ce-baseline] DTRACE t="
+                    + net.minecraft.server.MinecraftServer.currentTick
+                    + " path=" + path + " active=" + active
+                    + " tc=" + e.tickCount + " at=" + e.activatedTick
+                    + " mode=" + MODE_VAL[entId(e) & MAMASK]
+                    + " onG=" + e.onGround()
+                    + " dx=" + e.getDeltaMovement().x
+                    + " dy=" + e.getDeltaMovement().y
+                    + " age=" + e.age + " pd=" + e.pickupDelay);
+        }
+    }
+    // L44b: the window-skipped and home-missed candidate ids at MSQ scans —
+    // a merge partner that never reached the box test names itself here.
+    private static final int[] msqSkipId = new int[32];
+    private static final int[] msqSkipLo = new int[32];
+    private static final int[] msqSkipHi = new int[32];
+    private static final int[] msqSkipRow = new int[32];
+    private static int msqSkipN = 0;
+    private static final int[] msqHmId = new int[32];
+    private static int msqHmN = 0;
+    // L41e: the staged rows' (cx, cz, n, skips) — up to 12 rows per MSQ
+    private static final long[] msqRows = new long[48];
+    private static int msqRowsN = 0;
+
+    private static String msqIds() {
+        StringBuilder sb = new StringBuilder(msqN * 6 + 2);
+        sb.append('[');
+        for (int i = 0; i < msqN && i < 48; i++) {
+            sb.append(i == 0 ? "" : ",").append(MSQ_IDS[i]);
+        }
+        return sb.append(msqN > 48 ? ",...]" : "]").toString();
+    }
+
+    // L45: WHY did fastQuery refuse this scan? The mirror MSQ line used to
+    // say only path=mirror rawN=0 — the row-refusal reason (multi / key /
+    // stale / fresh / pending / big / view / notready / ...) was invisible,
+    // and the items t=219 hunt stalled on exactly that (run 41110186252:
+    // 6931 mirror rawN=0, reason unnameable). Set at every fastQuery /
+    // rowQuery refusal point; read by the mergeScanNative mirror branch.
+    public static volatile String fastRefuse = null;
 
     public static boolean mergeScanNative(ItemEntity e) {
         mergeChecks++;
@@ -317,18 +754,142 @@ public final class CeHooks {
                     w.paperConfig().entities.behavior.onlyMergeItemsHorizontally;
             AABB box = e.getBoundingBox().inflate(r, horizOnly ? 0.0 : r - 0.5, r);
             MERGE_SELF = e;
+            boolean msq = phDumpTickNow();
+            if (msq) {
+                msqN = 0;
+                msqPath = null;
+                if (bN > 0) {
+                    StringBuilder pb = new StringBuilder(200);
+                    int lim = Math.min(bN, 24);
+                    for (int k = 0; k < lim; k++) {
+                        pb.append(k == 0 ? "" : ",").append((int) (B_IDS[k] & 0xFFFF_FFFFL))
+                          .append(B_IDS[k] < 0 ? "!" : (B_IDS[k] & ROW_NEUTRAL) != 0 ? "~" : "+");
+                    }
+                    System.out.println("[ce-baseline] MSP t=" + CUR_TICK
+                            + " self=" + entId(e) + " bN=" + bN
+                            + " ids=" + pb + (bN > lim ? ",..." : ""));
+                }
+                msqWin0 = rowWinSkip;
+                msqHome0 = rowHomeMiss;
+                msqStale0 = rowStaleCand;
+                msqRejN = 0;
+                msqRowsN = 0;
+                msqSkipN = 0;
+                msqHmN = 0;
+                MSQ_COLLECT = true;
+            }
             List<Entity> cands;
+            // L46: the depth guard spans the query AND the consume loop — the
+            // scratch answer list must stay stable while mergeScanNative
+            // iterates it (a merge body that queries reentrantly lands at
+            // depth 2 and allocates its own list).
+            fqScratchDepth++;
             try {
-                cands = fastQuery(sl, e, box, MERGE_PRED);
-            } finally {
-                MERGE_SELF = null;
+                try {
+                    if (msq) {
+                        System.out.println("[ce-baseline] QB t=" + CUR_TICK
+                                + " self=" + entId(e)
+                                + " q=[" + box.minX + "," + box.maxX
+                                + " " + box.minY + "," + box.maxY
+                                + " " + box.minZ + "," + box.maxZ + "]"
+                                + " r=" + r);
+                    }
+                    cands = fastQuery(sl, e, box, MERGE_PRED, true);
+                } finally {
+                    MSQ_COLLECT = false;
+                    MERGE_SELF = null;
+                }
+                if (cands == null) {
+                    mergeMirror++;
+                    if (msq) {
+                        msqPath = msqPath == null ? "mirror" : msqPath;
+                        System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                                + " self=" + entId(e) + " path=mirror"
+                                + " rawN=" + msqN + " ids=" + msqIds()
+                                + " refuse=" + fastRefuse);
+                    }
+                    return false; // index unsure — vanilla body
+                }
+                mergeFast++;
+                mergeCand += cands.size();
+            // MS: the scan's candidate list at PH_DUMP ticks — the parity
+            // diff names the exact candidate-order divergence (vanilla's
+            // first candidate kills the ticking item at equal counts, so
+            // a different first candidate flips the survivor ids).
+            if (phDumpTickNow()) {
+                StringBuilder msb = new StringBuilder(96);
+                int mv = MS_MV;
+                MS_MV = 0;
+                int src = MS_SRC;
+                MS_SRC = 0;
+                msb.append("MS t=").append(CUR_TICK)
+                        .append(" self=").append(e.getId()).append(" n=").append(cands.size())
+                        .append(" tc=").append(e.tickCount)
+                        .append(" mv=").append(mv)
+                        .append(" src=").append(src);
+                for (int k = 0; k < Math.min(cands.size(), 24); k++) {
+                    msb.append(' ').append(cands.get(k).getId());
+                }
+                System.out.println("[ce-baseline] " + msb);
+                System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                        + " self=" + entId(e)
+                        + " path=" + (msqPath == null ? "row" : msqPath)
+                        + " rawN=" + msqN + " ids=" + msqIds()
+                        + " win=" + (rowWinSkip - msqWin0)
+                        + " home=" + (rowHomeMiss - msqHome0)
+                        + " stale=" + (rowStaleCand - msqStale0));
+                if (msqRejN > 0) {
+                    StringBuilder rb = new StringBuilder(160);
+                    for (int k = 0; k < msqRejN; k++) {
+                        rb.append(msqRejIds[k]).append(":[")
+                                .append((float) msqRej[k * 6]).append(',')
+                                .append((float) msqRej[k * 6 + 2]).append(',')
+                                .append((float) msqRej[k * 6 + 4]).append(']');
+                    }
+                    System.out.println("[ce-baseline] MSR t=" + CUR_TICK
+                            + " self=" + entId(e) + " rej=" + msqRejN
+                            + " liveMin=" + rb);
+                }
+                if (msqRejN > 0 && IBOX_ON) {
+                    StringBuilder rb2 = new StringBuilder(200);
+                    for (int k = 0; k < msqRejN; k++) {
+                        rb2.append(msqRejIds[k]).append(":[");
+                        if (Double.isNaN(msqRejIdx[k * 6])) {
+                            rb2.append('X'); // not indexed at sample time
+                        } else {
+                            rb2.append((float) msqRejIdx[k * 6]).append(',')
+                                    .append((float) msqRejIdx[k * 6 + 2]).append(',')
+                                    .append((float) msqRejIdx[k * 6 + 4]);
+                        }
+                        rb2.append(']');
+                    }
+                    System.out.println("[ce-baseline] MSIB t=" + CUR_TICK
+                            + " self=" + entId(e) + " rej=" + msqRejN
+                            + " idxMin=" + rb2);
+                }
+
+                if (msqHmN > 0) {
+                    StringBuilder sb4 = new StringBuilder(160);
+                    for (int k = 0; k < msqHmN; k++) {
+                        sb4.append(k == 0 ? "" : ",").append(msqHmId[k]);
+                    }
+                    System.out.println("[ce-baseline] MSH t=" + CUR_TICK
+                            + " self=" + entId(e) + " homeMiss=" + msqHmN
+                            + " ids=" + sb4);
+                }
+                if (msqRowsN > 0) {
+                    StringBuilder sb2 = new StringBuilder(200);
+                    for (int k = 0; k < msqRowsN && k < 12; k++) {
+                        sb2.append(k == 0 ? "[" : ",")
+                                .append('(').append(msqRows[k * 4])
+                                .append(',').append(msqRows[k * 4 + 1])
+                                .append(",n=").append(msqRows[k * 4 + 2])
+                                .append(')');
+                    }
+                    System.out.println("[ce-baseline] MSR t=" + CUR_TICK
+                            + " self=" + e.getId() + " rows=" + sb2.append(']'));
+                }
             }
-            if (cands == null) {
-                mergeMirror++;
-                return false; // index unsure — vanilla body
-            }
-            mergeFast++;
-            mergeCand += cands.size();
             boolean walls = w.paperConfig().fixes.fixItemsMergingThroughWalls;
             for (int k = 0; k < cands.size(); k++) {
                 ItemEntity other = (ItemEntity) cands.get(k);
@@ -346,6 +907,9 @@ public final class CeHooks {
                 if (e.isRemoved()) return true; // absorbed — vanilla stops
             }
             return true;
+            } finally {
+                fqScratchDepth--;
+            }
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "mergeScan: " + t;
@@ -407,7 +971,7 @@ public final class CeHooks {
         try {
             hurtProbes++; // TEMP L2a apply-check counter (also fires from tick)
             if (REST_ON && ACTIVE && e != null) {
-                REST_GEN[e.getId() & AMASK] = 0;
+                REST_GEN[entId(e) & AMASK] = 0;
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -418,6 +982,113 @@ public final class CeHooks {
     }
     // TEMP 4b.2a bring-up diagnostics (first rowKey miss snapshot).
     public static volatile long dbgExpKey = 0, dbgGotKey = 0, dbgExpSlot = -1, dbgMisses = 0;
+
+    /** L81 hunt: prefix of LivingEntity.hurtServer — names EVERY living
+     *  entity hurt inside the PH_DUMP window (tick, id, damage type,
+     *  amount, hp, type). The LRF armor-draw diff (RemoveBinomial at the
+     *  divergence ticks — mobs t=143 ON-extra, mixed t=146 / spread t=145
+     *  OFF-extra) proved the kernel's cramming audit diverges from
+     *  vanilla's live list in BOTH directions. This probe catches the
+     *  vanilla-internal hurts too (fire/fall/cramming all reach the same
+     *  virtual hurtServer), so the ON leg gets the full hurt ledger while
+     *  the OFF leg's truth is its LRF draw stream — cross-referencing the
+     *  two names the missed/extra cramming hurt's entity. Window-gated:
+     *  zero hot-path cost outside PH_DUMP. NEVER disarms (a failed
+     *  println must not kill the module). */
+    public static volatile long lhurtProbes = 0;
+    public static void probeLHurt(net.minecraft.world.entity.LivingEntity e,
+                                  net.minecraft.world.damagesource.DamageSource src,
+                                  float amt) {
+        try {
+            lhurtProbes++;
+            if (phDumpTickNow() && e != null) {
+                String st;
+                try {
+                    st = src == null ? "null" : src.type().msgId();
+                } catch (Throwable tt) {
+                    st = "err:" + tt.getClass().getSimpleName();
+                }
+                float hp;
+                String ty;
+                try {
+                    hp = e.getHealth();
+                    ty = e.getType().toString();
+                } catch (Throwable ignore) {
+                    hp = -1f;
+                    ty = e.getClass().getSimpleName();
+                }
+                // ct is the flush-space tick (3 levels at parity): print the
+                // derived plugin tick too so the lines diff against LRF t=
+                // directly (t = ct/3, run 40789269145: ct=423 at t=141).
+                System.out.println("[ce-baseline] LHURT t=" + (CUR_TICK / 3)
+                        + " ct=" + CUR_TICK + " id=" + entId(e)
+                        + " src=" + st + " amt=" + amt + " hp=" + hp
+                        + " type=" + ty);
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeLHurt: " + t;
+        }
+    }
+
+    /** L81b: prefix of Mob.burnUndead() — the SUNLIGHT armor-wear path.
+     *  javap 26.3: burnUndead draws the ENTITY random TWICE (the
+     *  isSunBurnTick nextFloat roll inside aiStep + the nextInt(2) here)
+     *  and — for a damageable ENCHANTED piece — one LEVEL.random draw via
+     *  hurtAndBreak -> processDurabilityChange -> RemoveBinomial, ALL
+     *  WITHOUT touching hurtServer (the armor durability is direct). The
+     *  L81 reference run proved it: LRC/LRF show identical burn draws on
+     *  both legs while LHURT printed nothing — the probe cannot see this
+     *  path by design. The engine hunt's t=143 +1 Level.random draw rides
+     *  THIS path (a burn-roll flip), not the cramming audit; the entity
+     *  random streams must have split EARLIER (the engine's staged-request
+     *  RNG protocol, doc 30 item 4) — the burn probability is just the
+     *  first Level.random-visible consequence. This probe names every
+     *  burn event + the mob's fire/light state on the ON leg; the OFF
+     *  leg's RemoveBinomial LRF lines are the vanilla truth. Window-gated,
+     *  zero hot-path cost outside PH_DUMP. */
+    public static volatile long burnProbes = 0;
+    public static void probeBurn(Entity e) {
+        try {
+            burnProbes++;
+            // L81b liveness: every 500th call prints REGARDLESS of the
+            // window — separates "the woven call never executes" (the class
+            // is vanilla at runtime) from "the window gate is closed".
+            if (burnProbes % 50_000 == 1) {
+                System.out.println("[ce-baseline] BURN-LIVE n=" + burnProbes
+                        + " t=" + (CUR_TICK / 3) + " ct=" + CUR_TICK);
+            }
+            if (phDumpTickNow() && e != null) {
+                String st;
+                try {
+                    net.minecraft.world.entity.Mob mob =
+                            (net.minecraft.world.entity.Mob) e;
+                    // L88 ENTROPY FIX: NO isSunBurnTick() here. The doc-41
+                    // "javap: zero random calls" audit was WRONG for 26.3 —
+                    // Mob.isSunBurnTick draws random.nextFloat() whenever
+                    // getLightLevelDependentMagicValue() > 0.5 (javap bc
+                    // 92-96: getfield random; RandomSource.nextFloat). In
+                    // the open PH_DUMP window the probe's extra call drew
+                    // +1 entity-random PER LIT MOB PER TICK in the ON leg
+                    // only (the SRF frames named it directly: x13
+                    // burnUndead→probeBurn→isSunBurnTick→nextFloat at
+                    // t=141, the exact divergence tick) — the +17 was
+                    // mostly this probe. fire/hp/type are entropy-free
+                    // reads; the line keeps them and drops the burn field.
+                    st = "fire=" + e.getRemainingFireTicks()
+                            + " hp=" + mob.getHealth();
+                } catch (Throwable tt) {
+                    st = "err:" + tt.getClass().getSimpleName();
+                }
+                System.out.println("[ce-baseline] BURN t=" + (CUR_TICK / 3)
+                        + " ct=" + CUR_TICK + " id=" + entId(e)
+                        + " type=" + e.getType() + " " + st);
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeBurn: " + t;
+        }
+    }
 
     /** One-line diagnostic snapshot (all counters). */
     public static String stats() {
@@ -431,6 +1102,8 @@ public final class CeHooks {
                 + " resMs=" + resolveNanos / 1_000_000
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
                 + " marginExtra=" + marginExtra
+                + " l109=" + l109Skip + "/" + l109Trim
+                + " bigbox=" + bigboxRefused + "/" + bigboxCand
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
@@ -448,16 +1121,21 @@ public final class CeHooks {
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
-                + " item=" + itemChecks + "/" + itemNative + "/" + itemResync
+                + " item=" + itemChecks + "/" + itemNative + "/" + itemResync + "/tn" + itemTailNone
                 + "/" + itemVanillaNext + "/" + itemAbort + "/" + itemFlushes
+                + " ds=" + dsame + "/" + dwrite
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
+                + "/w" + travelWalk + "/n" + travelWalkNoMove
                 + " idle=" + navCalls + "/" + navIdleHits + "/" + moveCalls + "/" + moveIdleHits
                 + "/" + lookCalls + "/" + lookIdleHits
                 + " push=" + pushChecks + "/" + pushNative + "/" + pushMirror
                 + "/" + pushCramming + "/" + pushSelfDelta
+                + "/" + pushPairs + "/" + pushPairMiss
+                + " ord=" + ordSkip + "/" + ordWork
+                + " l106=" + ordStructSkip + "/" + mViewBlew + "/" + (ORD_STRUCT_ON ? 1 : 0)
                 + " tracker=" + trackerChecks + "/" + trackerFast + "/" + trackerVanilla
                 + "/" + trackerErr
                 + " ticklist=" + tickListChecks + "/" + tickListErr
@@ -470,7 +1148,15 @@ public final class CeHooks {
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
+                + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
+                + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
+                + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
+                + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
+                + "/" + ttlDeclSync
                 + " eff=" + effCalls + "/" + effGate + "/" + (EFF_ON ? 1 : 0)
+                + " ench=" + enchCalls + "/" + enchGate + "/" + (ENCH_ON ? 1 : 0)
+                + " equip=" + equipCalls + "/" + equipGate + "/" + equipVanilla
+                + "/" + (EQUIP_ON ? 1 : 0)
                 + " mob=" + mobAiTicks + "/" + mobAiFallbacks + "/" + mobAiRequests
                 + "/" + mobAiClassified + "/" + mobAiRefused + "/" + (MOB_AI_ON ? 1 : 0)
                 + " oddJ=" + mobAiOddJava
@@ -517,60 +1203,8 @@ public final class CeHooks {
                     long dt = System.nanoTime() - t0;
                     fastNanos += dt;
                     if (out != null) {
-                        if (dt <= 0) dt = 1;
-                        ema(FAST_EMA, gi, dt);
-                        if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
-                        // Re-probe backoff + EMA unstick (4a.1): a fast sample
-                        // that lands far above the mirror price must not be
-                        // paid at 1/256 forever, and an EMA trained on an
-                        // empty world (bootstrap during fill) must jump to
-                        // the new reality instead of creeping at 1/8.
-                        long me = MIRR_EMA[gi];
-                        int bk = FAST_BACKOFF[gi];
-                        // L4 backoff: escalate only on a CLEAR loss (4x the
-                        // mirror price — 2x was within fill-phase noise and
-                        // starved probing into suspend storms); the duty
-                        // cycle never drops below 1/1024. A re-probe that is
-                        // CHEAPER than the EMA remembers snaps the EMA down
-                        // instantly: the world got denser (the common
-                        // direction), and the old 1/8 creep kept fast losing
-                        // for thousands of ticks after fill.
-                        if (me > 0 && dt > 4 * me) {
-                            if (bk < 2) bk++;
-                            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
-                            // an expensive sample also breaks the latch — the
-                            // world changed under it (density spike, batch)
-                            FAST_LATCH[gi] = 0;
-                            CHEAP_STREAK[gi] = 0;
-                        } else {
-                            if (me > 0 && dt < me) bk = 0; // cheap again
-                            if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
-                            // L4b win latch: 3 consecutive samples cheaper
-                            // than the mirror EMA latch the bucket to fast
-                            if (me > 0 && dt < me) {
-                                if (++CHEAP_STREAK[gi] >= 3) {
-                                    FAST_LATCH[gi] = 4096;
-                                    CHEAP_STREAK[gi] = 0;
-                                }
-                            } else {
-                                CHEAP_STREAK[gi] = 0;
-                            }
-                        }
-                        FAST_BACKOFF[gi] = bk;
-                        // L4d: the L4c latch release (drop the latch when the
-                        // stale fast EMA stops beating the mirror EMA) is
-                        // REVERTED — it was a self-fulfilling trap. CI mobs-25k:
-                        // releasing the latch stopped the fast stream, the JNI
-                        // path went cold (re-probes priced at ~348us vs ~13us
-                        // warm), everything fell back to a full-load mirror at
-                        // 8us x 18.7k/tick, and the leg regressed -36% -> +4.6%.
-                        // The spread regression L4c chased was the row CEILING
-                        // (rowBig refusals -> JNI toll), never the latch: in
-                        // spread w2b0 hysteresis alone routed fast (15us vs
-                        // 2.9ms mirror) even with the latch armed. The existing
-                        // break (dt > 4 x mirror EMA) still releases a latch
-                        // that genuinely loses.
                         queriesFast++;
+                        priceFastSample(gi, dt);
                         return out;
                     }
                     // fast refused (notReady/regrow/desync) — mirror is the
@@ -596,6 +1230,335 @@ public final class CeHooks {
         return mirror(level, source, box, predicate);
     }
 
+    /** L86: the routing/EMA bookkeeping shared by BOTH getEntities weaves
+     *  (the entity-typed and the class-typed). Verbatim move of the L4/L4b/
+     *  L4d block out of the entity-typed bridge — behavior identical, one
+     *  copy of the pricing logic; the typed weave feeds its samples into
+     *  the same per-cell EMAs so the latch learns from both query kinds.
+     *  Contract: dt > 0 (normalized by the caller), out != null (a refused
+     *  fast query must NOT be priced — the callers keep the latch-kill). */
+    private static void priceFastSample(int gi, long dt) {
+        if (dt <= 0) dt = 1;
+        ema(FAST_EMA, gi, dt);
+        if (FAST_N[gi] < 1_000_000) FAST_N[gi]++;
+        // Re-probe backoff + EMA unstick (4a.1): a fast sample that lands
+        // far above the mirror price must not be paid at 1/256 forever, and
+        // an EMA trained on an empty world (bootstrap during fill) must jump
+        // to the new reality instead of creeping at 1/8.
+        long me = MIRR_EMA[gi];
+        int bk = FAST_BACKOFF[gi];
+        // L4 backoff: escalate only on a CLEAR loss (4x the mirror price —
+        // 2x was within fill-phase noise and starved probing into suspend
+        // storms); the duty cycle never drops below 1/1024. A re-probe that
+        // is CHEAPER than the EMA remembers snaps the EMA down instantly:
+        // the world got denser (the common direction), and the old 1/8
+        // creep kept fast losing for thousands of ticks after fill.
+        if (me > 0 && dt > 4 * me) {
+            if (bk < 2) bk++;
+            if (dt > 4 * FAST_EMA[gi]) FAST_EMA[gi] = (FAST_EMA[gi] + dt) / 2;
+            // an expensive sample also breaks the latch — the world changed
+            // under it (density spike, batch)
+            FAST_LATCH[gi] = 0;
+            CHEAP_STREAK[gi] = 0;
+        } else {
+            if (me > 0 && dt < me) bk = 0; // cheap again
+            if (me > 0 && dt < FAST_EMA[gi]) FAST_EMA[gi] = dt;
+            // L4b win latch: 3 consecutive samples cheaper than the mirror
+            // EMA latch the bucket to fast
+            if (me > 0 && dt < me) {
+                if (++CHEAP_STREAK[gi] >= 3) {
+                    FAST_LATCH[gi] = 4096;
+                    CHEAP_STREAK[gi] = 0;
+                }
+            } else {
+                CHEAP_STREAK[gi] = 0;
+            }
+        }
+        FAST_BACKOFF[gi] = bk;
+        // L4d: the L4c latch release (drop the latch when the stale fast
+        // EMA stops beating the mirror EMA) is REVERTED — it was a self-
+        // fulfilling trap. CI mobs-25k: releasing the latch stopped the
+        // fast stream, the JNI path went cold (re-probes priced at ~348us
+        // vs ~13us warm), everything fell back to a full-load mirror at
+        // 8us x 18.7k/tick, and the leg regressed -36% -> +4.6%. The
+        // spread regression L4c chased was the row CEILING (rowBig
+        // refusals -> JNI toll), never the latch: in spread w2b0
+        // hysteresis alone routed fast (15us vs 2.9ms mirror) even with
+        // the latch armed. The existing break (dt > 4 x mirror EMA) still
+        // releases a latch that genuinely loses.
+    }
+
+    /** L86: the always-true inner predicate for the typed weave — the
+     *  caller's class+predicate filter runs in the typed post-filter
+     *  (isInstance FIRST — the vanilla class-typed sequence), never inside
+     *  fastQuery: a side-effectful caller predicate must not observe
+     *  non-isInstance entities. */
+    private static final java.util.function.Predicate<? super Entity> FQ_ALL = e -> true;
+
+    // ------------------------------------------------------------------
+    // L86 — Woven (replace_body): Level.getEntitiesOfClass(Class, AABB,
+    // Predicate). The EntityGetter 2-arg default funnels through Level's
+    // override (invokeinterface → the override), so ONE weave covers both
+    // overloads. This is the targeting cluster's funnel (javap: HurtBy-
+    // TargetGoal.alertOthers → getEntitiesOfClass; Mob's 2-arg call sites;
+    // findTarget's non-player branch): the moonrise by-section scan
+    // AABB-tests EVERY entity in the section range — the profile's
+    // 8.58% AABB.intersects + 2.94% getBoundingBox + 2.30% ListItr.next.
+    // The Rust index answers the SPATIAL question first (a margin superset
+    // in the exact vanilla order — doc 36b parity order), the class filter
+    // + the caller predicate run on the survivors in the vanilla sequence
+    // (isInstance → AABB (inside fastQuery) → predicate), so a
+    // side-effectful predicate observes exactly what vanilla's would.
+    // patched-method slots: 0=this(level), 1=clazz, 2=box, 3=predicate
+    // ------------------------------------------------------------------
+    public static List getEntitiesOfClass(
+            net.minecraft.world.level.Level level,
+            Class clazz, AABB box,
+            java.util.function.Predicate predicate) {
+        if (ACTIVE) {
+            try {
+                int gi = gateCell(level, box);
+                if (gi >= 0 && wantFast(gi)) {
+                    long t0 = System.nanoTime();
+                    List<Entity> raw = fastQuery(level, null, box, FQ_ALL);
+                    long dt = System.nanoTime() - t0;
+                    fastNanos += dt;
+                    if (raw != null) {
+                        queriesFast++;
+                        priceFastSample(gi, dt);
+                        List out = new ArrayList<>(Math.min(raw.size(), 64));
+                        for (int i = 0, s = raw.size(); i < s; i++) {
+                            Entity e = raw.get(i);
+                            if (!clazz.isInstance(e)) continue;
+                            if (predicate == null || predicate.test(e)) {
+                                out.add(e);
+                            }
+                        }
+                        if (ORDER_CHECK) {
+                            orderChecks++;
+                            List van = mirrorTyped(level, clazz, box, predicate);
+                            boolean same = van.size() == out.size();
+                            if (same) {
+                                for (int i = 0; i < out.size(); i++) {
+                                    if (van.get(i) != out.get(i)) {
+                                        same = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!same) {
+                                orderMismatches++;
+                                if (orderMismatches <= 12) {
+                                    // L97.4: name the FIRST differing position
+                                    // with both entities' order keys (id,
+                                    // section, ORD_SEQ) — the stale stamp side
+                                    // is identifiable in one read.
+                                    StringBuilder sb = new StringBuilder(360);
+                                    sb.append("[c-entities] ORDER-MISMATCH-TYPED"
+                                            + " n_van=" + van.size() + " n_fast=" + out.size()
+                                            + " box=" + box + " clazz=" + clazz.getName());
+                                    int fd = -1;
+                                    for (int i = 0; i < Math.min(van.size(), out.size()); i++) {
+                                        if (van.get(i) != out.get(i)) { fd = i; break; }
+                                    }
+                                    if (fd >= 0) {
+                                        Entity ve = (Entity) van.get(fd);
+                                        Entity fe = (Entity) out.get(fd);
+                                        sb.append(" FD=").append(fd)
+                                                .append(" van=(id=").append(ve.getId())
+                                                .append(" sec=").append(ve.moonrise$getSectionZ())
+                                                .append(',').append(ve.moonrise$getSectionX())
+                                                .append(',').append(ve.moonrise$getSectionY())
+                                                .append(" seq=").append(ORD_SEQ[entId(ve) & AMASK]).append(')')
+                                                .append(" fast=(id=").append(fe.getId())
+                                                .append(" sec=").append(fe.moonrise$getSectionZ())
+                                                .append(',').append(fe.moonrise$getSectionX())
+                                                .append(',').append(fe.moonrise$getSectionY())
+                                                .append(" seq=").append(ORD_SEQ[entId(fe) & AMASK]).append(')');
+                                    }
+                                    System.err.println(sb);
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    // fast refused — mirror is the safe answer; the latch
+                    // dies (routing must not stick to a refusing path).
+                    FAST_LATCH[gi] = 0;
+                    queriesMirror++;
+                    return mirrorTyped(level, clazz, box, predicate);
+                }
+                queriesMirror++;
+                return mirrorTyped(level, clazz, box, predicate);
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = String.valueOf(t);
+                t.printStackTrace();
+                ACTIVE = false; // never break the server
+            }
+        } else {
+            mDisabled++;
+        }
+        queriesMirror++;
+        return mirrorTyped(level, clazz, box, predicate);
+    }
+
+    /** Vanilla mirror — identical to the replaced body of
+     *  Level.getEntitiesOfClass(Class, AABB, Predicate), 26.3 (javap:
+     *  ArrayList + moonrise EntityLookup.getEntities(clazz, null, box,
+     *  ret, predicate); NO PlatformHooks.addToGetEntities on this overload
+     *  — the class-typed body never had it). Keep in sync. */
+    private static List mirrorTyped(
+            net.minecraft.world.level.Level level,
+            Class clazz, AABB box, java.util.function.Predicate predicate) {
+        List ret = new ArrayList<>();
+        ((net.minecraft.server.level.ServerLevel) level)
+                .moonrise$getEntityLookup().getEntities(clazz, null, box, ret, predicate);
+        return ret;
+    }
+
+    // ------------------------------------------------------------------
+    // L87 — Woven (replace_body): Level.getEntities(EntityTypeTest, AABB,
+    // Predicate, List, int) — the DEEPEST funnel: both the 3-arg and the
+    // 4-arg EntityTypeTest overloads delegate here, and the profile shows
+    // the route burning twice: the class-shaped tests reach
+    // EntityLookup.getEntities(Class, ...) DIRECTLY (spread: 2.36% —
+    // bypassing the L86 Level.getEntitiesOfClass weave), and the
+    // baseClass==Entity shape runs the entity-typed scan under a tryCast
+    // combining predicate.
+    //
+    // javap 26.3 shape (the 5-arg): EntityType INSTANCE → the type-indexed
+    // lookup scan (REFUSED — mirror; the Rust index carries no EntityType
+    // partition). null typeTest or baseClass null/Entity → the entity-
+    // typed scan under `e -> typeTest.tryCast(e) != null [&& pred.test]`.
+    // else → the CLASS-typed scan (baseClass) under the same combined
+    // predicate. ALL branches end with PlatformHooks.addToGetEntities —
+    // the fast path calls it identically (a compat hook may append).
+    // The limit semantics: the limited lookup scan returns the FIRST
+    // `limit` matches in scan order — the index order IS the vanilla scan
+    // order (doc 36b), so collecting up to `limit` on the fast path is
+    // the same answer.
+    // patched-method slots: 0=this, 1=typeTest, 2=box, 3=pred, 4=out,
+    // 5=limit
+    // ------------------------------------------------------------------
+    public static void getEntitiesTest$(
+            net.minecraft.world.level.Level level,
+            net.minecraft.world.level.entity.EntityTypeTest typeTest, AABB box,
+            java.util.function.Predicate pred, List out, int limit) {
+        boolean fast = false;
+        if (ACTIVE && out != null && typeTest != null
+                && !(typeTest instanceof net.minecraft.world.entity.EntityType)
+                && SERVER_THREAD.get()) {
+            try {
+                int gi = gateCell(level, box);
+                if (gi >= 0 && wantFast(gi)) {
+                    fast = true;
+                    long t0 = System.nanoTime();
+                    // the combined predicate, replicating the vanilla
+                    // invokedynamic lambdas exactly: tryCast FIRST (the
+                    // caller predicate only ever sees tryCast survivors),
+                    // then pred.
+                    List<Entity> raw = fastQuery(level, null, box, (e) -> {
+                        Object t = typeTest.tryCast(e);
+                        return t != null && (pred == null || pred.test(t));
+                    });
+                    long dt = System.nanoTime() - t0;
+                    fastNanos += dt;
+                    if (raw != null) {
+                        queriesFast++;
+                        priceFastSample(gi, dt);
+                        int n = raw.size();
+                        int lim = limit <= 0 ? 0 : Math.min(limit, n);
+                        for (int i = 0; i < lim; i++) {
+                            out.add(raw.get(i));
+                        }
+                        ca.spottedleaf.moonrise.common.PlatformHooks.get()
+                                .addToGetEntities(level, typeTest, box, pred, out, limit);
+                        return;
+                    }
+                    FAST_LATCH[gi] = 0;
+                }
+            } catch (Throwable t) {
+                lastError = System.nanoTime();
+                lastErrorText = String.valueOf(t);
+                t.printStackTrace();
+                ACTIVE = false; // never break the server
+                fast = false;
+            }
+        }
+        if (!fast) {
+            queriesMirror++;
+        }
+        // vanilla body replica (javap-verified; keep in sync). The RAW
+        // predicate flows through the null-typeTest branch (bc 103-190:
+        // aload_3 straight into the lookup scan) and the EntityType branch
+        // (bc 31-67: aload_3 — the type IS the test, no tryCast); the
+        // tryCast-combining lambda is built ONLY for the generic branch
+        // (bc 199-221).
+        if (typeTest == null) {
+            if (limit != Integer.MAX_VALUE) {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities((Entity) null, box, out, pred, limit);
+            } else {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities((Entity) null, box, out, pred);
+            }
+        } else if (typeTest instanceof net.minecraft.world.entity.EntityType et) {
+            if (limit != Integer.MAX_VALUE) {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities(et, box, out, pred, limit);
+            } else {
+                ((net.minecraft.server.level.ServerLevel) level)
+                        .moonrise$getEntityLookup()
+                        .getEntities(et, box, out, pred);
+            }
+        } else {
+            java.util.function.Predicate combined;
+            if (pred == null) {
+                combined = (e) -> typeTest.tryCast(e) != null;
+            } else {
+                combined = (e) -> {
+                    Object t = typeTest.tryCast(e);
+                    return t != null && pred.test(t);
+                };
+            }
+            // RAW Class on purpose: a Class<?> capture cannot satisfy the
+            // generic getEntities(Class<? extends T>, ...) inference with
+            // the raw list/predicate args (javac: "no suitable method") —
+            // the raw declaration makes the invocation an unchecked call
+            // with the exact erasure the bytecode uses.
+            Class base = typeTest.getBaseClass();
+            if (base == null || base == Entity.class) {
+                if (limit != Integer.MAX_VALUE) {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities((Entity) null, box, out, combined, limit);
+                } else {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities((Entity) null, box, out, combined);
+                }
+            } else {
+                if (limit != Integer.MAX_VALUE) {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities(base, (net.minecraft.world.entity.Entity) null, box,
+                                    out, combined, limit);
+                } else {
+                    ((net.minecraft.server.level.ServerLevel) level)
+                            .moonrise$getEntityLookup()
+                            .getEntities(base, (net.minecraft.world.entity.Entity) null, box,
+                                    out, combined);
+                }
+            }
+        }
+        ca.spottedleaf.moonrise.common.PlatformHooks.get()
+                .addToGetEntities(level, typeTest, box, pred, out, limit);
+    }
+
     /** Vanilla mirror — identical to the replaced body of
      *  Level.getEntities(Entity, AABB, Predicate), Paper 1.21.8
      *  (decompiled from the shipped jar; keep in sync). */
@@ -616,19 +1579,42 @@ public final class CeHooks {
     // entities too) — the batch is a multi-producer append buffer.
     // ------------------------------------------------------------------
 
-    /** Prefix of Entity.setDeltaMovement(Vec3) AND setDeltaMovement(DDD):
-     *  wake-on-impulse. A resting item's tick is skipped, so any external
-     *  velocity change (a push, knockback, plugin velocity) must clear the
-     *  rest state or the item would never move while vanilla slides it away.
-     *  Waking a non-resting entity is one array read + branch (~3ns). */
-    public static void probeDelta(Entity e) {
+    /** Prefix of Entity.setDeltaMovement(Vec3) — the VALUE-CARRYING capture
+     *  (L42). The 26.3 body assigns the ARGUMENT (an isFinite-gated field
+     *  write), so the argument IS the post-write field value; the old
+     *  field-read capture (probeDelta(Entity)) always batched the PRE-write
+     *  value, which left the push mirror's delta permanently one write
+     *  behind — for a standing mob the box event re-captured the post-move
+     *  pre-tail (0, 0, 0) every tick (the tail's (0, -g*vf, 0) write was
+     *  value-identical, the L20b gate skipped it AND its probe event), so
+     *  the kernel's self writeback replaced the fresh vanilla travel result
+     *  with (stale base + push): vy=0.0 ("the collision zeroed vy"), the
+     *  un-frictioned vx — the exact mobs/spread first-move PH divergence
+     *  (doc 40 addendum 5, attributed there to the travel classification).
+     *  The DDD overload delegates to this one, so its own wake-only probe
+     *  fires first and this fires second — the LAST event per entity wins
+     *  at the drain and carries the new value. */
+    public static void probeDelta(Entity e, net.minecraft.world.phys.Vec3 v) {
+        if (v != null) {
+            probeDeltaCommon(e, v.x, v.y, v.z);
+        } else {
+            // never observed (vanilla constructs the Vec3 before the call);
+            // the wake must still fire, the batch must not
+            probeDeltaCommon(e, Double.NaN, Double.NaN, Double.NaN);
+        }
+    }
+
+    /** The shared capture body: the wake semantics are UNCHANGED (every
+     *  real setDeltaMovement call wakes a resting item), only the batched
+     *  values changed (the argument instead of the pre-write field). */
+    private static void probeDeltaCommon(Entity e, double x, double y, double z) {
         try {
             // L7 first: an external velocity change on a dispatch-owned item
             // clears its native mode (the applier's own writebacks run inside
             // IN_ITEM_APPLY and do not trip this).
             l7ExternalMutation(e);
             if (e != null) {
-                int m = e.getId() & AMASK;
+                int m = entId(e) & AMASK;
                 // L12 push mirror: keep the native delta fresh. Only living
                 // entities are push-kernel state; the delta events of items
                 // are the item core's business. Off-thread callers skip (the
@@ -636,20 +1622,57 @@ public final class CeHooks {
                 if (ACTIVE && INDEXING && e instanceof net.minecraft.world.entity.LivingEntity
                         && SERVER_THREAD.get()) {
                     int pw = worldId(e.level());
-                    if (pw >= 0 && ARENA[m] == e) {
+                    if (pw >= 0 && ARENA[m] == e
+                            // the vanilla body SKIPS non-finite writes (the
+                            // Vec3 isFinite gate) — the field keeps the old
+                            // value, the mirror must too. Unreachable with
+                            // the L20b gate woven (it skips first); this is
+                            // the gate-off exactness guard.
+                            && Double.isFinite(x) && Double.isFinite(y)
+                            && Double.isFinite(z)) {
                         if (dbN >= BATCH_CAP) {
                             flush();
                         }
-                        Vec3 dv = e.getDeltaMovement();
                         DB_IDS[dbN] = ((pw & 0xFFFFL) << 32)
-                                | (e.getId() & 0xFFFF_FFFFL);
-                        DB_DV[dbN * 3] = dv.x;
-                        DB_DV[dbN * 3 + 1] = dv.y;
-                        DB_DV[dbN * 3 + 2] = dv.z;
+                                | (entId(e) & 0xFFFF_FFFFL);
+                        DB_DV[dbN * 3] = x;
+                        DB_DV[dbN * 3 + 1] = y;
+                        DB_DV[dbN * 3 + 2] = z;
                         dbN++;
                         if (dbN >= DRAIN_CAP) flush();
                     }
                 }
+                if (REST_GEN[m] != 0) { // resting: decide whether the impulse
+                    // is self-physics (this item's own marking tick) or an
+                    // external push; only the latter may break the rest.
+                    if (SELF_TICK_MASK == m && System.nanoTime() < SELF_TICK_UNTIL) {
+                        wakesSelf++;
+                    } else {
+                        REST_GEN[m] = 0;
+                        wakesDelta++;
+                        if (REST_CHURN[m] < 8) REST_CHURN[m]++;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeDelta: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
+    }
+
+    /** Prefix of Entity.setDeltaMovement(DDD) — wake-only. The 26.3 DDD
+     *  body DELEGATES to setDeltaMovement(Vec3) (javap-verified), so this
+     *  fires on the outer frame and the value-carrying probe above fires on
+     *  the inner one; the drain's last-event-wins keeps the mirror exact.
+     *  No batch here: the pre-write field read is now worthless (the inner
+     *  event carries the new value) and the double batch taxed the drain. */
+    public static void probeDelta(Entity e) {
+        try {
+            l7ExternalMutation(e);
+            if (e != null) {
+                int m = entId(e) & AMASK;
                 if (REST_GEN[m] != 0) { // resting: decide whether the impulse
                     // is self-physics (this item's own marking tick) or an
                     // external push; only the latter may break the rest.
@@ -675,9 +1698,12 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
-                ARENA[e.getId() & AMASK] = e;
+                int paId = entId(e);
+                int paSlot = paId & AMASK;
+                ARENA[paSlot] = e;
+                ARENA_ID[paSlot] = paId;
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
-                batchUpsert(e.getId(), worldId(e.level()), e, e.getBoundingBox(), false);
+                batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -692,15 +1718,90 @@ public final class CeHooks {
         try {
             if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
-                ARENA[e.getId() & AMASK] = null;
-                REST_GEN[e.getId() & AMASK] = 0; // gone: drop the rest state
-                batchRemove(e.getId());
+                int prId = entId(e);
+                int prSlot = prId & AMASK;
+                ARENA[prSlot] = null;
+                ARENA_ID[prSlot] = 0;
+                REST_GEN[prSlot] = 0; // gone: drop the rest state
+                batchRemove(prId);
+            }
+            // L63b: release the shape-cache slot (the te ref must not outlive
+            // the entity — the identity check tolerates stale slots, but a
+            // removed entity's TrackedEntity must be collectable). L65: the
+            // se/sit/steps refs ride the same slot lifecycle.
+            if (e != null) {
+                int sm = entId(e) & AMASK;
+                Object[] rf0 = TT_REF;
+                if (rf0 != null) {
+                    int ob = sm * 5;
+                    rf0[ob] = null;
+                    rf0[ob + 1] = null;
+                    rf0[ob + 2] = null;
+                    rf0[ob + 3] = null;
+                    rf0[ob + 4] = null;
+                }
+                long[] fl0 = TT_FLAT;
+                if (fl0 != null) fl0[sm * 2] = 0;
+                Entity[] fe = FROZ_E;
+                if (fe != null) fe[sm] = null;
+                AT_E[sm & (AT_CAP - 1)] = null;
+                // L73: the AI floor's shadow keys are STRONG — the removed
+                // mob's selector must be dropped explicitly (its goalSelector
+                // rides O_MOB_GOALSEL). A missed drop leaks one bounded
+                // entry; the drop never fires for non-mobs.
+                if (e instanceof net.minecraft.world.entity.Mob
+                        && O_MOB_GOALSEL >= 0 && U != null) {
+                    try {
+                        Object gsD = U.getObject(e, O_MOB_GOALSEL);
+                        if (gsD != null) aiDrop(gsD);
+                    } catch (Throwable dropFail) {
+                        // bounded leak, never a crash
+                    }
+                }
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
             lastErrorText = "probeRemove: " + t;
             t.printStackTrace();
             ACTIVE = false;
+        }
+    }
+
+    /** L38f: LivingEntity.die(DamageSource) prefix. javap-verified 26.3:
+     *  hurtServer deducts hp through actuallyHurt BEFORE `this.die(source)`
+     *  (the isDeadOrDying gate at the tail of the hurt flow) — at the
+     *  prefix hp is ALREADY <= 0, so isAlive() is false and the freshly
+     *  recomputed pushFlags clear PF_PUSHABLE. Without this probe the
+     *  corpse (position frozen, zero box/delta events for the whole
+     *  ~20-tick deathTime animation) stays pushable in the mirror while
+     *  vanilla's getPushableEntities excludes it — the kernel's cramming
+     *  audit then counts it (hits/nonPass) and applies hurtServer where
+     *  vanilla does not: an extra hurt with ZERO RNG draw (cramming has
+     *  no source position -> dealDefaultKnockback passes xd=zd=0, no
+     *  Math.random, no velocity) and ZERO position impact — the exact
+     *  PH-invisible hp divergence that failed the T382+ snapshot gate
+     *  (doc 40). The upsert rides the pending batch; the next
+     *  nativePush of THIS tick drains it (flushIfPending / drain_direct
+     *  at the kernel entry), so the within-tick pusher order sees the
+     *  corpse exactly when vanilla's fresh per-pusher list does. */
+    public static void probeDie(Entity e) {
+        try {
+            if (ACTIVE && INDEXING && e != null
+                    && e instanceof net.minecraft.world.entity.LivingEntity
+                    && SERVER_THREAD.get()
+                    && e.level() != null && !e.level().isClientSide()) {
+                int pdId = entId(e);
+                ARENA[pdId & AMASK] = e;
+                ARENA_ID[pdId & AMASK] = pdId;
+                batchUpsert(pdId, worldId(e.level()), e, e.getBoundingBox(), true);
+            }
+        } catch (Throwable t) {
+            // uncertain -> the mirror stays as-is. The failure mode is the
+            // PRE-fix staleness (a missed flag refresh can only LEAVE a
+            // corpse in the kernel's view — an extra audit hit), never a
+            // spurious removal: this probe may only shrink the view.
+            lastError = System.nanoTime();
+            lastErrorText = "probeDie: " + t;
         }
     }
 
@@ -718,9 +1819,12 @@ public final class CeHooks {
             l7ExternalMutation(e);
             if (ACTIVE && INDEXING && e != null && newBox != null && e.level() != null && !e.level().isClientSide()) {
                 probesBox++;
-                ARENA[e.getId() & AMASK] = e;
-                if (REST_GEN[e.getId() & AMASK] != 0) {
-                    REST_GEN[e.getId() & AMASK] = 0; // a box change is a disturbance
+                int pbId = entId(e);
+                int pbSlot = pbId & AMASK;
+                ARENA[pbSlot] = e;
+                ARENA_ID[pbSlot] = pbId;
+                if (REST_GEN[pbSlot] != 0) {
+                    REST_GEN[pbSlot] = 0; // a box change is a disturbance
                     wakesBox++;
                 }
                 // Row-neutral classification (4b.2a): a box change WITHIN one
@@ -729,10 +1833,18 @@ public final class CeHooks {
                 // may skip the entry. Without this, a moving entity's own
                 // pending probe would force its every query onto the native
                 // path (observed: falling items never hit the row path).
+                // PARITY ORDER (doc 36b): a section-Y change WITHIN the cell
+                // (y crossing a 16-block boundary) is a vanilla RE-APPEND —
+                // the row's id ORDER changes even though the id LIST does
+                // not, so it must NOT classify row-neutral (the row keeps
+                // its old order until the next dirty republish).
                 AABB oldBox = e.getBoundingBox();
-                boolean rowNeutral = oldBox != null
+                int curSy = e.moonrise$getSectionY();
+                boolean syMoved = LAST_SY[entId(e) & AMASK] != curSy;
+                LAST_SY[entId(e) & AMASK] = curSy;
+                boolean rowNeutral = !syMoved && oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
-                batchUpsert(e.getId(), worldId(e.level()), e, newBox, rowNeutral);
+                batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -806,7 +1918,7 @@ public final class CeHooks {
         // chunkZ, chunkX, sectionY, seq). moonrise$getSectionY and the
         // ORD_SEQ stamp live on plain Entity, not just LivingEntity.
         B_SY[bN] = e.moonrise$getSectionY();
-        B_SEQ[bN] = ORD_SEQ[e.getId() & AMASK];
+        B_SEQ[bN] = ORD_SEQ[entId(e) & AMASK];
         if (e instanceof net.minecraft.world.entity.LivingEntity le) {
             B_PF[bN] = pushFlags(le);
             B_PXZ[bN * 2] = le.getX();
@@ -814,7 +1926,7 @@ public final class CeHooks {
             Vec3 dv = le.getDeltaMovement();
             B_DV[bN * 3] = dv.x; B_DV[bN * 3 + 1] = dv.y; B_DV[bN * 3 + 2] = dv.z;
             Entity veh = le.isPassenger() ? le.getVehicle() : null;
-            B_VID[bN] = veh != null ? veh.getId() : 0;
+            B_VID[bN] = veh != null ? entId(veh) : 0;
         } else {
             B_PF[bN] = 0;
             B_PXZ[bN * 2] = 0.0;
@@ -826,16 +1938,25 @@ public final class CeHooks {
         if (bN >= DRAIN_CAP) flush();
     }
 
-    /** L12: the pushableBy predicate's stateful slice, folded into flag bits
-     *  (javap-verified against 26.3 LivingEntity.isPushable ->
-     *  isCollidable(false): isAlwaysTicking false, ServerLevel,
-     *  isPositionEntityTicking(blockPosition), isAlive, !isSpectator,
-     *  collides, !onClimbable). The team-rule slice is NOT folded — any
-     *  entity WITH a team routes the whole push vanilla (the guard checks).
-     *  Rare state flips without a box event (sleeping villager, spectator
-     *  flip) re-classify on the entity's next box probe; the deviation
-     *  window is documented in docs/research/23 and is behaviorally inert
-     *  (deltas of non-traveling entities never integrate into position). */
+    /** L12: the pushableBy predicate's stateful slice, folded into flag bits.
+     *  PF_PUSHABLE = the VIRTUAL LivingEntity.isPushable() (= isCollidable(
+     *  paperConfig.collisions.fixClimbingBypassingCrammingRule)). The call
+     *  MUST stay virtual: ArmorStand OVERRIDES isCollidable(boolean) to
+     *  `return false` unconditionally in 26.3 (armor stands are never push
+     *  candidates and never push — their doPush is empty and pushEntities
+     *  only looks at rideable minecarts), and AbstractHorse/Parrot override
+     *  too. The previous inlined copy of the LivingEntity body missed every
+     *  override and classified ALL armor stands pushable — the kernel then
+     *  pushed marker stands (stale pre-marker box + PF_PUSHABLE) that
+     *  vanilla's EntitySelector.pushableBy excludes at input.isPushable():
+     *  the extra-push family (mixed t=233 stand 235, spread t=235 stand
+     *  4142, mobs t=275 stand 1069). The team-rule slice is NOT folded —
+     *  any entity WITH a team routes the whole push vanilla (the guard
+     *  checks). Rare state flips without a box event (sleeping villager,
+     *  spectator flip) re-classify on the entity's next box probe; the
+     *  deviation window is documented in docs/research/23 and is
+     *  behaviorally inert (deltas of non-traveling entities never
+     *  integrate into position). */
     private static int pushFlags(net.minecraft.world.entity.LivingEntity le) {
         // THROW-PROOF BY CONTRACT: the first A/B round lost the whole module
         // to `le.isSpectator()` NPE'ing on a MID-CONSTRUCTION ServerPlayer
@@ -850,13 +1971,7 @@ public final class CeHooks {
             if (le.isVehicle()) f |= PF_VEHICLE;
             if (le.noPhysics) f |= PF_NOPHYSICS;
             if (le.isSpectator()) f |= PF_SPECTATOR;
-            if (!le.isAlwaysTicking()
-                    && le.level() instanceof net.minecraft.server.level.ServerLevel sl
-                    && sl.isPositionEntityTicking(le.blockPosition())
-                    && le.isAlive()
-                    && !le.isSpectator()
-                    && le.collides
-                    && !le.onClimbable()) {
+            if (le.isPushable()) {
                 f |= PF_PUSHABLE;
             }
         } catch (Throwable t) {
@@ -1068,6 +2183,17 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
+    // PARITY ORDER: the last section-Y seen per id (probeBox) — a change
+    // within the same home cell is a vanilla re-append and must force a
+    // dirty republish (see the rowNeutral classification in probeBox).
+    private static final int[] LAST_SY = new int[ARENA.length];
+    // L100a: the id mirror of the ARENA — ARENA_ID[si] is the FULL id of the
+    // entity ARENA[si] holds (0 when null). Every ARENA write pairs with an
+    // ARENA_ID write (probeAdd/probeRemove/probeDie/probeBox/ordBackfill), so
+    // the resolve loops' `entId(e) != cid` Unsafe read becomes one plain int[]
+    // load in the cache line next to the ARENA ref. Same invariant, same
+    // full-id compare (slot aliasing still falls back to the getter).
+    private static final int[] ARENA_ID = new int[ARENA.length];
 
     // ------------------------------------------------------------------
     // L37 — VANILLA SCAN ORDER. The parity A/B (run 40529103630) proved the
@@ -1099,7 +2225,7 @@ public final class CeHooks {
             new java.util.concurrent.atomic.AtomicInteger(1);
 
     private static void ordStamp(Entity e) {
-        ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+        ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
     }
 
     /** Prefix of EntityLookup.moveEntity(Entity): the vanilla RE-APPEND
@@ -1112,6 +2238,7 @@ public final class CeHooks {
     public static void probeMoveSection(Entity e) {
         try {
             if (!ACTIVE || !INDEXING || e == null) return;
+            if (SECTION_STAMP_SCHEME != 0) return; // slices-append scheme owns the stamp
             net.minecraft.world.level.Level lvl = e.level();
             if (lvl == null || lvl.isClientSide()) return;
             int oz = e.moonrise$getSectionZ();
@@ -1123,11 +2250,74 @@ public final class CeHooks {
             int ny = nyr < lvl.getMinSectionY() ? lvl.getMinSectionY()
                     : nyr > lvl.getMaxSectionY() ? lvl.getMaxSectionY() : nyr;
             if (nx != ox || nz != oz || ny != oy) {
-                ORD_SEQ[e.getId() & AMASK] = ORD_CNT.incrementAndGet();
+                ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
             }
         } catch (Throwable t) {
             // never break movement: a missed stamp costs order fidelity on
             // one entity, a throw here would desync every world tick
+        }
+    }
+
+    // The stamp-scheme selection (patch_lookup): 1 = the SLICES scheme — the
+    // seq stamp + moonrise field pre-write happen in the ChunkEntitySlices.
+    // addEntity PREFIX, which is the ONLY point where the live section
+    // structure, the moonrise fields and the order key are simultaneously
+    // consistent (between removeEntity and addEntity the entity is INVISIBLE
+    // to vanilla scans, so the pre-written fields cannot desync anything);
+    // 0 = the legacy moveEntity-PREFIX scheme — the stamp lands BEFORE the
+    // actual re-append, and every query inside the remove+add+setSection
+    // window sorts a (stale section, fresh seq) key that disagrees with the
+    // live structure — THE residual parity divergence (run 40647817613:
+    // 12/16500 merge flips, jockey lottery desync). The slices patch is
+    // attempted first; a refusal falls back to 0 (exact-ish, never worse).
+    // volatile (not final): the native side flips it to 0 when the slices
+    // weave is refused (the moveEntity fallback must then own the stamps).
+    public static volatile int SECTION_STAMP_SCHEME = 1;
+
+    public static void setSectionStampScheme(int v) {
+        SECTION_STAMP_SCHEME = v;
+    }
+
+    /** PARITY ORDER (doc 36b): the ChunkEntitySlices.addEntity PREFIX —
+     *  the vanilla re-append point. The receiver slices' chunkX/chunkZ are
+     *  the NEW chunk coords and `sy` the (already clamped) new section Y.
+     *  We PRE-WRITE the moonrise section fields and bump the insertion seq
+     *  HERE: the live structure still holds the entity in the old section
+     *  (the body appends it), but between removeEntity and addEntity the
+     *  entity is invisible to every vanilla scan — no observer can read the
+     *  transient state. From this point on (new fields + fresh seq) the
+     *  order key is consistent with the live structure FOREVER — the
+     *  moveEntity-prefix window (remove+add+setSection, dozens of ops with
+     *  allocations) is gone. Also pushes an immediate batchUpsert so the
+     *  Rust index/published rows re-sync in the SAME tick. */
+    public static void probeSectionAppend(Entity e, int sy) {
+        try {
+            if (!ACTIVE || !INDEXING || e == null) return;
+            net.minecraft.world.level.Level lvl = e.level();
+            if (lvl == null || lvl.isClientSide()) return;
+            // moveEntity computes the target chunk from blockPosition right
+            // before calling addEntity, and chunk-load paths add entities at
+            // their own position — deriving the new chunk coords from the
+            // entity is exact. `sy` is the ALREADY clamped section Y the
+            // slices body receives.
+            int nx = (int) Math.floor(e.getX()) >> 4;
+            int nz = (int) Math.floor(e.getZ()) >> 4;
+            e.moonrise$setSectionX(nx);
+            e.moonrise$setSectionY(sy);
+            e.moonrise$setSectionZ(nz);
+            ORD_SEQ[entId(e) & AMASK] = ORD_CNT.incrementAndGet();
+            LAST_SY[entId(e) & AMASK] = sy;
+            if (lvl instanceof net.minecraft.server.level.ServerLevel) {
+                AABB b = e.getBoundingBox();
+                if (b != null) {
+                    int wid = worldId(lvl);
+                    if (wid >= 0) {
+                        batchUpsert(entId(e), wid, e, b, false);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // never break movement — same reasoning as probeMoveSection
         }
     }
 
@@ -1136,13 +2326,62 @@ public final class CeHooks {
     private static long[] ORD_KA = new long[0];
     private static long[] ORD_KB = new long[0];
 
+    /** L97.4: the ordSortVanilla prescan ledger — ordSkip = inputs already in
+     *  vanilla key order (the sort skipped), ordWork = genuinely stale inputs
+     *  that paid the full sort. The ratio names whether the residual
+     *  TimSort tax is index-order staleness (a Rust-side resync fix) or
+     *  inherent re-append ordering (the stamps must move). */
+    public static long ordSkip = 0, ordWork = 0;
+
+    // === L106 (doc 41 grind, the query-family pack) ======================
+    // CE_L106=0 restores the pre-L106 behavior one knob for the whole pack:
+    //   1. STRUCTURAL ordSkip: the native resolve and the (chunkZ-major)
+    //      row scan serve candidates in the vanilla EntityLookup order by
+    //      construction — the per-query ordKey stamp + prescan (+ the rare
+    //      sort) is skipped (native) / kept only for PQ-carrying row queries
+    //      (row). ORDER_CHECK and the CI parity gate referee the claim.
+    //   2. VIEW HOIST: viewN/IN_ITEM_APPLY are loop-stable (the flush apply
+    //      runs before the resolve; the row path never applies) — one local
+    //      test replaces the per-candidate isViewAfter call. A predicate
+    //      that mutated view state mid-loop trips the vBlew net -> mirror.
+    //   3. COUNTER LOCALS: marginExtra/rowWinSkip/homeMiss accumulate in
+    //      locals and flush once per query (the putstatic per candidate was
+    //      a hot self-time line: rowQuery 3250 = 5.17%, spread-100k-mod).
+    //   4. Inline AABB.intersects in the row scan (javap-verified identical
+    //      6-compare test).
+    private static final boolean ORD_STRUCT_ON =
+            !"0".equals(System.getenv("CE_L106"));
+    public static long ordStructSkip = 0;
+    public static long mViewBlew = 0;
+
+    /** L38 — the collide fast path (CE_COLLIDE=0 disables the weave).
+     *  Byte-exact port of LivingEntity.canCollideWithBukkit (26.3):
+     *  `isPushable() && collides != collidableExemptions.contains(uuid)` —
+     *  with the EMPTY-SET fast path. A default Paper server keeps
+     *  collidableExemptions empty (Bukkit-API opt-in), and HashSet.contains
+     *  pays a full UUID hash + table probe for an answer that is provably
+     *  FALSE for an empty set — EntitySelector.pushableBy evaluates this
+     *  per candidate per push/collision query, 7.1% of the mobs-25k-mod
+     *  profile (the single largest controllable leaf). isPushable() stays a
+     *  real virtual call; the exempt branch on a NON-empty set is exactly
+     *  vanilla (same hash, same probe, same result). */
+    public static boolean canCollideWithBukkit$(net.minecraft.world.entity.LivingEntity le,
+                                                net.minecraft.world.entity.Entity other) {
+        if (!le.isPushable()) {
+            return false;
+        }
+        java.util.Set<java.util.UUID> ex = le.collidableExemptions;
+        boolean exempt = ex != null && !ex.isEmpty() && ex.contains(other.getUUID());
+        return le.collides != exempt;
+    }
+
     /** The two-long vanilla order key: ka = (chunkZ biased 22b) << 22 |
      *  (chunkX biased 22b); kb = (sectionY biased 22b) << 40 | seq (32b). */
     private static void ordKey(Entity e, int i) {
         int cz = e.moonrise$getSectionZ();
         int cx = e.moonrise$getSectionX();
         int sy = e.moonrise$getSectionY();
-        int seq = ORD_SEQ[e.getId() & AMASK];
+        int seq = ORD_SEQ[entId(e) & AMASK];
         ORD_KA[i] = ((((long) cz + 2097152L) & 0x3FFFFFL) << 22)
                 | (((long) cx + 2097152L) & 0x3FFFFFL);
         ORD_KB[i] = ((((long) sy + 2097152L) & 0x3FFFFFL) << 40)
@@ -1222,7 +2461,9 @@ public final class CeHooks {
                     getEnts.invoke(lookup, null, box, all, null);
                     for (int i = 0; i < all.size(); i++) {
                         Entity en = all.get(i);
-                        ARENA[en.getId() & AMASK] = en;
+                        int enId = entId(en);
+                        ARENA[enId & AMASK] = en;
+                        ARENA_ID[enId & AMASK] = enId;
                         ordStamp(en);
                     }
                 }
@@ -1250,6 +2491,17 @@ public final class CeHooks {
                 ORD_E[i] = en;
                 ordKey(en, i);
             }
+            // L97.4 prescan: the index streams cells in vanilla order (doc
+            // 36b ensure_cell_order + the chunkZ-major walk) — a fresh index
+            // makes the sort a no-op; skip it (ordSkip) and keep the sorting
+            // machinery for genuinely stale inputs (ordWork). A skipped sort
+            // is semantics-free: the input order already IS the key order.
+            boolean sorted = ordPrescan(n);
+            if (sorted) {
+                ordSkip++;
+                return;
+            }
+            ordWork++;
             for (int i = 1; i < n; i++) {
                 Entity te = ORD_E[i];
                 long ta = ORD_KA[i];
@@ -1267,6 +2519,28 @@ public final class CeHooks {
             }
             for (int i = 0; i < n; i++) out.set(i, ORD_E[i]);
         } else {
+            if (ORD_E.length < n) {
+                ORD_E = new Entity[Math.max(n, ORD_E.length * 2)];
+                ORD_KA = new long[ORD_E.length];
+                ORD_KB = new long[ORD_E.length];
+            }
+            for (int i = 0; i < n; i++) {
+                Entity en = out.get(i);
+                ORD_E[i] = en;
+                ordKey(en, i);
+            }
+            // L97.4 prescan (the big-scan branch): the >512 TimSort with the
+            // per-compare moonrise getters + ORD_SEQ lookups was 4.18%+0.99%
+            // self-time on the fresh mobs-25k-mod profile — the index order
+            // and the live ORD_SEQ disagree somewhere, so the sort does REAL
+            // merges. The prescan names which side wins (ordSkip vs ordWork
+            // on the hooks@ line) and kills the sorted-input cost outright.
+            boolean sorted = ordPrescan(n);
+            if (sorted) {
+                ordSkip++;
+                return;
+            }
+            ordWork++;
             Entity[] arr = out.toArray(new Entity[0]);
             java.util.Arrays.sort(arr, (a, b) -> {
                 long cza = a.moonrise$getSectionZ();
@@ -1278,10 +2552,21 @@ public final class CeHooks {
                 long sya = a.moonrise$getSectionY();
                 long syb = b.moonrise$getSectionY();
                 if (sya != syb) return Long.compare(sya, syb);
-                return Integer.compare(ORD_SEQ[a.getId() & AMASK], ORD_SEQ[b.getId() & AMASK]);
+                return Integer.compare(ORD_SEQ[entId(a) & AMASK], ORD_SEQ[entId(b) & AMASK]);
             });
             for (int i = 0; i < n; i++) out.set(i, arr[i]);
         }
+    }
+
+    /** L97.4: O(n) already-in-vanilla-order test over ORD_KA/ORD_KB. */
+    private static boolean ordPrescan(int n) {
+        for (int i = 1; i < n; i++) {
+            if (ORD_KA[i] < ORD_KA[i - 1]
+                    || (ORD_KA[i] == ORD_KA[i - 1] && ORD_KB[i] < ORD_KB[i - 1])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1291,11 +2576,39 @@ public final class CeHooks {
     private static final ThreadLocal<long[]> QBUF =
             ThreadLocal.withInitial(() -> new long[1024]);
 
+    // L46 (doc 41 move 2): the merge-scan caller consumes its candidate list
+    // synchronously inside mergeScanNative — a fresh ArrayList per scan
+    // (~32k scans/tick on items-100k) churned TLAB garbage that showed up as
+    // allocator + GC pressure inside fastQuery's 13.96% self-time bucket.
+    // The scratch list is server-thread-confined (fastQuery already refuses
+    // off-thread callers) and guarded by a depth counter: a REENTRANT
+    // fastQuery inside the consume loop (a merge body that queries) must
+    // never see its own answer list cleared under it — depth > 1 allocates
+    // normally. The general getEntities hook keeps allocating (callers may
+    // retain the list).
+    private static final ArrayList<Entity> FQ_SCRATCH = new ArrayList<>(512);
+    private static int fqScratchDepth = 0;
+    // L46 parity knob: CE_FQ_SCRATCH=0 restores the allocate-per-scan answer
+    // list (the bisect handle if a red gate pins anything to the scratch).
+    private static final boolean FQ_SCRATCH_ON =
+            !"0".equals(System.getenv("CE_FQ_SCRATCH"));
+
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, Entity source,
             AABB box, Predicate<? super Entity> predicate) {
+        return fastQuery(level, source, box, predicate, false);
+    }
+
+    private static List<Entity> fastQuery(
+            net.minecraft.world.level.Level level, Entity source,
+            AABB box, Predicate<? super Entity> predicate, boolean reuseScratch) {
+        fastRefuse = null;
+        // L46: only the OUTERMOST guarded caller may take the scratch —
+        // a reentrant query inside a consume loop allocates (see FQ_SCRATCH).
+        final boolean useScratch = FQ_SCRATCH_ON && reuseScratch && fqScratchDepth == 1;
         if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
             mNotServerLevel++;
+            fastRefuse = "notserverlevel";
             return null;
         }
         // The fast path touches server-thread-only state (batch arrays, gate
@@ -1304,11 +2617,13 @@ public final class CeHooks {
         // pre-existing batch-array race.
         if (!SERVER_THREAD.get()) {
             mOffThread++;
+            fastRefuse = "offthread";
             return null;
         }
         int wid = worldId(sl);
         if (wid < 0) {
             mBadWorld++;
+            fastRefuse = "badworld";
             return null;
         }
 
@@ -1320,11 +2635,30 @@ public final class CeHooks {
             if (OVERSIZE_POP != 0) {
                 rowOv++; // native oversize entities: exact scan is native-only
             } else {
-                List<Entity> out = rowQuery(sl, wid, source, box, predicate);
-                if (out != null) return out;
+                List<Entity> out = rowQuery(sl, wid, source, box, predicate, useScratch);
+                if (out != null) {
+                    msqPath = "row";
+                    return out;
+                }
             }
         } else if (PUBLISH_SEQ == 0) {
             rowNoPub++;
+        }
+        msqPath = "native";
+        // L44: the native resolve filters against the INDEX boxes (POST-move
+        // for resync entries). When any AFTER-scanner view entry's PRE box
+        // touches the query, that answer is one physics step past vanilla's
+        // per-body view — refuse instead (the row path served it above; a
+        // refusal here falls to the mirror, which is equally view-stale but
+        // rare: it needs a row-path refusal AND a fresh spawn in range).
+        if (viewTouches(box)) {
+            mViewRefuse++;
+            // keep the ROW reason: the chain "pending+view" names BOTH the
+            // row refusal and the native view refusal in one print (the
+            // first L45 run overwrote it and the items t=219 row reason
+            // stayed unnameable).
+            fastRefuse = fastRefuse == null ? "view" : fastRefuse + "+view";
+            return null;
         }
 
         // FLUSH-MERGED QUERY (iteration 3): the pending probe batch is applied
@@ -1367,10 +2701,12 @@ public final class CeHooks {
             }
             if (n == -1) {
                 mNotReady++;
+                fastRefuse = "notready";
                 return null; // index not ready / buffer vanished — mirror
             }
             if (n < 0) {
                 mRegrowFail++;
+                fastRefuse = "regrow";
                 return null; // regrow failed — mirror
             }
             if (n > 0) {
@@ -1380,6 +2716,7 @@ public final class CeHooks {
                 if (n > ids.length) {
                     if (n > (1 << 20)) {
                         mRegrowFail++;
+                        fastRefuse = "regrow2";
                         return null;
                     }
                     ids = new long[n];
@@ -1387,6 +2724,7 @@ public final class CeHooks {
                 }
                 if ((long) n << 3 > dbb.capacity()) {
                     mRegrowFail++;
+                    fastRefuse = "regrow3";
                     return null;
                 }
                 for (int k = 0; k < n; k++) {
@@ -1415,22 +2753,53 @@ public final class CeHooks {
             }
             if (n < 0) {
                 mNotReady++;
+                fastRefuse = "notready2";
                 return null; // index not ready — mirror
             }
             if (n > ids.length) {
                 mRegrowFail++;
+                fastRefuse = "regrow4";
                 return null; // regrow failed 3x — mirror
             }
         }
         if (prof) queryNanos += System.nanoTime() - t1;
 
-        ArrayList<Entity> out = new ArrayList<>(Math.min(n, 64));
+        // L104: cap the resolve-loop work BEFORE paying it. The scan (and
+        // the flush-merged batch application, already done above) is cheap;
+        // the per-candidate Java resolve is not. n here is the index's
+        // margin-superset result size.
+        if (n > BIG_N_REFUSE) {
+            bigboxRefused++;
+            bigboxCand += n;
+            fastRefuse = "bigbox";
+            return null;
+        }
+
+        ArrayList<Entity> out = useScratch
+                ? FQ_SCRATCH
+                : new ArrayList<>(Math.min(n, 64));
+        if (useScratch) { out.clear(); }
         int resolved = 0;
         int stale = 0;
         int srcSkip = 0;
         candidatesSeen += n;
         long t2 = prof ? System.nanoTime() : 0L;
-        int srcId = source == null ? -1 : source.getId();
+        int srcId = source == null ? -1 : entId(source);
+        // L106 view hoist: viewN/IN_ITEM_APPLY are stable across the resolve
+        // loop (the flush-merged apply ran BEFORE it, inside queryNative2;
+        // the loop itself never applies a batch; a predicate that mutated the
+        // view is caught by the vBlew check below and falls back to the
+        // mirror). One local test replaces the per-candidate isViewAfter
+        // call (2 static loads + a frame) on every candidate of every query.
+        final boolean vApply0 = IN_ITEM_APPLY;
+        final int vN0 = viewN;
+        final boolean vActive = vApply0 && vN0 > 0;
+        // L106 marginExtra in a local: the putstatic per rejected candidate
+        // was a hot self-time line on the spread-100k-mod profile.
+        int marginLocal = 0;
+        // L109 same trick: per-candidate volatile putstatic would eat the
+        // win; accumulate once after the loop.
+        int l109SkipLoc = 0, l109TrimLoc = 0;
         for (int k = 0; k < n; k++) {
             int cid = (int) ids[k];
             if (cid == srcId) {
@@ -1440,11 +2809,17 @@ public final class CeHooks {
                 srcSkip++;
                 continue;
             }
+            if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
+                // the RAW candidate id — pre-window, pre-home, pre-box:
+                // the MSQ diff names WHICH stage dropped a merge partner
+                MSQ_IDS[msqN++] = cid;
+            }
             // ZERO-RESOLVE: the probes keep refs in ARENA[id & AMASK]; the
             // id-match rejects stale/wrapped slots, the getter is only a
             // fallback (e.g. right after a resync window).
-            Entity e = ARENA[cid & AMASK];
-            if (e == null || e.getId() != cid) {
+            int rSlot = cid & AMASK;
+            Entity e = ARENA[rSlot];
+            if (e == null || ARENA_ID[rSlot] != cid) {
                 arenaMiss++;
                 e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                 if (e == null) {
@@ -1469,12 +2844,46 @@ public final class CeHooks {
             // pushed zombies outside the push box — THE item and mob
             // divergence in one). The vanilla test is
             // entity.getBoundingBox().intersects(box) on the LIVE box.
-            AABB eb = e.getBoundingBox();
-            if (!(eb.minX < box.maxX && eb.maxX > box.minX
-                    && eb.minY < box.maxY && eb.maxY > box.minY
-                    && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
-                marginExtra++;
-                continue;
+            // L44: an AFTER-scanner resync entry is seen at its PRE-body box
+            // (the vanilla scan ran before that entry's body).
+            boolean viewAfter = vActive && isViewAfter(cid);
+            if (L109_TRUST && !viewAfter) {
+                // L109: the index box decided the scan; the live trim is the
+                // proven-redundant margin tax (see L109_TRUST). The vanilla
+                // predicate below still applies, as it must.
+                l109SkipLoc++;
+            } else {
+                AABB eb = e.getBoundingBox();
+                if (viewAfter) {
+                    eb = viewBox(cid, eb);
+                }
+                if (!(eb.minX < box.maxX && eb.maxX > box.minX
+                        && eb.minY < box.maxY && eb.maxY > box.minY
+                        && eb.minZ < box.maxZ && eb.maxZ > box.minZ)) {
+                    marginLocal++;
+                    // L41d: sample the first rejects' index-box vs LIVE-box —
+                    // the Rust scan already filters all 3 axes against the
+                    // INDEX box exactly, so an 84% rejection rate means the
+                    // index box disagrees with the live box. The sample names
+                    // which side is stale (the doc-41 exact-f64-query move).
+                    if (MSQ_COLLECT && msqRejN < 32) {
+                        msqRej[msqRejN * 6] = eb.minX;
+                        msqRej[msqRejN * 6 + 1] = eb.maxX;
+                        msqRej[msqRejN * 6 + 2] = eb.minY;
+                        msqRej[msqRejN * 6 + 3] = eb.maxY;
+                        msqRej[msqRejN * 6 + 4] = eb.minZ;
+                        msqRej[msqRejN * 6 + 5] = eb.maxZ;
+                        msqRejIds[msqRejN] = cid;
+                        if (IBOX_ON) {
+                            java.util.Arrays.fill(iboxBuf, Double.NaN);
+                            nativeIndexBox(wid, cid, iboxBuf);
+                            System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
+                        }
+                        msqRejN++;
+                    }
+                    continue;
+                }
+                l109TrimLoc++;
             }
             // NOTE: the vanilla predicate still applies, as it must.
             if (predicate.test(e)) {
@@ -1482,6 +2891,21 @@ public final class CeHooks {
             }
         }
         if (prof) resolveNanos += System.nanoTime() - t2;
+        // L106 flushes + safety nets.
+        marginExtra += marginLocal;
+        if (L109_TRUST) {
+            l109Skip += l109SkipLoc;
+            l109Trim += l109TrimLoc;
+        }
+        if (IN_ITEM_APPLY != vApply0 || viewN != vN0) {
+            // the loop mutated view state through a predicate (never seen in
+            // the wild; the flush apply ran before the loop) — the vActive
+            // decision may be stale for the tail candidates: refuse to the
+            // mirror, which re-runs the whole query exactly.
+            mViewBlew++;
+            fastRefuse = "viewblew";
+            return null;
+        }
         // "resolved" for the parity assert means "the id mapped to a LIVE
         // entity" — the source self-hit (srcSkip) is exactly that (the
         // vanilla exclusion skips the PUSH, not the resolution). The L12
@@ -1503,7 +2927,22 @@ public final class CeHooks {
         // the merge partner choice, the maxEntityCollisions cap and every
         // other order-sensitive consumer need the exact (chunkZ, chunkX,
         // sectionY, insertionSeq) sequence.
-        ordSortVanilla(out);
+        // L106 STRUCTURAL ORDER: the native resolve adds survivors in the
+        // Rust scan order, which IS the vanilla EntityLookup order by
+        // construction (lib.rs query(): chunkZ-major cell walk x
+        // ensure_cell_order per cell, oversize re-keyed in Rust; skips and
+        // the arena fallback preserve relative order; viewBox substitutes a
+        // box, never a position; the view-touch case refused above). The
+        // per-candidate ordKey stamping + prescan ran on EVERY query and cost
+        // ~4.5% self-time on spread-100k-mod (2488 3.03% + ordKey 1.45%) to
+        // conclude ordSkip 207789 : ordWork 9. CE_L106=0 restores the sort.
+        // ORDER_CHECK (below) still element-verifies against the mirror when
+        // enabled, and the CI parity gate is the referee.
+        if (!ORD_STRUCT_ON) {
+            ordSortVanilla(out);
+        } else {
+            ordStructSkip++;
+        }
         if (ORDER_CHECK) {
             orderChecks++;
             List<Entity> van = mirror(level, source, box, predicate);
@@ -1529,6 +2968,28 @@ public final class CeHooks {
                             .append(')')
                             .append(" src=").append(srcId);
                     java.util.HashSet<Entity> vanSet = new java.util.HashSet<>(van);
+                    // L97.4: the first differing POSITION (both sides in
+                    // order, with the full order key) — the stale-stamp side
+                    // names itself (id, section, ORD_SEQ).
+                    int fd = -1;
+                    for (int i = 0; i < Math.min(van.size(), out.size()); i++) {
+                        if (van.get(i) != out.get(i)) { fd = i; break; }
+                    }
+                    if (fd >= 0) {
+                        Entity vfe = van.get(fd);
+                        Entity ffe = out.get(fd);
+                        sb.append(" FD=").append(fd)
+                                .append(" van=(id=").append(vfe.getId())
+                                .append(" sec=").append(vfe.moonrise$getSectionZ())
+                                .append(',').append(vfe.moonrise$getSectionX())
+                                .append(',').append(vfe.moonrise$getSectionY())
+                                .append(" seq=").append(ORD_SEQ[entId(vfe) & AMASK]).append(')')
+                                .append(" fast=(id=").append(ffe.getId())
+                                .append(" sec=").append(ffe.moonrise$getSectionZ())
+                                .append(',').append(ffe.moonrise$getSectionX())
+                                .append(',').append(ffe.moonrise$getSectionY())
+                                .append(" seq=").append(ORD_SEQ[entId(ffe) & AMASK]).append(')');
+                    }
                     int shown = 0;
                     for (Entity fe : out) {
                         if (!vanSet.contains(fe) && shown < 4) {
@@ -1581,14 +3042,15 @@ public final class CeHooks {
     }
 
     // Multi-cell scratch (server-thread only, reused — no per-query alloc).
-    // L32: widened 4 -> 16 — the staging rectangle is up to 4x4 cells
-    // (span <= 3 per axis); the scan below is already rectangle-general.
-    private static final long[][] MQ_ROWS = new long[16][];
-    private static final int[] MQ_CELL = new int[16];
+    // L32: widened 4 -> 16; L41b: 16 -> 36 — the staging rectangle is up to
+    // 6x6 cells (raw span <= 3 + the 1-cell single-homing expansion per
+    // axis); the scan below is already rectangle-general.
+    private static final long[][] MQ_ROWS = new long[36][];
+    private static final int[] MQ_CELL = new int[36];
     // L4c windowed rows: the UNWRAPPED cell x-origin of each covered row
     // (world blocks) — the reference frame for the packed candidate windows.
-    private static final long[] MQ_CELL_X0 = new long[16];
-    private static final long[] MQ_CELL_Z0 = new long[16];
+    private static final long[] MQ_CELL_X0 = new long[36];
+    private static final long[] MQ_CELL_Z0 = new long[36];
     // Pending row-neutral ids homed in a covered cell: their packed windows
     // are stale until the next publish, so the window test must not skip them.
     // Sized to PENDING_CAP: every pending row-neutral id of a covered cell
@@ -1596,16 +3058,53 @@ public final class CeHooks {
     private static final int[] WIN_IDS = new int[64];
     private static int winN = 0;
 
+    // L49 — the pending-fresh view serve (the items t=219 fix). A pending
+    // batch entry whose (POST) home cell is covered used to refuse the row
+    // path outright; the refusal fell to the native (viewTouches) and then
+    // to the mirror — the vanilla body AT THE FLUSH, one physics step past
+    // the vanilla view — and the merge vanilla made (6931 absorbed by the
+    // fresh 7892 at its PRE spawn box) never happened. The exact semantics
+    // per covered entry (batch index i, batch box BB, live box LB):
+    //   i <= MS_KIDX (its body ran before the scanner): vanilla saw POST = LB.
+    //   i >  MS_KIDX (its body runs later): vanilla saw PRE — exact ONLY
+    //       when the entity is untouched since collect (LB == BB: a fresh
+    //       add's batch box IS its spawn box); a moved entry's PRE is
+    //       unknown -> refuse (unchanged conservative shape).
+    // Served entries join `out` before ordSortVanilla, so the answer stays
+    // in the exact vanilla scan order. Knob: CE_ROW_VIEW=0 restores the
+    // refusal.
+    private static final int PQ_CAP = 64;
+    private static final int[] PQ_ID = new int[PQ_CAP];
+    private static final int[] PQ_KIDX = new int[PQ_CAP];
+    private static final double[] PQ_BOX = new double[PQ_CAP * 6];
+    private static int pqN = 0;
+    private static final boolean ROW_VIEW_ON =
+            !"0".equals(System.getenv("CE_ROW_VIEW"));
+
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
-            Entity source, AABB box, Predicate<? super Entity> predicate) {
-        int cx0 = cellFloor(box.minX);
-        int cx1 = cellFloor(box.maxX);
-        int cz0 = cellFloor(box.minZ);
-        int cz1 = cellFloor(box.maxZ);
-        // L32: the window is 4x4 (span <= 3). Wider boxes (the really wide
-        // targeting scans) still refuse into the native/mirror paths.
-        if (cx1 - cx0 > 3 || cz1 - cz0 > 3) { rowMulti++; return null; }
+            Entity source, AABB box, Predicate<? super Entity> predicate,
+            boolean useScratch) {
+        // L41b CELL EXPANSION: an entity single-homes at its CENTER cell,
+        // while vanilla's moonrise EntityLookup registers it in EVERY section
+        // its BOX overlaps — a neighbor whose center sits just past a cell
+        // boundary but whose box overlaps the query box is INVISIBLE to a
+        // raw-cell row walk, while vanilla finds it. The native path expands
+        // by max_half_span + MARGIN for exactly this single-homing safety;
+        // the row path must too: a 1-cell expansion covers every center
+        // within half-span <= 16 (bigger boxes are oversize-listed and never
+        // homed here). run 40889274763: the items t=159 survivor flip
+        // (971/1873) is a merge scan of self=971 returning n=0 where
+        // vanilla found the cross-boundary 1873; mixed t=152 (469/964) —
+        // the same shape.
+        int cx0 = cellFloor(box.minX) - 1;
+        int cx1 = cellFloor(box.maxX) + 1;
+        int cz0 = cellFloor(box.minZ) - 1;
+        int cz1 = cellFloor(box.maxZ) + 1;
+        // L32: the window is 6x6 (span <= 5 after the expansion). Wider
+        // boxes (the really wide targeting scans) still refuse into the
+        // native/mirror paths.
+        if (cx1 - cx0 > 5 || cz1 - cz0 > 5) { rowMulti++; fastRefuse = "multi"; return null; }
         // L35: narrow shapes (collision, merge scans) get the raised total
         // cap — the packed x-window below does the mass skip for them.
         double wxs = box.maxX - box.minX;
@@ -1628,8 +3127,14 @@ public final class CeHooks {
         // zero-fresh window means the index says nothing about it (early
         // boot, regrowth, foreign world) and the query refuses.
         boolean freshSeen = false;
-        for (int cx = cx0; cx <= cx1; cx++) {
-            for (int cz = cz0; cz <= cz1; cz++) {
+        // L106: chunkZ-MAJOR collect (vanilla iterates chunks Z outer, X
+        // inner). The rows stream into MQ_ROWS in collection order and the
+        // scan loop preserves it — with the swap the served order matches the
+        // vanilla EntityLookup walk for every window, which is the second
+        // half of the structural ordSkip (the first half: each row is
+        // published from an ensure_cell_order'ed index cell).
+        for (int cz = cz0; cz <= cz1; cz++) {
+            for (int cx = cx0; cx <= cx1; cx++) {
                 int packed = ((wid & 0x7) << 20) | (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 long[] row = ROWS[packed];
                 if (row == null) {
@@ -1644,6 +3149,7 @@ public final class CeHooks {
                         | (long) ((cz + (1 << 20)) & 0x3FFFFF);
                 if (row[0] != key) {
                     rowKey++;
+                    fastRefuse = "key";
                     if (dbgMisses < 3) {
                         dbgMisses++;
                         dbgExpKey = key;
@@ -1653,10 +3159,10 @@ public final class CeHooks {
                     return null;
                 }
                 long hdr = row[1];
-                if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; return null; }
+                if ((hdr >>> 11) != PUBLISH_SEQ) { rowStale++; fastRefuse = "stale"; return null; }
                 freshSeen = true;
                 int n = (int) (hdr & 0x7FF);
-                if (n > ROW_CAP) { rowBig++; return null; } // dense-kill sentinel
+                if (n > ROW_CAP) { rowBig++; fastRefuse = "bigdense"; return null; } // dense-kill sentinel
                 MQ_ROWS[nr] = row;
                 MQ_CELL[nr] = (cx & 0x3FF) | ((cz & 0x3FF) << 10);
                 MQ_CELL_X0[nr] = (long) cx << 4;
@@ -1669,6 +3175,7 @@ public final class CeHooks {
             // L32: every covered cell is either null or stale-fresh — the
             // index proves nothing about this window; the native/mirror
             // paths decide (the pre-L32 behavior for any non-empty window).
+            fastRefuse = "nofresh";
             return null;
         }
         // Pending (unflushed) probe batch: an upsert whose NEW home cell is
@@ -1680,8 +3187,9 @@ public final class CeHooks {
             // L4e: bound raised 16 -> 64 to match DRAIN_CAP — probe-time
             // draining keeps bN <= 64, so the scan below stays O(64x4) while
             // the row path now serves between drains instead of refusing.
-            if (bN > 64) { rowPending++; return null; } // bound the scan
+            if (bN > 64) { rowPending++; fastRefuse = "pending64"; return null; } // bound the scan
             winN = 0;
+            pqN = 0;
             for (int i = 0; i < bN; i++) {
                 long l = B_IDS[i];
                 if (l < 0) continue;                 // removals resolve to null below
@@ -1707,17 +3215,58 @@ public final class CeHooks {
                 int o2 = i * 6;
                 int home = (cellFloor((B_BOX[o2] + B_BOX[o2 + 3]) * 0.5) & 0x3FF)
                         | ((cellFloor((B_BOX[o2 + 2] + B_BOX[o2 + 5]) * 0.5) & 0x3FF) << 10);
+                boolean pqAdded = false;
                 for (int r = 0; r < nr; r++) {
-                    if (MQ_CELL[r] == home) {
+                    if (MQ_CELL[r] != home) continue;
+                    // L49: the covered pending entry. Decide serve vs refuse
+                    // by the exactness rule in the PQ block comment.
+                    if (!ROW_VIEW_ON || pqN >= PQ_CAP) {
                         rowPending++;
+                        fastRefuse = "pending";
                         return null;
                     }
+                    if (pqAdded) break;              // one row match is enough
+                    int pid = (int) (l & 0xFFFF_FFFFL);
+                    int pSlot = pid & AMASK;
+                    Entity pe = ARENA[pSlot];
+                    if (pe == null || ARENA_ID[pSlot] != pid) {
+                        rowPending++;
+                        fastRefuse = "pending";
+                        return null;
+                    }
+                    AABB lb = pe.getBoundingBox();
+                    boolean after = IN_ITEM_APPLY && i > MS_KIDX;
+                    if (after
+                            && !(lb.minX == B_BOX[o2] && lb.maxX == B_BOX[o2 + 3]
+                                 && lb.minY == B_BOX[o2 + 1] && lb.maxY == B_BOX[o2 + 4]
+                                 && lb.minZ == B_BOX[o2 + 2] && lb.maxZ == B_BOX[o2 + 5])) {
+                        // an AFTER-scanner entry whose body already moved it:
+                        // its PRE box is unknown — the conservative refusal.
+                        rowPending++;
+                        fastRefuse = "pending";
+                        return null;
+                    }
+                    PQ_ID[pqN] = pid;
+                    PQ_KIDX[pqN] = i;
+                    if (after) {
+                        System.arraycopy(B_BOX, o2, PQ_BOX, pqN * 6, 6);
+                    } else {
+                        PQ_BOX[pqN * 6] = lb.minX;
+                        PQ_BOX[pqN * 6 + 1] = lb.maxX;
+                        PQ_BOX[pqN * 6 + 2] = lb.minY;
+                        PQ_BOX[pqN * 6 + 3] = lb.maxY;
+                        PQ_BOX[pqN * 6 + 4] = lb.minZ;
+                        PQ_BOX[pqN * 6 + 5] = lb.maxZ;
+                    }
+                    pqN++;
+                    pqAdded = true;
                 }
             }
         } else {
             winN = 0;
+            pqN = 0;
         }
-        if (total == 0) {
+        if (total == 0 && pqN == 0) {
             // L16: the shared immutable empty list. At ~32k queries/tick the
             // per-query ArrayList(0) churned ~25MB/s of TLAB garbage that
             // shows up as allocator + GC pressure (Arrays.copyOf shows in the
@@ -1738,10 +3287,24 @@ public final class CeHooks {
         // ~30us/query x 6.7k/tick = ~200ms/tick, +10% p50 over vanilla.
         // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
         // on the native path while serving mid-density rows at ~10-20us.
-        if (total > totalCap) { rowBig++; return null; }
-        ArrayList<Entity> out = new ArrayList<>(Math.min(total, totalCap));
-        int srcId = source == null ? -1 : source.getId();
-        int stale = 0, homeMiss = 0;
+        if (total > totalCap) { rowBig++; fastRefuse = "bigcap"; return null; }
+        ArrayList<Entity> out = useScratch
+                ? FQ_SCRATCH
+                : new ArrayList<>(Math.min(total, totalCap));
+        out.clear();
+        int srcId = source == null ? -1 : entId(source);
+        int stale = 0;
+        // L106 view hoist (native-path twin): viewN/IN_ITEM_APPLY are stable
+        // across the scan (the row path never applies a batch; a predicate
+        // that mutated the view is caught by the vBlew check below and falls
+        // back to the mirror).
+        final boolean vApply0 = IN_ITEM_APPLY;
+        final int vN0 = viewN;
+        final boolean vActive = vApply0 && vN0 > 0;
+        // L106 counter locals: rowWinSkip/homeMiss putstatic per candidate
+        // sat on the hot self-time lines (rowQuery 3250 = 5.17% on
+        // spread-100k-mod).
+        int winSkipLocal = 0, homeMissLocal = 0;
         for (int r = 0; r < nr; r++) {
             long[] row = MQ_ROWS[r];
             int packed = MQ_CELL[r];
@@ -1760,6 +3323,20 @@ public final class CeHooks {
             // the answer. Typical push query: ~2.6 blocks wide in a 16-block
             // cell -> ~85% of candidates skipped at ~3ns each.
             long cellX0 = MQ_CELL_X0[r];
+            int rowSkipN = 0;
+            if (MSQ_COLLECT) { msqSkipN = 0; }
+            if (MSQ_COLLECT && msqRowsN < 12) {
+                // L41e: the staged rows' (cx, cz, n) + the query interval —
+                // the MSQ 971 case showed path=row rawN=0 win=163 (every
+                // candidate window-rejected) while the neighbor scan of the
+                // SAME cell found the merge partner: the staged-cell/window
+                // dump pins the exact disagreement.
+                msqRows[msqRowsN * 4] = (cellX0 >> 4);
+                msqRows[msqRowsN * 4 + 1] = (MQ_CELL_Z0[r] >> 4);
+                msqRows[msqRowsN * 4 + 2] = n;
+                msqRows[msqRowsN * 4 + 3] = 0;
+                msqRowsN++;
+            }
             double x0 = (double) cellX0;          // exact: |cx| << 49
             double z0 = (double) MQ_CELL_Z0[r];
             int qLo = ((int) Math.floor((box.minX - cellX0) * 1024.0)) - 2 + 32768;
@@ -1775,18 +3352,38 @@ public final class CeHooks {
                 for (int w = 0; w < winN; w++) {
                     if (WIN_IDS[w] == cid) { winTrusted = false; break; }
                 }
+                // L44: an AFTER-scanner resync entry's packed window rides its
+                // POST-move box — the vanilla scan view is the PRE-move box,
+                // so the window must not skip it.
+                if (vActive && winTrusted && isViewAfter(cid)) winTrusted = false;
                 if (winTrusted
                         && ((((int) (p >>> 48)) & 0xFFFF) < qLo
                             || (((int) (p >>> 32)) & 0xFFFF) > qHi)) {
-                    rowWinSkip++;
+                    winSkipLocal++;
+                    // L44b: name the skipped candidates PER ROW (the packed
+                    // interval vs the row's qLo/qHi pins the staleness)
+                    if (MSQ_COLLECT && msqSkipN < 16) {
+                        msqSkipId[msqSkipN] = cid;
+                        msqSkipLo[msqSkipN] = ((int) (p >>> 32)) & 0xFFFF;
+                        msqSkipHi[msqSkipN] = ((int) (p >>> 48)) & 0xFFFF;
+                        msqSkipRow[msqSkipN] = rowSkipN++;
+                        msqSkipN++;
+                    }
                     continue;
                 }
-                Entity e = ARENA[cid & AMASK];
-                if (e == null || e.getId() != cid) {
+                int rSlot = cid & AMASK;
+                Entity e = ARENA[rSlot];
+                if (e == null || ARENA_ID[rSlot] != cid) {
                     e = sl.getEntity(cid); // LevelEntityGetter.byId — id-keyed
                     if (e == null) { stale++; continue; }
                 }
                 AABB eb = e.getBoundingBox();
+                // L44: an AFTER-scanner resync entry is seen at its PRE-body
+                // box (the vanilla scan ran before that entry's body).
+                boolean viewAfter = vActive && isViewAfter(cid);
+                if (viewAfter) {
+                    eb = viewBox(cid, eb);
+                }
                 // home re-check (exactness): the entity's CURRENT home must
                 // still be the cell whose row we are reading; a pending
                 // cross-cell move drops out here exactly like vanilla's
@@ -1797,28 +3394,127 @@ public final class CeHooks {
                 // floor(center)==c as doubles <=> center in [c*16, c*16+16),
                 // and (min+max)*0.5 is exact (division by 2), so comparing
                 // center against the [x0, x0+16) interval is the SAME test.
-                double ecx = (eb.minX + eb.maxX) * 0.5;
-                if (ecx < x0 || ecx >= x0 + 16.0) {
-                    homeMiss++;
-                    continue;
+                // L44: view entries are dropped by the POST-home row but
+                // vanilla saw them registered at their PRE-move sections —
+                // the (PRE-)box test below is authoritative for them.
+                if (!viewAfter) {
+                    double ecx = (eb.minX + eb.maxX) * 0.5;
+                    if (ecx < x0 || ecx >= x0 + 16.0) {
+                        homeMissLocal++;
+                        if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
+                        continue;
+                    }
+                    double ecz = (eb.minZ + eb.maxZ) * 0.5;
+                    if (ecz < z0 || ecz >= z0 + 16.0) {
+                        homeMissLocal++;
+                        if (MSQ_COLLECT && msqHmN < 32) { msqHmId[msqHmN++] = cid; }
+                        continue;
+                    }
                 }
-                double ecz = (eb.minZ + eb.maxZ) * 0.5;
-                if (ecz < z0 || ecz >= z0 + 16.0) {
-                    homeMiss++;
-                    continue;
+                // L106: AABB.intersects(AABB) IS this 6-compare test (javap
+                // 1.21.8: delegates to intersects(DDDDDD), which is exactly
+                // these comparisons) — inlined to drop the virtual dispatch
+                // and the second object deref (box fields are already live
+                // in registers here).
+                if (eb.minX < box.maxX && eb.maxX > box.minX
+                        && eb.minY < box.maxY && eb.maxY > box.minY
+                        && eb.minZ < box.maxZ && eb.maxZ > box.minZ) {
+                    if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
+                        MSQ_IDS[msqN++] = cid;
+                    }
+                    if (predicate == null || predicate.test(e)) {
+                        out.add(e);
+                    }
+                } else if (MSQ_COLLECT && msqRejN < 32) {
+                    // row-path reject sample (the native resolve had one; the
+                    // 971 scan's 13 window-passed candidates were box-rejected
+                    // invisibly — this names them).
+                    msqRej[msqRejN * 6] = eb.minX;
+                    msqRej[msqRejN * 6 + 1] = eb.maxX;
+                    msqRej[msqRejN * 6 + 2] = eb.minY;
+                    msqRej[msqRejN * 6 + 3] = eb.maxY;
+                    msqRej[msqRejN * 6 + 4] = eb.minZ;
+                    msqRej[msqRejN * 6 + 5] = eb.maxZ;
+                    msqRejIds[msqRejN] = cid;
+                    if (IBOX_ON) {
+                        java.util.Arrays.fill(iboxBuf, Double.NaN);
+                        nativeIndexBox(wid, cid, iboxBuf);
+                        System.arraycopy(iboxBuf, 0, msqRejIdx, msqRejN * 6, 6);
+                    }
+                    msqRejN++;
                 }
-                if (eb.intersects(box) && (predicate == null || predicate.test(e))) {
-                    out.add(e);
+            }
+            // L44b: per-row skip dump — the packed interval vs this row's
+            // window, with the row origin, pins a stale row entry exactly.
+            if (MSQ_COLLECT && msqSkipN > 0) {
+                StringBuilder sb3 = new StringBuilder(240);
+                for (int k = 0; k < msqSkipN; k++) {
+                    sb3.append(k == 0 ? "" : " ").append(msqSkipId[k])
+                            .append(':').append(msqSkipLo[k])
+                            .append('-').append(msqSkipHi[k]);
                 }
+                System.out.println("[ce-baseline] MSSR t=" + CUR_TICK
+                        + " row=(" + (cellX0 >> 4) + ',' + (MQ_CELL_Z0[r] >> 4) + ')'
+                        + " win=[" + qLo + ',' + qHi + "] ox=" + cellX0
+                        + " skip=" + rowSkipN + " idLoHi=" + sb3);
+                msqSkipN = 0;
             }
         }
         rowStaleCand += stale;
-        rowHomeMiss += homeMiss;
+        rowHomeMiss += homeMissLocal;
+        rowWinSkip += winSkipLocal;
+        if (vApply0 != IN_ITEM_APPLY || vN0 != viewN) {
+            // L106 safety net: the scan mutated view state through a
+            // predicate (never seen in the wild) — refuse to the mirror,
+            // which re-runs the whole query exactly.
+            mViewBlew++;
+            fastRefuse = "viewblew";
+            return null;
+        }
+        // L49: serve the covered pending entries collected above (see the
+        // PQ block comment). Their box was chosen at collect time by the
+        // exactness rule (PRE = the batch box for an untouched
+        // after-scanner entry, LIVE otherwise); the home re-check is
+        // skipped for them — vanilla registers a crosser in BOTH sections,
+        // and a fresh add's PRE registration is the covered cell itself.
+        for (int q = 0; q < pqN; q++) {
+            int qSlot = PQ_ID[q] & AMASK;
+            Entity pe = ARENA[qSlot];
+            if (pe == null || ARENA_ID[qSlot] != PQ_ID[q]) continue;
+            boolean dup = false;
+            for (int k = 0; k < out.size(); k++) {
+                if (out.get(k).getId() == PQ_ID[q]) { dup = true; break; }
+            }
+            if (dup) continue;
+            double bx0 = PQ_BOX[q * 6], bx1 = PQ_BOX[q * 6 + 1];
+            double by0 = PQ_BOX[q * 6 + 2], by1 = PQ_BOX[q * 6 + 3];
+            double bz0 = PQ_BOX[q * 6 + 4], bz1 = PQ_BOX[q * 6 + 5];
+            if (bx0 < box.maxX && bx1 > box.minX
+                    && by0 < box.maxY && by1 > box.minY
+                    && bz0 < box.maxZ && bz1 > box.minZ) {
+                if (predicate == null || predicate.test(pe)) {
+                    out.add(pe);
+                }
+            }
+        }
+        // (per-row MSS lines print inside the row loop — see MSSR above)
         rowFast++;
         if (narrow) rowNarrow++;
         // L37: the row walk order (cells, rows, packed windows) is not the
         // vanilla EntityLookup order — same sort as the native path.
-        ordSortVanilla(out);
+        // L106 STRUCTURAL ORDER: the PQ appends are the ONLY reordering this
+        // path can produce. The collect loop is chunkZ-major (vanilla chunk
+        // walk) and each row is published from an ensure_cell_order'ed index
+        // cell, so with pqN == 0 the served order IS the vanilla order — the
+        // prescan agreed 207789 : 9 (ordSkip : ordWork, mobs-25k-mod) while
+        // paying the full ordKey stamp per candidate (~4.5% self-time).
+        // CE_L106=0 restores the unconditional sort; ORDER_CHECK/parity
+        // referee the claim.
+        if (pqN != 0 || !ORD_STRUCT_ON) {
+            ordSortVanilla(out);
+        } else {
+            ordStructSkip++;
+        }
         return out;
     }
 
@@ -2010,10 +3706,15 @@ public final class CeHooks {
      *  Returns a packed long: bit0 = ok (vanilla body suppressed), bit1 =
      *  cramming audit needed, bits 2..21 = non-passenger hit count,
      *  bits 22..53 = numCollisions after the tick. The post-tick delta is
-     *  written into PUSH_SDX/SDY/SDZ (server-thread confined statics). */
+     *  written into PUSH_SDX/SDY/SDZ (server-thread confined statics).
+     *  L50: realNcol — the pusher's REAL numCollisions field read by the
+     *  caller (one Unsafe read); the authoritative pre-reset value (the
+     *  mirror lagged behind vanilla-routed bodies' candidate increments
+     *  and the cap replay under-counted — the extra-push family). */
     public static native long nativePush(
             int wid, int selfId, int selfVehicle, int selfPlayer,
-            int onlyPlayers, int maxEC, int cramming, int curTick);
+            int onlyPlayers, int maxEC, int cramming, int curTick, int realNcol,
+            int diag);
     public static native void nativeBoxDirect(
             long id, int world, double x0, double y0, double z0, double x1, double y1, double z1);
     public static native void nativeRemoveDirect(long id);
@@ -2086,10 +3787,101 @@ public final class CeHooks {
     // ==================================================================
 
     public static final boolean ITEM_TICK_ON = !"0".equals(System.getenv("CE_ITEM_TICK"));
+
+    // MS diagnostics: the merge scan streams its candidate list when the
+    // current tick is inside the PH_DUMP window (one range — enough to aim
+    // the parity diff). CUR_TICK bumps once per itemTickFlush (the scans
+    // run only inside the flush, so it is exact for them).
+    private static final int[] MS_WINDOW = parseMsWindow(System.getenv("PH_DUMP"));
+    public static volatile int CUR_TICK = 0;
+
+    private static int[] parseMsWindow(String s) {
+        if (s == null || s.isBlank()) return new int[0];
+        // ADDENDUM-18: ALL comma-separated ranges, not just the first — the
+        // mixed (t=353) and spread (t=259) seeds sit OUTSIDE the mobs window
+        // and the KPH/TLO/KPD instruments must cover them too.
+        java.util.ArrayList<int[]> out = new java.util.ArrayList<>();
+        for (String tok : s.split(",")) {
+            tok = tok.trim();
+            if (tok.isEmpty()) continue;
+            int dash = tok.indexOf('-');
+            int lo, hi;
+            if (dash > 0) {
+                lo = Integer.parseInt(tok.substring(0, dash).trim());
+                hi = Integer.parseInt(tok.substring(dash + 1).trim());
+            } else {
+                lo = hi = Integer.parseInt(tok);
+            }
+            // PH_DUMP is in PLUGIN-tick space; CUR_TICK counts flushes across
+            // ALL loaded levels (3 at parity: overworld+nether+end — run
+            // 40789269145: ct=423 at t=141) — scale and pad.
+            out.add(new int[]{lo * 3 - 15, hi * 3 + 15});
+        }
+        int[] r = new int[out.size() * 2];
+        for (int i = 0; i < out.size(); i++) {
+            r[i * 2] = out.get(i)[0];
+            r[i * 2 + 1] = out.get(i)[1];
+        }
+        return r;
+    }
+
+    private static boolean phDumpTickNow() {
+        // L81b: one-shot init line — proves the PH_DUMP parse ONCE per boot
+        // (the reference run's LHURT/CRAM silence had two candidate causes:
+        // the probe not woven and the window empty; this line removes the
+        // ambiguity from every future hunt log).
+        if (!MS_INIT_PRINTED) {
+            MS_INIT_PRINTED = true;
+            System.out.println("[ce-baseline] CE-INIT MS_WINDOW=" + java.util.Arrays.toString(MS_WINDOW)
+                    + " PH_DUMP=" + System.getenv("PH_DUMP"));
+        }
+        for (int i = 0; i + 1 < MS_WINDOW.length; i += 2) {
+            if (CUR_TICK >= MS_WINDOW[i] && CUR_TICK <= MS_WINDOW[i + 1]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static volatile boolean MS_INIT_PRINTED = false;
+
+    // ---- doc-40 addendum-17 instruments: TLO / TTR / KPD ----
+    // The push-timing family's surviving hypotheses were (a) the kernel
+    // delivering a pair one phase early and (b) the mob TRAVEL floor serving
+    // a first-walk tick differently than vanilla. The PTRACE at mobs t=275
+    // (id 1069, exact x0.5/0.5133872 + vx ratio 1/(0.6*0.91)) needs a
+    // per-tick witness INSIDE the ON-only paths: the walk order (TLO), the
+    // travel floor's serving decision (TTR), and the push kernel's decline
+    // reasons (KPD). All gated on phDumpTickNow() + the PARITY_TRACE_ID env;
+    // the OFF leg runs none of them (module off) — vanilla's order comes
+    // from the plugin's TL stream (the same raw array).
+    private static final int TR_ID = parseTraceId(System.getenv("PARITY_TRACE_ID"));
+
+    // L76: the AI-engine protocol trace — armed with TR_ID (a per-tick
+    // staged-request witness for the traced mob, ON leg only; the OFF leg
+    // runs no engine). Streams AITR lines via the run-baseline whitelist
+    // (add the pattern there in the same commit).
+    private static final boolean AITR = TR_ID >= 0;
+
+    private static int parseTraceId(String s) {
+        if (s == null || s.isBlank()) return -1;
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException quiet) {
+            return -1;
+        }
+    }
     // L15b: PLAIN (per item-tick, 100k/tick) — see the mergeChecks note.
     public static long itemChecks = 0, itemNative = 0, itemInactive = 0,
             itemResync = 0, itemVanillaRouted = 0, itemMerge = 0, itemDespawn = 0,
-            itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0;
+            itemLand = 0, itemVoid = 0, itemVanillaNext = 0, itemAbort = 0, itemFlushes = 0,
+            dsame = 0, dwrite = 0, itemTailNone = 0;
+    // L60: the DELTA_SAME verdict census — dsame = the core said the post-tick
+    // delta is identical to pre (the write skipped), dwrite = the flush wrote
+    // a fresh Vec3. The items profile burns ~10% (caller 5.89 + callee 5.7)
+    // in Entity.setDeltaMovement — this pair names whether the resting fixed
+    // point misses widely (dwrite ~ item count per tick) or the cost is a
+    // small moving subpopulation.
 
     // ---- batch (server-thread confined; one world per tick segment) ----
     private static final int IB_CAP = 1 << 17;
@@ -2097,11 +3889,11 @@ public final class CeHooks {
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
     // this (one array read) instead of arenaRef(id) (an ARENA read + the
-    // megamorphic cand.getId() staleness call: measured 15.6% of the
+    // megamorphic entId(cand) staleness call: measured 15.6% of the
     // items-100k-mod leg). The batch is per-tick state, so no id-match
     // staleness check is needed: a mid-tick removal is caught by
     // isRemoved() (a plain field read).
-    private static final Entity[] IB_REF = new Entity[IB_CAP];
+    private static final ItemEntity[] IB_ITEM = new ItemEntity[IB_CAP];
     // L8.2 COMPACT BATCH: only collector-data entries (resync /
     // force-vanilla — the rare population) carry the 14-double state stride;
     // they are side-packed contiguously into IB_CD. The 1-based slot number
@@ -2114,6 +3906,11 @@ public final class CeHooks {
     private static final int IF_CDMASK = 0x3F; // the IF_* bit namespace
     private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
     private static int ibN = 0;
+    // L64c: the batch's RESYNC|FORCE_VANILLA population — the flush's pass-1
+    // re-read loop and the L44 view-build loop both scan ALL n entries to
+    // find these; on the bench steady state the count is ZERO and both
+    // full-batch scans skip on one compare.
+    private static int ibResyncN = 0;
 
     // flag bits (must match itemcore.rs)
     public static final int IF_INACTIVE = 1;        // entry came from inactiveTick
@@ -2134,9 +3931,54 @@ public final class CeHooks {
     /** L12 kernel outputs (server-thread confined): the post-tick delta and
      *  the packed verdict of the last nativePush call. */
     public static double PUSH_SDX = 0.0, PUSH_SDY = 0.0, PUSH_SDZ = 0.0;
+    /** L42 pushed-pair outputs (server-thread confined): the kernel emits
+     *  (id, ddx, ddz) per pushed candidate instead of mutating the mirror —
+     *  the apply loop writes the candidate's delta THIS TICK (vanilla's
+     *  doPush lands both sides' forces inside the pusher's body), and the
+     *  write's own probe event re-syncs the mirror. Sized for the
+     *  maxEntityCollisions cap with headroom; the kernel caps the emission. */
+    public static final int PUSH_PAIR_CAP = 256;
+    public static final long[] PUSH_PAIR_IDS = new long[PUSH_PAIR_CAP];
+    public static final double[] PUSH_PAIR_D = new double[PUSH_PAIR_CAP * 2];
+    public static int PUSH_PAIR_N = 0;
+    /** ADDENDUM-18: the pre-break candidate hits (superset of the pairs).
+     *  Vanilla increments entityx.numCollisions BEFORE doPush, so gated
+     *  candidates (same-vehicle/noPhysics/vehicle-receiver/onlyPlayers)
+     *  still consume their hit; the old emit-only loop lost those and the
+     *  entity's numCollisions grew ~10x slower than vanilla — the cap
+     *  never bound where vanilla's did (the mobs t=275 seed: vanilla's
+     *  78-pass broke at post-decay nc=10 >= maxec 8, the kernel's nc=1
+     *  pass served the pair). The apply loop now counts EVERY hit. */
+    public static final long[] PUSH_HIT_IDS = new long[PUSH_PAIR_CAP];
+    public static int PUSH_HIT_N = 0;
+    /** ADDENDUM-18e: the per-candidate intersect diag at the traced id's
+     *  pass (the KPI instrument — the decisive one per doc-40 addendum 18d).
+     *  For EVERY raw candidate the kernel saw, the KPI line pairs the MIRROR
+     *  box the exact-f64 intersect compared (PUSH_DIAG_MB) with the
+     *  candidate's LIVE box (the ARENA entity's getBoundingBox() at the
+     *  apply moment) — the diff names the stale member and the magnitude.
+     *  Stage codes (low nibble): 1=flags-drop, 2=intersect-fail, 3=cap-break,
+     *  4=same-vehicle gate, 5=nophys gate, 6=players gate, 7=eps-crammed
+     *  route, 8=served pair, 9=no-mirror-slot. Bit 4: 0=detect pass,
+     *  1=apply pass. PUSH_DIAG_SB = the SELF's mirror box at scan time. */
+    public static final int PUSH_DIAG_CAP = 128;
+    public static final long[] PUSH_DIAG_IDS = new long[PUSH_DIAG_CAP];
+    public static final long[] PUSH_DIAG_STAGES = new long[PUSH_DIAG_CAP];
+    public static final double[] PUSH_DIAG_MB = new double[PUSH_DIAG_CAP * 6];
+    public static final double[] PUSH_DIAG_SB = new double[6];
+    /** ADDENDUM-18f: the scan walk range — (cx0, cx1, cz0, cz1, ex, world). */
+    public static final double[] PUSH_DIAG_WALK = new double[6];
+    public static int PUSH_DIAG_N = 0;
     // L15b: PLAIN (per push, 25k/tick on mobs-25k) — see the mergeChecks note.
     public static long pushChecks = 0, pushNative = 0, pushMirror = 0,
-            pushCramming = 0, pushSelfDelta = 0;
+            pushCramming = 0, pushSelfDelta = 0, pushPairs = 0, pushPairMiss = 0;
+    /** ADDENDUM-18: the scan-stage witnesses (set by n_push for BOTH the
+     *  served and the declined passes). PUSH_RAW = the raw pre-filter
+     *  candidate count summed over the pass's cells; PUSH_DROWS = the
+     *  density-gate row population; the reason rides n_push's bits 54..56
+     *  (1=density gate, 2=crammed route, 4=arena/flags miss). */
+    public static int PUSH_RAW = 0, PUSH_DROWS = 0;
+
     /** L12 kill switch: -Dcentities.pushNative=false keeps every push vanilla. */
     public static final boolean PUSH_ON =
             !"false".equals(System.getProperty("centities.pushNative", "true"));
@@ -2151,6 +3993,11 @@ public final class CeHooks {
     private static volatile java.lang.invoke.MethodHandle MH_RANDOM;
     private static volatile java.lang.invoke.MethodHandle MH_NEXT_INT;
     private static volatile boolean MH_NCOL_FAILED = false;
+    /** L42: the Unsafe offset of the PROTECTED Entity.numCollisions field —
+     *  the pushed candidates' per-pair increment (vanilla entityx
+     *  .numCollisions++ in the pusher's body) must reach the Java field
+     *  even when the candidate's own kernel run never writebacks it. */
+    private static long O_NCOL = -1;
 
     private static synchronized boolean initNcolMh(Entity sample) {
         if (MH_NCOL_FAILED) return false;
@@ -2166,11 +4013,16 @@ public final class CeHooks {
                     java.lang.invoke.MethodHandles.lookup().unreflectSetter(f)
                             .asType(java.lang.invoke.MethodType.methodType(
                                     void.class, Entity.class, int.class));
-            // the PUBLIC getter — no setAccessible on the protected field
-            java.lang.reflect.Method g = net.minecraft.world.entity.LivingEntity.class
-                    .getDeclaredMethod("getRandom");
+            // 26.3 removed Entity.getRandom()/LivingEntity.getRandom() — the
+            // RandomSource is the protected final Entity.random FIELD
+            // (javap-verified: no getRandom on Entity/LivingEntity/Mob;
+            // observed: NoSuchMethodException killed the whole ncolMh bind
+            // and silently vanilla-routed the push kernel in every leg).
+            java.lang.reflect.Field rf = net.minecraft.world.entity.Entity.class
+                    .getDeclaredField("random");
+            rf.setAccessible(true);
             java.lang.invoke.MethodHandle rnd =
-                    java.lang.invoke.MethodHandles.lookup().unreflect(g)
+                    java.lang.invoke.MethodHandles.lookup().unreflectGetter(rf)
                             .asType(java.lang.invoke.MethodType.methodType(
                                     net.minecraft.util.RandomSource.class,
                                     net.minecraft.world.entity.LivingEntity.class));
@@ -2183,11 +4035,13 @@ public final class CeHooks {
             MH_NCOL = ncol;
             MH_RANDOM = rnd;
             MH_NEXT_INT = next;
+            O_NCOL = U.objectFieldOffset(f);
             return true;
         } catch (Throwable t) {
             MH_NCOL = null;
             MH_RANDOM = null;
             MH_NEXT_INT = null;
+            O_NCOL = -1;
             MH_NCOL_FAILED = true;
             lastError = System.nanoTime();
             lastErrorText = "ncolMh: " + t;
@@ -2261,16 +4115,81 @@ public final class CeHooks {
             int wid = worldId(w);
             if (wid < 0) return false;
             boolean selfVehicle = le.isVehicle();
+            // ADDENDUM-18 (the mobs t=275 root cause): publish the SELF's
+            // LIVE box before the scan. The probeBox weave targets
+            // setBoundingBox — the single choke point of 1.21.8 — but the
+            // 26.3 move path no longer routes every reposition through it,
+            // so a mob's mirror box lagged one tick behind its live box.
+            // The scan then used the stale SELF box: an overlap the entity
+            // walked into THIS tick was invisible to the kernel (the 78
+            // pass at t=245: the live box overlaps 916 by 0.027, the PQ
+            // witness names 916 the only vanilla candidate, the scan saw
+            // hn=0) while stale overlaps kept being served (the L47 "extra
+            // push" family) — and the missing candidate hits starved the
+            // numCollisions cap (OFF 2..18 vs the kernel's flat 0-1), so
+            // vanilla's cap-blocked passes were served by the kernel. The
+            // self's own dispatch publishes its fresh box; the entities
+            // earlier in the walk did the same at their dispatches, and the
+            // not-yet-ticked ones are end-of-previous-tick = live. The scan
+            // becomes live-box exact, vanilla's semantics.
+            if (ACTIVE && INDEXING) {
+                batchUpsert(entId(le), wid, le, le.getBoundingBox(), false);
+            }
             // the kernel reads the mirror: drain the pending probe batches first
             flushIfPending();
-            long res = nativePush(wid, le.getId(), selfVehicle ? 1 : 0,
+            // ADDENDUM-18: the EXACT real numCollisions the kernel's cap
+            // replay starts from — printed on the KPH line so the OFF leg's
+            // vanilla pass verdict (the same field, same moment) can be
+            // compared without a re-run.
+            final int realNcol = O_NCOL >= 0 && U != null ? U.getInt(le, O_NCOL) : 0;
+            // ADDENDUM-18e: the KPI diag rides ONLY the traced id's pass at
+            // a PD tick (one branch off the hot path otherwise).
+            final boolean diagPass =
+                    phDumpTickNow() && TR_ID >= 0 && entId(le) == TR_ID;
+            long res = nativePush(wid, entId(le), selfVehicle ? 1 : 0,
                     PUSH_CFG_PLAYERS ? 1 : 0, PUSH_CFG_ONLYPLAYERS ? 1 : 0,
-                    PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK);
+                    PUSH_CFG_MAXEC, PUSH_CFG_CRAMMING, PUSH_CFG_TICK,
+                    realNcol, diagPass ? 1 : 0);
+            if (diagPass) {
+                printKpi(le);
+            }
             if ((res & 1L) == 0L) {
                 // kernel declined (arena miss / index not ready): sync the
                 // mirror's numCollisions into the Java field, then vanilla.
+                // L41c: the mirror value is authoritative ONLY when the
+                // kernel computed this entity's push THIS tick (the native
+                // gates it on its ncol_tick) — a stale mirror value would
+                // RESET the vanilla numCollisions (the vanilla body updates
+                // the real field every tick; the mirror never sees those
+                // writes) and remove the maxEntityCollisions cap from the
+                // vanilla pushes that follow (the mobs 377 trace: the ON
+                // leg's delta carried the un-capped push forces).
                 pushMirror++;
-                int ncolMirror = nativePushNcol(le.getId());
+                // KPD (addendum 17): the kernel's DECLINE verdict for the
+                // traced mob at PD ticks — density-gate refusals and mirror
+                // misses are the push-timing family's remaining suspects;
+                // the served path already prints KPH.
+                if (phDumpTickNow() && TR_ID >= 0 && entId(le) == TR_ID) {
+                    System.out.println("[ce-baseline] KPD t=" + CUR_TICK
+                            + " id=" + entId(le) + " decline=kernel"
+                            + " ncol=" + nativePushNcol(entId(le), PUSH_CFG_TICK));
+                }
+                // ADDENDUM-18: the KPX line — EVERY declined pass at PD
+                // ticks, with the decline reason and the scan-stage
+                // witnesses. A hit can only be lost on a SERVED pass whose
+                // scan missed the candidate, so the declined lines bound
+                // the suspect set from below.
+                if (phDumpTickNow()) {
+                    int reason = (int) ((res >>> 54) & 0x7);
+                    System.out.println("[ce-baseline] KPX t=" + CUR_TICK
+                            + " self=" + entId(le)
+                            + " tc=" + le.tickCount
+                            + " reason=" + reason
+                            + " raw=" + PUSH_RAW
+                            + " rows=" + PUSH_DROWS
+                            + " nc=" + realNcol);
+                }
+                int ncolMirror = nativePushNcol(entId(le), PUSH_CFG_TICK);
                 if (ncolMirror >= 0 && MH_NCOL != null) {
                     try {
                         MH_NCOL.invokeExact((Entity) le, ncolMirror);
@@ -2318,10 +4237,106 @@ public final class CeHooks {
                     ACTIVE = false;
                     return false;
                 }
+                // L81 hunt: every kernel cramming-condition firing (bit1 =
+                // hits_count > cramming-1) with the audit's numbers — the
+                // module's view of the list the vanilla aiStep counts live.
+                // The OFF leg's LRF armor-draw stream is vanilla's truth;
+                // a CRAM line whose tick carries no OFF draw (or vice versa)
+                // IS the divergence. Window-gated, one line per firing.
+                if (phDumpTickNow()) {
+                    System.out.println("[ce-baseline] CRAM t=" + (CUR_TICK / 3)
+                            + " ct=" + CUR_TICK + " id=" + entId(le)
+                            + " np=" + nonPass + " roll=" + roll
+                            + " ncol=" + ncolNew
+                            + " hurt=" + (roll == 0
+                                          && nonPass > PUSH_CFG_CRAMMING - 1
+                                          ? 1 : 0));
+                }
                 if (roll == 0 && nonPass > PUSH_CFG_CRAMMING - 1) {
                     le.hurtServer(sl, sl.damageSources().cramming(), 6.0f);
                 }
             }
+            // L42: the pushed candidates' own writes — vanilla applies them
+            // INSIDE the pusher's body (doPush -> entityx.push(this) mutates
+            // BOTH deltas; the audit runs BEFORE the pair loop, hence this
+            // placement). The old mirror-only deferral lost the force
+            // whenever the candidate's own kernel run declined, and the
+            // pusher's writeback then carried the stale mirror base — the
+            // first-move PH divergence (doc 40 addendum 5). entityx
+            // .numCollisions++ precedes doPush in vanilla; the push() call
+            // is the EXACT vanilla 3-arg overload (no event, needsSync,
+            // the probe captures the new value for the mirror).
+            if (O_NCOL < 0) {
+                return false; // cannot maintain the candidates' counters
+            }
+            int pn = PUSH_PAIR_N;
+            // ADDENDUM-18: the candidates' REAL numCollisions increments —
+            // for EVERY pre-break hit (the pairs are a subset), matching
+            // vanilla's pre-doPush entityx.numCollisions++.
+            int hn = PUSH_HIT_N;
+            for (int i = 0; i < hn; i++) {
+                long hid = PUSH_HIT_IDS[i];
+                int hSlot = (int) (hid & AMASK);
+                Entity he = ARENA[hSlot];
+                if (he == null || ARENA_ID[hSlot] != (int) (hid & 0xFFFF_FFFFL)) {
+                    pushPairMiss++;
+                    continue;
+                }
+                U.putInt(he, O_NCOL, U.getInt(he, O_NCOL) + 1);
+            }
+            for (int i = 0; i < pn; i++) {
+                long pid = PUSH_PAIR_IDS[i];
+                int p2Slot = (int) (pid & AMASK);
+                Entity pe = ARENA[p2Slot];
+                if (pe == null || ARENA_ID[p2Slot] != (int) (pid & 0xFFFF_FFFFL)) {
+                    // unreachable once the JNI side writes the arrays IN
+                    // PLACE: the pair ids come from the mirror the ARENA
+                    // feeds, no Java code runs between n_push and this loop.
+                    // (The first CI run missed 210/223 because the arrays
+                    // were static-final and the JIT folded the ORIGINAL
+                    // empty-array reference while n_push swapped the field
+                    // to a fresh array each call — the compiled loop read
+                    // all-zero ids. The region-write fix keeps the object.)
+                    pushPairMiss++;
+                    continue;
+                }
+                // the counter increment now rides the hits loop above
+                pe.push(PUSH_PAIR_D[i * 2], 0.0, PUSH_PAIR_D[i * 2 + 1]);
+            }
+            PUSH_HIT_N = 0;
+            pushPairs += pn;
+            // L47 PUSH FORENSICS: the mixed t=233 PTRACE proved an EXTRA
+            // push on a resting armor stand (ON gained vx/vz at tc=90,
+            // vanilla stayed zero; spread t=235 4142 and mobs t=275 1069
+            // are the same one-tick family) — the kernel accepted a pair
+            // vanilla's in-phase scan excludes. At PD ticks, dump the
+            // pusher's identity + live box and the exact pair set with
+            // forces; the OFF leg's PD/PTRACE supplies the vanilla outcome,
+            // so the diff names the culprit pair and its geometry.
+            if (phDumpTickNow()) {
+                StringBuilder pb = new StringBuilder(96 + pn * 24);
+                AABB sbx = le.getBoundingBox();
+                pb.append("[ce-baseline] KPH t=").append(CUR_TICK)
+                        .append(" self=").append(le.getId())
+                        .append(" tc=").append(le.tickCount)
+                        .append(" nc=").append(realNcol)
+                        .append(" maxec=").append(PUSH_CFG_MAXEC)
+                        .append(" raw=").append(PUSH_RAW)
+                        .append(" rows=").append(PUSH_DROWS)
+                        .append(" hn=").append(hn)
+                        .append(" n=").append(pn)
+                        .append(" box=[").append(sbx.minX).append(',').append(sbx.maxX)
+                        .append(' ').append(sbx.minY).append(',').append(sbx.maxY)
+                        .append(' ').append(sbx.minZ).append(',').append(sbx.maxZ)
+                        .append(']');
+                for (int i = 0; i < Math.min(pn, 16); i++) {
+                    pb.append(' ').append(PUSH_PAIR_IDS[i] & 0xFFFF_FFFFL)
+                            .append(':').append(PUSH_PAIR_D[i * 2])
+                            .append(',').append(PUSH_PAIR_D[i * 2 + 1]);
+                }
+                System.out.println(pb);
+            }
+            PUSH_PAIR_N = 0;
             return true;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -2332,9 +4347,106 @@ public final class CeHooks {
         }
     }
 
+    /** ADDENDUM-18e: the KPI instrument — the decisive one per doc-40
+     *  addendum 18d. Printed right after the traced id's kernel pass (the
+     *  ARENA entities' live boxes ARE the exact scan-moment values: the
+     *  walk is sequential on the server thread and the pass mutates only
+     *  deltas/counter mirrors, not boxes). Each record pairs the
+     *  candidate's MIRROR box (what the exact-f64 intersect compared) with
+     *  its LIVE box — the diff names the stale member and the magnitude; a
+     *  stage-2 (intersect-fail) record whose live box DOES overlap the
+     *  self's live box is the missed candidate. dsb = the self's
+     *  mirror-vs-live max component diff (the self publish should keep it
+     *  at exactly 0). All boxes print as x0,y0,z0,x1,y1,z1 (the mirror
+     *  layout, component-wise comparable). Stage 10 = the SELF's own row
+     *  (the duplicated-self witness); the header carries the walk range
+     *  (w=cx0:cx1/cz0:cz1 ex= world=). */
+    private static void printKpi(Entity le) {
+        AABB sv = le.getBoundingBox();
+        StringBuilder pb = new StringBuilder(220);
+        pb.append("[ce-baseline] KPI t=").append(CUR_TICK)
+                .append(" self=").append(le.getId())
+                .append(" tc=").append(le.tickCount)
+                .append(" sboxm=[").append(box6Str(PUSH_DIAG_SB))
+                .append("] sboxv=[").append(box6Str(sv)).append(']');
+        double dsb = 0.0;
+        for (int k = 0; k < 6; k++) {
+            double d = Math.abs(PUSH_DIAG_SB[k] - aabbComp(sv, k));
+            if (d > dsb) dsb = d;
+        }
+        pb.append(" dsb=").append(dsb)
+                .append(" w=").append((int) PUSH_DIAG_WALK[0]).append(':')
+                .append((int) PUSH_DIAG_WALK[1]).append('/')
+                .append((int) PUSH_DIAG_WALK[2]).append(':')
+                .append((int) PUSH_DIAG_WALK[3])
+                .append(" ex=").append(PUSH_DIAG_WALK[4])
+                .append(" wld=").append((int) PUSH_DIAG_WALK[5])
+                .append(" n=").append(PUSH_DIAG_N);
+        System.out.println(pb);
+        for (int i = 0; i < PUSH_DIAG_N; i++) {
+            long cid = PUSH_DIAG_IDS[i];
+            int stg = (int) PUSH_DIAG_STAGES[i];
+            int cSlot = (int) (cid & AMASK);
+            Entity ce = ARENA[cSlot];
+            boolean live = ce != null && ARENA_ID[cSlot] == (int) (cid & 0xFFFF_FFFFL);
+            StringBuilder rb = new StringBuilder(256);
+            rb.append("[ce-baseline] KPIc t=").append(CUR_TICK)
+                    .append(" self=").append(le.getId())
+                    .append(" cand=").append(cid)
+                    .append(" p=").append(stg >> 4)
+                    .append(" st=").append(stg & 0xF)
+                    .append(" m=[");
+            for (int k = 0; k < 6; k++) {
+                if (k > 0) rb.append(',');
+                rb.append(PUSH_DIAG_MB[i * 6 + k]);
+            }
+            rb.append(']');
+            if (live) {
+                AABB lv = ce.getBoundingBox();
+                rb.append(" v=[").append(box6Str(lv)).append(']');
+                double dm = 0.0;
+                for (int k = 0; k < 6; k++) {
+                    double d = Math.abs(PUSH_DIAG_MB[i * 6 + k] - aabbComp(lv, k));
+                    if (d > dm) dm = d;
+                }
+                rb.append(" dm=").append(dm);
+            } else {
+                rb.append(" v=null");
+            }
+            System.out.println(rb);
+        }
+    }
+
+    /** The box6 order (x0,y0,z0,x1,y1,z1) of an AABB — component-wise
+     *  comparable with the mirror arrays. */
+    private static String box6Str(AABB b) {
+        return b.minX + "," + b.minY + "," + b.minZ + ","
+                + b.maxX + "," + b.maxY + "," + b.maxZ;
+    }
+
+    private static String box6Str(double[] b6) {
+        return b6[0] + "," + b6[1] + "," + b6[2] + ","
+                + b6[3] + "," + b6[4] + "," + b6[5];
+    }
+
+    private static double aabbComp(AABB b, int k) {
+        switch (k) {
+            case 0: return b.minX;
+            case 1: return b.minY;
+            case 2: return b.minZ;
+            case 3: return b.maxX;
+            case 4: return b.maxY;
+            default: return b.maxZ;
+        }
+    }
+
     /** The numCollisions mirror value for `id`, or -1 (mirror miss). Read
      *  through a tiny native so the decline path can re-sync the field. */
-    private static native int nativePushNcol(int id);
+    private static native int nativePushNcol(int id, int curTick);
+
+    /** L53-diag: the INDEX box of (world, id) into out[0..6] (x0,y0,z0,x1,y1,z1);
+     *  returns 1 when found, 0 when the id is not indexed. CE_FQ_IBOX=1 only. */
+    private static native int nativeIndexBox(int world, long id, double[] out);
 
     /** Drain any pending probe batches before a kernel call: the kernel
      *  reads the push mirror, so its view must be current. No-op when the
@@ -2408,10 +4520,21 @@ public final class CeHooks {
         if (!(ent instanceof ItemEntity e)) return false;
         if (ibN >= IB_CAP) return false;
         try {
-            if (e.level().isClientSide()) return false;
-            int slot = e.getId() & MAMASK;
+            // L66: the direct client check — javap 26.3: e.level() reads the
+            // private `level` field, isClientSide() the private final
+            // `isClientSide` boolean; two typed Unsafe reads replace the
+            // virtual call pair. A null level (never for a ticking entity)
+            // or an unresolved offset routes the exact vanilla pair.
+            Object lv = O_ENT_LEVEL >= 0 ? U != null
+                    ? U.getObject(e, O_ENT_LEVEL) : null : null;
+            if (lv == null || O_LEVEL_CLIENT < 0) {
+                if (e.level().isClientSide()) return false;
+            } else if (U.getBoolean(lv, O_LEVEL_CLIENT)) {
+                return false;
+            }
+            int slot = entId(e) & MAMASK;
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
-                if (REST_ID[slot] != e.getId()) {
+                if (REST_ID[slot] != entId(e)) {
                     // slot turnover: entity ids are monotonic per run, so a
                     // mismatched stamp belongs to a dead predecessor
                     MODE_VAL[slot] = 0;
@@ -2423,7 +4546,7 @@ public final class CeHooks {
                             || e.portalProcess != null || e.isOnPortalCooldown()
                             || stackEmptyDispatch(e)
                             || !e.getPassengers().isEmpty()
-                            || ARENA[e.getId() & AMASK] != e) {
+                            || ARENA[entId(e) & AMASK] != e) {
                         MODE_VAL[slot] = 0;
                         restExits++;
                         dispPass++;
@@ -2452,7 +4575,8 @@ public final class CeHooks {
                     // isTemporarilyActive toggle has no readers outside the
                     // skipped move path; MISC items take no immunity stamps)
                     boolean cadence = (e.tickCount + 1) % 40 == 0;
-                    boolean active = cadence && itemCheckActive(e);
+                    boolean active = cadence && itemCheckActive(e, true);
+                    dtrace(e, "rest", active);
                     // dispatcher prologue mirror (the suppressed
                     // tickNonPassenger: setOldPosAndRot is value-identical
                     // at a fixed point, the counters are not)
@@ -2525,7 +4649,19 @@ public final class CeHooks {
                     return false;
                 }
             }
-            boolean active = itemCheckActive(e);
+            // L52: the dispatch weave OWNS the dispatcher for MODE-1 items
+            // (tickNonPassenger suppressed — commonTick has NOT run this
+            // tick; the Rust core mirrors the ++ itself). The field is PRE,
+            // exactly the rest branch's phase: pass preIncrement=true. The
+            // old false read one-behind'ed the gate at the tc=200 activation
+            // boundary: the engine granted the item one extra ACTIVE tick
+            // (gravity) vanilla's checkIfActive denied — the items-340
+            // family (PTRACE item 2: vy -0.04 -> -0.08 at t=340, the settle
+            // 343 vs vanilla 342, tc bit-identical both legs). Young items
+            // (tc<200) are unaffected: every clause returns active either
+            // way.
+            boolean active = itemCheckActive(e, true);
+            dtrace(e, "dispatch", active);
             appendDispatch(e, active);
             if (active) {
                 dispNative++;
@@ -2551,10 +4687,27 @@ public final class CeHooks {
      * tickCount read is (field + 1). The portal branches are unreachable:
      * itemDispatch routes portalProcess/portalCooldown items vanilla.
      */
-    private static boolean itemCheckActive(ItemEntity e) {
-        if ((e.tickCount + 1 + e.getId()) % 4 == 0) return true;
+    private static boolean itemCheckActive(ItemEntity e, boolean preIncrement) {
+        // The tickCount the vanilla checkIfActive reads is the POST-commonTick
+        // value (ServerLevel.tickNonPassenger: commonTick THEN tick, javap).
+        // BOTH callers own the dispatcher for their items (the weave
+        // suppresses tickNonPassenger; the Rust core / the rest branch mirror
+        // the ++ themselves), so BOTH pass preIncrement=true and see the PRE
+        // field. HISTORY: the t=159-era weave did NOT own the dispatcher
+        // (field post) and an unconditional "+1" then shifted the MS scan
+        // lists one tick early (run 40791707738, item 971, the merge
+        // survivor flip) — preIncrement=false was correct THEN. The
+        // dispatcher ownership moved to the weave later; the stale false
+        // read went latent (young items return active under either phase —
+        // tc<200 and the (tc+id)%4 clause agree) until the first MODE-1
+        // cohort crossed tc=200: the engine's gate read 199 where vanilla
+        // read 200, granted ONE extra active tick (gravity), and the
+        // items-340 family was born (PTRACE item 2: vy -0.04 -> -0.08 at
+        // t=340; the settle 343 vs vanilla 342; tc bit-identical). L52.
+        int tc = e.tickCount + (preIncrement ? 1 : 0);
+        if ((tc + entId(e)) % 4 == 0) return true;
         if (e.defaultActivationState) return true;
-        if (e.tickCount + 1 < 200) return true; // isAlive(): isRemoved gated above
+        if (tc < 200) return true; // isAlive(): isRemoved gated above
         long cur = net.minecraft.server.MinecraftServer.currentTick;
         boolean isActive = e.activatedTick >= cur;
         e.isTemporarilyActive = false;
@@ -2594,17 +4747,21 @@ public final class CeHooks {
      *  store owns the full state for IF_NATIVE entries (hydrated from the
      *  last commit). pickupDelay is re-read fresh every dispatch (plugin
      *  parity: a mid-flight change must win over the stored value; the
-     *  flush compares and prefers the batch). */
+     *  flush compares and prefers the batch).
+     *  L80: the other three quad slots stay STALE — the native path's
+     *  only iv read is iv[k*4+2] (the fresh_pd re-read); the tick/age/
+     *  rate slots are overwritten from the store (phase 1) and every
+     *  Java-side read of them is either resync-path (the check writer
+     *  fills its own quads) or behind the (f & IF_NATIVE) != 0
+     *  short-circuit (the rateOk arms). Three stores per item per tick
+     *  off the dispatch append (the #2 items leaf). */
     private static void appendDispatch(ItemEntity e, boolean active) {
         int i = ibN;
         ibN = i + 1;
-        IB_IDS[i] = e.getId();
+        IB_IDS[i] = entId(e);
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
-        IB_REF[i] = e;
-        IB_I[i * 4] = 0;
-        IB_I[i * 4 + 1] = 0;
+        IB_ITEM[i] = e;
         IB_I[i * 4 + 2] = e.pickupDelay;
-        IB_I[i * 4 + 3] = 0;
     }
 
     /** L7: an external mutation of this item (box or velocity change
@@ -2614,7 +4771,7 @@ public final class CeHooks {
      *  gates (it must fire even when the query index is suspended). */
     private static void l7ExternalMutation(Entity e) {
         if (ITEM_TICK_ON && !IN_ITEM_APPLY && e instanceof ItemEntity) {
-            int slot = e.getId() & MAMASK;
+            int slot = entId(e) & MAMASK;
             if (MODE_GEN[slot] == MODE_EPOCH) {
                 MODE_VAL[slot] = 0;
             }
@@ -2729,7 +4886,7 @@ public final class CeHooks {
     public static void probeSetItem(net.minecraft.world.entity.item.ItemEntity e,
             net.minecraft.world.item.ItemStack st) {
         try {
-            STACK_EMPTY[e.getId() & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
+            STACK_EMPTY[entId(e) & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
         } catch (Throwable ignored) {
             // cache is an optimization only; the dispatch falls back to the
             // synched read for unseen slots
@@ -2739,7 +4896,7 @@ public final class CeHooks {
     /** Empty-stack parity check for the dispatch guard: cached bit when the
      *  item has been seen by the setItem probe, synched read otherwise. */
     private static boolean stackEmptyDispatch(net.minecraft.world.entity.item.ItemEntity e) {
-        byte v = STACK_EMPTY[e.getId() & MAMASK];
+        byte v = STACK_EMPTY[entId(e) & MAMASK];
         return v == 0 ? e.getItem().isEmpty() : v == (byte) 2;
     }
 
@@ -2812,6 +4969,21 @@ public final class CeHooks {
     private static int intAt(Object o, long off) { return U.getInt(o, off); }
     private static void putIntAt(Object o, long off, int v) { U.putInt(o, off, v); }
 
+    /** L75: the direct entity-id read. 26.3 entId(Entity) (javap) reads
+     *  the id field TWICE around a defensive
+     *  "Tried to access entity ID before ID assignment" throw and the
+     *  method is not final — 4.52% self on the items-100k leg across the
+     *  ~9 probe/dispatch reads per item per tick. One Unsafe field load,
+     *  no virtual dispatch, no throw edge. The 0-id (unassigned) entity
+     *  previously threw and disarmed through the probe guards; it now
+     *  indexes slot 0 and declines by mismatch — dead on live populations
+     *  (id assignment precedes the first probe by construction). The
+     *  fallback covers an unresolved offset (initDataOffsets order). */
+    static int entId(net.minecraft.world.entity.Entity e) {
+        long off = O_ENT_ID;
+        return off >= 0 ? U.getInt(e, off) : entId(e);
+    }
+
     // L19: the DataItem fast read. SynchedEntityData.getItem (javap, 26.3)
     // is exactly `itemsById[accessor.id()]` and get() adds only the value
     // load — with the two field offsets captured once, a gate reads the
@@ -2827,6 +4999,11 @@ public final class CeHooks {
     private static long O_DESPAWN_RATE = -1;
     // L22b: the inside-block-effect scratch lists (ArrayDeque / List)
     private static long O_MOVEMENT_TICK = -1, O_FINAL_MOVEMENTS = -1;
+    // L75: the Entity.id offset — the direct read replaces 26.3
+    // entId(Entity) (which reads the field TWICE around a defensive
+    // throw — 4.5% self on the items leg across the ~9 probe/dispatch
+    // reads per item per tick)
+    private static long O_ENT_ID = -1;
 
     // ---- L22b: the inside-block-effect no-op floor ----
     // Woven EarlyReturnGuard on Entity.applyEffectsFromBlocks(). Vanilla
@@ -2982,14 +5159,24 @@ public final class CeHooks {
     // exact-equality test fails and those mobs route vanilla.
     public static final boolean MOB_TRAVEL_ON =
             !"0".equals(System.getenv("CE_MOB_TRAVEL"));
+    // L71b: the steering widening's own knob (a -D system property so the
+    // parity dispatch's extra_jvm can flip it per run). L77: default ON —
+    // the L74 move()-setPos fix resolved the f5156eb divergence and the
+    // traced re-bisect (41521042020, trace 652, travelSteer=true) passed
+    // the gate 12/12; the widening's hull + delta math is the proven
+    // SHAPE C port (run-baseline.sh can still ship it off per run).
+    public static final boolean TRAVEL_STEER_ON =
+            !"false".equals(System.getProperty("centities.travelSteer", "true"));
     // plain longs (the L15b lesson: a volatile add per entity per tick was
     // 1-2ms/tick at 100k; the verifier/e2e readers tolerate eventual
     // visibility)
-    public static long travelChecks = 0, travelQuiet = 0, travelWalk = 0, travelFail = 0;
+    public static long travelChecks = 0, travelQuiet = 0, travelWalk = 0,
+            travelWalkNoMove = 0, travelFail = 0;
     // L24b: the two protected members the SHAPE C writeback needs —
     // resolved once with setAccessible (unreflect honors the flag), the
     // virtual dispatch stays exact through the MethodHandle
-    private static volatile MethodHandle MH_BACK_OFF_EDGE, MH_BOUNCINESS;
+    private static volatile MethodHandle MH_BACK_OFF_EDGE, MH_BOUNCINESS,
+            MH_BLOCK_SPEED;
     private static volatile boolean TRAVEL_MH_READY = false;
 
     private static synchronized boolean initTravelMh() {
@@ -3005,7 +5192,16 @@ public final class CeHooks {
                     .getDeclaredMethod("getEntityBounciness");
             bn.setAccessible(true);
             MH_BOUNCINESS = MethodHandles.lookup().unreflect(bn);
-            TRAVEL_MH_READY = MH_BACK_OFF_EDGE != null && MH_BOUNCINESS != null;
+            // L74: Entity.getBlockSpeedFactor() — the move() tail multiplies
+            // the delta by it (getBlockSpeedFactor: honey/soul sand 0.4,
+            // cobweb 0.05...); the gate declines anything != 1.0F so the
+            // writeback's scale stays exact on every feet block
+            java.lang.reflect.Method bs = net.minecraft.world.entity.Entity.class
+                    .getDeclaredMethod("getBlockSpeedFactor");
+            bs.setAccessible(true);
+            MH_BLOCK_SPEED = MethodHandles.lookup().unreflect(bs);
+            TRAVEL_MH_READY = MH_BACK_OFF_EDGE != null && MH_BOUNCINESS != null
+                    && MH_BLOCK_SPEED != null;
             return TRAVEL_MH_READY;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -3014,109 +5210,80 @@ public final class CeHooks {
         }
     }
 
-    // L27: the per-mob AttributeInstance cache. AttributeMap builds its
-    // instances once in the constructor and never replaces them, so caching
-    // the instance references is the same read as AttributeMap.getValue
-    // (which is attributes.get(holder) -> instance.getValue()) without the
-    // HashMap.get per call (the 2.18% AttributeMap.getInstance bucket in
-    // the mixed-150k profile; the SHAPE C path pays it 3x per covered mob
-    // per tick). Slots: [0]=AIR_DRAG_MODIFIER, [1]=FRICTION_MODIFIER,
-    // [2]=MOVEMENT_SPEED. A null slot means the supplier lacks the
-    // attribute — vanilla's getAttributeValue base-default path routes for
-    // those. Weak-keyed identity table (the AIKey pattern): an entry dies
-    // with its mob, dead slots are claimed in place, server-thread confined
-    // (mobTravelNative runs inside the tick phase).
-    private static final int AT_CAP_INIT = 1 << 13;   // 8192 slots
-    private static AIKey[] AT_KEYS = new AIKey[AT_CAP_INIT];
-    private static net.minecraft.world.entity.ai.attributes.AttributeInstance[][] AT_VALS =
-            new net.minecraft.world.entity.ai.attributes.AttributeInstance[AT_CAP_INIT][];
-    private static int AT_SIZE = 0, AT_DEAD = 0;
+    // L73: the per-mob AttributeInstance cache, DIRECT-MAPPED by entity id.
+    // The L27 weak identity table paid a WeakReference.get + an
+    // identity-hash probe per covered mob per travel tick (30% of the
+    // mobs leg's Reference.get bucket); the id-slot stamp (AT_E[m] == e)
+    // proves the same thing with one array read. AttributeMap builds its
+    // instances once in the constructor and never replaces them, so the
+    // cached refs are the same reads without the HashMap.get per call.
+    // Slots: [0]=AIR_DRAG_MODIFIER, [1]=FRICTION_MODIFIER,
+    // [2]=MOVEMENT_SPEED. A null instance slot means the supplier lacks
+    // the attribute — vanilla's getAttributeValue base-default path routes
+    // for those. probeRemove clears the stamp; id-slot collisions evict
+    // (the identity check rejects, the next travel re-fills) — a
+    // two-colliding-mobs-same-tick thrash is rare and only re-reads three
+    // fields. Server-thread confined (mobTravelNative runs in the tick).
+    private static final int AT_CAP = 1 << 15;   // 32768 direct slots
+    private static final net.minecraft.world.entity.LivingEntity[] AT_E =
+            new net.minecraft.world.entity.LivingEntity[AT_CAP];
+    private static final net.minecraft.world.entity.ai.attributes.AttributeInstance[][] AT_V =
+            new net.minecraft.world.entity.ai.attributes.AttributeInstance[AT_CAP][];
 
     private static net.minecraft.world.entity.ai.attributes.AttributeInstance[] attrCache(
             net.minecraft.world.entity.LivingEntity e) {
-        AIKey[] keys = AT_KEYS;
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] vals = AT_VALS;
-        int mask = keys.length - 1;
-        int i = System.identityHashCode(e) & mask;
-        while (true) {
-            AIKey k = keys[i];
-            if (k == null) {
-                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
-                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
-                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.AIR_DRAG_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.FRICTION_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.MOVEMENT_SPEED),
-                        };
-                keys[i] = new AIKey(e);
-                vals[i] = v;
-                AT_SIZE++;
-                if (AT_SIZE + (AT_SIZE >> 1) >= keys.length) {
-                    attrRebuild(keys.length << 1);
-                }
-                return v;
-            }
-            Object cur = k.get();
-            if (cur == e) return vals[i];
-            if (cur == null) {
-                // dead slot: claim in place (same linear-probe law as the
-                // AI table — the incoming key's probe path starts here)
-                net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
-                net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
-                        new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.AIR_DRAG_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.FRICTION_MODIFIER),
-                                am.getInstance(net.minecraft.world.entity.ai.attributes
-                                        .Attributes.MOVEMENT_SPEED),
-                        };
-                AT_DEAD++;
-                keys[i] = new AIKey(e);
-                vals[i] = v;
-                if (AT_DEAD > 2048 && AT_DEAD * 2 > AT_SIZE) {
-                    attrRebuild(keys.length); // sweep dead, same capacity
-                }
-                return v;
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    private static void attrRebuild(int newCap) {
-        AIKey[] oldKeys = AT_KEYS;
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] oldVals = AT_VALS;
-        AIKey[] nk = new AIKey[newCap];
-        net.minecraft.world.entity.ai.attributes.AttributeInstance[][] nv =
-                new net.minecraft.world.entity.ai.attributes.AttributeInstance[newCap][];
-        int mask = newCap - 1;
-        int live = 0;
-        for (int j = 0; j < oldKeys.length; j++) {
-            AIKey k = oldKeys[j];
-            if (k == null) continue;
-            if (k.get() == null) continue; // dead — dropped
-            int i = k.hash & mask;
-            while (nk[i] != null) i = (i + 1) & mask;
-            nk[i] = k;
-            nv[i] = oldVals[j];
-            live++;
-        }
-        AT_KEYS = nk;
-        AT_VALS = nv;
-        AT_SIZE = live;
-        AT_DEAD = 0;
+        int m = entId(e) & (AT_CAP - 1);
+        if (AT_E[m] == e) return AT_V[m];
+        net.minecraft.world.entity.ai.attributes.AttributeMap am = e.getAttributes();
+        net.minecraft.world.entity.ai.attributes.AttributeInstance[] v =
+                new net.minecraft.world.entity.ai.attributes.AttributeInstance[]{
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.AIR_DRAG_MODIFIER),
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.FRICTION_MODIFIER),
+                        am.getInstance(net.minecraft.world.entity.ai.attributes
+                                .Attributes.MOVEMENT_SPEED),
+                };
+        AT_E[m] = e;
+        AT_V[m] = v;
+        return v;
     }
 
     public static boolean mobTravelNative(net.minecraft.world.entity.LivingEntity e,
             net.minecraft.world.phys.Vec3 input) {
         if (!ACTIVE || !MOB_TRAVEL_ON || O_STUCK < 0) return false;
         travelChecks++;
+        // TTR (addendum 17): the travel floor's per-tick decision witness for
+        // the traced mob. The t=275 PTRACE (exact x 0.5 vs 0.5133872, vx
+        // ratio 1/(0.6*0.91)) needs the SERVING verdict inside the ON-only
+        // path: which shape ran, with what entering delta/input. The OFF leg
+        // prints nothing (module off); decline = an enter line without an
+        // exit line (the traced id is unique).
+        final boolean ttr = phDumpTickNow() && TR_ID >= 0 && e != null
+                && entId(e) == TR_ID;
+        if (ttr) {
+            net.minecraft.world.phys.Vec3 dT = e.getDeltaMovement();
+            System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                    + " id=" + entId(e) + " tc=" + e.tickCount
+                    + " enter d=(" + dT.x + "," + dT.y + "," + dT.z + ")"
+                    + " in=(" + input.x + "," + input.y + "," + input.z + ")"
+                    + " onG=" + e.onGround()
+                    + " pos=(" + e.getX() + "," + e.getY() + "," + e.getZ() + ")"
+                    + " yaw=" + e.getYRot());
+        }
         try {
+            // L71b: the steering widening (input.x/z != 0 riding SHAPE C)
+            // is KNOB-GATED (centities.travelSteer, default OFF) — the
+            // f5156eb parity run failed the mobs-bearing scenes with the
+            // widening active (small drifts: yaw 9.4deg, x 0.07 — a tiny
+            // per-tick steering-math divergence compounding through the
+            // AI), while the coasting shapes and L72's identity swap stay
+            // bit-identical. The shipped gate keeps the proven
+            // input==0 contract; the traced bisect run flips the knob.
+            final boolean steer = TRAVEL_STEER_ON;
             if (e.level().isClientSide() || e.isRemoved()
-                    || input.x != 0.0F || input.y != 0.0F || input.z != 0.0F
+                    || input.y != 0.0F
+                    || (!steer && (input.x != 0.0F || input.z != 0.0F))
                     || !e.getPassengers().isEmpty()
                     || e.isFallFlying()
                     || e.isTemporarilyActive
@@ -3143,6 +5310,10 @@ public final class CeHooks {
                     return false;
                 }
                 travelQuiet++;
+                if (ttr) {
+                    System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                            + " exit shape=A");
+                }
                 return true;
             }
             // SHAPE C — the moving grounded walk on proven-open ground (the
@@ -3173,7 +5344,14 @@ public final class CeHooks {
                         || e.horizontalCollision || e.minorHorizontalCollision
                         || e.onClimbable() || e.isPassenger()
                         || e.getVehicle() != null
-                        || e.isInWater() || e.isInLava()) {
+                        || e.isInWater() || e.isInLava()
+                        || e.fallDistance != 0.0) {
+                    // L74: fallDistance joins the gate — the move()'s
+                    // fall-damage RESET clip (fallDistance != 0.0 &&
+                    // movementLength >= 1.0 → level.clip + resetFallDistance)
+                    // must be provably dead; a grounded mob's fallDistance
+                    // is 0 (checkFallDamage resets it every grounded tick),
+                    // so this declines nothing in practice
                     return false;
                 }
                 net.minecraft.world.level.Level lvl = e.level();
@@ -3269,6 +5447,12 @@ public final class CeHooks {
                 // maybeBackOffFromEdge must be the identity (non-sneaking
                 // mobs) — compare by reference like the no-op returns
                 if (!initTravelMh()) return false;
+                // L74: the move() tail multiplies the delta by
+                // getBlockSpeedFactor() (the FEET block: honey/soul sand
+                // 0.4, cobweb 0.05) — the writeback scales by frictC*hdC
+                // only, so the factor must be proven 1.0 or the mob routes
+                // vanilla (the bench's plain terrain always is)
+                if (((float) MH_BLOCK_SPEED.invoke(e)) != 1.0F) return false;
                 net.minecraft.world.phys.Vec3 wantedC =
                         new net.minecraft.world.phys.Vec3(dmX, dmY, dmZ);
                 if (MH_BACK_OFF_EDGE.invoke(e, wantedC,
@@ -3351,10 +5535,35 @@ public final class CeHooks {
                 // applyEffectsFromBlocks, which the block-fx gate no-ops
                 // on the SAME all-air hull — the record is unobservable,
                 // and skipping it keeps that gate armed.
-                e.setPos(e.getX() + dmX, y, e.getZ() + dmZ);
+                // L74 — the move()'s setPos condition (26.3 Entity.move):
+                //   movement = collide(delta);
+                //   if (movement.lengthSqr() > 1.0E-7
+                //       || delta.lengthSqr() - movement.lengthSqr() < 1.0E-7) {
+                //     addMovementThisTick; setPos(pos + movement); recordMovement; }
+                // The y-clip makes movement == (dmX, 0.0, dmZ), so the
+                // guard's second term is (dmX*dmX + dmY*dmY) + dmZ*dmZ
+                // minus ((dmX*dmX + 0.0) + dmZ*dmZ) — for the gated mob
+                // dmY = -g*vf (|dmY| ~ 0.078) the difference is ~6.1e-3 ≥
+                // 1e-7 regardless of the sum roundings, and the condition
+                // reduces to movement.lengthSqr() > 1.0E-7. A NEAR-
+                // STATIONARY mob (dm_horiz² ≤ 1e-7, |dm_horiz| ≤ 3.16e-4)
+                // does NOT setPos in vanilla — the old writeback moved it
+                // every tick: a per-tick drift of up to ~3.2e-4 exactly in
+                // the decelerating-coaster / wall-residue population the
+                // L71 widening newly routes here (the f5156eb T382/T389
+                // tiny drifts, mixed yaw 9.4deg). The flags, the
+                // setOnGroundWithMovement rescan and the delta tail run
+                // OUTSIDE the condition in vanilla — reproduced identically
+                // in both branches below.
                 net.minecraft.world.phys.Vec3 clippedC =
                         new net.minecraft.world.phys.Vec3(dmX, 0.0, dmZ);
-                e.recordMovement(net.minecraft.world.entity.MoverType.SELF, clippedC);
+                double mlC = (dmX * dmX + 0.0) + dmZ * dmZ;
+                double dlC = (dmX * dmX + dmY * dmY) + dmZ * dmZ;
+                boolean moveC = mlC > 1.0E-7 || dlC - mlC < 1.0E-7;
+                if (moveC) {
+                    e.setPos(e.getX() + dmX, y, e.getZ() + dmZ);
+                    e.recordMovement(net.minecraft.world.entity.MoverType.SELF, clippedC);
+                }
                 e.setOnGroundWithMovement(true, false, clippedC);
                 float hdC = 1.0F - (1.0F - 0.91F) * dragMod; // the horizontal drag
                 if (hdC < 0.0F) hdC = 0.0F;
@@ -3364,11 +5573,26 @@ public final class CeHooks {
                         dmX * (double) hC,
                         (0.0 - g) * (double) vf,
                         dmZ * (double) hC));
-                travelWalk++;
+                if (moveC) travelWalk++; else travelWalkNoMove++;
+                if (ttr) {
+                    System.out.println("[ce-baseline] TTR t=" + CUR_TICK
+                            + " exit shape=C" + (moveC ? "" : " noMove")
+                            + " dm=(" + dmX + "," + dmY + "," + dmZ + ")"
+                            + " post=(" + e.getX() + "," + e.getY() + "," + e.getZ() + ")"
+                            + " dv=(" + e.getDeltaMovement().x + ","
+                            + e.getDeltaMovement().y + "," + e.getDeltaMovement().z + ")");
+                }
                 return true;
             }
-            // SHAPE B: the standing fixed point (0, -g * vf, 0)
-            if (d.x != 0.0 || d.z != 0.0 || !e.onGround()
+            // SHAPE B: the standing fixed point (0, -g * vf, 0).
+            // L71: zero horizontal INPUT is part of the contract — a mob
+            // steering into a wall has vanilla-observed delta.x/z AFTER the
+            // tick (the steering's moveRelative + the wall's collision
+            // restitution leave the input's residue in the horizontal
+            // delta), which this shape does not reproduce; it routes
+            // vanilla (the writeback would have erased the residue).
+            if (input.x != 0.0F || input.z != 0.0F
+                    || d.x != 0.0 || d.z != 0.0 || !e.onGround()
                     || e.fallDistance != 0.0
                     || e.horizontalCollision
                     || !e.verticalCollision
@@ -3440,6 +5664,9 @@ public final class CeHooks {
                 return false;
             }
             travelQuiet++;
+            if (ttr) {
+                System.out.println("[ce-baseline] TTR t=" + CUR_TICK + " exit shape=B");
+            }
             return true;
         } catch (Throwable t) {
             travelFail++;
@@ -3465,6 +5692,18 @@ public final class CeHooks {
                                 .getDeclaredField("id"));
             } catch (Throwable t) {
                 O_ACC_ID = -1; // the typed gates fall back to the get() chain
+            }
+        }
+        // L75: the entity id offset — resolved idempotently with the rest
+        // (initDataOffsets first ran at the L15 frozen-gate init, before
+        // every O_ existed; the same idempotent pattern applies)
+        if (O_ENT_ID < 0 && U != null) {
+            try {
+                O_ENT_ID = U.objectFieldOffset(
+                        net.minecraft.world.entity.Entity.class
+                                .getDeclaredField("id"));
+            } catch (Throwable t) {
+                O_ENT_ID = -1; // entId falls back to the virtual getId()
             }
         }
         if (O_ED_ITEMS >= 0 || U == null) return;
@@ -3649,14 +5888,22 @@ public final class CeHooks {
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) return false;
         if (e.level().isClientSide()) return false; // client-side ticks stay vanilla
         try {
-            boolean nativeMode = MODE_GEN[e.getId() & MAMASK] == MODE_EPOCH
-                    && MODE_VAL[e.getId() & MAMASK] != 0;
+            boolean nativeMode = MODE_GEN[entId(e) & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[entId(e) & MAMASK] != 0;
             // fresh-flag gates: anything the core cannot compute exactly runs
             // vanilla THIS tick (the flush re-evaluates the mode afterwards).
+            // L55: the onGround flag MUST ride every RESYNC-flavored batch
+            // entry — the phase-1 ingest commits entry.on_ground from the
+            // flags verbatim (itemcore F_ON_GROUND), so a flag-less
+            // FORCE_VANILLA collect clobbered the store's on_ground to FALSE
+            // for an on-ground item (the belt dust, addendum 14: the next
+            // wakeup's active body read !st.on_ground and ran a SPURIOUS
+            // move+friction vanilla's gate skipped — 53 items at t=413, one
+            // 0.588 vx/vz step each, 1214 by T639).
             if (e.isRemoved() || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
-                appendItem(e, IF_FORCE_VANILLA);
+                appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
                 return false;
             }
             appendItem(e, (nativeMode ? IF_NATIVE : IF_RESYNC)
@@ -3695,9 +5942,13 @@ public final class CeHooks {
         if (ACTIVE && ITEM_TICK_ON && cplugReady && ibN < IB_CAP
                 && !e.level().isClientSide()) {
             try {
-                int slot = e.getId() & MAMASK;
+                int slot = entId(e) & MAMASK;
                 if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
-                    appendItem(e, IF_INACTIVE | IF_RESYNC);
+                    // L55: the onGround flag rides the RESYNC ingest too (the
+                    // vanilla body ran; its PRE-tick onGround is the freshest
+                    // store-side truth — an inactive body never moves).
+                    appendItem(e, IF_INACTIVE | IF_RESYNC
+                            | (e.onGround() ? IF_ON_GROUND : 0));
                 }
             } catch (Throwable t) {
                 lastError = System.nanoTime();
@@ -3710,10 +5961,15 @@ public final class CeHooks {
 
     private static void appendItem(ItemEntity e, int flags) {
         int i = ibN;
-        int id = e.getId();
+        int id = entId(e);
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
-        IB_REF[i] = e;
+        // L64c: the flush's two full-batch scans (pass-1 re-read + the L44
+        // view build) skip entirely when this count is zero.
+        if ((flags & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
+            ibResyncN++;
+        }
+        IB_ITEM[i] = e;
         // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
         int ci = ibCDN;
         int o = ci * 14;
@@ -3729,6 +5985,22 @@ public final class CeHooks {
         IB_CD[o + 3] = d.x;
         IB_CD[o + 4] = d.y;
         IB_CD[o + 5] = d.z;
+        // L44: the PRE-body box capture (the vanilla per-body scan view).
+        // The ci-th entry's 6 doubles ride in IB_PRE[ci*6 .. +5]; the flush
+        // exposes them to the query paths as the VIEW for resync entries.
+        int ci6 = ci * 6;
+        if (IB_PRE.length < ci6 + 6) {
+            double[] np = new double[Math.max(ci6 + 6, IB_PRE.length * 2)];
+            System.arraycopy(IB_PRE, 0, np, 0, Math.min(IB_PRE.length, ci6));
+            IB_PRE = np;
+        }
+        AABB pbox = e.getBoundingBox();
+        IB_PRE[ci6] = pbox.minX;
+        IB_PRE[ci6 + 1] = pbox.minY;
+        IB_PRE[ci6 + 2] = pbox.minZ;
+        IB_PRE[ci6 + 3] = pbox.maxX;
+        IB_PRE[ci6 + 4] = pbox.maxY;
+        IB_PRE[ci6 + 5] = pbox.maxZ;
         IB_CD[o + 6] = fallDistOf(e);
         // stuck + supporting are store-owned; only resync entries get fresh
         // values (flush pass 1)
@@ -3751,10 +6023,39 @@ public final class CeHooks {
     public static void itemTickFlush(Level level) {
         int n = ibN;
         itemFlushes++;
+        CUR_TICK++;
+        // L92: the quiet-bitset epoch — cleared at every flush entry, so a
+        // slot without THIS tick's applier stamp is conservatively full-path
+        // in the tracker pass. Per-level order (flush -> tracker) keeps the
+        // stamps valid exactly for the level being tracked.
+        if (TTL_QUIET_ON) {
+            // L99: the quiet bits are now PERSISTENT (was: cleared at every
+            // flush entry). The applier CLEARs the bit whenever its tail
+            // did work for the item (moved/merged/resynced — anything but
+            // TAIL_NONE) and the tracker skip is exact for as long as the
+            // bit holds: the item's tickCount is the only state the
+            // vanilla tracker mutates for a quiet entry, and the mirror
+            // bump moved INTO the tracker skip to pay exactly that debt
+            // once per tick regardless of who stamped the slot.
+            // KNOWN WINDOW: a position change that bypasses the applier
+            // AND the probe loop (an explosion impulse, /tp) leaves a
+            // stale quiet bit for one tracker pass — absent in the bench
+            // and parity scenarios (no explosions, no teleports).
+        }
+        // L89: the gate ledger — one JNI crossing per level-tick, the print
+        // only at dump ticks; must run BEFORE the n==0 early return.
+        if (MOB_AI_ON) {
+            gateLedgerPrint();
+            mobLedgerDump();
+        }
         if (n == 0) return;
         ibN = 0;
         int cdN = ibCDN;
         ibCDN = 0;
+        // L64c: captured before the reset — the two resync-scans below skip
+        // on this being zero (the bench steady state).
+        int rsN = ibResyncN;
+        ibResyncN = 0;
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || !(level instanceof ServerLevel)) {
             return;
         }
@@ -3767,12 +6068,12 @@ public final class CeHooks {
             boolean isNether = level.dimension() == Level.NETHER;
 
             // pass 1: resync entries re-read state POST vanilla tick
-            for (int i = 0; i < n; i++) {
+            // (L64c: skipped wholesale when the batch carried none)
+            for (int i = 0; rsN != 0 && i < n; i++) {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
-                    Entity ref = IB_REF[i];
-                    if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
-                    ItemEntity e = (ItemEntity) ref;
+                    ItemEntity e = IB_ITEM[i];
+                    if (e == null || e.isRemoved()) continue;
                     int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
                     IB_CD[o] = e.getX();
                     IB_CD[o + 1] = e.getY();
@@ -3820,7 +6121,11 @@ public final class CeHooks {
             envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
 
             double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
-            int[] outI = growI(n * 4);    // age, pickupDelay, bits, tickCount (L7)
+            // L79 COMPACT APPLY: n*4 per-entry quads + outI[n*4] = cn + the
+            // compact batch indices — the core lists the entries whose
+            // post-counter tail is NOT the proven TAIL_NONE no-op, and the
+            // applier's loop B walks only those.
+            int[] outI = growI(n * 5 + 1); // age, pickupDelay, bits, tickCount (L7)
 
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI);
@@ -3847,14 +6152,61 @@ public final class CeHooks {
                 }
             }
 
+            // L44: build the merge-scan view — the batch's RESYNC entries'
+            // PRE-body boxes (their bodies ran during the phase; the live
+            // boxes are already POST-move, one physics step past the vanilla
+            // per-body scan view). VTAB: id -> view slot (L57 int table);
+            // VIEW_KIDX: the entry's batch index (the vanilla body order).
+            viewN = 0;
+            vtabClear();
+            // L64c: the scan skips wholesale when the batch carried no
+            // RESYNC|FORCE_VANILLA entries (viewN stays 0 — the consumers
+            // see an empty view exactly as the full scan would produce).
+            for (int i = 0; rsN != 0 && i < n; i++) {
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                // RESYNC and FORCE_VANILLA entries both ran their vanilla
+                // bodies DURING the phase (their live boxes are POST-move);
+                // inactive entries never move — no view needed for them.
+                if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) == 0
+                        || (f & IF_INACTIVE) != 0) continue;
+                if (viewN >= VIEW_IDS.length) break;
+                ItemEntity ei = IB_ITEM[i];
+                if (ei == null || ei.isRemoved()) continue;
+                int cdSlot = (IB_FLAGS[i] >>> IF_CDSHIFT) - 1;
+                if (cdSlot < 0) continue;
+                VIEW_IDS[viewN] = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
+                int p6 = cdSlot * 6;
+                if (IB_PRE.length >= p6 + 6) {
+                    VIEW_BOX[viewN * 6] = IB_PRE[p6];
+                    VIEW_BOX[viewN * 6 + 1] = IB_PRE[p6 + 1];
+                    VIEW_BOX[viewN * 6 + 2] = IB_PRE[p6 + 2];
+                    VIEW_BOX[viewN * 6 + 3] = IB_PRE[p6 + 3];
+                    VIEW_BOX[viewN * 6 + 4] = IB_PRE[p6 + 4];
+                    VIEW_BOX[viewN * 6 + 5] = IB_PRE[p6 + 5];
+                } else {
+                    AABB lb = ei.getBoundingBox();
+                    VIEW_BOX[viewN * 6] = lb.minX;
+                    VIEW_BOX[viewN * 6 + 1] = lb.minY;
+                    VIEW_BOX[viewN * 6 + 2] = lb.minZ;
+                    VIEW_BOX[viewN * 6 + 3] = lb.maxX;
+                    VIEW_BOX[viewN * 6 + 4] = lb.maxY;
+                    VIEW_BOX[viewN * 6 + 5] = lb.maxZ;
+                }
+                VIEW_KIDX[viewN] = i;
+                vtabPut(VIEW_IDS[viewN], viewN);
+                viewN++;
+            }
+
             // pass 2: apply, in batch order (== vanilla entity tick order).
             // The writebacks fire setPos/setDeltaMovement → probeBox/probeDelta
             // — IN_ITEM_APPLY marks them as OUR writes (no mode clearing).
             IN_ITEM_APPLY = true;
             try {
             int epoch = MODE_EPOCH + 1;
+            // L92: one volatile read per flush - TT_MIRROR flips only in
+            // the tracker reconcile (between flushes), never mid-flush.
+            final boolean quietStampArm = TTL_QUIET_ON && TT_MIRROR;
             for (int i = 0; i < n; i++) {
-                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
@@ -3883,11 +6235,11 @@ public final class CeHooks {
                     // full-ticking forever). Until the inline path mirrors
                     // the full per-tick semantics, rest stays off: items
                     // stay in the native batch where tick_item is exact.
-                    Entity r0 = IB_REF[i];
+                    ItemEntity r0 = IB_ITEM[i];
                     if (false
                             && (bits & (1 << 15)) != 0
-                            && r0 instanceof ItemEntity ie0
-                            && !restSectionTouched(ie0)) {
+                            && r0 != null
+                            && !restSectionTouched(r0)) {
                         MODE_VAL[mSlot] = 2;
                         REST_ID[mSlot] = IB_IDS[i];
                         MODE_REV[mSlot] = WORLD_REV;
@@ -3906,17 +6258,93 @@ public final class CeHooks {
                     if ((bits & (1 << 13)) != 0) itemAbort++;
                     continue;
                 }
-                Entity ref = IB_REF[i];
-                if (!(ref instanceof ItemEntity) || ref.isRemoved()) continue;
-                ItemEntity e = (ItemEntity) ref;
+                ItemEntity e = IB_ITEM[i];
+                if (e == null || e.isRemoved()) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
-                // skipped for dispatch-owned entries).
+                // skipped for dispatch-owned entries). L78: the age write
+                // joins the counters — it is unconditional in BOTH the
+                // inactive and the active tail, and it must precede the
+                // despawn check (e.age >= rate) — the tails' relative order
+                // is preserved (age before pd/fd/delta/pos/merge/despawn).
                 e.tickCount = outI[i * 4 + 3];
                 e.totalEntityAge = e.totalEntityAge + 1;
+                e.age = outI[i * 4];
+                // L78 TAIL_NONE: the core set bit 16 when the ENTIRE
+                // post-counter tail is a provable no-op for this entry —
+                // DELTA_SAME + not MOVED/IMPULSE/MERGE/DESPAWN-fireable/
+                // VOID/LAND + the out-fd/out-pd/out-onGround equal their
+                // pre-states (the store/batch carries them). The skipped
+                // compares are exactly the ones the tails would skip; the
+                // gate runs the full 12/12 over every scenario.
+                if ((bits & (1 << 16)) != 0) {
+                    itemTailNone++;
+                    // L92: the tracker-quiet stamp — the whole post-counter
+                    // tail is a provable no-op, so nothing tracker-visible
+                    // changed. With the L70 mirror owning the tickCount and
+                    // the fill's structural verdicts pinned (TT_OK, no SIT
+                    // handler, the slot identity), the tracker pass for this
+                    // slot reduces to the mirror bump — performed HERE and
+                    // the tracker loop skips the slot. ttlCachedPath's
+                    // remaining per-tick work for such an entity was exactly
+                    // this bump: syncVelocity is false (checked), SIT is
+                    // excluded (checked), updateDataBeforeSync iterates an
+                    // EMPTY dirty set (no metadata writer ran — merge is a
+                    // TAIL_NONE breaker).
+                    if (quietStampArm && !e.syncVelocity) {
+                        Object[] rq = TT_REF;
+                        long[] fq = TT_FLAT;
+                        if (rq != null && fq != null) {
+                            int mq = (int) (IB_IDS[i] & AMASK);
+                            int obq = mq * 5;
+                            if (rq[obq + 2] == e) {
+                                long shq = fq[mq * 2];
+                                if ((shq & TT_OK) != 0 && (shq & TT_SIT) == 0) {
+                                    TT_QUIET[mq >> 6] |= 1L << (mq & 63);
+                                    ttlQuietBumps++;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // L99: the persistent-quiet reset - this applier tail did
+                    // WORK for the item (moved/merged/resynced), so the slot
+                    // is tracker-visible again: clear the quiet bit and let
+                    // the tracker pass serve the full vanilla tracker (the
+                    // position/meta deltas ride sendChanges exactly as the
+                    // vanilla leg produces them).
+                    if (quietStampArm) {
+                        Object[] rq2 = TT_REF;
+                        long[] fq2 = TT_FLAT;
+                        if (rq2 != null && fq2 != null) {
+                            int mq2 = (int) (IB_IDS[i] & AMASK);
+                            int obq2 = mq2 * 5;
+                            if (rq2[obq2 + 2] == e) {
+                                TT_QUIET[mq2 >> 6] &= ~(1L << (mq2 & 63));
+                            }
+                        }
+                    }
+                }
+            }
+            // L79 loop B: the FULL tail over the core's compact index list
+            // (outI[n*4] = cn, then the batch indices, batch order kept).
+            // The list is the !TAIL_NONE set among the IF_NATIVE non-abort
+            // entries — exactly the population the old single loop ran
+            // tails for. Entries a tail removes LATER in the pass (merge
+            // absorb / despawn / void) had their counters run in loop A;
+            // a removed entity's tickCount/totalEntityAge/age are
+            // unobservable (discard fires no reads of them; the store
+            // mirror already holds the core's committed values).
+            int cn = outI[n * 4];
+            for (int j = 0; j < cn; j++) {
+                int i = outI[n * 4 + 1 + j];
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                int bits = outI[i * 4 + 2];
+                ItemEntity e = IB_ITEM[i];
+                if (e == null || e.isRemoved()) continue;
+                if ((bits & (1 << 16)) != 0) continue; // belt: the core excludes these
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
-                    e.age = outI[i * 4];
                     int pd = outI[i * 4 + 1];
                     if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                         e.pickupDelay = pd;
@@ -3934,6 +6362,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
+                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
                 int o = i * 8;
                 // L16 DELTA_SAME: when the core reports the post-tick delta
                 // is bit-identical to the pre-tick delta (the resting-item
@@ -3944,9 +6373,40 @@ public final class CeHooks {
                 // ~100k Vec3 allocations + virtual writes per tick on
                 // items-100k (setDeltaMovement self was 3.5% of the leg).
                 if ((bits & (1 << 14)) == 0) { // not DELTA_SAME
-                    e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                    dwrite++;
+                    // L63a: the direct delta write. javap 26.3 — the whole
+                    // vanilla body of setDeltaMovement(Vec3) is the isFinite
+                    // gate + the posLock-guarded field store (NO flag
+                    // writes: markHurt owns syncVelocity). The woven call
+                    // chain for a dispatch-owned item inside the apply
+                    // window adds three dead frames: the deltaNoOp guard
+                    // (a value compare the ds=0/34.5M verdict says NEVER
+                    // fires on live populations), the probeDelta capture
+                    // (l7ExternalMutation no-ops under IN_ITEM_APPLY; the
+                    // LivingEntity push batch is dead for items; the REST
+                    // wake only matters when REST_GEN is set — routed
+                    // below), and the virtual dispatch. The volatile store
+                    // is STRONGER than the monitor-guarded plain store
+                    // (uncontended on the single server thread); the fresh
+                    // Vec3 matches vanilla's per-write identity exactly
+                    // (Entity.move's identity term reads it the same way).
+                    // Non-finite: vanilla SKIPS the write — replicated (the
+                    // field keeps the old value; no probe fires on the
+                    // guard path either — the deltaNoOp !isFinite early
+                    // return precedes the capture).
+                    if (O_ENT_DELTA > 0 && U != null
+                            && REST_GEN[idSlot & AMASK] == 0) {
+                        if (Double.isFinite(outD[o]) && Double.isFinite(outD[o + 1])
+                                && Double.isFinite(outD[o + 2])) {
+                            U.putObjectVolatile(e, O_ENT_DELTA,
+                                    new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                        }
+                    } else {
+                        e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                    }
+                } else {
+                    dsame++;
                 }
-                e.age = outI[i * 4];
                 int pd = outI[i * 4 + 1];
                 if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                     e.pickupDelay = pd;
@@ -3969,7 +6429,25 @@ public final class CeHooks {
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
                     itemMerge++;
-                    mergeScanNative(e);
+                    // MS diagnostics: the flush path decided this scan; mv
+                    // carries the Rust cadence's floor-change verdict (rate 2
+                    // vs 40) — the mixed t=152 / items t=159 analysis wants
+                    // the cadence split per scanner, not just the scan list.
+                    MS_SRC = 1;
+                    MS_MV = (bits & (1 << 6)) != 0 ? 1 : 2;
+                    // L44: this scanner's batch index = its vanilla body
+                    // position; the view entries after it are seen PRE-move.
+                    MS_KIDX = i;
+                    // A refusal (index unsure) or a disabled fast path
+                    // (CE_MERGE=0 knob) MUST fall back to the vanilla body —
+                    // an ignored false here DROPPED the merge outright
+                    // (observed: 104,383 dropped merges in one spread leg).
+                    // State is fresh: age/pickupDelay/pos are already applied
+                    // above in vanilla tick order, so mergeWithNeighbours
+                    // sees exactly what vanilla's mid-tick body would see.
+                    if (!mergeScanNative(e)) {
+                        runVanillaMerge(e);
+                    }
                     if (e.isRemoved()) continue;
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
@@ -3999,6 +6477,7 @@ public final class CeHooks {
             }
         } catch (Throwable t) {
             ibN = 0;
+            ibResyncN = 0; // L64c: the batch is dropped wholesale
             IN_ITEM_APPLY = false;
             lastError = System.nanoTime();
             lastErrorText = "itemTickFlush: " + t;
@@ -4010,7 +6489,7 @@ public final class CeHooks {
     /** ARENA resolve with the id-match staleness check (same as queries). */
     private static Entity arenaRef(long id) {
         Entity cand = ARENA[(int) (id & 0xFFFF_FFFFL) & AMASK];
-        return (cand != null && cand.getId() == id) ? cand : null;
+        return (cand != null && entId(cand) == id) ? cand : null;
     }
 
     /** The exact vanilla despawn tail (ItemEntity.tick/inactiveTick):
@@ -4614,15 +7093,37 @@ public final class CeHooks {
                 // itemDispatch chain (mode table + fresh-flag belt + activation),
                 // and a false keeps the vanilla accept path exactly as before.
                 boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
+                // TLO (addendum 17): the ACTUAL walk order at PD ticks — the
+                // plugin's TL stream reads the same raw array, so this line
+                // must be IDENTICAL to the OFF leg's TL at the mapped tick
+                // (module t = 3*plugin t ± pad). Any mismatch names the
+                // iteration-order divergence outright.
+                final boolean tloOn = phDumpTickNow();
+                StringBuilder tlo = tloOn ? new StringBuilder(512) : null;
+                long tloH = 0;
+                int tloN = 0;
                 for (int i = 0; i < maxIndex; i++) {
                     Object o = arr[i];
                     if (o instanceof Entity e) {
+                        if (tloOn) {
+                            tloH = tloH * 0x9E3779B97F4A7C15L + entId(e);
+                            tloH ^= Long.rotateLeft(tloH, 13);
+                            if (tloN < 48) {
+                                tlo.append(e.getId()).append(' ');
+                            }
+                            tloN++;
+                        }
                         if (collect && e instanceof ItemEntity
                                 && itemDispatch((ItemEntity) e)) {
                             continue; // native flush computes this tick
                         }
                         consumer.accept(e);
                     }
+                }
+                if (tloOn && tloN > 0) {
+                    System.out.println("[ce-baseline] TLO t=" + CUR_TICK
+                            + " n=" + tloN + " h=" + tloH
+                            + " ids=" + tlo.toString().trim());
                 }
             } finally {
                 set.finishRawIterator();        // iteratorCount-- + defrag check
@@ -4758,56 +7259,33 @@ public final class CeHooks {
     // the 26.3 mobs-25k-mod profile billed its segment chain
     // (Segment.getFirst 1.46% + getEntry 0.57%) per tick per selector
     // (25k mobs). This table is a flat open-addressed identity probe with
-    // WEAK keys: one identityHashCode, one slot, one WeakReference.get()
-    // — ~5-10ns. Dead entries (GC-cleared selectors) are reused in place
-    // on the next probe that touches them; a periodic sweep rebuilds the
-    // table when dead slots pile up (mob churn). Server-thread confined
-    // (every caller runs inside the goal tick phase) — plain arrays, no
-    // fences.
-    private static final class AIKey extends java.lang.ref.WeakReference<Object> {
-        final int hash;
-        AIKey(Object k) {
-            super(k);
-            hash = System.identityHashCode(k);
-        }
-    }
-
+    // L73: STRONG keys with explicit removal (probeRemove drops the removed
+    // mob's selector via its goalSelector field). The weak-key table paid a
+    // WeakReference.get() per probe per mob per tick (48% of the mobs leg's
+    // Reference.get bucket) plus the dead-slot sweep bookkeeping — with
+    // probeRemove as the proven universal removal choke point the strong
+    // keys need no GC coupling: one identityHashCode + one array compare
+    // per probe, and aiDrop's backward-shift deletion keeps the probe
+    // chains intact. Server-thread confined (every caller runs inside the
+    // goal tick phase) — plain arrays, no fences.
     private static final int AI_CAP_INIT = 1 << 13;   // 8192 slots
-    private static AIKey[] AI_KEYS = new AIKey[AI_CAP_INIT];
+    private static Object[] AI_KEYS = new Object[AI_CAP_INIT];
     private static AIShadow[] AI_VALS = new AIShadow[AI_CAP_INIT];
-    private static int AI_SIZE = 0;      // live + dead entries
-    private static int AI_DEAD = 0;      // GC-cleared entries seen while probing
+    private static int AI_SIZE = 0;      // live entries
 
     private static AIShadow shadowOf(Object gs) {
         int mask = AI_KEYS.length - 1;
-        int h = System.identityHashCode(gs);
-        int i = h & mask;
+        int i = System.identityHashCode(gs) & mask;
         while (true) {
-            AIKey k = AI_KEYS[i];
-            if (k == null) {
+            Object cur = AI_KEYS[i];
+            if (cur == gs) return AI_VALS[i];
+            if (cur == null) {
                 AIShadow sh = new AIShadow();
-                AI_KEYS[i] = new AIKey(gs);
+                AI_KEYS[i] = gs;
                 AI_VALS[i] = sh;
                 AI_SIZE++;
                 if (AI_SIZE + (AI_SIZE >> 1) >= AI_KEYS.length) {
                     aiRebuild(AI_KEYS.length << 1);
-                }
-                return sh;
-            }
-            Object cur = k.get();
-            if (cur == gs) return AI_VALS[i];
-            if (cur == null) {
-                // dead slot: claim in place. Safe under linear probing —
-                // the incoming key's probe path starts here, so the new
-                // pair is found first; the dead key is unreachable by
-                // definition; every other chain still terminates at a
-                // null or its own live key.
-                AI_DEAD++;
-                AIShadow sh = new AIShadow();
-                AI_KEYS[i] = new AIKey(gs);
-                AI_VALS[i] = sh;
-                if (AI_DEAD > 2048 && AI_DEAD * 2 > AI_SIZE) {
-                    aiRebuild(AI_KEYS.length); // sweep dead, same capacity
                 }
                 return sh;
             }
@@ -4821,49 +7299,85 @@ public final class CeHooks {
      *  the probe must WALK PAST them (a live entry later in the chain is
      *  still reachable), terminating at the first true null. */
     private static AIShadow aiShadowPeek(Object gs) {
-        AIKey[] keys = AI_KEYS;
+        Object[] keys = AI_KEYS;
         AIShadow[] vals = AI_VALS;
         int mask = keys.length - 1;
         int i = System.identityHashCode(gs) & mask;
         while (true) {
-            AIKey k = keys[i];
-            if (k == null) return null;
-            Object cur = k.get();
+            Object cur = keys[i];
+            if (cur == null) return null;
             if (cur == gs) return vals[i];
             i = (i + 1) & mask;
         }
     }
 
-    /** Rehash (capacity 0 = same capacity, dead sweep only). Keeps the
-     *  live pairs, drops the dead ones. Called from the server thread —
-     *  no racing readers. */
+    /** L73: drop a removed mob's selector entry (probeRemove). Open
+     *  addressing with backward-shift deletion: after clearing the slot,
+     *  the following cluster entries whose home does NOT lie cyclically
+     *  between the hole and their own slot shift back, so every probe
+     *  chain stays intact (Knuth 6.4R). A missed drop (a removal path
+     *  that skips probeRemove — none known) leaks one bounded entry. */
+    private static void aiDrop(Object gs) {
+        int mask = AI_KEYS.length - 1;
+        int i = System.identityHashCode(gs) & mask;
+        while (true) {
+            Object cur = AI_KEYS[i];
+            if (cur == null) return;               // not present
+            if (cur == gs) break;
+            i = (i + 1) & mask;
+        }
+        int j = i;
+        while (true) {
+            j = (j + 1) & mask;
+            Object k = AI_KEYS[j];
+            if (k == null) break;
+            int h = System.identityHashCode(k) & mask;
+            boolean between = (i < j) ? (h > i && h <= j)
+                                      : (h > i || h <= j);
+            if (!between) {
+                AI_KEYS[i] = k;
+                AI_VALS[i] = AI_VALS[j];
+                AI_KEYS[j] = null;
+                AI_VALS[j] = null;
+                i = j;
+            }
+        }
+        AI_KEYS[i] = null;
+        AI_VALS[i] = null;
+        AI_SIZE--;
+    }
+
+    /** Rehash (growth only — strong keys have no dead slots). Called from
+     *  the server thread — no racing readers. */
     private static void aiRebuild(int newCap) {
-        AIKey[] oldKeys = AI_KEYS;
+        Object[] oldKeys = AI_KEYS;
         AIShadow[] oldVals = AI_VALS;
-        AIKey[] nk = new AIKey[newCap];
+        Object[] nk = new Object[newCap];
         AIShadow[] nv = new AIShadow[newCap];
         int mask = newCap - 1;
-        int live = 0;
         for (int j = 0; j < oldKeys.length; j++) {
-            AIKey k = oldKeys[j];
+            Object k = oldKeys[j];
             if (k == null) continue;
-            Object cur = k.get();
-            if (cur == null) continue; // dead — dropped
-            int i = k.hash & mask;
+            int i = System.identityHashCode(k) & mask;
             while (nk[i] != null) i = (i + 1) & mask;
             nk[i] = k;
             nv[i] = oldVals[j];
-            live++;
         }
         AI_KEYS = nk;
         AI_VALS = nv;
-        AI_SIZE = live;
-        AI_DEAD = 0;
     }
 
     private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_LOCK_TABLE =
             ThreadLocal.withInitial(
                 () -> new net.minecraft.world.entity.ai.goal.WrappedGoal[32]);
+
+    // L69: the set-ordered running-array scratch. The update merge-walk
+    // rebuilds the shadow in availableGoals INSERTION order — the order
+    // vanilla's cleanup walk and tickRunningGoals(true) tail use — instead
+    // of the old start-order appends (the T382 parity divergence).
+    private static final ThreadLocal<net.minecraft.world.entity.ai.goal.WrappedGoal[]> AI_RUN_TABLE =
+            ThreadLocal.withInitial(
+                () -> new net.minecraft.world.entity.ai.goal.WrappedGoal[8]);
 
     /** Precompute-time proof: the private-handle set must resolve BEFORE
      *  the GoalSelector bodies are replaced (doc-25 rule — the mirror has
@@ -4965,15 +7479,25 @@ public final class CeHooks {
             net.minecraft.util.profiling.ProfilerFiller profiler =
                     net.minecraft.util.profiling.Profiler.get();
             long disabled = disabledBacking(gs);
+            java.util.EnumMap locked = lockedOf(gs);
             // cleanup — vanilla conditions and short-circuit order
             profiler.push("goalCleanup");
             for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
                 if (g.isRunning()
                         && (((g.getFlags().getBackingSet() & disabled) != 0L)
                             || !g.canContinueToUse())) {
+                    lockWrite(locked, g, false);
                     g.stop();
                     gsFloorStops++;
                 }
+            }
+            // L97.3: the vanilla goalCleanup tail — entries whose goal is not
+            // running die (the mirror's removeIf port; covers externally
+            // stopped goals the loop above never visits)
+            if (locked != null) {
+                locked.entrySet().removeIf(
+                        e -> !((net.minecraft.world.entity.ai.goal.WrappedGoal)
+                                ((java.util.Map.Entry) e).getValue()).isRunning());
             }
             profiler.pop();
             // rebuild the lock table + running shadow (silent pass)
@@ -5021,6 +7545,9 @@ public final class CeHooks {
                                 gsFloorStops++;
                             }
                             lock[ord] = g;
+                            // L97.3: the vanilla map write — put BEFORE start
+                            // (javap bc 211-265), the displaced stop rides above
+                            if (locked != null) locked.put(goalFlags()[ord], g);
                         }
                         g.start();
                         gsFloorStarts++;
@@ -5030,6 +7557,21 @@ public final class CeHooks {
             profiler.pop();
             // vanilla tick() ends with tickRunningGoals(true) — full-set walk
             tickRunningImpl(gs, true);
+            // L69: rebuild the running shadow in SET order — the update pass
+            // above starts goals into the lock table only; the pre-update
+            // rebuild predates them, so the shadow missed every fresh starter
+            // and the next fast-path tick would have skipped their cleanup
+            // and tail (the stale-shadow fullPass loop). One extra set walk
+            // per FULL pass — full passes are rare by design.
+            sh.n = 0;
+            for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
+                if (g.isRunning()) {
+                    if (sh.n == sh.goals.length) {
+                        sh.goals = java.util.Arrays.copyOf(sh.goals, sh.n * 2);
+                    }
+                    sh.goals[sh.n++] = g;
+                }
+            }
             // record the shadow shape for the L25 flat path
             sh.allSize = goals.size();
             sh.first = firstOf(goals);
@@ -5092,6 +7634,7 @@ public final class CeHooks {
             net.minecraft.util.profiling.ProfilerFiller profiler =
                     net.minecraft.util.profiling.Profiler.get();
             long disabled = disabledBacking(gs);
+            java.util.EnumMap locked = lockedOf(gs);
             // cleanup — vanilla conditions and short-circuit order, over the
             // running shadow (same relative set order; isRunning re-checked
             // per entry so an externally stopped goal skips exactly where
@@ -5103,6 +7646,7 @@ public final class CeHooks {
                 if (!g.isRunning()) continue;
                 long fb = g.getFlags().getBackingSet();
                 if (((fb & disabled) != 0L) || !g.canContinueToUse()) {
+                    lockWrite(locked, g, false);
                     g.stop();
                     gsFloorStops++;
                     continue;
@@ -5110,6 +7654,14 @@ public final class CeHooks {
                 sh.goals[w++] = g;
             }
             sh.n = w;
+            // L97.3: the vanilla goalCleanup tail — entries whose goal is not
+            // running die (the mirror's removeIf port; covers externally
+            // stopped goals the shadow walk never visits)
+            if (locked != null) {
+                locked.entrySet().removeIf(
+                        e -> !((net.minecraft.world.entity.ai.goal.WrappedGoal)
+                                ((java.util.Map.Entry) e).getValue()).isRunning());
+            }
             profiler.pop();
             // lock table from the survivors
             net.minecraft.world.entity.ai.goal.WrappedGoal[] lock = AI_LOCK_TABLE.get();
@@ -5136,13 +7688,29 @@ public final class CeHooks {
             // set element must be the next expected survivor (both walk the
             // same insertion order); anything else (external start, direct
             // set surgery) falls to the exact 4-pass rebuild.
+            // L69: the running array is rebuilt in SET ORDER. Vanilla's
+            // cleanup and its tickRunningGoals(true) tail walk availableGoals
+            // itself — the order two live goals of one mob tick/stop in IS
+            // the set's insertion order. The old append-at-tail built START
+            // order: once goal X (set pos 0) started after goal Y (set pos
+            // 1) was already running, the shadow was [Y, X] while vanilla
+            // walked [X, Y] — navigation/lookControl writes interleave in
+            // the wrong sequence and the mob diverges (the T382 gate).
+            // The merge below places survivors and fresh starters at their
+            // set positions by construction (the walk IS the set order).
             profiler.push("goalUpdate");
-            int n = w;
+            net.minecraft.world.entity.ai.goal.WrappedGoal[] out = AI_RUN_TABLE.get();
+            int rn = 0;
             int j = 0;
             for (net.minecraft.world.entity.ai.goal.WrappedGoal g : goals) {
                 if (g.isRunning()) {
                     if (j < w && sh.goals[j] == g) {
                         j++;
+                        if (rn == out.length) {
+                            out = java.util.Arrays.copyOf(out, rn * 2);
+                            AI_RUN_TABLE.set(out);
+                        }
+                        out[rn++] = g;
                         continue;
                     }
                     profiler.pop();
@@ -5162,13 +7730,17 @@ public final class CeHooks {
                             gsFloorStops++;
                         }
                         lock[ord] = g;
+                        // L97.3: the vanilla map write — put BEFORE start
+                        // (javap bc 211-265), the displaced stop rides above
+                        if (locked != null) locked.put(goalFlags()[ord], g);
                     }
                     g.start();
                     gsFloorStarts++;
-                    if (n == sh.goals.length) {
-                        sh.goals = java.util.Arrays.copyOf(sh.goals, n * 2);
+                    if (rn == out.length) {
+                        out = java.util.Arrays.copyOf(out, rn * 2);
+                        AI_RUN_TABLE.set(out);
                     }
-                    sh.goals[n++] = g;
+                    out[rn++] = g;
                 }
             }
             profiler.pop();
@@ -5178,11 +7750,23 @@ public final class CeHooks {
                 fullPassTick(gs, goals, sh);
                 return;
             }
-            sh.n = n;
+            // L69: compact entries a same-pass stop dropped (a candidate
+            // replaced a survivor the walk had already placed) — set order kept
+            int m = 0;
+            for (int i = 0; i < rn; i++) {
+                net.minecraft.world.entity.ai.goal.WrappedGoal g = out[i];
+                if (g.isRunning()) out[m++] = g;
+            }
+            if (sh.goals.length < m) {
+                sh.goals = java.util.Arrays.copyOf(
+                        sh.goals, Math.max(m, sh.goals.length * 2));
+            }
+            System.arraycopy(out, 0, sh.goals, 0, m);
+            sh.n = m;
             // vanilla tail — tickRunningGoals(true): the running array IS the
             // set's running subset in the same order; every entry re-checked
             profiler.push("goalTick");
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < m; i++) {
                 net.minecraft.world.entity.ai.goal.WrappedGoal g = sh.goals[i];
                 if (g.isRunning()) g.tick();
             }
@@ -5337,6 +7921,14 @@ public final class CeHooks {
     // proven get-chain layer counts into the same frozenGate/convGate).
     public static long frozenCalls = 0, convCalls = 0;
     public static long frozenGate = 0, frozenWrites = 0, frozenDirect = 0;
+    // L68: the frozen memo — FROZ_E[m] == e pins the slot to its fill; the
+    // jar-wide scan proves setTicksFrozen is DATA_TICKS_FROZEN's ONLY writer
+    // (Entity + PowderSnowBlock reference the accessor; the block only
+    // resends), so a slot memo filled on any access is exact until the
+    // setter writes, and the setter refreshes the slot on every real write.
+    private static volatile Entity[] FROZ_E;
+    private static volatile int[] FROZ_V;
+    public static volatile boolean FROZ_MEMO_OK = false;
     public static long convGate = 0, convWrites = 0, convDirect = 0;
     // system-property kill switches, folded to static finals at class init.
     // NOTE the idiom: Boolean.getBoolean(name) returns FALSE when the
@@ -5362,32 +7954,49 @@ public final class CeHooks {
             if (VH_ENT_DATA.off >= 0) {
                 O_ED = VH_ENT_DATA.off;
             }
-            // L29: freeze the static accessor indices once the offsets are
-            // in. The reads below are the SAME capture pattern the flag
-            // gate uses for DATA_SHARED_FLAGS_ID (static-field Unsafe read
-            // — identity preserved), and each accessor is instanceof'd
-            // before its record component is read.
-            if (U != null && O_ED >= 0 && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0) {
+            // L64a: the static accessor indices resolve via the accessor's
+            // public id() METHOD (the L28d verdict: EntityDataAccessor is a
+            // RECORD — Unsafe refuses its fields, so O_ACC_ID can never
+            // resolve; id() is the exact read, JIT-inlined). Each layer now
+            // gates on ITS OWN index — the old shared EDV_OK needed BOTH
+            // indices (IDX_FLAGS lives in initFlagHandles' timeline), so one
+            // missed precondition silently killed every L29 direct read (the
+            // run telemetry: froz gate 15.5M, fd=0 — the chain served 100%).
+            // Every skip now records its reason into lastErrorText.
+            if (U == null) {
+                lastError = System.nanoTime();
+                lastErrorText = "edvskip: U==null";
+            } else if (O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
+                lastError = System.nanoTime();
+                lastErrorText = "edvskip: O_ED=" + O_ED + " ITEMS=" + O_ED_ITEMS
+                        + " DI=" + O_DI_VALUE;
+            } else {
                 try {
                     java.lang.reflect.Field ff = Entity.class
                             .getDeclaredField("DATA_TICKS_FROZEN");
                     ff.setAccessible(true);
                     Object fa = U.getObject(U.staticFieldBase(ff),
                             U.staticFieldOffset(ff));
-                    if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor) {
-                        IDX_FROZEN = ((net.minecraft.network.syncher.EntityDataAccessor<?>) fa).id();
+                    if (fa instanceof net.minecraft.network.syncher.EntityDataAccessor acc) {
+                        IDX_FROZEN = acc.id();
+                    } else {
+                        lastError = System.nanoTime();
+                        lastErrorText = "edvskip: frozen acc=" + fa;
                     }
                 } catch (Throwable frozenIdx) {
                     IDX_FROZEN = -1;
+                    lastError = System.nanoTime();
+                    lastErrorText = "edvskip: frozen idx " + frozenIdx;
                 }
-                if (FLAGS_ID instanceof net.minecraft.network.syncher.EntityDataAccessor) {
-                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>) FLAGS_ID).id();
-                }
-                // FLAGS_ID is captured by initFlagHandles which may run
-                // after us; EDV_OK then flips in initFlagHandles too.
-                if (IDX_FROZEN >= 0 && IDX_FLAGS >= 0) {
-                    EDV_OK = true;
-                }
+            }
+            // L68: the memo slots (ARENA-indexed like TT_*/MODE_*; the
+            // identity check tolerates a stale slot, probeRemove releases
+            // the ref). A failed allocation keeps FROZ_MEMO_OK false — the
+            // weaves route the proven walks/vanilla chain unchanged.
+            if (FROZ_E == null) {
+                FROZ_E = new Entity[ARENA.length];
+                FROZ_V = new int[ARENA.length];
+                FROZ_MEMO_OK = true;
             }
             FROZEN_HANDLES_OK = true;
         } catch (Throwable t) {
@@ -5494,7 +8103,11 @@ public final class CeHooks {
      *  the value hop. Returns null on any structural doubt — the caller
      *  routes the vanilla chain exactly as with entityDataValue. */
     private static Object entityDataValueIdx(Entity e, int idx) {
-        if (!EDV_OK) {
+        // L64a: per-call validity — the caller's own index plus the three
+        // data-array offsets. The shared EDV_OK (which also required the
+        // FLAGS timeline) is no longer a precondition; a negative idx or
+        // offset routes the vanilla chain below.
+        if (idx < 0 || O_ED < 0 || O_ED_ITEMS < 0 || O_DI_VALUE < 0) {
             return null;
         }
         try {
@@ -5540,6 +8153,10 @@ public final class CeHooks {
             if (VH_ENT_DATA == null) {
                 VH_ENT_DATA = new RefField(Entity.class, "entityData");
             }
+            // L64a: the accessor-id offset must exist before the index read
+            // below — initFlagHandles may run before any other initDataOffsets
+            // caller (idempotent, the L27-proven shape).
+            initDataOffsets();
             if (U != null) {
                 java.lang.reflect.Field f =
                         Entity.class.getDeclaredField("DATA_SHARED_FLAGS_ID");
@@ -5548,17 +8165,14 @@ public final class CeHooks {
             }
             if (FLAGS_ID != null) {
                 FLAGG_HANDLES_OK = true;
-                // L29: the flags index may freeze here when initFlagHandles
-                // runs before initFrozenHandles (or re-freeze after).
-                if (U != null && IDX_FROZEN >= 0 && O_ED >= 0
-                        && O_ED_ITEMS >= 0 && O_DI_VALUE >= 0
-                        && FLAGS_ID instanceof
-                                net.minecraft.network.syncher.EntityDataAccessor) {
-                    IDX_FLAGS = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
-                            FLAGS_ID).id();
-                    if (IDX_FLAGS >= 0) {
-                        EDV_OK = true;
-                    }
+                // L64a: the flags index resolves independently (the id()
+                // method per the L28d record verdict) and gates ONLY the
+                // flags layer (entityDataValueIdx checks per-call validity)
+                // — the frozen timeline no longer gates the flags direct
+                // read, and the flags capture never gated the frozen one.
+                if (FLAGS_ID instanceof
+                        net.minecraft.network.syncher.EntityDataAccessor acc) {
+                    IDX_FLAGS = acc.id();
                 }
             }
         } catch (Throwable t) {
@@ -5973,6 +8587,21 @@ public final class CeHooks {
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
             mobAiClassified = 0, mobAiRefused = 0, mobAiOddJava = 0;
+    // L90b: the per-tick branch counters of the AI floor — the GL line
+    // prints `br=<even-ai>/<odd-java>/<odd-rust>`; the vanilla cadence
+    // reference: even+oddJava+oddRust == the AI'd mob count and even ==
+    // {tickCount<=1} U {(tickCount+id)%2==0} — the L90 census caught the
+    // engine's set running ONE TICK EARLY (engine-set(t) ==
+    // vanilla-set(t+1), five consecutive ticks).
+    public static long floorEven = 0, floorOddJava = 0, floorOddRust = 0;
+    // L91: the guard-reach census — grEntries counts EVERY mobAiFloor entry
+    // that passed the ACTIVE gate (= the ON leg's serverAiStep call sites);
+    // grFresh counts the entries with tickCount <= 1 (the fresh batch). The
+    // GL line prints gr=<entries>/<fresh>: the vanilla cadence model plus
+    // the OFF leg's canUse census then name the reach difference (the
+    // engine's fresh batch reaching the AI one tick early is the L90
+    // one-tick-early verdict's remaining candidate mechanism).
+    public static long grEntries = 0, grFresh = 0;
     /** Diagnostics: reason (FB_*) + round + request op of the FIRST fallback
      *  this boot; the one-shot log line makes a classified-mob fallback
      *  diagnosable from the CI log alone (behavior itself stays exact — the
@@ -6000,7 +8629,9 @@ public final class CeHooks {
             MF_NEAR_VILLAGE = 64, MF_PEACEFUL = 128, MF_TEAMS_PRESENT = 256,
             MF_MANY_PLAYERS = 512;
     static final int ACT_GOAL_START = 1, ACT_GOAL_STOP = 2, ACT_GOAL_TICK_V = 3,
-            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10;
+            ACT_GOAL_STOP_D = 4,
+            ACT_LOOK_TICK_AROUND = 5, ACT_LOOK_TICK_AT = 6, ACT_REF_SET_PLAYER = 10,
+            ACT_GOAL_LOCK_MAP = 11;
     static final int REQ_LOS_SCAN = 7;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
     static final int MAX_GOALS = 16, GOAL_STRIDE = 8, IN_HEADER = 34, OUT_HEADER = 8;
@@ -6077,6 +8708,11 @@ public final class CeHooks {
     private static long O_MOB_LASTHURTBY = -1, O_MOB_LASTHURTBY_TS = -1;
     private static long O_LVL_SKYDARKEN = -1;
     private static long O_NAT_TARGET = -1; // NearestAttackableTargetGoal.target
+    // L93: the native-funnel findTarget handles - the goal's targetType
+    // (the class filter) and targetConditions (the REAL test() object;
+    // getTargetConditions() re-applies range(fd) per call - replicated
+    // by invoking the private method itself).
+    private static long O_NAT_TYPE = -1, O_NAT_CONDS = -1;
     private static long O_STROLL_FORCE = -1, O_STROLL_WX = -1, O_STROLL_WY = -1, O_STROLL_WZ = -1;
     private static long O_NAV_PATH = -1, O_NAV_TICK = -1, O_NAV_DELAYED = -1;
     private static long O_PATH_NEXT = -1, O_PATH_NODES = -1;
@@ -6093,7 +8729,8 @@ public final class CeHooks {
     private static long O_RNG_VALUE = -1;
     private static java.lang.invoke.MethodHandle MH_GET_POSITION;   // RandomStrollGoal subclass
     private static java.lang.invoke.MethodHandle MH_STROLL_WX, MH_STROLL_WY, MH_STROLL_WZ;
-    private static java.lang.invoke.MethodHandle MH_FIND_TARGET, MH_NEAREST_TARGET_F;
+    private static java.lang.invoke.MethodHandle MH_FIND_TARGET, MH_NEAREST_TARGET_F,
+            MH_TARGET_CONDS;
     private static java.lang.invoke.MethodHandle MH_LOOKAT_CTX;     // lookAtContext getter
     private static Object MOVE_OP_WAIT; // MoveControl.Operation.WAIT enum ref
 
@@ -6151,6 +8788,10 @@ public final class CeHooks {
             O_NAT_TARGET = offOf(Class.forName(
                     "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal"),
                     "target");
+            Class<?> natCls0 = Class.forName(
+                    "net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal");
+            O_NAT_TYPE = offOf(natCls0, "targetType");
+            O_NAT_CONDS = offOf(natCls0, "targetConditions");
             MOVE_OP_WAIT = java.lang.Enum.valueOf(
                     (Class<? extends java.lang.Enum>) Class.forName(
                             "net.minecraft.world.entity.ai.control.MoveControl$Operation"),
@@ -6180,6 +8821,25 @@ public final class CeHooks {
                     .getDeclaredField("SHARED_RANDOM");
             sr.setAccessible(true);
             SHARED_RANDOM = sr.get(null);
+            // L85b: the parity harness wraps the static with a recording
+            // proxy at plugin ENABLE — before any entity (Entity.random is
+            // captured from the static at construction), so by the time
+            // this init runs the field may hold the proxy. A proxy class
+            // has no 'value' field: the seed handoff would fail-fast and
+            // the engine would silently disarm. The proxy answers the
+            // duck-typed ceSrOriginal() contract (SrUnwrap marker from the
+            // harness) with the wrapped ORIGINAL — setAccessible waives
+            // the cross-loader visibility check. No wrap: the call throws,
+            // the catch keeps the plain object, nothing changes.
+            try {
+                java.lang.reflect.Method om = SHARED_RANDOM.getClass()
+                        .getMethod("ceSrOriginal");
+                om.setAccessible(true);
+                Object orig = om.invoke(SHARED_RANDOM);
+                if (orig != null) {
+                    SHARED_RANDOM = orig;
+                }
+            } catch (Throwable noWrap) { /* no harness wrap — plain path */ }
             O_RNG_VALUE = offOf(SHARED_RANDOM.getClass(), "value");
             // protected stroll override + goal-internal fields —
             // privateLookupIn: publicLookup CANNOT unreflect protected
@@ -6208,9 +8868,27 @@ public final class CeHooks {
             MH_FIND_TARGET = pnl.findVirtual(nat, "findTarget",
                     java.lang.invoke.MethodType.methodType(void.class));
             MH_NEAREST_TARGET_F = pnl.unreflectGetter(nat.getDeclaredField("target"));
+            // L93: the private getTargetConditions() - the per-call
+            // range(fd) re-application the vanilla findTarget performs
+            // (javap bc 55-56: the STORED conditions object is mutated).
+            MH_TARGET_CONDS = pnl.findVirtual(nat, "getTargetConditions",
+                    java.lang.invoke.MethodType.methodType(
+                            net.minecraft.world.entity.ai.targeting.TargetingConditions.class));
             Class<?> lalCls = Class.forName("net.minecraft.world.entity.ai.goal.LookAtPlayerGoal");
             MH_LOOKAT_CTX = java.lang.invoke.MethodHandles.privateLookupIn(lalCls, pub)
                     .unreflectGetter(lalCls.getDeclaredField("lookAtContext"));
+            // L22c fix: the classification walks the mob's GoalSelectors —
+            // the goalTypes/lockedFlags RefFields belong to THIS engine too.
+            // They used to live only in the L15 initAIHandles; with the
+            // GoalSelector floor shipped off (aiFloor=0) that init never ran
+            // and a classification NPE'd mid-tick on a half-mutated mob (run
+            // 40881390981). Resolve them HERE so the engine is
+            // self-contained; the mobAiFloor entry guard keeps the
+            // belt-and-suspenders fail-fast.
+            VH_GS_DISABLED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "goalTypes");
+            VH_GS_LOCKED = new RefField(
+                    net.minecraft.world.entity.ai.goal.GoalSelector.class, "lockedFlags");
             AI_HANDLES_SCRATCH_OK();
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -6227,7 +8905,8 @@ public final class CeHooks {
                 || O_MOB_LASTHURTBY_TS < 0 || O_LVL_SKYDARKEN < 0 || O_NAT_TARGET < 0
                 || O_RLA_LOOKTIME < 0 || O_LAL_LOOKAT < 0 || O_STROLL_FORCE < 0
                 || O_ENT_POS < 0 || MH_GET_POSITION == null || MH_FIND_TARGET == null
-                || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null) {
+                || MH_LOOKAT_CTX == null || MH_NEAREST_TARGET_F == null
+                || MH_TARGET_CONDS == null || O_NAT_TYPE < 0 || O_NAT_CONDS < 0) {
             MOB_AI_HANDLES_OK = false;
         } else {
             MOB_AI_HANDLES_OK = true;
@@ -6479,7 +9158,7 @@ public final class CeHooks {
         if (U.getObject(mob, O_MOB_LASTHURTBY) != null) mf |= 16; // MF_LAST_HURT_BY=16
         in[1] = mf;
         in[2] = mob.tickCount;
-        in[3] = mob.getId();
+        in[3] = entId(mob);
         // noActionTime already incremented by the floor (vanilla order)
         in[4] = U.getInt(mob, O_MOB_NOACTION);
         in[5] = ctx.tGoals.length;
@@ -6569,7 +9248,7 @@ public final class CeHooks {
                 if (pl.isDiscrete()) fl |= AIPF_DISCRETE;
                 if (pl.isPassenger()) fl |= AIPF_RIDING;
                 in2[b + PFLAGS] = fl;
-                in2[b + PID] = pl.getId();
+                in2[b + PID] = entId(pl);
             }
         }
         int base = IN_HEADER;
@@ -6724,7 +9403,40 @@ public final class CeHooks {
 
     /** The floor body — the EarlyReturnGuard check for Mob.serverAiStep. */
     public static boolean mobAiFloor(net.minecraft.world.entity.Mob mob) {
-        if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK) return false;
+        // VH_GS_DISABLED (GoalSelector.goalTypes) is resolved by the L15
+        // initAIHandles — a DIFFERENT init than initMobAiHandles. With the
+        // L15 GoalSelector floor shipped off (aiFloor=0) it stays null while
+        // MOB_AI_HANDLES_OK is true: a classification would then throw
+        // MID-TICK (after noActionTime++ and sensing.tick(), stepped=true)
+        // and the mirror-tail recovery desynced the leg (run 40881390981:
+        // push-triggered harness armed the engine via the parity.yml empty-
+        // input trap, the NPE fired at t~158, PH diverged at t=161, n=2507
+        // vs 2509 at T382). Fail-fast BEFORE any mutation instead: the
+        // guard declines, vanilla serverAiStep runs, behavior stays exact.
+        if (!ACTIVE || !MOB_AI_ON || !MOB_AI_HANDLES_OK || VH_GS_DISABLED == null) {
+            return false;
+        }
+        // L97.5 THE t=157 ROOT CAUSE: the EarlyReturnGuard is woven at the
+        // METHOD TOP (bc 0) — vanilla's aware branch (javap bc 10-48:
+        // !aware → goalFloat.canUse/tick + jumpControl.tick + RETURN, NO
+        // selectors, NO cadence gate, NO RNG) runs AFTER it. An unaware mob
+        // must take the vanilla body — the engine's AI preempts a branch
+        // vanilla never runs and evaluates its gates natively: +2 mobs in
+        // the engine's even walk = +8 NearestTarget/stroll rolls = THE +8
+        // stream shift at t=157 (GL t=157: gr=236, br=121+113, kind-8
+        // 484=121×4 vs vanilla 119×4=476; the PTRACE: vanilla 107 strolls,
+        // the engine starts RLA at the shifted stream positions). The
+        // aware branch draws NO randomness — declining the guard for
+        // !aware mobs is byte-exact (the vanilla body IS the semantics).
+        // The gr census now counts post-aware entries: gr-br = the aiClassify
+        // refusal count (was: refusals + the unaware set).
+        if (!mob.aware) {
+            return false;
+        }
+        // L91: guard-reach census — every entry that passed the kill-switch
+        // gate (a real serverAiStep call site on the ON leg)
+        grEntries++;
+        if (mob.tickCount <= 1) grFresh++;
         boolean stepped = false;
         try {
             AiCtx ctx = aiClassify(mob);
@@ -6743,7 +9455,18 @@ public final class CeHooks {
             // walk: lookTime-- + setLookAt, no RNG, no engine round-trip —
             // run it in pure Java and skip the JNI entirely (half the ticks
             // of a peaceful zombie).
-            boolean odd = ((mob.tickCount + mob.getId()) & 1) != 0 && mob.tickCount > 1;
+            boolean odd = ((mob.tickCount + entId(mob)) & 1) != 0 && mob.tickCount > 1;
+            if (phDumpTickNow()) {
+                if (odd) {
+                    floorOddRust++; // reached only when the melee walk runs
+                    if (!aiMeleeRunning(ctx)) {
+                        floorOddRust--;
+                        floorOddJava++;
+                    }
+                } else {
+                    floorEven++;
+                }
+            }
             if (odd && !aiMeleeRunning(ctx)) {
                 for (int i = 0; i < ctx.gGoals.length; i++) {
                     if (ctx.gKind[i] == GK_LOOKAROUND && ctx.gGoals[i].isRunning()) {
@@ -6833,6 +9556,19 @@ public final class CeHooks {
             int req = AI_OUT[1];
             lastReqOp = req;
             int gi = AI_OUT[2];
+            // L76 hunt: the per-round protocol witness for the traced mob —
+            // the (round, req-op, goal, cursor) sequence names the EXACT
+            // staged request at the first RNG-divergent tick (SR/LR first
+            // diverge at mobs t=143/145 with the engine armed; the PH hash
+            // covers only x/y/z+v so the state was still "identical")
+            if (AITR) {
+                boolean oddB = ((mob.tickCount + entId(mob)) & 1) != 0 && mob.tickCount > 1;
+                System.out.println("[ce-baseline] AITR t=" + CUR_TICK
+                        + " id=" + entId(mob) + " r=" + round
+                        + " op=" + req + " gi=" + gi + " cur=" + cursor
+                        + " tc=" + mob.tickCount + " odd=" + (oddB ? 1 : 0)
+                        + " seed=" + Long.toHexString(seed));
+            }
             res = 1;
             rx = ry = rz = 0;
             boolean targetSel = ((cursor >> 9) & 1) == 0;
@@ -6854,9 +9590,35 @@ public final class CeHooks {
                 case REQ_CANUSE_VANILLA:
                     res = wg.canUse() ? 1 : 0;
                     break;
-                case REQ_START_VANILLA:
-                    res = 1; // the engine emits the start action
+                case REQ_START_VANILLA: {
+                    // L102: the REAL start() runs INLINE at the resolution —
+                    // vanilla's update walk performs start() (and its RNG
+                    // draws) mid-walk, BEFORE the remaining gates. The old
+                    // apply-time start left the engine's LCG model behind by
+                    // the body's draws (the RLA start: nextDouble +
+                    // nextInt(20) — javap 26.3) — every later gate of the
+                    // same tick read a shifted stream position (the t=157
+                    // stroll flip). The lock transition (stops + map put)
+                    // rode the PARK round's actions (ACT_GOAL_LOCK_MAP), so
+                    // this is the vanilla order: stops → put → start.
+                    try {
+                        wg.start();
+                    } catch (Throwable t) {
+                        mobAiFallbackWhy = FB_JAVA_PREDICATE;
+                        mobAiFallbackRound = round;
+                        mobAiFallbackReq = lastReqOp;
+                        mobAiFallbackMob = mob.getClass().getName();
+                        logFirstFallback();
+                        return ST_FALLBACK;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " START-RESOLVED gi=" + gi
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
+                    res = 1;
                     break;
+                }
                 case REQ_STROLL_POS: {
                     Object pos = null;
                     try {
@@ -6876,7 +9638,20 @@ public final class CeHooks {
                         U.putDouble(g, O_STROLL_WZ, v.z);
                         U.putByte(g, O_STROLL_FORCE, (byte) 0);
                         rx = v.x; ry = v.y; rz = v.z;
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRPOS t=" + CUR_TICK
+                                    + " id=" + entId(mob)
+                                    + " v=" + v
+                                    + " cls=" + wg.getGoal().getClass().getSimpleName()
+                                    + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
+                        }
                     } else {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRPOS t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " v=NULL"
+                                    + " cls=" + wg.getGoal().getClass().getSimpleName()
+                                    + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
+                        }
                         res = 0;
                     }
                     break;
@@ -6902,17 +9677,105 @@ public final class CeHooks {
                     break;
                 }
                 case REQ_FIND_TARGET: {
-                    try {
-                        MH_FIND_TARGET.invoke(wg.getGoal());
-                        Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
-                        res = t != null ? 1 : 0;
-                    } catch (Throwable t2) {
+                    boolean done = false;
+                    // L93: the native-funnel findTarget. The vanilla body
+                    // (javap 26.3) is
+                    //   getEntitiesOfClass(targetType,
+                    //       mob.getBoundingBox().inflate(fd, fd, fd), p -> true)
+                    //   + getNearestEntity(list, getTargetConditions(), mob,
+                    //       mob.getX(), mob.getEyeY(), mob.getZ())
+                    // where getTargetConditions() = the goal's OWN stored
+                    // conditions re-applied with range(fd) (the object is
+                    // MUTATED), and getNearestEntity walks the list IN
+                    // ORDER keeping the FIRST strict-min
+                    // distanceToSqr(x, eyeY, z) among the test()-passing
+                    // candidates. The class scan is the ~14% vanilla slice
+                    // walk (mobs-25k: 25k queries/tick for classes that
+                    // are absent); the module index answers the same AABB
+                    // in bit-identical vanilla order (doc 36b), so the
+                    // class-filtered SUBSEQUENCE and the tie rule see the
+                    // exact vanilla sequence. The conditions run as the
+                    // REAL virtual test() calls; test() draws no RNG
+                    // (visibility/LoS only) and Sensing caches, so the
+                    // port is stream-neutral. Any failure routes the real
+                    // findTarget body (the pre-L93 behavior) below.
+                    if (ACTIVE && O_NAT_TYPE >= 0 && O_NAT_CONDS >= 0
+                            && MH_TARGET_CONDS != null) {
+                        try {
+                            Object g2 = wg.getGoal();
+                            @SuppressWarnings("unchecked")
+                            Class<? extends net.minecraft.world.entity.LivingEntity> tt =
+                                    (Class<? extends net.minecraft.world.entity.LivingEntity>)
+                                            U.getObject(g2, O_NAT_TYPE);
+                            Object conds0 = U.getObject(g2, O_NAT_CONDS);
+                            net.minecraft.server.level.ServerLevel lvl =
+                                    (net.minecraft.server.level.ServerLevel) mob.level();
+                            if (tt != null && conds0 != null && lvl != null
+                                    && tt != net.minecraft.world.entity.player.Player.class
+                                    && tt != net.minecraft.server.level.ServerPlayer.class) {
+                                // the EXACT double: getFollowDistance() = getAttributeValue(
+                                // FOLLOW_RANGE) (javap TargetGoal) - the packed IN_FOLLOW
+                                // is the f32 rounding and would shift the query area
+                                double fd = mob.getAttributeValue(
+                                        net.minecraft.world.entity.ai.attributes.Attributes.FOLLOW_RANGE);
+                                net.minecraft.world.phys.AABB bb = mob.getBoundingBox();
+                                net.minecraft.world.phys.AABB area = bb.inflate(fd, fd, fd);
+                                net.minecraft.world.entity.ai.targeting.TargetingConditions conds =
+                                        (net.minecraft.world.entity.ai.targeting.TargetingConditions)
+                                                MH_TARGET_CONDS.invoke(g2);
+                                long[] qout = QBUF.get();
+                                if (qout.length < 4096) {
+                                    qout = new long[4096];
+                                    QBUF.set(qout);
+                                }
+                                int qn = queryNative(worldId(lvl),
+                                        area.minX, area.minY, area.minZ,
+                                        area.maxX, area.maxY, area.maxZ,
+                                        qout, 0, B_IDS, B_BOX, B_SY, B_SEQ);
+                                if (qn >= 0) {
+                                    net.minecraft.world.entity.LivingEntity best = null;
+                                    double bd = -1.0;
+                                    double mx = mob.getX(), mey = mob.getEyeY(), mz = mob.getZ();
+                                    for (int qi = 0; qi < qn; qi++) {
+                                        long lid = qout[qi];
+                                        Entity ce = ARENA[(int) (lid & AMASK)];
+                                        if (ce == null || ce.isRemoved()
+                                                || !tt.isInstance(ce)) {
+                                            continue;
+                                        }
+                                        net.minecraft.world.entity.LivingEntity le =
+                                                (net.minecraft.world.entity.LivingEntity) ce;
+                                        if (!conds.test(lvl, mob, le)) {
+                                            continue;
+                                        }
+                                        double d2 = le.distanceToSqr(mx, mey, mz);
+                                        if (bd < 0.0 || d2 < bd) {
+                                            bd = d2;
+                                            best = le;
+                                        }
+                                    }
+                                    U.putObject(g2, O_NAT_TARGET, best);
+                                    res = best != null ? 1 : 0;
+                                    done = true;
+                                }
+                            }
+                        } catch (Throwable portFail) {
+                            done = false; // the real findTarget resolves it
+                        }
+                    }
+                    if (!done) {
+                        try {
+                            MH_FIND_TARGET.invoke(wg.getGoal());
+                            Object t = MH_NEAREST_TARGET_F.invoke(wg.getGoal());
+                            res = t != null ? 1 : 0;
+                        } catch (Throwable t2) {
                         mobAiFallbackWhy = FB_JAVA_PREDICATE;
                         mobAiFallbackRound = round;
                         mobAiFallbackReq = lastReqOp;
                         mobAiFallbackMob = mob.getClass().getName();
                         logFirstFallback();
                         return ST_FALLBACK;
+                    }
                     }
                     break;
                 }
@@ -6942,6 +9805,14 @@ public final class CeHooks {
                     mobAiFallbackMob = mob.getClass().getName();
                     logFirstFallback();
                     return ST_FALLBACK;
+            }
+            if (AITR) {
+                System.out.println("[ce-baseline] AITR t=" + CUR_TICK
+                        + " id=" + entId(mob) + " r=" + round
+                        + " op=" + req + " RES=" + res
+                        + " pos=" + Double.toHexString(rx) + ","
+                        + Double.toHexString(ry) + "," + Double.toHexString(rz)
+                        + " seed=" + Long.toHexString(U.getLong(SHARED_RANDOM, O_RNG_VALUE)));
             }
         }
         mobAiFallbackWhy = FB_JAVA_ROUND_CAP;
@@ -6986,8 +9857,51 @@ public final class CeHooks {
             switch (op) {
                 case ACT_GOAL_START: {
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
-                    if (wg == null) return;
+                    if (wg == null) {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " START-NULL gi=" + p0);
+                        }
+                        return;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " START gi=" + p0
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
+                    // L97.3: vanilla GoalSelector.update puts flag→goal BEFORE
+                    // start() (javap bc 211-265); WrappedGoal.start() itself
+                    // never writes the map. The engine's internal lock table is
+                    // already right — replay it into the vanilla map, or the
+                    // vanilla-side cleanup (removeIf), the displaced
+                    // canBeReplacedForAllFlags reads and the A/B selector-state
+                    // dump all diverge from the first engine start (L97.2
+                    // PTRACE: goalSelector=[] while vanilla shows MOVE=Stroll).
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, true);
                     wg.start();
+                    break;
+                }
+                case ACT_GOAL_LOCK_MAP: {
+                    // L102: the map write ONLY — the start body ran at the
+                    // REQ_START_VANILLA resolution (inline, vanilla order:
+                    // stops → put → start); the real start() also set the
+                    // WrappedGoal.isRunning flag.
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) {
+                        if (AITR) {
+                            System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                    + " id=" + entId(mob) + " LOCKMAP-NULL gi=" + p0);
+                        }
+                        return;
+                    }
+                    if (AITR) {
+                        System.out.println("[ce-baseline] AITRACT t=" + CUR_TICK
+                                + " id=" + entId(mob) + " LOCKMAP gi=" + p0
+                                + " cls=" + wg.getGoal().getClass().getSimpleName());
+                    }
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, true);
                     break;
                 }
                 case ACT_GOAL_TICK_V: {
@@ -6997,6 +9911,23 @@ public final class CeHooks {
                     break;
                 }
                 case ACT_GOAL_STOP: {
+                    net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
+                    if (wg == null) return;
+                    // L97.3: the paired map remove — two-arg (a no-op when a
+                    // later start already replaced the value), so the write is
+                    // exact whether or not WrappedGoal.stop() cleans itself.
+                    lockWrite(lockedOf((p0 < ctx.tGoals.length)
+                            ? ctx.targetSel : ctx.goalSel), wg, false);
+                    wg.stop();
+                    break;
+                }
+                case ACT_GOAL_STOP_D: {
+                    // L97.7 (javap 26.3): the DISPLACED stop of the update
+                    // walk — vanilla cur.stop() NEVER touches the map (the
+                    // holder's entries on the new goal's other flags stay
+                    // !isRunning until the next tick's removeIf, and
+                    // goalCanBeReplacedForAllFlags reads them without an
+                    // isRunning check). So: wg.stop() ONLY — no map remove.
                     net.minecraft.world.entity.ai.goal.WrappedGoal wg = goalAt(ctx, p0);
                     if (wg == null) return;
                     wg.stop();
@@ -7044,6 +9975,43 @@ public final class CeHooks {
 
     private static int kindAt(AiCtx ctx, int gi) {
         return gi < ctx.tKind.length ? ctx.tKind[gi] : ctx.gKind[gi - ctx.tKind.length];
+    }
+
+    /** L97.3: the vanilla GoalSelector.lockedFlags EnumMap — vanilla's update
+     *  walk maintains it (javap bc 211-265: flag→goal put BEFORE start(); the
+     *  !isRunning removeIf in goalCleanup). The mirrors already write it
+     *  (gsMirrorTick); the floor and the engine path did NOT — the map stayed
+     *  empty from the first engine start (L97.2 PTRACE: goalSelector=[]),
+     *  breaking the A/B selector-state evidence and any vanilla reader.
+     *  Every engine-side start/stop now replays its paired map write.
+     *  Null-safe: a null selector (REFUSED ctx) or an unresolved RefField
+     *  just skips the write (the map is evidence + kill-switch surface). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static java.util.EnumMap lockedOf(Object gs) {
+        if (gs == null || VH_GS_LOCKED == null) return null;
+        return (java.util.EnumMap) VH_GS_LOCKED.getObj(gs);
+    }
+
+    /** The per-flag map write for a WrappedGoal — the backing-set walk the
+     *  mirrors use (Paper's OptimizedSmallEnumSet). put=false is the paired
+     *  remove (two-arg: a no-op when a later start already replaced the
+     *  value — the same walk order vanilla's update pass produces). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void lockWrite(java.util.EnumMap locked,
+            net.minecraft.world.entity.ai.goal.WrappedGoal wg, boolean put) {
+        if (locked == null) return;
+        long it = wg.getFlags().getBackingSet();
+        int fs = wg.getFlags().size();
+        for (int i = 0; i < fs; i++) {
+            int ord = Long.numberOfTrailingZeros(it);
+            it &= it - 1;
+            Object flag = goalFlags()[ord];
+            if (put) {
+                locked.put(flag, wg);
+            } else {
+                locked.remove(flag, wg);
+            }
+        }
     }
 
     private static net.minecraft.world.entity.ai.goal.WrappedGoal goalAt(AiCtx ctx, int gi) {
@@ -7139,6 +10107,88 @@ public final class CeHooks {
      *  ST_DONE / ST_REQUEST / ST_FALLBACK and fills out. */
     public static native int nativeMobAiFloor(int[] in, int[] out);
 
+    /** L89: the gate ledger — per-class canUse census (evals/no/staged/rolls
+     *  for the GK_* classes 0..8, 36 ints) collected by the engine while
+     *  armed; null when the interval was not armed. `on` arms the NEXT
+     *  interval. */
+    private static native int[] nativeGlTake(int on);
+
+    /** doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) — the staged
+     *  continuation witness for the t=157 residual. Records are 7 longs:
+     *  [0] id | tickCount<<32, [1] seed in, [2] seed out, [3] draws |
+     *  kinds<<32, [4] cursor | status<<56, [5] seq, [6] eval-mask |
+     *  pack-running-mask<<32. `arm` sets the NEXT interval's arming
+     *  (gl_take semantics); the dump rides the SAME per-tick boundary and
+     *  window gate as gateLedgerPrint. */
+    private static native long[] nativeMobLedgerTake(int arm);
+
+    /** The env master switch — the native is never called when off, so the
+     *  shipped path pays nothing. Armed via the parity workflow's extra_env
+     *  (CE_MOB_LEDGER=1). */
+    private static final boolean MOB_LEDGER_ON =
+            "1".equals(System.getenv("CE_MOB_LEDGER"));
+
+    private static void mobLedgerDump() {
+        if (!MOB_LEDGER_ON) {
+            return;
+        }
+        boolean win = phDumpTickNow();
+        long[] rec = nativeMobLedgerTake(win ? 1 : 0);
+        if (rec == null) {
+            return;
+        }
+        for (int i = 0; i + 6 < rec.length; i += 7) {
+            long meta = rec[i], sin = rec[i + 1], sout = rec[i + 2];
+            long dk = rec[i + 3], cur = rec[i + 4], seq = rec[i + 5];
+            long ev = rec[i + 6];
+            System.out.println("[ce-baseline] MLEDGER t=" + CUR_TICK / 3
+                    + " seq=" + seq + " id=" + (meta & 0xFFFF_FFFFL)
+                    + " tc=" + (meta >>> 32)
+                    + " s0=" + Long.toHexString(sin)
+                    + " s1=" + Long.toHexString(sout)
+                    + " dr=" + (dk & 0xFFFF_FFFFL)
+                    + " st=" + (cur >>> 56)
+                    + " rs=" + (cur & 0x00FF_FFFF_FFFF_FFFFL)
+                    + " k=" + Long.toHexString(dk >>> 32)
+                    + " e=" + Long.toHexString(ev >>> 32)
+                    + " rt=" + Long.toHexString(ev & 0xFFFF_FFFFL));
+        }
+    }
+
+    /** One GL line per dump tick: c<kind>=evals/no/staged/rolls. The arming rides
+     *  the CURRENT window check (the counters cover the tick that is about
+     *  to run); the read returns the interval that just ended. */
+    private static void gateLedgerPrint() {
+        int[] l = nativeGlTake(phDumpTickNow() ? 1 : 0);
+        if (l == null) {
+            return;
+        }
+        boolean any = false;
+        StringBuilder sb = new StringBuilder("[ce-baseline] GL t=").append(CUR_TICK / 3)
+                .append(" sc=").append(System.getenv("RUN_NAME"));
+        sb.append(" br=").append(floorEven).append('/').append(floorOddJava)
+                .append('/').append(floorOddRust);
+        boolean guardData = grEntries != 0 || floorEven != 0
+                || floorOddJava != 0 || floorOddRust != 0;
+        sb.append(" gr=").append(grEntries).append('/').append(grFresh);
+        floorEven = 0;
+        floorOddJava = 0;
+        floorOddRust = 0;
+        grEntries = 0;
+        grFresh = 0;
+        for (int k = 0; k < 9; k++) {
+            int e = l[k * 4], n = l[k * 4 + 1], s = l[k * 4 + 2], r = l[k * 4 + 3];
+            if ((e | n | s | r) != 0) {
+                any = true;
+                sb.append(' ').append(k).append('=').append(e).append('/')
+                        .append(n).append('/').append(s).append('/').append(r);
+            }
+        }
+        if (any || guardData) {
+            System.out.println(sb.toString());
+        }
+    }
+
     public static void setMobAiOn(boolean on) {
         MOB_AI_ON = on;
     }
@@ -7155,7 +10205,7 @@ public final class CeHooks {
                 (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_TARGETSEL);
         net.minecraft.world.entity.ai.goal.GoalSelector gs =
                 (net.minecraft.world.entity.ai.goal.GoalSelector) U.getObject(mob, O_MOB_GOALSEL);
-        int idBasedTickCount = mob.tickCount + mob.getId();
+        int idBasedTickCount = mob.tickCount + entId(mob);
         if (idBasedTickCount % 2 != 0 && mob.tickCount > 1) {
             ts.tickRunningGoals(false);
             gs.tickRunningGoals(false);
@@ -7425,7 +10475,13 @@ public final class CeHooks {
     // try/finally protocol, the same hasPlayers/chunk-status gate) with
     // ONE fused fast path: no chunk players AND seenBy empty AND
     // trackedPlayers empty AND interp NO_OP AND !hardColliding AND
-    // !syncVelocity -> updateDataBeforeSync + tickCount++, skip the rest.
+    // (L61) syncVelocity either clear or consumable -> updateDataBeforeSync
+    // + tickCount++ (+ the syncVelocity consumption for non-ServerPlayers,
+    // javap bc 1218-1246: the branch's only state effect is the flag write;
+    // the motion-packet send rides the provably-empty tracked set), skip
+    // the rest. L59a: the chunk-player read is memoized per distinct chunk
+    // per pass (the lists are stable inside the tracker loop — mutations
+    // ride the player-move/chunk phases), reset at every pass entry.
     // TTL_ON gates ONLY the fast path; the mirror is always the body.
     // ==================================================================
 
@@ -7434,12 +10490,105 @@ public final class CeHooks {
     public static final boolean TTL_FLAG_ON =
             !"false".equals(System.getProperty("centities.trackerLoop", "true"));
     public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
+    public static long ttlQuiet = 0, ttlQuietBumps = 0; // L92
+    // L59a/L61 decline-site counters (the fuse verdict, per site) + the
+    // per-pass chunk memo (reset at every newTrackerTick$ entry).
+    public static long ttlDeclChunk = 0, ttlDeclSeen = 0, ttlDeclSe = 0,
+            ttlDeclTrk = 0, ttlDeclInterp = 0, ttlDeclHard = 0, ttlDeclSync = 0;
+    private static Object ttlMemoChunk = null;
+    private static boolean ttlMemoEmpty = false;
 
     private static volatile RefField VH_CM_TRACKERS;  // ChunkMap.trackerEntities
     private static volatile RefField VH_CM_ITERATING; // ChunkMap.iteratingTrackerEntities
     private static volatile RefField VH_TE_SERVERENT; // TrackedEntity.serverEntity (public final)
     private static long O_TE_SE = -1;                 // the same field's direct offset
     private static long O_ENT_TRACKED = -1;           // Entity.trackedEntity (private final)
+    // L62b (run 41449046210 verdict): the interp gate — 26.3 gives EVERY
+    // LivingEntity a real SteppedInterpolationTracker (create() server
+    // side), so `!= InterpolationTracker.NO_OP` declined every mob
+    // (ttlDeclInterp=8,075,257 on mobs-25k) and the fuse covered nothing
+    // with a LivingEntity in it. The exact consumption needs the tracker's
+    // own three fields plus the entity's syncPosition flag.
+    private static volatile RefField VH_SIT_STEPS;    // SteppedInterpolationTracker.trackedSteps
+    private static volatile RefField VH_SIT_DELTA;    // SteppedInterpolationTracker.predictedDelta
+    private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
+    private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
+    private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
+    // L63a: Entity.deltaMovement (private Vec3) — the flush apply loop's
+    // direct delta write (javap 26.3: setDeltaMovement's whole body is the
+    // isFinite gate + the posLock-guarded field store; no flag writes).
+    private static volatile long O_ENT_DELTA = -1;
+    // L66: Entity.level (private Level) + Level.isClientSide (private final
+    // boolean) — itemDispatch's per-item client check (the 3.2% Entity.level
+    // frame on items: 98.9% of it is the dispatch walk's own
+    // e.level().isClientSide()) becomes two typed Unsafe reads; any
+    // unresolved offset routes the exact vanilla pair of calls.
+    private static volatile long O_ENT_LEVEL = -1, O_LEVEL_CLIENT = -1;
+    // L63b: the TTL shape cache — per mirror slot, the te identity + the
+    // structural verdicts the fill probe established. With NO ServerPlayers
+    // in the level (the per-pass players().isEmpty() gate) seenBy /
+    // trackedPlayers / nearby-players lists cannot GAIN entries (only
+    // tracking writes them; removals only shrink), so a fill-time empty
+    // verdict holds until the te identity changes. Per-tick volatile
+    // inputs (syncVelocity, syncPosition, steps-emptiness for SIT) stay
+    // per-entity reads in the cached path.
+    // L66r: the FLAT slot layout — ONE Object[] (stride 5: [te, se, ent,
+    // sitObj, steps]) + ONE long[] (stride 2: [shape, tickCount]) instead
+    // of the six parallel arrays (TT_TE/TT_SHAPE/TT_SE/TT_SITOBJ/TT_STEPS/
+    // TT_TC/TT_E). The per-tick walk for an item reads ent/se (adjacent
+    // refs, one cache line) + shape/tickCount (adjacent longs, one line
+    // shared by 4 slots) — 2 misses per entity instead of 5-6 (the
+    // items-100k-mod JFR pinned 9.9% across the array-ref loads — pure
+    // cache-miss traffic). Slot base ob = slot*5, long base lb = slot*2.
+    private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
+    private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
+    private static final long TT_OK = 1L, TT_SIT = 2L;
+    // L92: the QUIET bitset — per mirror slot, set by the item-tick applier
+    // for batch-owned items whose ENTIRE tracker-visible surface is provably
+    // untouched this tick (TAIL_NONE out-flag + no velocity sync + the fill
+    // stamped TT_OK with no SIT handler + the L70 mirror owning the tickCount
+    // bump). While a ChunkMap is ARMED (players() empty — the same gate the
+    // L63b cache requires) the tracker pass for a quiet slot reduces to the
+    // ServerEntity.tickCount mirror bump, which the applier performs INLINE
+    // (one array write it already pays cache residency for); the tracker
+    // loop then skips the slot entirely. The bitset is cleared at every
+    // itemTickFlush entry, so a slot without this tick's applier stamp is
+    // conservatively FULL-PATH (the exact pre-L92 behavior). Entities the
+    // batch does not own (mobs, stands, fresh spawns) never get a stamp and
+    // never take the quiet path.
+    private static volatile long[] TT_QUIET;
+    public static final boolean TTL_QUIET_ON =
+            !"false".equals(System.getProperty("centities.ttlQuiet", "true"));
+    // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
+    // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
+    // increment — the counter is unobservable while nobody tracks the
+    // entity (its ONLY reader is sendChanges' interval gate). Transitions
+    // reconcile exactly: armed->disarmed hands the mirror back into the
+    // real field, disarmed->armed re-captures the real field, and every
+    // decline tick (real sendChanges ran) re-captures per entity, so the
+    // mirror can never fork from the real counter. Any reconcile failure
+    // disables the mirror (TT_TC=null) — the real RMW stays the fallback.
+    // L70: the tickCount mirror. While a ChunkMap is ARMED (players()
+    // empty) the L63b cached path owns the per-tick ServerEntity.tickCount
+    // increment — the counter is unobservable while nobody tracks the
+    // entity (its ONLY reader is sendChanges' interval gate). Transitions
+    // reconcile exactly: armed->disarmed hands the mirror back into the
+    // real field, disarmed->armed re-captures the real field, and every
+    // decline tick (real sendChanges ran) re-captures per entity, so the
+    // mirror can never fork from the real counter. Any reconcile failure
+    // disables the mirror (TT_MIRROR=false) — the real RMW stays the
+    // fallback.
+    private static volatile boolean TT_MIRROR;
+    // the per-ChunkMap armed memo (tiny direct map; #dims entries)
+    private static final Object[] TT_ARM_CM = new Object[8];
+    /** L99: per-ChunkMap hash of the player list (size + x/y/z/yaw/pitch).
+     *  A changed hash disarms the tracker cache for that tick — the
+     *  full vanilla tracker re-serves the subscription sets first. */
+    private static final java.util.WeakHashMap<Object, Long> TT_PQ_HASH =
+            new java.util.WeakHashMap<>();
+    private static final boolean[] TT_ARM_VAL = new boolean[8];
+    public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
+
 
     public static void initTrackerLoopHandles() {
         try {
@@ -7450,6 +10599,36 @@ public final class CeHooks {
             VH_TE_SERVERENT = new RefField(te, "serverEntity");
             O_TE_SE = VH_TE_SERVERENT.off;
             O_ENT_TRACKED = offOf(Entity.class, "trackedEntity");
+            // L62b: the SteppedInterpolationTracker shape (server-side
+            // LivingEntity handlers) + the syncPosition flag read.
+            Class<?> sit = Class.forName(
+                    "net.minecraft.world.entity.SteppedInterpolationTracker");
+            VH_SIT_STEPS = new RefField(sit, "trackedSteps");
+            VH_SIT_DELTA = new RefField(sit, "predictedDelta");
+            VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
+            O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
+            // L63a: the delta field offset (the flush apply loop's direct
+            // write; a miss keeps every writeback on the woven call).
+            O_ENT_DELTA = offOf(Entity.class, "deltaMovement");
+            // L66: the dispatch walk's client check offsets.
+            O_ENT_LEVEL = offOf(Entity.class, "level");
+            O_LEVEL_CLIENT = offOf(net.minecraft.world.level.Level.class,
+                    "isClientSide");
+            // L63b: the shape-cache arrays (slot-indexed like the ARENA;
+            // allocated once — the identity check tolerates stale entries,
+            // probeRemove clears the slot to release the te ref).
+            if (TT_REF == null) {
+                TT_REF = new Object[ARENA.length * 5];
+                TT_FLAT = new long[ARENA.length * 2];
+                TT_QUIET = new long[(ARENA.length + 63) >> 6];
+                TT_MIRROR = true;
+            }
+            if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
+                    && VH_SIT_TICKS.off >= 0) {
+                O_SIT_STEPS = VH_SIT_STEPS.off;
+                O_SIT_DELTA = VH_SIT_DELTA.off;
+                O_SIT_TICKS = VH_SIT_TICKS.off;
+            }
             TTL_HANDLES_OK = VH_CM_TRACKERS.off >= 0 && VH_CM_ITERATING.off >= 0
                     && O_TE_SE >= 0;
         } catch (Throwable t) {
@@ -7480,9 +10659,12 @@ public final class CeHooks {
         }
     }
 
-    /** The L30 fused fast path. All reads are pure (the L15b REORDER rule —
+    /** The L30 fused fast path. All READS are pure (the L15b REORDER rule —
      *  running the probes BEFORE vanilla's moonrise$tick order is free);
-     *  a decline routes the exact vanilla pair. */
+     *  a decline routes the exact vanilla pair. The ONE effect beyond the
+     *  classic two-effect tail is the L61 syncVelocity consumption (below)
+     *  — it runs only after every read has proven the empty-tracking shape,
+     *  so the reads' relative order is still free. */
     private static boolean ttlFastPath(Entity ent, Object te, Object chunk) {
         ttlFuseChecks++;
         if (!TTL_ON || !TTL_HANDLES_OK || U == null) return false;
@@ -7493,31 +10675,115 @@ public final class CeHooks {
         try {
             // 1. the chunk side: the VIEW_DISTANCE player list. null chunk
             //    or null/empty list = the clearPlayers-or-nothing case.
-            if (chunk != null) {
-                ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk tc =
-                        (ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk;
-                ca.spottedleaf.moonrise.common.list.ReferenceList<?> players =
-                        tc.getPlayers(ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.VIEW_DISTANCE);
-                if (players != null && players.size() != 0) return false;
+            //    L59a memo: the player lists cannot change DURING the pass
+            //    (mutations ride the player-move/chunk phases, never the
+            //    tracker loop — moonrise$tick/sendChanges only read them),
+            //    so one read per distinct chunk per pass is exact; the memo
+            //    is reset at every pass entry. On a getPlayers throw the
+            //    memo stays unwritten and the catch declines this entity —
+            //    the next entity of the same chunk re-reads.
+            if (chunk != ttlMemoChunk) {
+                if (chunk == null) {
+                    ttlMemoChunk = null;
+                    ttlMemoEmpty = true;
+                } else {
+                    ca.spottedleaf.moonrise.common.list.ReferenceList<?> players =
+                            ((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk)
+                                    .getPlayers(ca.spottedleaf.moonrise.common.misc.NearbyPlayers.NearbyMapType.VIEW_DISTANCE);
+                    ttlMemoChunk = chunk;
+                    ttlMemoEmpty = players == null || players.size() == 0;
+                }
+            }
+            if (!ttlMemoEmpty) {
+                ttlDeclChunk++;
+                return false;
             }
             // 2. seenBy empty — no removals could fire, updatePlayer loop
             //    provably empty.
             Object seen = U.getObject(te, O_TE_SEEN);
-            if (!(seen instanceof java.util.Set<?> ss) || !ss.isEmpty()) return false;
+            if (!(seen instanceof java.util.Set<?> ss) || !ss.isEmpty()) {
+                ttlDeclSeen++;
+                return false;
+            }
             // 3. the ServerEntity side: the sendChanges fast-exit shape
             //    (the L24a conditions — same equivalence, now from the loop).
             Object se = U.getObject(te, O_TE_SE);
             if (!(se instanceof net.minecraft.server.level.ServerEntity serverEntity)) {
+                ttlDeclSe++;
                 return false;
             }
             Object trk = U.getObject(serverEntity, O_SE_TRACKED_PLAYERS);
-            if (!(trk instanceof java.util.Set<?> ts) || !ts.isEmpty()) return false;
-            if (U.getObject(serverEntity, O_SE_INTERP)
-                    != net.minecraft.world.entity.InterpolationTracker.NO_OP) return false;
-            if (ent.moonrise$isHardColliding() || ent.syncVelocity) return false;
+            if (!(trk instanceof java.util.Set<?> ts) || !ts.isEmpty()) {
+                ttlDeclTrk++;
+                return false;
+            }
+            if (O_SE_INTERP > 0
+                    && U.getObject(serverEntity, O_SE_INTERP)
+                            != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                // L62b: 26.3 hands every LivingEntity a REAL
+                // SteppedInterpolationTracker (SteppedInterpolationHandler
+                // .create routes server-side to the tracker), so the old
+                // !=NO_OP test declined every mob (ttlDeclInterp=8.07M,
+                // run 41449046210). The exact per-tick sendChanges effect
+                // (javap bc 298-307) is ONE updateTracking(trackingPosition())
+                // whose full observable shape, on an EMPTY trackedSteps list
+                // with syncPosition FALSE, is exactly
+                //   { predictedDelta = Vec3.ZERO; ticksSinceLastStep++ }
+                // — the replaceAll gate reads predictedDelta but mutates
+                // only non-empty steps, and the position argument is read
+                // solely by addStep (dead under !syncPosition). Both writes
+                // are replicated here; any other shape routes vanilla. The
+                // ticksSinceLastStep++ is NOT skippable: addStep packs it
+                // into PositionStep(vec, ticksSinceLastStep) on a later
+                // teleport (an observable packet payload).
+                if (O_SIT_STEPS < 0 || O_SIT_DELTA < 0 || O_SIT_TICKS < 0
+                        || O_ENT_SYNC_POS < 0
+                        || !(U.getObject(serverEntity, O_SE_INTERP)
+                                instanceof net.minecraft.world.entity
+                                        .SteppedInterpolationTracker)) {
+                    ttlDeclInterp++;
+                    return false;
+                }
+                Object sitObj = U.getObject(serverEntity, O_SE_INTERP);
+                Object steps = U.getObject(sitObj, O_SIT_STEPS);
+                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                    ttlDeclInterp++; // a later replaceAll/addStep would mutate
+                    return false;
+                }
+                if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
+                    ttlDeclInterp++; // the syncPosition branch is live: addStep
+                    return false;
+                }
+                U.putObject(sitObj, O_SIT_DELTA,
+                        net.minecraft.world.phys.Vec3.ZERO);
+                U.putInt(sitObj, O_SIT_TICKS,
+                        U.getInt(sitObj, O_SIT_TICKS) + 1);
+            }
+            if (ent.moonrise$isHardColliding()) {
+                ttlDeclHard++;
+                return false;
+            }
+            if (ent.syncVelocity) {
+                // L61 (javap 26.3 sendChanges bc 1116-1246): for a
+                // non-ServerPlayer the velocity branch is
+                // `entity.syncVelocity = false` + the motion packet emitted
+                // through sendToTrackingPlayersAndSelf over the tracked set
+                // — HERE provably empty (checked 2 and 3 above), so the send
+                // is a no-op and the packet allocation is not state. The
+                // consumption is the branch's only observable effect and is
+                // replicated here, which extends the fuse to hurt-marked
+                // entities. ServerPlayers keep the Bukkit event path (the
+                // PlayerVelocityEvent branch can cancel the consumption via
+                // the z-return) and route vanilla.
+                if (ent instanceof net.minecraft.server.level.ServerPlayer) {
+                    ttlDeclSync++;
+                    return false;
+                }
+                ent.syncVelocity = false;
+            }
             // ALL conditions passed: this entity's tracker tick emits
-            // nothing. Reproduce the two unconditional effects:
-            ent.updateDataBeforeSync();                       // sendChanges bc 19-23
+            // nothing. Reproduce the unconditional effects:
+            ent.updateDataBeforeSync();                       // sendChanges bc 19-23 (javap: an EMPTY stub — the call itself is the whole effect)
             U.putInt(serverEntity, O_SE_TICKCOUNT,
                     U.getInt(serverEntity, O_SE_TICKCOUNT) + 1); // bc 1106-1113
             return true;
@@ -7526,10 +10792,123 @@ public final class CeHooks {
         }
     }
 
+    /** L63b — the cached fast path. The fill probe (ttlFastPath) proved,
+     *  under the SAME per-pass conditions this pass re-proves (players()
+     *  empty), the STRUCTURAL verdicts: chunk-players list empty, seenBy
+     *  empty, trackedPlayers empty, !hardColliding (a ctor-fixed field),
+     *  and the interp shape (NO_OP or a SteppedInterpolationTracker). None
+     *  of those can change without a player or a new TrackedEntity — the
+     *  te identity check (TT_REF[ob] == te) covers the latter, the per-pass
+     *  players gate covers the former. What CAN change every tick stays a
+     *  per-entity read here: syncVelocity (markHurt), syncPosition (the
+     *  bounce/ServerEntity writers), and — for SIT entities — the
+     *  trackedSteps emptiness (addStep is NOT player-gated: the L62b
+     *  decline must re-fire on any live step). The replicated effects are
+     *  byte-identical to the fill path's fused tail. */
+    /** L92: the quiet-cohort skip — the bitset was stamped by THIS tick's
+     *  item-tick applier (cleared at every flush entry) and the slot
+     *  identity still pins the same entity. The tracker pass's remaining
+     *  per-tick work for such an entity (the ServerEntity.tickCount mirror
+     *  bump) already ran inline in the flush. */
+    private static boolean ttlQuietSkip(Entity ent, int m) {
+        long[] tq = TT_QUIET;
+        if (tq == null) return false;
+        int q = m & 63;
+        int w = m >> 6;
+        if ((tq[w] & (1L << q)) == 0) return false;
+        Object[] rq = TT_REF;
+        return rq != null && rq[m * 5 + 2] == ent;
+    }
+
+    private static boolean ttlCachedPath(Entity ent, int m) {
+        // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
+        // read — the te Unsafe hop existed only to prove the slot).
+        // probeRemove clears the slot unconditionally, so a removed
+        // entity can never pass; a re-tracked entity (fresh te for a
+        // fresh add) re-fills.
+        Object[] rf = TT_REF;
+        if (rf == null) return false;
+        int ob = m * 5;
+        if (rf[ob + 2] != ent) return false;
+        long[] fl = TT_FLAT;
+        if (fl == null) return false;
+        int lb = m * 2;
+        long sh = fl[lb];
+        if ((sh & TT_OK) == 0) return false;
+        // L67: typed read — the te identity above pins this slot to the
+        // fill that validated the type (the fill probe's instanceof is
+        // the check; per-tick it is a proven tautology).
+        net.minecraft.server.level.ServerEntity serverEntity =
+                (net.minecraft.server.level.ServerEntity) rf[ob + 1];
+        if (serverEntity == null) {
+            return false;
+        }
+        ttlFuseChecks++;
+        try {
+            if ((sh & TT_SIT) != 0) {
+                // L65: the interp handler and the steps LIST are fill-cached
+                // (both final; the te identity pins the chain) — the per-tick
+                // reads are the cached refs' live state.
+                if (O_SIT_DELTA < 0 || O_SIT_TICKS < 0 || O_ENT_SYNC_POS < 0) {
+                    return false;
+                }
+                Object sitObj = rf[ob + 3];
+                if (sitObj == null) {
+                    return false; // L67: the type was fill-proven
+                }
+                Object steps = rf[ob + 4];
+                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                    return false; // a live step: addStep would mutate — vanilla
+                }
+                if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
+                    return false; // the syncPosition branch is live: addStep
+                }
+                U.putObject(sitObj, O_SIT_DELTA,
+                        net.minecraft.world.phys.Vec3.ZERO);
+                U.putInt(sitObj, O_SIT_TICKS,
+                        U.getInt(sitObj, O_SIT_TICKS) + 1);
+            }
+            if (ent.syncVelocity) {
+                // the L61 consumption (same shape as the fill path)
+                if (ent instanceof net.minecraft.server.level.ServerPlayer) {
+                    return false;
+                }
+                ent.syncVelocity = false;
+            }
+            ent.updateDataBeforeSync();
+            // L70: the cached path runs ONLY while the cm is ARMED — the
+            // increment rides the mirror (the real field is handed back on
+            // the armed->disarmed transition; the L70 tail below);
+            // the real RMW stays the fallback.
+            if (TT_MIRROR) {
+                fl[lb + 1] = fl[lb + 1] + 1;
+            } else {
+                U.putInt(serverEntity, O_SE_TICKCOUNT,
+                        U.getInt(serverEntity, O_SE_TICKCOUNT) + 1);
+            }
+            ttlCache++;
+            return true;
+        } catch (Throwable cacheFail) {
+            return false; // route the exact vanilla pair — never break tracking
+        }
+    }
+
+    /** L70 helper: the tracked entity read the main loop performs (the
+     *  direct offset when resolved, the interface call otherwise). */
+    private static Object trackedEntityOf(Entity ent) {
+        return (O_ENT_TRACKED >= 0 && U != null)
+                ? U.getObject(ent, O_ENT_TRACKED)
+                : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
+                        .moonrise$getTrackedEntity();
+    }
+
     /** Replacement body of ChunkMap.newTrackerTick() — the byte-exact
-     *  vanilla loop (javap-anchored) with the L30 fused fast path. */
+     *  vanilla loop (javap-anchored) with the L30 fused fast path and the
+     *  L63b cached fast path (fill = the L30 probe; hit = the cache). */
     public static void newTrackerTick$(Object cmObj) {
         ttlCalls++;
+        ttlMemoChunk = null; // L59a: fresh chunk reads every pass
+        ttlMemoEmpty = true;
         setIterating(cmObj, true);
         try {
             Object listObj = VH_CM_TRACKERS.getObj(cmObj);
@@ -7539,19 +10918,230 @@ public final class CeHooks {
             // same cast here; a CCE is the honest vanilla-shaped failure.
             Entity[] raw = (Entity[]) list.getRawDataUnchecked();
             int size = list.size();
+            // L63b per-pass hoists: the ON/handles checks ran PER ENTITY
+            // inside ttlFastPath before this (a volatile read + three
+            // offset compares per entity per tick). All of them are
+            // pass-stable — hoisted. The players() gate is ONE read per
+            // pass: any ServerPlayer in the level disables the cache (the
+            // fill probe still runs and the vanilla decline path is
+            // untouched; with players present the L30 probe alone is the
+            // exact behavior).
+            boolean on = TTL_ON && TTL_HANDLES_OK && U != null
+                    && O_TE_SE > 0 && O_ENT_TRACKED >= 0
+                    // the ttlFastPath per-entity guard, hoisted: with any of
+                    // these negative the L30 probe declined EVERY entity —
+                    // the whole loop routed vanilla; replicate exactly.
+                    && O_TE_SEEN > 0 && O_SE_TRACKED_PLAYERS > 0
+                    && O_SE_INTERP > 0 && O_SE_TICKCOUNT > 0;
+            boolean cacheArm = false;
+            if (on) {
+                cacheArm = TT_REF != null && TT_FLAT != null
+                        && O_ENT_SYNC_POS >= 0;
+                // L99: the PLAYER-QUIET gate (was: players().isEmpty()). The
+                // tracker skip is exact for a quiet entity only while the
+                // tracking geometry is STATIC: moonrise$tick owns the
+                // subscription sets, and a MOVED player adds/removes
+                // subscribers a skipped tick would miss. The bench bot
+                // stands still — arm; any player movement (or a changed
+                // player list) disarms this tick and the leg serves the
+                // full vanilla tracker. The old is-empty gate kept the
+                // whole cache dead in every player-present benchmark.
+                if (cacheArm) {
+                    try {
+                        java.util.List<?> pl = ((net.minecraft.server.level.ChunkMap) cmObj)
+                                .level.players();
+                        int pn = pl.size();
+                        long h = pn;
+                        for (int pi = 0; pi < pn && cacheArm; pi++) {
+                            Object pe = pl.get(pi);
+                            double px = ((net.minecraft.world.entity.Entity) pe).getX();
+                            double py = ((net.minecraft.world.entity.Entity) pe).getY();
+                            double pz = ((net.minecraft.world.entity.Entity) pe).getZ();
+                            float pyr = ((net.minecraft.world.entity.Entity) pe).getYRot();
+                            float ppi = ((net.minecraft.world.entity.Entity) pe).getXRot();
+                            h = h * 31 + Double.doubleToLongBits(px);
+                            h = h * 31 + Double.doubleToLongBits(py);
+                            h = h * 31 + Double.doubleToLongBits(pz);
+                            h = h * 31 + Float.floatToIntBits(pyr);
+                            h = h * 31 + Float.floatToIntBits(ppi);
+                        }
+                        Long prev = TT_PQ_HASH.get(cmObj);
+                        if (prev == null || prev != h) {
+                            TT_PQ_HASH.put(cmObj, h);
+                            cacheArm = pn == 0; // first sight: arm only if playerless
+                        }
+                        // unchanged player set AND unchanged positions: arm
+                        // (the static geometry keeps every skip exact)
+                    } catch (Throwable pqFail) {
+                        cacheArm = false;
+                    }
+                }
+                if (!cacheArm) ttlPopBlock++;
+                // L70: the tickCount mirror reconcile on the armed-state
+                // transition (and on first sight of this ChunkMap). One list
+                // walk per transition; the steady state walks nothing. Any
+                // failure disables the mirror globally (TT_MIRROR=false) — the
+                // cached path falls back to the real RMW, which is exact
+                // once the mirror is off (the real field is authoritative
+                // again from the next tick).
+                if (TT_MIRROR) {
+                    int cmi = -1;
+                    boolean lastArm = false;
+                    boolean known = false;
+                    for (int t = 0; t < TT_ARM_CM.length; t++) {
+                        if (TT_ARM_CM[t] == cmObj) {
+                            cmi = t;
+                            lastArm = TT_ARM_VAL[t];
+                            known = true;
+                            break;
+                        }
+                    }
+                    if (!known) {
+                        cmi = (int) (ttlCalls & (TT_ARM_CM.length - 1));
+                        TT_ARM_CM[cmi] = cmObj;
+                        lastArm = !cacheArm; // force the reconcile below
+                    }
+                    if (cacheArm != lastArm) {
+                        try {
+                            Object[] rfr = TT_REF;
+                            long[] flr = TT_FLAT;
+                            for (int i = 0; i < size; i++) {
+                                Entity ent = raw[i];
+                                int m = entId(ent) & AMASK;
+                                int ob2 = m * 5;
+                                Object te2 = trackedEntityOf(ent);
+                                if (te2 == null || rfr[ob2] != te2) continue;
+                                Object se2 = U.getObject(te2, O_TE_SE);
+                                if (!(se2 instanceof net.minecraft.server.level.ServerEntity)) continue;
+                                if (cacheArm) { // re-capture: the real field is the truth
+                                    flr[m * 2 + 1] = U.getInt(se2, O_SE_TICKCOUNT);
+                                } else {        // hand the mirror back
+                                    U.putInt(se2, O_SE_TICKCOUNT,
+                                            (int) flr[m * 2 + 1]);
+                                }
+                            }
+                            TT_ARM_VAL[cmi] = cacheArm;
+                        } catch (Throwable reconcileFail) {
+                            TT_MIRROR = false; // mirror off; real RMW everywhere
+                        }
+                    } else if (!known) {
+                        TT_ARM_VAL[cmi] = cacheArm;
+                    }
+                }
+            }
+            // L92: the quiet-skip arm: the mirror state AFTER the reconcile
+            // block above. Stamps made under TT_MIRROR=true are consumed only
+            // while the mirror still owns the counter (a mid-pass reconcile
+            // failure routes everything conservative).
+            boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON
+                    && ACTIVE && ITEM_TICK_ON; // L99: no applier -> no reset path -> stale bits
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
                 // direct offset when resolved, the interface call otherwise.
+                // L63b/L72: the cached path first (ONE array-read identity
+                // compare for the bulk of the population) — the te read and
+                // the chunk read are both deferred behind the cache check,
+                // the fill probe on any doubt.
+                if (cacheArm) {
+                    int m0 = entId(ent) & AMASK;
+                    // L92: the applier-stamped quiet cohort — the mirror bump
+                    // already ran inline in the item-tick flush; skip the
+                    // whole probe chain (the cached path's remaining work for
+                    // such an entity was exactly that bump).
+                if (quietArm && ttlQuietSkip(ent, m0)) {
+                    ttlQuiet++;
+                    // L99: the mirror bump lives HERE (was in the applier
+                    // stamp) - a persistent-quiet slot owes exactly one
+                    // tickCount increment per tick no matter who stamped
+                    // it or whether the applier saw it at all.
+                    long[] flb = TT_FLAT;
+                    if (flb != null && TT_MIRROR) {
+                        int lb0 = m0 * 2;
+                        flb[lb0 + 1] = flb[lb0 + 1] + 1;
+                    }
+                    continue;
+                }
+                    if (ttlCachedPath(ent, m0)) {
+                        ttlFuse++;
+                        continue;
+                    }
+                }
                 Object te = (O_ENT_TRACKED >= 0 && U != null)
                         ? U.getObject(ent, O_ENT_TRACKED)
                         : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
+                if (cacheArm) {
+                    int m = entId(ent) & AMASK;
+                    Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                            .moonrise$getChunkData().nearbyPlayers;
+                    if (ttlFastPath(ent, te, chunk)) {
+                        ttlFuse++;
+                        try { // fill: cache the structural verdicts + refs
+                            net.minecraft.server.level.ServerEntity se0 =
+                                    (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
+                            Object interp = O_SE_INTERP > 0
+                                    ? U.getObject(se0, O_SE_INTERP) : null;
+                            Object[] rff = TT_REF;
+                            long[] flf = TT_FLAT;
+                            int ob = m * 5;
+                            rff[ob] = te;
+                            rff[ob + 1] = se0;
+                            rff[ob + 2] = ent;
+                            // L70: stamp the mirror from the real field
+                            // (the fast path just did its real RMW — the
+                            // stamp captures the post-increment truth)
+                            flf[m * 2 + 1] = U.getInt(se0, O_SE_TICKCOUNT);
+                            flf[m * 2] = TT_OK;
+                            if (interp instanceof
+                                            net.minecraft.world.entity
+                                                    .SteppedInterpolationTracker
+                                    && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
+                                    && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
+                                rff[ob + 3] = interp;
+                                rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
+                                flf[m * 2] = TT_OK | TT_SIT;
+                            }
+                            ttlFill++;
+                        } catch (Throwable fillFail) {
+                            TT_REF[m * 5] = null;
+                        }
+                        continue;
+                    }
+                    ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$tick((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk);
+                    // vanilla bc 71-94: sendChanges iff hasPlayers() OR the
+                    // entity's chunk is entity-ticking — NO negation (the
+                    // first weave shipped with an inverted !hasPlayers();
+                    // players tracking an entity in a non-entity-ticking
+                    // chunk would have missed every update).
+                    if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$hasPlayers()
+                            || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                                    .moonrise$getChunkStatus()
+                                    .isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
+                        ((net.minecraft.server.level.ServerEntity) VH_TE_SERVERENT.getObj(te))
+                                .sendChanges();
+                    }
+                    // L70: the decline tick ran the REAL sendChanges (its own
+                    // tickCount++ inside — the L26 fast exit or the vanilla
+                    // body) — re-capture so the mirror never forks from the
+                    // real counter while armed. Skipped when disarmed (the
+                    // real field is the truth there; the re-arm transition
+                    // walk re-captures everything).
+                    long[] flc = TT_FLAT;
+                    Object[] rfc = TT_REF;
+                    if (flc != null && rfc != null && rfc[m * 5] == te) {
+                        Object se2 = U.getObject(te, O_TE_SE);
+                        if (se2 instanceof net.minecraft.server.level.ServerEntity) {
+                            flc[m * 2 + 1] = U.getInt(se2, O_SE_TICKCOUNT);
+                        }
+                    }
+                    continue;
+                }
                 Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                         .moonrise$getChunkData().nearbyPlayers;
-                // L30: the fused no-tracking fast path (declines to the
-                // exact vanilla pair on any doubt).
                 if (ttlFastPath(ent, te, chunk)) {
                     ttlFuse++;
                     continue;
@@ -7622,6 +11212,201 @@ public final class CeHooks {
         EFF_ON = on;
     }
 
+    // ==================================================================
+    // L62 — the empty-equipment floors. The fresh mobs profile (2ed4aba)
+    // pins two per-mob-per-tick walks on EMPTY equipment:
+    //   1. EnchantmentHelper.tickEffects (javap: the lambda visitor + ONE
+    //      runIterationOnEquipment call, bc 0-11) — 47.5% of the
+    //      ImmutableList$ListItr leaves (6.32% of the leg) ride it from
+    //      LivingEntity.baseTick. With every equipment slot EMPTY the walk
+    //      reads six EMPTY stacks' ENCHANTMENTS components and the visitor
+    //      never fires — a provable no-op.
+    //   2. LivingEntity.detectEquipmentUpdates -> collectEquipmentChanges
+    //      (javap bc 4-208) — 39.3% of the same leaves from
+    //      LivingEntity.tick. With every slot EMPTY and the
+    //      lastEquipmentItems map already primed with the EMPTY singletons,
+    //      equipmentHasChanged (= !ItemStack.matches) is false per slot,
+    //      the changes maps stay null (return null), the refresh puts write
+    //      EMPTY over EMPTY, and the caller's handleHandSwap/
+    //      handleEquipmentChanges never run — the whole body is a no-op.
+    // Any present item, an unprimed map (the first tick) or any shape doubt
+    // routes the exact vanilla body. The tickEffects guard is an EARLY-
+    // RETURN PREFIX (op-5 guard2, static locals 0+1) — the vanilla body
+    // stays intact behind the check. L62a lesson (2026-11-02, parity
+    // mobs-ON leg): the first cut ReplaceBody'd tickEffects and replayed
+    // vanilla via a direct EnchantmentHelper.tickEffects call — which IS
+    // the woven body — so every helmeted mob (the fill's UNBREAKING-255
+    // iron helmets) recursed into its own guard until StackOverflowError,
+    // and Paper's per-entity tick handler removed every thrower: the
+    // world emptied at the arming tick. A replay into the woven static
+    // can NEVER be the decline path; the equip floor replays through the
+    // UNWOVEN protected trio and is immune by construction.
+    // ==================================================================
+
+    public static volatile boolean ENCH_ON = false;
+    public static final boolean ENCH_FLAG_ON =
+            !"false".equals(System.getProperty("centities.enchTick", "true"));
+    public static volatile boolean EQUIP_ON = false;
+    public static final boolean EQUIP_FLAG_ON =
+            !"false".equals(System.getProperty("centities.equipUpdates", "true"));
+    // liveness counters for the verifier (PLAIN longs — same reasoning as
+    // frozenCalls: bumped on every bridge entry, proven before arming).
+    public static long enchCalls = 0, enchGate = 0;
+    public static long equipCalls = 0, equipGate = 0, equipVanilla = 0;
+
+    public static void setEnchTickGateOn(boolean on) {
+        ENCH_ON = on;
+    }
+
+    public static void setEquipGateOn(boolean on) {
+        EQUIP_ON = on;
+    }
+
+/** tickEffects(ServerLevel,LivingEntity) guard: TRUE = the all-empty
+ *  equipment early-out ran (the vanilla body is skipped — a provable
+ *  no-op); FALSE = the vanilla body follows IN THE SAME METHOD (the
+ *  guard is an early-return prefix woven ahead of the untouched body).
+ *  NEVER replay vanilla by calling the woven static from here — that
+ *  re-enters this guard and recurses (the L62a lesson). */
+    public static boolean enchGate$(net.minecraft.server.level.ServerLevel level,
+            net.minecraft.world.entity.LivingEntity e) {
+        enchCalls++;
+        if (!ENCH_ON) return false;
+        try {
+            if (e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty()
+                    && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty()) {
+                enchGate++;
+                return true;
+            }
+        } catch (Throwable gateFail) {
+            // route the exact vanilla body
+        }
+        return false;
+    }
+
+    // The protected trio behind the detectEquipmentUpdates decline path,
+    // resolved once against the live LivingEntity class.
+    private static volatile boolean EQUIP_HANDLES_OK = false;
+    private static java.lang.reflect.Method M_COLLECT_EQUIP;
+    private static java.lang.reflect.Method M_HANDLE_HAND_SWAP;
+    private static java.lang.reflect.Method M_HANDLE_EQUIP_CHANGES;
+    private static volatile RefField VH_LE_LAST_EQUIP; // LivingEntity.lastEquipmentItems
+
+    public static void initEquipHandles() {
+        try {
+            Class<?> le = net.minecraft.world.entity.LivingEntity.class;
+            M_COLLECT_EQUIP = le.getDeclaredMethod("collectEquipmentChanges", java.util.Map.class);
+            M_COLLECT_EQUIP.setAccessible(true);
+            M_HANDLE_HAND_SWAP = le.getDeclaredMethod("handleHandSwap", java.util.Map.class);
+            M_HANDLE_HAND_SWAP.setAccessible(true);
+            M_HANDLE_EQUIP_CHANGES = le.getDeclaredMethod("handleEquipmentChanges", java.util.Map.class);
+            M_HANDLE_EQUIP_CHANGES.setAccessible(true);
+            VH_LE_LAST_EQUIP = new RefField(le, "lastEquipmentItems");
+            EQUIP_HANDLES_OK = M_COLLECT_EQUIP != null && M_HANDLE_HAND_SWAP != null
+                    && M_HANDLE_EQUIP_CHANGES != null && VH_LE_LAST_EQUIP.off >= 0;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initEquipHandles: " + t;
+            EQUIP_HANDLES_OK = false;
+        }
+    }
+
+    /** Replacement body of LivingEntity.detectEquipmentUpdates(). */
+    @SuppressWarnings("unchecked")
+    public static void equipUpdates$(net.minecraft.world.entity.LivingEntity e) {
+        equipCalls++;
+        if (EQUIP_ON && EQUIP_HANDLES_OK) {
+            try {
+                java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> last =
+                        (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                                VH_LE_LAST_EQUIP.getObj(e);
+                if (last != null) {
+                    // The no-change gate: every slot EMPTY now and the cache
+                    // primed with the same EMPTY singleton — matches() true
+                    // per slot, the refresh puts idempotent, the result null,
+                    // the handles never called. Value-exact skip.
+                    if (last.get(net.minecraft.world.entity.EquipmentSlot.MAINHAND)
+                            == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.HEAD)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.CHEST)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.LEGS)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && last.get(net.minecraft.world.entity.EquipmentSlot.FEET)
+                                    == net.minecraft.world.item.ItemStack.EMPTY
+                            && e.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET)
+                                    == net.minecraft.world.item.ItemStack.EMPTY) {
+                        equipGate++;
+                        return;
+                    }
+                }
+            } catch (Throwable gateFail) {
+                // route the exact vanilla body
+            }
+        }
+        // The vanilla body, replayed: collectEquipmentChanges on the live
+        // lastEquipmentItems, then the null/isEmpty guard around the two
+        // handlers. The reflection cost rides the CHANGED path only.
+        if (!EQUIP_HANDLES_OK) {
+            // Unreachable when the weave is applied (the Rust side proves the
+            // handles BEFORE replace_body) — the degraded last resort is a
+            // logged skip, never a re-entry into this replaced body.
+            lastError = System.nanoTime();
+            lastErrorText = "equipUpdates$: handles broken, body skipped";
+            return;
+        }
+        try {
+            java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> last =
+                    (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                            VH_LE_LAST_EQUIP.getObj(e);
+            java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack> changes =
+                    (java.util.Map<net.minecraft.world.entity.EquipmentSlot, net.minecraft.world.item.ItemStack>)
+                            M_COLLECT_EQUIP.invoke(e, last);
+            if (changes != null) {
+                M_HANDLE_HAND_SWAP.invoke(e, changes);
+                if (!changes.isEmpty()) {
+                    M_HANDLE_EQUIP_CHANGES.invoke(e, changes);
+                }
+            }
+            equipVanilla++;
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            // The vanilla body threw — propagate EXACTLY as vanilla would
+            // (its caller is LivingEntity.tick, which declares nothing).
+            Throwable t = ite.getCause();
+            if (t instanceof RuntimeException re) {
+                throw re;
+            }
+            if (t instanceof Error err) {
+                throw err;
+            }
+            throw new RuntimeException(t);
+        } catch (IllegalAccessException iae) {
+            // Only realistic on a class reload; the equipment handling for
+            // this entity-tick is lost, the floor self-disarms (the verifier
+            // re-arms after a fresh prove). Never re-enter the replaced body.
+            EQUIP_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "equipUpdates$ replay: " + iae;
+        }
+    }
+
     private static void setTickingFlag(net.minecraft.world.entity.LivingEntity e, boolean v) {
         RefField rf = VH_LE_TICKING;
         try {
@@ -7666,6 +11451,29 @@ public final class CeHooks {
     public static void setTicksFrozen$(Entity e, int i) {
         frozenCalls++;
         if (FROZEN_ON && FROZEN_HANDLES_OK) {
+            // L68: memo-first — a slot hit replaces the whole direct walk.
+            // The setter is the accessor's only writer (jar-scan proof), so
+            // FROZ_V[m] IS the live value whenever FROZ_E[m] == e; every
+            // real write below refreshes the slot on its way out.
+            if (FROZ_MEMO_OK) {
+                int m = entId(e) & AMASK;
+                if (FROZ_E[m] == e) {
+                    if (FROZ_V[m] == i) {
+                        frozenDirect++;
+                        frozenGate++;
+                        return;
+                    }
+                    // memo says the value differs: the write is real
+                    frozenWrites++;
+                    ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA
+                            .getObj(e)).set(Entity.DATA_TICKS_FROZEN, Integer.valueOf(i));
+                    FROZ_V[m] = i;
+                    return;
+                }
+                // slot miss: fall through to the proven direct walk — both
+                // of its exits fill the memo (the walk that proves the
+                // value also stamps it).
+            }
             // L25: the direct-read gate — one typed Unsafe walk instead of
             // the getTicksFrozen() boxed chain. LAYERED after the e2e
             // forensics (a77b3ea: the direct walk served zero catches while
@@ -7681,6 +11489,11 @@ public final class CeHooks {
                 if (cur instanceof Integer iv && iv.intValue() == i) {
                     frozenDirect++;
                     frozenGate++;
+                    if (FROZ_MEMO_OK) {
+                        int m = entId(e) & AMASK;
+                        FROZ_E[m] = e;
+                        FROZ_V[m] = i;
+                    }
                     return;
                 }
             } catch (Throwable directFail) {
@@ -7695,9 +11508,40 @@ public final class CeHooks {
                 // never swallow the write — fall through to the vanilla body
             }
             frozenWrites++;
+            if (FROZ_MEMO_OK) {
+                int m = entId(e) & AMASK;
+                FROZ_E[m] = e;
+                FROZ_V[m] = i;
+            }
         }
         ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e))
                 .set(Entity.DATA_TICKS_FROZEN, Integer.valueOf(i));
+    }
+
+    /** Replacement body of Entity.getTicksFrozen() — the L68 memo read.
+     *  javap 26.3: the vanilla body is the boxed entityData.get chain. The
+     *  jar-wide scan proves the setter is the accessor's only writer, so a
+     *  slot hit IS the live value; a miss reads the exact value via the
+     *  L64a direct walk (the boxed chain on any doubt) and fills. */
+    public static int getTicksFrozen$(Entity e) {
+        if (FROZ_MEMO_OK) {
+            int m = entId(e) & AMASK;
+            if (FROZ_E[m] == e) {
+                return FROZ_V[m];
+            }
+            if (IDX_FROZEN >= 0) {
+                Object cur = entityDataValueIdx(e, IDX_FROZEN);
+                if (cur instanceof Integer iv) {
+                    int v = iv.intValue();
+                    FROZ_E[m] = e;
+                    FROZ_V[m] = v;
+                    return v;
+                }
+            }
+            // direct-walk doubt: the exact vanilla chain, memo unfilled
+        }
+        return ((net.minecraft.network.syncher.SynchedEntityData) VH_ENT_DATA.getObj(e))
+                .get(Entity.DATA_TICKS_FROZEN);
     }
 
     /** Replacement body of ConversionTracker.setConverting(boolean). */

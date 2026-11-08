@@ -23,6 +23,9 @@ on:
       ce_merge:
         description: 'CE_MERGE for the mod leg (1=on, 0=merge fast path off — bisect knob)'
         default: '1'
+      ce_extra_env:
+        description: 'extra KEY=VAL pairs exported to the mod leg (space-separated, e.g. "CE_L108B=1")'
+        default: ''
 
 permissions:
   contents: write
@@ -30,7 +33,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # vanilla side (~20 min) + mod side (up to RUN_TIMEOUT*2s = 120 min)
+    # + paperclip boot x2 + builds (~8 min) with margin.
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       # ubuntu-26 runner images reclaim long JVM-heavy jobs (three runs lost
@@ -64,7 +69,14 @@ jobs:
       TILE_FURNACES: ${{ matrix.TILE_F }}
       MEASURE_TICKS: ${{ matrix.MEASURE }}
       AREA: ${{ matrix.AREA || '150' }}
-      RUN_TIMEOUT: '1100'
+      # Per-SIDE script watchdog (run-baseline.sh waits RUN_TIMEOUT*2s for
+      # baseline.json, then FATAL-kills the server): 1100 = 36.7 min/side —
+      # run 341 lost all three mod sides to THIS, not to the job timeout:
+      # a pre-L104 mod side ticks at 3.3-15.7 s/tick and needs 70-445 min.
+      # 3600 = 120 min/side covers spread-mod (93 min) and mobs-mod (70 min)
+      # at their CURRENT price, so a regression side still finishes and
+      # uploads its JFR instead of dying with baseline.json missing.
+      RUN_TIMEOUT: '3600'
       # 8G + JFR + 100k entities OOM-killed the 16GB runner on the big legs;
       # 5G still died on the new ubuntu-26 images — 4G plus the JFR maxsize
       # cap keeps the JVM footprint well inside the runner budget.
@@ -91,11 +103,6 @@ jobs:
         run: bash scripts/build-plugin.sh
       - name: Install mineflayer
         run: mkdir -p tools && cd tools && npm install mineflayer minecraft-data@3.117.0 --no-save --loglevel=error
-      - name: Run paired A/B (vanilla then module, same runner)
-        if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
-        run: |
-          bash scripts/run-baseline.sh
-          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Install ViaVersion + ViaBackwards (bench bot speaks 26.1; ViaBackwards is REQUIRED — ViaVersion alone refuses old clients, which is why every 26.3 run so far was playerless)
         run: |
           mkdir -p build/viaversion
@@ -109,6 +116,11 @@ jobs:
           curl -fsSL -o build/viaversion/ViaVersion.jar "$VV"
           curl -fsSL -o build/viaversion/ViaBackwards.jar "$VB"
 
+      - name: Run paired A/B (vanilla then module, same runner)
+        if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
+        run: |
+          bash scripts/run-baseline.sh
+          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} ${{ github.event.inputs.ce_extra_env || '' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
         if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh
@@ -173,7 +185,15 @@ jobs:
           # on reports/baseline/* (the L18 publish lost to the L17 one this
           # way; benchmarks are monotonic — the later run wins).
           git pull --rebase -X theirs origin main || git rebase --abort
-          git push || (git pull --rebase -X theirs origin main && git push)
+          # Push HEAD:main, not the current branch. Run 42396574161 (full-matrix
+          # workflow_dispatch on l104b-replay) failed here: the rebase onto main
+          # rewrote the branch onto a main base, so a plain `git push` went to
+          # origin/l104b-replay and was rejected non-fast-forward; the retry
+          # re-pulled main (a no-op) and hit the same rejection. After
+          # `pull --rebase origin main` HEAD is exactly origin/main + the
+          # results commit, so HEAD:main is always a fast-forward on main —
+          # both for push-event runs (checkout = main) and branch dispatches.
+          git push origin HEAD:main || (git pull --rebase -X theirs origin main && git push origin HEAD:main)
 
   # ubuntu-26 runners reclaim long JVM-heavy jobs at random ("runner
   # shutdown", exit 143) — the failure rate scales with leg DURATION, which
@@ -185,7 +205,7 @@ jobs:
   # overwrite committed reports) — artifacts are uploaded for forensics.
   rerun:
     needs: run
-    if: failure() && github.event_name == 'push'
+    if: ${{ always() && !success() && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -209,9 +229,11 @@ jobs:
           echo "failed legs: $FAILED"
           if [ -n "$FAILED" ]; then
             sleep 30  # let the runner fully release
+            # workflow_dispatch accepts a BRANCH/TAG name, not a SHA —
+            # run 341's rerun got HTTP 422 dispatching github.sha.
             CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
               -H "Authorization: token ${{ github.token }}" \
               "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/baseline.yml/dispatches" \
-              -d "{\"ref\":\"${{ github.sha }}\",\"inputs\":{\"only\":\"$FAILED\"}}")
+              -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"only\":\"$FAILED\"}}")
             echo "dispatch http=$CODE"
           fi

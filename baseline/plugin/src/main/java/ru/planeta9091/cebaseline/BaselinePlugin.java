@@ -83,9 +83,11 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
 
     // --- behavioral parity harness ---
     private boolean parity = false;
+    private boolean tlTraceOn = false;
     private long paritySeed = 4242L;
     private int parityFillStartTick = 100; // fixed-tick fill window start
     private long fillDoneTick = -1;
+    private long fillAnchorTick = -1; // L94: the absolute tick the fill's first batch spawns at
     private Object sharedRandom;           // net.minecraft...Entity.SHARED_RANDOM
     private boolean sharedRandomTried;
     private static final int[] PARITY_SNAP_OFFSETS = {50, 300};
@@ -119,6 +121,16 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         parity = "1".equals(env("PARITY", "0"));
         paritySeed = longEnv("PARITY_SEED", 4242L);
         traceId = (int) longEnv("PARITY_TRACE_ID", -1L);
+        // L54 diag: the tick-list order stream rides a SYSTEM property
+        // (ce.tl.trace=1) so a workflow_dispatch can arm it via extra_jvm
+        // (-Dce.tl.trace=1) without a new workflow input. The CE_TL_TRACE
+        // env var is the second, OBSERVED-RELIABLE arm path: the -D
+        // property failed to reach onEnable in the run 41234855357 leg
+        // (EXTRA_JVM carried the flag, the env dump showed it, zero TL
+        // lines and zero bind warnings — tlTraceOn stayed false), while
+        // every env() read in this class provably works (PD/PH fire).
+        tlTraceOn = "1".equals(firstNonEmpty(
+                System.getProperty("ce.tl.trace"), env("CE_TL_TRACE", "0")));
 
         // Neutralize non-entity noise.
         for (World w : Bukkit.getWorlds()) {
@@ -175,13 +187,36 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // stream evolves identically tick-by-tick. Any behavioral
             // difference (extra draw, different decision) diverges it.
             boolean seeded = seedSharedRandom("onEnable");
+            boolean lvlSeeded = seedLevelRandom("onEnable");
+            // L85b: the SR wrap installs HERE — at enable, before ANY
+            // entity exists. Entity.random is an INSTANCE field captured
+            // from the static in the constructor (javap 26.3: getstatic
+            // SHARED_RANDOM; putfield random), so an entity born before
+            // the wrap holds the original forever and its draws bypass
+            // the proxy. Run 307's SRC calls=0 was exactly that: the lazy
+            // install at the first non-empty tick postdated the whole
+            // fill. Early install = every fill mob carries the proxy =
+            // every entity draw is counted + framed. The wrap is a pure
+            // observer (it delegates to the SAME object the module's seed
+            // handoff reads/writes; the module unwraps via SrUnwrap), so
+            // the stream is untouched — the shipped-config neutrality
+            // gate proves it every push.
+            if (seeded) {
+                installSharedRandomWrap("onEnable");
+            }
             getLogger().info("PARITY harness armed: seed=" + paritySeed
-                    + " seeded=" + seeded
+                    + " seeded=" + seeded + " lvlSeeded=" + lvlSeeded
                     + " fillStartTick=" + parityFillStartTick + " (bot ignored)");
             Bukkit.getScheduler().runTaskTimer(this, () -> {
                 if (!started && tickNo >= parityFillStartTick) {
                     started = true; // ONE-SHOT — begin() must never run twice
-                    getLogger().info("PARITY: fixed-tick fill start at T" + tickNo);
+                    // Re-pin the WORLD random at fill-start: boot-phase draws
+                    // (spawn-point search, worldgen edges) may consume a
+                    // variable count of Level.random — a fresh seed here makes
+                    // the fill window's starting state seed-exact regardless.
+                    boolean lvl2 = seedLevelRandom("fill-start");
+                    getLogger().info("PARITY: fixed-tick fill start at T" + tickNo
+                            + " lvlSeeded=" + lvl2);
                     begin(null);
                 }
             }, 1L, 1L);
@@ -219,9 +254,66 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Level.random (protected final RandomSource on Level) is a SECOND
+    // entropy stream the old harness never pinned. Mob.finalizeSpawn —
+    // invoked by CraftRegionAccessor.addEntity on EVERY Bukkit-spawned
+    // mob (randomizeData=true) — draws its canPickUpLoot / baby-odds /
+    // CHICKEN-JOCKEY / canBreakDoors / equipment rolls from
+    // `level.getRandom()` (Mob.java:1201, 26.3), NOT from
+    // SHARED_RANDOM. Unpinned, the two legs rolled different jockeys:
+    // the vanilla off-leg itself varied across CI runs (n_off=2505/2506/
+    // 2508 at mobs-T382) and every knob config "failed" with ~10-12
+    // CHICKEN<->ZOMBIE flips that were NEVER the module's fault.
+    // LegacyRandomSource.setSeed is freely re-callable (no lock, unlike
+    // SHARED_RANDOM) — pin it once at enable and once at fill-start
+    // (a fill-start re-pin also absorbs any variable boot-phase draw
+    // count, making the fill window's starting state seed-exact).
+    // ------------------------------------------------------------------
+    private java.lang.reflect.Method lvlSeedM;
+    private Object lvlRandom;
+    private boolean lvlRandomTried;
+
+    private boolean seedLevelRandom(String where) {
+        try {
+            if (!lvlRandomTried) {
+                lvlRandomTried = true;
+                World w = Bukkit.getWorlds().get(0);
+                Object sl = w.getClass().getMethod("getHandle").invoke(w);
+                Field f = null;
+                for (Class<?> c = sl.getClass(); c != null && f == null; c = c.getSuperclass()) {
+                    try {
+                        f = c.getDeclaredField("random");
+                    } catch (NoSuchFieldException ignore) { }
+                }
+                if (f == null) return false;
+                f.setAccessible(true);
+                lvlRandom = f.get(sl);
+                if (lvlRandom == null) return false;
+                lvlSeedM = lvlRandom.getClass().getMethod("setSeed", long.class);
+                lvlSeedM.setAccessible(true);
+            }
+            if (lvlRandom == null || lvlSeedM == null) return false;
+            lvlSeedM.invoke(lvlRandom, paritySeed ^ 0x9E3779B97F4A7C15L);
+            return true;
+        } catch (Throwable t) {
+            getLogger().warning("PARITY: cannot seed Level.random (" + where + "): " + t);
+            return false;
+        }
+    }
+
     private static String env(String k, String d) {
         String v = System.getenv(k);
         return v == null || v.isEmpty() ? d : v;
+    }
+
+    /** First non-null, non-empty candidate (the diag-knob arm path:
+     * a -D system property with an env fallback). */
+    private static String firstNonEmpty(String... vs) {
+        for (String v : vs) {
+            if (v != null && !v.isEmpty()) return v;
+        }
+        return "";
     }
 
     private static int intEnv(String k, int d) {
@@ -274,12 +366,28 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         }
 
         phase = "FILL";
+        // L94: the fill phase is pinned in ABSOLUTE plugin ticks. The old
+        // registration relied on the scheduler's RELATIVE 40-tick delay,
+        // whose first-fire tick depends on WHERE within the boot the
+        // begin() poll task happened to cross its tickNo threshold - a
+        // +-1 REAL-tick race between the A/B legs (observed locally: the
+        // OFF leg's first spawn batch at tickNo 141, the ON leg's at 140;
+        // reproduced across two boots of the same seed). The shifted fill
+        // phase shifts every mob's tickCount at the same game tick, the
+        // (tickCount+id) cadence gate flips, the AI'd sets diverge by one
+        // tick, the shared-RNG consumer order splits at the first goal
+        // start, and the whole A/B reads as an engine divergence. The
+        // fillStep now polls the absolute anchor instead.
+        fillAnchorTick = tickNo + 40L;
         Bukkit.getScheduler().runTaskTimer(this, this::fillStep, 40L, 1L);
     }
 
     private void fillStep() {
         World w = Bukkit.getWorlds().get(0);
         if (tickNo < 1) return;
+        // L94: the absolute fill-phase pin - the spawns wait for the SAME
+        // plugin tick in both legs regardless of the scheduler phase.
+        if (tickNo < fillAnchorTick) return;
 
         // --- entities ---
         if (spawnedItems + spawnedStands + spawnedZombies < scale) {
@@ -393,8 +501,17 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 }
             }
         }
+        if (parity) {
+            logParityHash();
+            // L77-hunt: the per-tick Level.random call count + the caller
+            // frames inside the window (LRC_WINDOW="lo-hi", default 138-150)
+            lrcTickEnd();
+        }
         if (parity && traceId >= 0) {
             traceStep();
+        }
+        if (parity && tlTraceOn && phDumpActive()) {
+            dumpTickList();
         }
         switch (phase) {
             case "WARMUP" -> {
@@ -666,7 +783,807 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     // L37 parity diagnostics: lazily-bound NMS accessors for tickCount /
     // activatedTick (parity mode only — perf irrelevant there).
     private static volatile java.lang.reflect.Method PARITY_GET_HANDLE;
-    private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED;
+    private static volatile java.lang.reflect.Field PARITY_TICK_COUNT, PARITY_ACTIVATED,
+            PARITY_NCOL;
+    private static volatile java.lang.reflect.Method PQ_METHOD;
+    private static volatile Object PQ_LEVEL;
+    private static volatile java.lang.reflect.Method PQ_BB;
+
+    // ------------------------------------------------------------------
+    // PARITY PHASH: per-tick ORDER-INDEPENDENT checksum of the whole
+    // observable entity state. One "PH t=.. h=.. n=.. adds=.." line per
+    // tick in each leg's log (parity mode only); a post-hoc diff of the
+    // two legs' log streams names the FIRST diverging tick and scenario —
+    // the snapshot triple only shows T+50/+300/+650 accumulations, which
+    // is useless for locating the seed of a cascade (observed: mixed has
+    // 3814 type flips by T389 — the seed is ticks earlier, invisible in
+    // snapshots). Order-independent by construction: commutative sum of a
+    // per-entity 64-bit avalanche, so the world's entity-list iteration
+    // order can neither fake nor mask a divergence. Spawn divergence is
+    // visible through adds= (entity ids are monotonic within a session,
+    // so id > watermark <=> new entity); removals are derivable post-hoc
+    // (n_prev - n + adds). Zero allocation: MethodHandles with primitive
+    // signatures (no boxing), ~8 invokes + 7 multiplies per entity.
+    // ------------------------------------------------------------------
+    private static volatile java.lang.invoke.MethodHandle PH_GET_HANDLE,
+            PH_X, PH_Y, PH_Z, PH_DM, PH_VX, PH_VY, PH_VZ, PH_TC;
+    // L91: Entity.tickCount getter — the PD avalanche CANNOT see a counter
+    // phase shift (a mob ticked one extra time at spawn / a gate reading the
+    // post-increment field leaves x/y/z/v identical on that tick). Mixing
+    // tickCount into the per-entity hash makes the FIRST tick where the
+    // legs' tc phases split light up in the PD diff directly; the TC line
+    // (below) aggregates the distribution so the reach difference (the
+    // fresh batch's first AI tick: spawn tick vs s+1) is readable per tick
+    // without any post-processing.
+    private long phMaxId;
+    private long phLines;
+    private long phFails;
+
+    // PH_DUMP="140-158,170": at those ticks each leg additionally streams
+    // per-entity "PD t=.. id:m id:m .." lines (10 pairs/line) where m is the
+    // SAME per-entity avalanche the total PH h is built from — a post-hoc
+    // OFF-vs-ON diff of the (id -> m) multisets names the exact culprit
+    // ENTITY (and re-summing phMix(m) must reproduce h, which cross-checks
+    // the dump integrity). Stage 2 then aims PARITY_TRACE_ID at that id.
+    private int[] phDumpRanges;
+
+    private boolean phDumpActive() {
+        int[] r = phDumpRanges;
+        if (r == null) {
+            String s = System.getenv("PH_DUMP");
+            if (s == null || s.isBlank()) {
+                r = new int[0];
+            } else {
+                java.util.ArrayList<Integer> lo = new java.util.ArrayList<>();
+                java.util.ArrayList<Integer> hi = new java.util.ArrayList<>();
+                for (String tok : s.split(",")) {
+                    tok = tok.trim();
+                    if (tok.isEmpty()) continue;
+                    int dash = tok.indexOf('-');
+                    try {
+                        if (dash > 0) {
+                            lo.add(Integer.parseInt(tok.substring(0, dash)));
+                            hi.add(Integer.parseInt(tok.substring(dash + 1)));
+                        } else {
+                            int v = Integer.parseInt(tok);
+                            lo.add(v); hi.add(v);
+                        }
+                    } catch (NumberFormatException quiet) { }
+                }
+                r = new int[lo.size() * 2];
+                for (int i = 0; i < lo.size(); i++) { r[i * 2] = lo.get(i); r[i * 2 + 1] = hi.get(i); }
+            }
+            phDumpRanges = r;
+        }
+        for (int i = 0; i < r.length; i += 2) {
+            if (tickNo >= r[i] && tickNo <= r[i + 1]) return true;
+        }
+        return false;
+    }
+
+    private static long phMix(long k) {
+        k *= 0x9E3779B97F4A7C15L;
+        k ^= k >>> 30; k *= 0xBF58476D1CE4E5B9L;
+        k ^= k >>> 27; k *= 0x94D049BB133111EBL;
+        return k ^ (k >>> 31);
+    }
+
+    private void phBind(Object nmsSample) {
+        try {
+            var lk = java.lang.invoke.MethodHandles.lookup();
+            // Bind from the NMS BASE class, not the sample's runtime class:
+            // unreflect + asType inserts a CHECKCAST to the receiver type —
+            // a ServerItemEntity-typed handle throws CCE for the first
+            // zombie/stand/chicken and the stream dies (observed: mixed and
+            // spread streams end at t=140, the first non-item tick; items
+            // legs — 100% one class — lived).
+            Class<?> nms = Class.forName(
+                    "net.minecraft.world.entity.Entity",
+                    false, getClass().getClassLoader());
+            java.lang.reflect.Method m;
+            m = nms.getMethod("getX"); PH_X = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getY"); PH_Y = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getZ"); PH_Z = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            m = nms.getMethod("getDeltaMovement");
+            PH_DM = lk.unreflect(m)
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
+            // 26.3 Vec3: x/y/z are PUBLIC FINAL FIELDS (no getX accessors —
+            // observed: NoSuchMethodException Vec3.getX() killed the bind
+            // after PH_X/Y/Z/DM were assigned, so the loop ran with null
+            // PH_VX/VY/VZ and the NPE silenced every later tick).
+            Class<?> vec3 = m.getReturnType();
+            PH_VX = lk.findGetter(vec3, "x", double.class)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            PH_VY = lk.findGetter(vec3, "y", double.class)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            PH_VZ = lk.findGetter(vec3, "z", double.class)
+                    .asType(java.lang.invoke.MethodType.methodType(double.class, Object.class));
+            // L91: tickCount is a PUBLIC int field on the NMS Entity (the
+            // module reads it directly) — a plain findGetter bind.
+            PH_TC = lk.findGetter(nms, "tickCount", int.class)
+                    .asType(java.lang.invoke.MethodType.methodType(int.class, Object.class));
+        } catch (Throwable t) {
+            getLogger().warning("PH bind failed (n/adds only): " + t);
+        }
+    }
+
+    private void logParityHash() {
+        try {
+            List<Entity> ents = Bukkit.getWorlds().get(0).getEntities();
+            int n = ents.size();
+            // seed the sum with the tick so a symmetric remove+respawn in
+            // one tick cannot produce a constant stream
+            long h = phMix(tickNo);
+            long adds = 0, maxId = phMaxId;
+            if (ents.isEmpty()) {
+                phMaxId = maxId;
+                getLogger().info("PH t=" + tickNo + " h=" + String.format("%016x", h)
+                        + " n=0 adds=0");
+                return;
+            }
+            if (PH_GET_HANDLE == null) {
+                phBindRoot(ents.get(0));
+            }
+            boolean bound = PH_GET_HANDLE != null;
+            if (bound && PH_X == null) {
+                Object sample = PH_GET_HANDLE.invoke(ents.get(0));
+                if (sample != null) phBind(sample);
+                // ALL-OR-NOTHING: a partial bind (some handles assigned, some
+                // not) must never reach the loop — a null invokeExact would
+                // throw every tick and silence the stream (observed).
+                bound = PH_X != null && PH_Y != null && PH_Z != null
+                        && PH_DM != null && PH_VX != null
+                        && PH_VY != null && PH_VZ != null;
+            }
+            boolean dump = phDumpActive();
+            StringBuilder dsb = dump ? new StringBuilder(1024) : null;
+            int dcnt = 0;
+            // L91 TC-line accumulators (dump ticks only)
+            int tcn = 0, tcZero = 0, tcOne = 0, tcMin = 0, tcMax = -1;
+            for (int i = 0; i < n; i++) {
+                Entity be = ents.get(i);
+                int id = be.getEntityId();
+                if (id > maxId) { adds++; maxId = id; }
+                long m = 0;
+                if (bound) {
+                    Object e = PH_GET_HANDLE.invoke(be);
+                    double x = (double) PH_X.invokeExact(e);
+                    double y = (double) PH_Y.invokeExact(e);
+                    double z = (double) PH_Z.invokeExact(e);
+                    Object dm = (Object) PH_DM.invokeExact(e);
+                    m = phMix(id);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(x)), 7);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(y)), 17);
+                    m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(z)), 27);
+                    if (dm != null) {
+                        double vx = (double) PH_VX.invokeExact(dm);
+                        double vy = (double) PH_VY.invokeExact(dm);
+                        double vz = (double) PH_VZ.invokeExact(dm);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vx)), 37);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vy)), 47);
+                        m ^= Long.rotateLeft(phMix(Double.doubleToLongBits(vz)), 57);
+                    }
+                    // VITALS (doc 40): the cramming-hurt fields the snapshot
+                    // gate reads and the position avalanche cannot see. A
+                    // cramming-hurt divergence (an extra/missing hurtServer)
+                    // touches NO position and NO RNG draw (cramming has no
+                    // source position -> knockback xd=zd=0 -> zero draws) —
+                    // PH-invisible until hp/fire/alive ride the same hash.
+                    // Plain Bukkit reads (the exact calls the snapshot makes):
+                    // no NMS handles, nothing new to bind, no allocation.
+                    m ^= Long.rotateLeft(phMix(be.getFireTicks() & 0xFFFF_FFFFL), 67);
+                    m ^= Long.rotateLeft(phMix(be.isValid() ? 0x59L : 0x5AL), 71);
+                    if (be instanceof org.bukkit.entity.LivingEntity vle) {
+                        // getHealth() is a DOUBLE in this API (the snapshot's
+                        // hp field is Double.toHexString of the same read) —
+                        // mix the same 64 bits the snapshot prints
+                        m ^= Long.rotateLeft(phMix(
+                                Double.doubleToLongBits(vle.getHealth())), 73);
+                    }
+                    if (be instanceof org.bukkit.entity.Item ie2) {
+                        // L43: the STACK COUNT rides the avalanche. A partial
+                        // merge (the surviving from-stack loses only delta <
+                        // from.count) touches NO position, NO delta, NO hp —
+                        // PH-invisible until the count divergence flips a
+                        // later merge DIRECTION (the items t=159 pair
+                        // 971/1873: vanish/appear swapped, n equal). The
+                        // count is the merge arithmetic's whole state.
+                        m ^= Long.rotateLeft(phMix(ie2.getItemStack().getAmount()), 79);
+                    }
+                    if (dump && PH_TC != null) {
+                        // L91: the counter phase rides the avalanche at dump
+                        // ticks — both legs run the same plugin, so the hash
+                        // stays comparable and the first tc split names its
+                        // tick + entity set with no new tooling.
+                        int tc = (int) PH_TC.invokeExact(e);
+                        m ^= Long.rotateLeft(phMix(tc & 0xFFFF_FFFFL), 83);
+                        tcn++;
+                        if (tc <= 0) tcZero++;
+                        if (tc == 1) tcOne++;
+                        if (tcn == 1 || tc < tcMin) tcMin = tc;
+                        if (tcn == 1 || tc > tcMax) tcMax = tc;
+                    }
+                    h += phMix(m);
+                }
+                if (dump) {
+                    dsb.append(id);
+                    if (bound) dsb.append(':').append(String.format("%016x", m));
+                    dsb.append(' ');
+                    if (++dcnt == 10) {
+                        getLogger().info("PD t=" + tickNo + " " + dsb.toString().trim());
+                        dsb.setLength(0);
+                        dcnt = 0;
+                    }
+                }
+            }
+            if (dump && dcnt > 0) {
+                getLogger().info("PD t=" + tickNo + " " + dsb.toString().trim());
+            }
+            if (dump && tcn > 0) {
+                // L91: the tickCount phase census — the OFF-vs-ON diff of the
+                // distribution per tick names the reach/phase difference
+                // directly: tc0 = entities still at tc<=0 (never baseTicked),
+                // tc1 = the first-tick cohort, min/max bracket the spread.
+                getLogger().info("TC t=" + tickNo + " sc=" + runName
+                        + " n=" + tcn + " tc0=" + tcZero + " tc1=" + tcOne
+                        + " tcmin=" + tcMin + " tcmax=" + tcMax);
+            }
+            phMaxId = maxId;
+            phLines++;
+            // Adaptive emit: full per-tick resolution through t=200 (the seed
+            // zone — observed: mixed ids 9/10/45 vanish by T389), 1-in-8
+            // afterwards (the cascade is already lost there; the ±8-tick
+            // window is enough to aim a PARITY_TRACE_ID run). Keeps the
+            // streamed job log at ~270 lines/leg instead of ~72k.
+            if (tickNo <= 400 || tickNo % 8 == 0) {
+                getLogger().info("PH t=" + tickNo + " ct=" + ceCurTick()
+                        + " h=" + String.format("%016x", h)
+                        + " n=" + n + " adds=" + adds);
+                logEntropyStreams();
+            }
+        } catch (Throwable t) {
+            // warn on the first FAILURES (not the first successes): a loop
+            // that starts dying at t=140 must not be silent about it
+            if (++phFails <= 3) getLogger().warning("PH step failed: " + t);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L54 diag — the TICK-LIST ORDER dump (ce.tl.trace=1). At PD ticks,
+    // walk the overworld's EntityTickList raw array (the EXACT order the
+    // entity loop iterates: IteratorSafeOrderedReferenceSet keeps insertion
+    // order, removals null the slot, defrag compacts in order) and stream
+    // the ids 10/line. Both legs run this plugin, so the OFF leg streams
+    // too — the FIRST order divergence names its tick and the exact
+    // entities whose relative turn order flipped (the trace-823 family:
+    // the pushed-vs-integrated push delta at the tick end proves the
+    // pusher's turn ran on different sides of the target's body).
+    // Read-only reflection, cached; any failure disables the stream once.
+    // ------------------------------------------------------------------
+    private volatile boolean tlReady = false;
+    private volatile Object TL_SET_OBJ;
+
+    private void dumpTickList() {
+        if (!tlReady) {
+            try {
+                Object w = Bukkit.getWorlds().get(0);
+                Object sl = w.getClass().getMethod("getHandle").invoke(w);
+                // walk the hierarchy for entityTickList (ServerLevel declares it)
+                java.lang.reflect.Field list = null;
+                for (Class<?> c = sl.getClass(); c != null && list == null; c = c.getSuperclass()) {
+                    try {
+                        list = c.getDeclaredField("entityTickList");
+                    } catch (NoSuchFieldException ignored) { }
+                }
+                if (list == null) throw new NoSuchFieldException("entityTickList");
+                list.setAccessible(true);
+                Object tickList = list.get(sl);
+                java.lang.reflect.Field set = tickList.getClass().getDeclaredField("entities");
+                set.setAccessible(true);
+                TL_SET_OBJ = set.get(tickList);
+                TL_GETLIST = TL_SET_OBJ.getClass().getMethod("getListRaw");
+                TL_GETSIZE = TL_SET_OBJ.getClass().getMethod("getListSize");
+                // L54b fix (run 41236407174): the raw list's component type is
+                // Object[] (the field's declared type) — Object.getId() does
+                // not exist and the bind died with NoSuchMethodException,
+                // silently disabling the whole stream. Bind getId on the
+                // Entity class instead (every list member is an Entity).
+                TL_GETID = Class.forName("net.minecraft.world.entity.Entity")
+                        .getMethod("getId");
+                tlReady = true;
+            } catch (Throwable t) {
+                tlReady = true; // stop retrying; the stream stays off
+                getLogger().warning("TL dump bind failed: " + t);
+                return;
+            }
+        }
+        try {
+            if (TL_GETLIST == null) return;
+            Object[] arr = (Object[]) TL_GETLIST.invoke(TL_SET_OBJ);
+            int size = (Integer) TL_GETSIZE.invoke(TL_SET_OBJ);
+            StringBuilder sb = new StringBuilder(256);
+            int cnt = 0, emitted = 0;
+            for (int i = 0; i < size && i < arr.length; i++) {
+                Object e = arr[i];
+                if (e == null) continue;
+                int id = (Integer) TL_GETID.invoke(e);
+                sb.append(id).append(' ');
+                if (++cnt == 10) {
+                    getLogger().info("TL t=" + tickNo + " i=" + emitted + " " + sb.toString().trim());
+                    sb.setLength(0);
+                    cnt = 0;
+                    emitted += 10;
+                }
+            }
+            if (cnt > 0) {
+                getLogger().info("TL t=" + tickNo + " i=" + emitted + " " + sb.toString().trim());
+            }
+        } catch (Throwable t) {
+            getLogger().warning("TL dump failed: " + t);
+            TL_GETLIST = null; // disable the stream
+        }
+    }
+
+    private volatile java.lang.reflect.Method TL_GETLIST, TL_GETSIZE, TL_GETID;
+
+    // ------------------------------------------------------------------
+    // SR/LR — per-tick ENTROPY-STREAM probes. The parity seeds both streams
+    // (Level.random + Entity.SHARED_RANDOM) identically, so their STATES
+    // must stay bit-equal across the legs forever. A diff of the SR/LR
+    // lines names the FIRST tick a stream desynced — and therefore which
+    // subsystem consumed it differently (the native AI advances SHARED
+    // natively; the spawner/baby-rolls consume LEVEL). One line per stream
+    // per tick, lazily-bound reflection reads, zero stream mutation.
+    // ------------------------------------------------------------------
+    private static volatile java.lang.invoke.MethodHandle SR_SEED, LR_XLO;
+    private static volatile Object SR_OBJ, LR_OBJ;
+    // L77-hunt: the counting Level.random proxy (parity legs only). The
+    // mob_ai=1 SR/LR step-count diff named t=143 as EXACTLY ONE extra
+    // Level.random draw on the ON leg (SR still identical) — but NO
+    // AI-path class references Level.random and the module's own code
+    // never touches it (javap scans). The proxy keeps the stream EXACT
+    // (it delegates every call to the original RandomSource reflectively —
+    // the harness compiles against paper-api ONLY, so the NMS interface is
+    // loaded at runtime) and records the CALLER of every draw; the tick
+    // end prints the count and, inside the LRC_WINDOW, the per-draw caller
+    // frames. The OFF leg proxies too (same harness) — the first tick with
+    // a different count diff names the extra caller by diffing LRF lines.
+    private static volatile Object LR_WRAP; // the Proxy (RandomSource)
+    private static volatile long LR_CALLS;
+    private static final java.util.List<char[]> LR_FRAMES = new java.util.ArrayList<>();
+    // L85-hunt: the same proxy machinery for SHARED_RANDOM — the per-draw
+    // caller frames name every ENTITY-random consumer (the engine's staged
+    // serving vs vanilla's per-mob sequence). The module's seed handoff
+    // reads/writes the ORIGINAL's 'value' directly; the proxy only watches.
+    private static volatile Object SR_WRAP;
+    private static volatile long SR_CALLS;
+    private static final java.util.List<char[]> SR_FRAMES = new java.util.ArrayList<>();
+    private static final int LRC_LO = parseLrcBound(0), LRC_HI = parseLrcBound(1);
+    /** per-draw frame depth (stack indices 3..LRF_DEPTH-1). Env knob
+     *  LRF_DEPTH, default 9 (6 real frames after the reflective hop). */
+    private static final int LRF_DEPTH = parseLrfDepth();
+
+    private static int parseLrfDepth() {
+        try {
+            String s = System.getenv("LRF_DEPTH");
+            if (s != null && !s.isBlank()) {
+                int v = Integer.parseInt(s.trim());
+                if (v >= 6 && v <= 40) return v;
+            }
+        } catch (Throwable quiet) { /* default */ }
+        return 9;
+    }
+
+    private static int parseLrcBound(int idx) {
+        try {
+            String s = System.getenv("LRC_WINDOW");
+            if (s == null || s.isBlank()) s = "138-150";
+            String[] parts = s.split("-");
+            return Integer.parseInt(parts[idx].trim());
+        } catch (Throwable quiet) {
+            return idx == 0 ? 138 : 150;
+        }
+    }
+
+    private static void recLrDraw() {
+        LR_CALLS++;
+        if (LR_FRAMES.size() < 4096) {
+            LR_FRAMES.add(drawFrames());
+        }
+    }
+
+    /** L85: the SHARED_RANDOM twin of recLrDraw — the SR proxy records
+     *  into its own buffers so the SRC/SRF lines diff independently. */
+    private static void recSrDraw() {
+        SR_CALLS++;
+        if (SR_FRAMES.size() < 4096) {
+            char[] f = drawFrames();
+            SR_FRAMES.add(f);
+            glvClassify(f);
+        } else {
+            // L90: the census must cover EVERY draw — past the 512-frame
+            // cap the stack walk is no longer stored but still classified.
+            glvClassify(drawFrames());
+        }
+    }
+
+    /** L90: the scenario tag — RUN_NAME of the leg (parity-mobs-on ...).
+     *  Every streamed census/state line carries it so the interleaved
+     *  8-server job log separates per-scenario without positional
+     *  heuristics (the t=145 GL lines of run 41766511483 were unreadable
+     *  across the three mob scenarios sharing one console). */
+    private static final String SC_TAG = env("RUN_NAME", "?");
+
+    /** L90: the vanilla-side twin of the engine's GL ledger — a per-
+     *  callsite draw census keyed by the SIMPLE caller of the proxy draw
+     *  (token[1] of the stored frame: RandomStrollGoal.canUse,
+     *  RandomPos.generateRandomDirection, RandomLookAroundGoal.start,
+     *  the spawn-path ctors ...). The 512-frame SRF cap eats the AI
+     *  frames when the spawn noise is high (run 41766511483: 2572 spawn
+     *  frames at t=145 left only a biased prefix of the AI frames) — the
+     *  counters are cap-free, so the OFF leg's per-gate roll census
+     *  survives any fill noise. Printed inside the LRC window as
+     *  GLV t=<tick> sc=<tag> n=<total> <Class.method>=<n> ... (sorted,
+     *  one line per tick), reset per tick; the ON leg's GLV shows only
+     *  the Java-visible draws (the Rust-served rolls bypass the proxy) —
+     *  the GL line covers those. */
+    private static final java.util.TreeMap<String, Integer> GLV = new java.util.TreeMap<>();
+    private static int GLV_N;
+
+    private static void glvClassify(char[] f) {
+        String s = new String(f);
+        int sp = s.indexOf(' ');
+        if (sp < 0) {
+            return;
+        }
+        int sp2 = s.indexOf(' ', sp + 1);
+        String site = sp2 < 0 ? s.substring(sp + 1) : s.substring(sp + 1, sp2);
+        // keep the last two dot segments (Class.method)
+        int dot = site.lastIndexOf('.');
+        if (dot <= 0) {
+            return;
+        }
+        int cls = site.lastIndexOf('.', dot - 1);
+        String key = cls < 0 ? site : site.substring(cls + 1);
+        GLV.merge(key, 1, Integer::sum);
+        GLV_N++;
+    }
+
+    /** The shared frame capture (the stack shape is identical for both
+     *  proxies: [0]=rec* [1]=the handler lambda [2]=the $Proxy method
+     *  [3..4]=the reflective delegate hop [5..]=the real callers). */
+    private static char[] drawFrames() {
+        StackTraceElement[] st = new Throwable().getStackTrace();
+        StringBuilder sb = new StringBuilder(160);
+        for (int i = 3; i < Math.min(st.length, LRF_DEPTH); i++) {
+            sb.append(st[i].getClassName().replace("net.minecraft.", "n.m."))
+                    .append('.').append(st[i].getMethodName()).append(' ');
+        }
+        return sb.toString().toCharArray();
+    }
+
+    /** The DEEPEST frames first: the console/log handler truncates long
+     *  records (observed in run 41670844291 — the depth-30 RemoveBinomial
+     *  line cut at ~430 chars, exactly the frame window where the caller
+     *  that NAMES the path — burnUndead vs finalizeSpawn vs the cramming
+     *  hurt — would appear). Reversing puts the caller chain first; the
+     *  leaf machinery (RemoveBinomial/Enchantment) tail is the least
+     *  informative part and is the part that gets lost. The k= index
+     *  keeps the draws orderable; the frame order within one k is a
+     *  display convention only — both legs print the same shape. */
+    private static String lrfFramesReversed(char[] f) {
+        String[] parts = new String(f).trim().split(" ");
+        StringBuilder sb = new StringBuilder(f.length + 8);
+        for (int i = parts.length - 1; i >= 0; i--) {
+            sb.append(parts[i]);
+            if (i > 0) sb.append(' ');
+        }
+        return sb.toString();
+    }
+
+    /** Wrap the level's RandomSource in a counting, delegating Proxy. The
+     *  interface type is resolved BY NAME from the delegate's loader —
+     *  Paper 26.3's Level.random is a ThreadUnsafeRandom whose DIRECT
+     *  interface is BitRandomSource (a RandomSource SUB-interface), so the
+     *  old getClass().getInterfaces() scan never matched and the proxy
+     *  degraded to a silent no-op: LR_WRAP == the original object, the
+     *  field write was skipped by the != guard, and every LRC line
+     *  streamed calls=0 (run 41581856021: 6738 zeros). isInstance()
+     *  accepts the hierarchy at any depth. */
+    private static Object wrapLevelRandom(Object random) {
+        return wrapRandomSource(random, false);
+    }
+
+    /** L85b: the SR proxy carries this marker interface (defined HERE —
+     *  the harness owns the wrap) so the module can unwrap duck-typed by
+     *  method name: ceSrOriginal() returns the wrapped ORIGINAL
+     *  RandomSource. No cross-loader class link — the module resolves the
+     *  method on the proxy object reflectively (setAccessible waives the
+     *  loader-visibility check). */
+    public interface SrUnwrap {
+        Object ceSrOriginal();
+    }
+
+    private static Object wrapSharedRandom(Object random) {
+        return wrapRandomSource(random, true);
+    }
+
+    /** The shared proxy factory; isSr routes the recording to the SR
+     *  buffers (the SRF instrument) and attaches the SrUnwrap marker so
+     *  the module's seed handoff can recover the ORIGINAL. */
+    private static Object wrapRandomSource(Object random, boolean isSr) {
+        Class<?> iface;
+        try {
+            iface = Class.forName("net.minecraft.util.RandomSource",
+                    false, random.getClass().getClassLoader());
+        } catch (ClassNotFoundException unexpected) {
+            return random; // unexpected shape: leave it exact
+        }
+        if (!iface.isInstance(random)) return random;
+        Class<?>[] ifaces = isSr
+                ? new Class<?>[]{iface, SrUnwrap.class}
+                : new Class<?>[]{iface};
+        // L86: the DEFINING LOADER must SEE every interface — the JDK
+        // ProxyClassFactory runs Class.forName(name, false, loader) per
+        // interface and IllegalArgumentExceptions otherwise. The L85b
+        // install passed the delegate's (NMS) loader: RandomSource is
+        // visible, SrUnwrap (THIS plugin's class, a child loader) is NOT
+        // — every install died "SrUnwrap is not visible from class
+        // loader", SR_WRAP stayed null and the streamed log showed SRC=0
+        // again (the diagnostic line itself fell under the whitelist gap).
+        // The harness loader sees BOTH (SrUnwrap its own class,
+        // RandomSource up the parent chain). Vanilla keeps calling the
+        // proxy through the RandomSource TYPE — the defining loader of
+        // the proxy CLASS is invisible to callers. The LR path keeps the
+        // proven delegate loader (single NMS interface, L77-green).
+        return java.lang.reflect.Proxy.newProxyInstance(
+                isSr
+                        ? BaselinePlugin.class.getClassLoader()
+                        : random.getClass().getClassLoader(),
+                ifaces,
+                (proxy, method, args) -> {
+                    String n = method.getName();
+                    if (isSr && n.equals("ceSrOriginal")) {
+                        return random; // the unwrap contract: the ORIGINAL
+                    }
+                    if (n.startsWith("next") || n.equals("fork")
+                            || n.equals("forkPositional") || n.equals("triangle")
+                            || n.equals("consumeCount")) {
+                        if (isSr) recSrDraw(); else recLrDraw();
+                    }
+                    try {
+                        return method.invoke(random, args);
+                    } catch (java.lang.reflect.InvocationTargetException ite) {
+                        Throwable c = ite.getCause();
+                        if (c != null) throw c;
+                        throw ite;
+                    }
+                });
+    }
+
+    private void lrcTickEnd() {
+        // L85: the SHARED_RANDOM twin — the SRC count + the SRF frames.
+        // Printed BEFORE the LR block so an LR failure never eats it.
+        if (SR_WRAP != null) {
+            getLogger().info("SRC t=" + tickNo + " calls=" + SR_CALLS + " sc=" + SC_TAG);
+            if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
+                if (GLV_N > 0) {
+                    StringBuilder sb = new StringBuilder(256).append("GLV t=").append(tickNo)
+                            .append(" sc=").append(SC_TAG).append(" n=").append(GLV_N);
+                    for (java.util.Map.Entry<String, Integer> e : GLV.entrySet()) {
+                        sb.append(' ').append(e.getKey()).append('=').append(e.getValue());
+                    }
+                    getLogger().info(sb.toString());
+                }
+                int k = 0;
+                for (char[] f : SR_FRAMES) {
+                    getLogger().info("SRF t=" + tickNo + " k=" + (k++) + ' '
+                            + lrfFramesReversed(f));
+                }
+            }
+            GLV.clear();
+            GLV_N = 0;
+            SR_CALLS = 0;
+            SR_FRAMES.clear();
+        }
+        if (LR_WRAP == null) return;
+        getLogger().info("LRC t=" + tickNo + " calls=" + LR_CALLS + " sc=" + SC_TAG);
+        if (tickNo >= LRC_LO && tickNo <= LRC_HI) {
+            StringBuilder sb = new StringBuilder(128)
+                    .append("LRF t=").append(tickNo).append(" n=").append(LR_FRAMES.size());
+            getLogger().info(sb.toString());
+            // one INFO call PER FRAME — a single multi-line record never
+            // reaches the CI job log (the console handler dropped the
+            // embedded newlines: run 41584262024 streamed the n= headers
+            // with zero frame lines). Same per-line shape as the PD dumps;
+            // the k= index keeps the order diffable.
+            int k = 0;
+            for (char[] f : LR_FRAMES) {
+                getLogger().info("LRF t=" + tickNo + " k=" + (k++) + ' '
+                        + lrfFramesReversed(f));
+            }
+        }
+        LR_CALLS = 0;
+        LR_FRAMES.clear();
+    }
+
+    /** Walk the class hierarchy for a declared long field and bind a
+     *  primitive getter — both SHARED_RANDOM (Entity$RandomRandomSource) and
+     *  Level.random (ThreadUnsafeRandom, Paper-patched — NOT Xoroshiro, the
+     *  randomNumberGenerator bind NoSuchFieldException'd forever and the
+     *  silent catch hid it: run 40765408173 streamed zero SR/LR lines) keep
+     *  their LCG state in an INHERITED 'value' long. */
+    private static java.lang.invoke.MethodHandle bindValue(Object o) throws Throwable {
+        for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField("value");
+                f.setAccessible(true);
+                return java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(f)
+                        .asType(java.lang.invoke.MethodType.methodType(
+                                long.class, Object.class));
+            } catch (NoSuchFieldException ignored) { }
+        }
+        throw new NoSuchFieldException("value not found on " + o.getClass().getName());
+    }
+
+    // ------------------------------------------------------------------
+    // L85b: install the SHARED_RANDOM recording proxy. See the onEnable
+    // call site for WHY this must precede the first entity (Entity.random
+    // is captured from the static at construction). The proxy carries the
+    // SrUnwrap marker: the module's seed handoff recovers the ORIGINAL
+    // duck-typed (method-name contract), so the engine keeps reading and
+    // writing the one true LCG state while entities route their draws
+    // through the observer. Idempotent; a failed static write degrades to
+    // instrument-off with the stream exact (the SR_WRAP=null guard).
+    // ------------------------------------------------------------------
+    private void installSharedRandomWrap(String where) {
+        if (SR_WRAP != null) return; // already installed
+        try {
+            Class<?> nms = Class.forName("net.minecraft.world.entity.Entity",
+                    false, getClass().getClassLoader());
+            java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
+            f.setAccessible(true);
+            if (SR_OBJ == null) {
+                SR_OBJ = f.get(null);
+                SR_SEED = bindValue(SR_OBJ);
+            }
+            Object wrap = wrapSharedRandom(SR_OBJ);
+            if (wrap != SR_OBJ) {
+                try {
+                    f.set(null, wrap);
+                    SR_WRAP = wrap;
+                } catch (Throwable setFail) {
+                    getLogger().info("PH SR-wrap-set-failed (" + where + "): " + setFail);
+                    // instrument off, stream exact
+                }
+            }
+            getLogger().info("PH SR-wrap-installed (" + where + ") live=" + (SR_WRAP != null));
+        } catch (Throwable t) {
+            getLogger().info("PH SR-wrap-install-failed (" + where + "): " + t);
+        }
+    }
+
+    private void logEntropyStreams() {
+        try {
+            // SR first, emitted BEFORE the LR bind — a LR failure must not
+            // suppress the SR stream again (the emit-after-bind ordering bug
+            // above zeroed BOTH streams for two whole runs).
+            if (SR_OBJ == null) {
+                Class<?> nms = Class.forName(
+                        "net.minecraft.world.entity.Entity",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field f = nms.getDeclaredField("SHARED_RANDOM");
+                f.setAccessible(true);
+                SR_OBJ = f.get(null);
+                SR_SEED = bindValue(SR_OBJ);
+            }
+            // L85b fallback: the normal install happens at onEnable (the
+            // constructor-captured Entity.random makes a late wrap blind —
+            // run 307's SRC calls=0). This retry covers an install failure
+            // at enable; it must use the SAME SrUnwrap-carrying factory.
+            if (SR_WRAP == null) {
+                installSharedRandomWrap("lazy-retry");
+            }
+            if (SR_SEED != null && SR_OBJ != null) {
+                long s = (long) SR_SEED.invokeExact(SR_OBJ);
+                getLogger().info("SR t=" + tickNo + " s=" + Long.toHexString(s) + " sc=" + SC_TAG);
+            }
+            if (LR_OBJ == null) {
+                // the field belongs to the NMS Level — CraftWorld is the
+                // Bukkit wrapper (rf.get(craftWorld) throws
+                // IllegalArgumentException); resolve the ServerLevel handle.
+                Object handle = Bukkit.getWorlds().get(0)
+                        .getClass().getMethod("getHandle")
+                        .invoke(Bukkit.getWorlds().get(0));
+                if (handle == null) return;
+                Class<?> lvl = Class.forName(
+                        "net.minecraft.world.level.Level",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field rf = lvl.getDeclaredField("random");
+                rf.setAccessible(true);
+                LR_OBJ = rf.get(handle);
+                LR_XLO = bindValue(LR_OBJ);
+                // L77-hunt: wrap ONCE — the field now holds the delegating
+                // proxy (the stream is untouched: every call forwards to
+                // the original object the probe reads); the count + the
+                // caller frames localize the extra Level.random draw
+                if (LR_WRAP == null) {
+                    LR_WRAP = wrapLevelRandom(LR_OBJ);
+                    if (LR_WRAP != LR_OBJ) {
+                        try {
+                            rf.set(handle, LR_WRAP);
+                        } catch (Throwable setFail) {
+                            // a silent failure here reads as LRC=0 with the
+                            // probe still live — print it (the PH prefix) so
+                            // a hunt does not burn a whole run on it
+                            getLogger().info("PH t=" + tickNo
+                                    + " LR-wrap-set-failed: " + setFail);
+                            LR_WRAP = null; // no proxy in the field: instrument off
+                        }
+                    }
+                }
+            }
+            if (LR_XLO != null && LR_OBJ != null) {
+                long a = (long) LR_XLO.invokeExact(LR_OBJ);
+                getLogger().info("LR t=" + tickNo + " a=" + Long.toHexString(a) + " sc=" + SC_TAG);
+            }
+        } catch (Throwable t) {
+            // log ONCE then disable — but through INFO with the PH prefix so
+            // the watchdog streams it into the job log (server.log-only
+            // warnings were invisible for two runs)
+            if (SR_OBJ == null || SR_SEED == null) {
+                SR_OBJ = new Object();
+                SR_SEED = null;
+            }
+            getLogger().info("PH t=" + tickNo + " entropy-probe-disabled: " + t);
+        }
+    }
+
+    private static volatile java.lang.invoke.MethodHandle CT_GETTER;
+
+    /** CeHooks.CUR_TICK — the module flush counter — so the MS window can
+     *  be aimed in ct-space (the flush count may drift from tickNo). */
+    private long ceCurTick() {
+        try {
+            if (CT_GETTER == null) {
+                Class<?> ch = Class.forName("dev.planeta9091.centities.CeHooks",
+                        false, getClass().getClassLoader());
+                java.lang.reflect.Field f = ch.getDeclaredField("CUR_TICK");
+                f.setAccessible(true);
+                CT_GETTER = java.lang.invoke.MethodHandles.lookup()
+                        .unreflectGetter(f).asType(java.lang.invoke.MethodType
+                                .methodType(long.class));
+            }
+            return (long) CT_GETTER.invokeExact();
+        } catch (Throwable quiet) {
+            return -1;
+        }
+    }
+
+    private void phBindRoot(Entity be) {
+        try {
+            var lk = java.lang.invoke.MethodHandles.lookup();
+            // Bind getHandle from the CraftEntity BASE class — a runtime-
+            // class bind (CraftItem) would checkcast-reject the first
+            // non-item entity and kill the stream (see phBind).
+            Class<?> craftEntity = be.getClass();
+            while (craftEntity != null && !"org.bukkit.craftbukkit.entity.CraftEntity"
+                    .equals(craftEntity.getName())
+                    && !"org.bukkit.craftbukkit.CraftEntity".equals(craftEntity.getName())) {
+                craftEntity = craftEntity.getSuperclass();
+            }
+            java.lang.reflect.Method gh = (craftEntity != null ? craftEntity : be.getClass())
+                    .getMethod("getHandle");
+            PH_GET_HANDLE = lk.unreflect(gh)
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class));
+        } catch (Throwable t) {
+            getLogger().warning("PH root bind failed: " + t);
+        }
+    }
 
     // ------------------------------------------------------------------
     // PARITY_TRACE_ID: per-tick EXACT trace of ONE entity (both legs write
@@ -708,6 +1625,21 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                             Class<?> nms = PARITY_GET_HANDLE.getReturnType();
                             PARITY_TICK_COUNT = nms.getField("tickCount");
                             PARITY_ACTIVATED = nms.getField("activatedTick");
+                            // ADDENDUM-18: the crammed-cap counter — the push
+                            // seed family's verdict field. numCollisions is
+                            // PROTECTED on Entity (26.3) — getField() finds
+                            // publics only, so walk declared fields up the
+                            // hierarchy (observed: NoSuchFieldException would
+                            // kill the bind block and re-throw every tick).
+                            Class<?> ncClass = nms;
+                            while (ncClass != null && PARITY_NCOL == null) {
+                                try {
+                                    PARITY_NCOL = ncClass.getDeclaredField("numCollisions");
+                                    PARITY_NCOL.setAccessible(true);
+                                } catch (NoSuchFieldException ignored) {
+                                    ncClass = ncClass.getSuperclass();
+                                }
+                            }
                         }
                     }
                 }
@@ -716,6 +1648,47 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                 traceOut.write("t=" + tickNo + " REMOVED\n");
                 traceOut.flush();
                 return;
+            }
+            // ADDENDUM-18: the vanilla LIVE candidate list for the traced id —
+            // a read-only getPushableEntities at the plugin phase, streamed in
+            // BOTH legs ("PQ t=.. id=.. n=.. [ids]"). The cross-leg PQ diff
+            // names the exact second pusher the ON-side kernel scan missed
+            // (the nc(78) gap: OFF counts a hit the ON leg never sees).
+            if (phDumpActive() && PARITY_GET_HANDLE != null) {
+                try {
+                    if (PQ_METHOD == null) {
+                        Object wh = Bukkit.getWorlds().get(0);
+                        Object sl = wh.getClass().getMethod("getHandle").invoke(wh);
+                        for (Class<?> c = sl.getClass(); c != null && PQ_METHOD == null; c = c.getSuperclass()) {
+                            try {
+                                java.lang.reflect.Method m = c.getDeclaredMethod(
+                                        "getPushableEntities",
+                                        Class.forName("net.minecraft.world.entity.Entity"),
+                                        Class.forName("net.minecraft.world.phys.AABB"));
+                                m.setAccessible(true);
+                                PQ_METHOD = m;
+                                PQ_LEVEL = sl;
+                            } catch (NoSuchMethodException ignored) { }
+                        }
+                    }
+                    if (PQ_METHOD != null) {
+                        Object h = PARITY_GET_HANDLE.invoke(traced);
+                        if (PQ_BB == null) {
+                            PQ_BB = h.getClass().getMethod("getBoundingBox");
+                        }
+                        Object res = PQ_METHOD.invoke(PQ_LEVEL, h, PQ_BB.invoke(h));
+                        java.util.List<?> list = (java.util.List<?>) res;
+                        StringBuilder qb = new StringBuilder(64);
+                        for (Object o2 : list) {
+                            qb.append(o2.getClass().getMethod("getId").invoke(o2)).append(' ');
+                        }
+                        getLogger().info("PQ t=" + tickNo + " id=" + traceId
+                                + " n=" + list.size() + " [" + qb.toString().trim() + "]");
+                    }
+                } catch (Throwable pqFail) {
+                    getLogger().warning("PQ failed: " + pqFail);
+                    PQ_METHOD = null;
+                }
             }
             Location l = traced.getLocation();
             org.bukkit.util.Vector v = traced.getVelocity();
@@ -727,6 +1700,37 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     Object h = PARITY_GET_HANDLE.invoke(traced);
                     sb.append(" tc=").append(PARITY_TICK_COUNT.getInt(h))
                             .append(" at=").append(PARITY_ACTIVATED.getLong(h));
+                    if (PARITY_NCOL != null) {
+                        sb.append(" nc=").append(PARITY_NCOL.getInt(h));
+                    }
+                    // L97.5: the aware flag — the t=157 root-cause evidence
+                    // (the engine's guard preempts vanilla's aware branch;
+                    // the unaware set must be visible in BOTH legs' traces).
+                    try {
+                        java.lang.reflect.Field af =
+                                findField(h.getClass(), "aware");
+                        if (af != null) {
+                            sb.append(" aw=").append(af.getBoolean(h) ? 1 : 0);
+                        }
+                    } catch (Throwable awQuiet) {
+                        // diagnostics only
+                    }
+                    // L101: the target — the NearestAttackableTarget lock
+                    // state (getTarget() != null skips its own canUse via
+                    // the targeting short-circuit; the L97.2 suspect list).
+                    // Both legs print it, so the ON/OFF diff names the pair's
+                    // lock state at the divergence tick.
+                    try {
+                        Object tgt = h.getClass().getMethod("getTarget").invoke(h);
+                        if (tgt == null) {
+                            sb.append(" tg=null");
+                        } else {
+                            Object tid = tgt.getClass().getMethod("getId").invoke(tgt);
+                            sb.append(" tg=").append(tid);
+                        }
+                    } catch (Throwable tgQuiet) {
+                        sb.append(" tg=?");
+                    }
                 } catch (Throwable quiet) {
                     // diagnostics only
                 }
@@ -739,11 +1743,84 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .append(" vy=").append(hex(v.getY()))
                     .append(" vz=").append(hex(v.getZ()))
                     .append(" onG=").append(traced.isOnGround() ? 1 : 0)
-                    .append('\n');
+                    // vitals (doc 40): hp/fire ride the trace so a cramming
+                    // hurt divergence names its exact tick without a re-run
+                    .append(" fire=").append(traced.getFireTicks())
+                    .append(" alive=").append(traced.isValid() ? 1 : 0);
+            if (traced instanceof org.bukkit.entity.LivingEntity tle) {
+                sb.append(" hp=").append(hex(tle.getHealth()));
+            }
+            // L97.2: the selector-state dump for the traced mob — the
+            // vanilla GoalSelector skip that the engine must reproduce
+            // (t=157: 2 mobs the vanilla update pass never called canUse
+            // on) needs the lockedFlags/running snapshot in BOTH legs.
+            try {
+                Object h = PARITY_GET_HANDLE.invoke(traced);
+                for (String selName : new String[]{"targetSelector", "goalSelector"}) {
+                    java.lang.reflect.Field sf = h.getClass().getSuperclass() != null
+                            ? findField(h.getClass(), selName) : null;
+                    Object sel = sf != null ? sf.get(h) : null;
+                    if (sel == null) continue;
+                    java.lang.reflect.Field lf = findField(sel.getClass(), "lockedFlags");
+                    Object locks = lf != null ? lf.get(sel) : null;
+                    StringBuilder lb = new StringBuilder("[");
+                    if (locks instanceof java.util.Map<?, ?> lm) {
+                        for (java.util.Map.Entry<?, ?> e2 : lm.entrySet()) {
+                            Object g = e2.getValue();
+                            if (g != null && !"NO_GOAL".equals(String.valueOf(
+                                    g.getClass().getSimpleName()))) {
+                                Object inner = null;
+                                try {
+                                    java.lang.reflect.Method gm = g.getClass()
+                                            .getMethod("getGoal");
+                                    inner = gm.invoke(g);
+                                } catch (Throwable ignore) { }
+                                lb.append(e2.getKey()).append('=')
+                                        .append(g.getClass().getSimpleName())
+                                        .append(':').append(
+                                        inner == null ? "?" : inner.getClass().getSimpleName())
+                                        .append(" isRunning=")
+                                        .append(callIsRunning(g)).append(", ");
+                            }
+                        }
+                    }
+                    lb.append(']');
+                    sb.append(" ").append(selName).append("=").append(lb);
+                }
+            } catch (Throwable quiet) {
+                sb.append(" selDump=fail");
+            }
+            sb.append('\n');
             traceOut.write(sb.toString());
             traceOut.flush();
+            // Stream into server.log too: the watchdog delta-tails it into
+            // the job log, making the per-tick trace diff instant (the
+            // parity-results artifact is 1.8GB and outlived its welcome).
+            getLogger().info("PTRACE t=" + tickNo + " "
+                    + sb.substring(sb.indexOf(" type=")).trim());
         } catch (Throwable t) {
             getLogger().warning("trace step failed: " + t);
+        }
+    }
+
+    /** L97.2 helpers: declared-field walk up the hierarchy (targetSelector
+     *  / goalSelector live on Mob, lockedFlags on GoalSelector). */
+    private static java.lang.reflect.Field findField(Class<?> c, String name) {
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = k.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) { }
+        }
+        return null;
+    }
+
+    private static boolean callIsRunning(Object wrappedGoal) {
+        try {
+            return (Boolean) wrappedGoal.getClass().getMethod("isRunning").invoke(wrappedGoal);
+        } catch (Throwable t) {
+            return false;
         }
     }
 }

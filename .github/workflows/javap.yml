@@ -1,0 +1,76 @@
+name: javap
+# javap forensics on the mojang-mapped 26.3 jar: the L97.6 NEXT items are
+# bytecode questions, answerable in ~5 min without any parity leg:
+#   1. RandomLookAroundGoal — the constructor's setFlags argument (the
+#      engine's lock_only writes the goal under flags(RLA); the ON leg's
+#      lockedFlags map holds MOVE=RLA, which requires flags(RLA) to carry
+#      MOVE — checkable in one javap read).
+#   2. GoalSelector — the update walk's put-vs-start pairing and the
+#      goalCleanup removeIf cadence (the OFF leg's non-running
+#      LOOK=RLA(false) holder survived the same-tick removeIf — the
+#      vanilla map semantics the mirror's port must reproduce EXACTLY).
+# Dispatch-only: no legs, no gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      classes:
+        description: 'fully-qualified class names, space-separated'
+        default: 'net.minecraft.world.entity.ai.goal.RandomLookAroundGoal net.minecraft.world.entity.ai.goal.GoalSelector net.minecraft.world.entity.ai.goal.WrappedGoal net.minecraft.world.entity.ai.goal.Goal net.minecraft.world.entity.ai.goal.WaterAvoidingRandomStrollGoal'
+      method:
+        description: 'optional: print ONLY this method of each class (awk slice past the head cap)'
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  javap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Fetch Paper 26.3 (paperclip)
+        run: bash scripts/fetch-paper.sh 26.3 server/paper.jar
+      - name: Paperclip boot -> mojang-mapped jar (one-shot, no world)
+        run: |
+          PB=build/paperboot
+          mkdir -p "$PB"
+          cp server/paper.jar "$PB/paper.jar"
+          echo "eula=false" > "$PB/eula.txt"
+          (cd "$PB" && timeout 300 java -Xmx2G -jar paper.jar nogui > boot.log 2>&1 || true)
+          MAPPED=$(find "$PB/versions" -name "paper-*.jar" | head -1)
+          [ -n "$MAPPED" ] || { echo "FATAL: paperclip produced no mapped jar"; tail -20 "$PB/boot.log"; exit 1; }
+          echo "MAPPED=$MAPPED" >> "$GITHUB_ENV"
+      - name: javap dumps into the job log
+        run: |
+          set -uo pipefail
+          WORK=$(mktemp -d)
+          # NOTE: unzip exits 11 when ONE pattern matches nothing — the
+          # per-class CLS check below is the real guard, so the patterns
+          # stay forgiving (|| true).
+          unzip -o -q "$MAPPED" 'net/minecraft/world/entity/ai/goal/*.class' 'net/minecraft/world/entity/ai/goal/target/*.class' 'net/minecraft/world/entity/Mob*.class' 'net/minecraft/world/entity/Entity*.class' 'net/minecraft/world/entity/LivingEntity.class' 'net/minecraft/world/entity/PathfinderMob.class' 'net/minecraft/world/entity/monster/zombie/*.class' -d "$WORK" || true
+          for C in ${{ inputs.classes || 'net.minecraft.world.entity.ai.goal.RandomLookAroundGoal net.minecraft.world.entity.ai.goal.GoalSelector net.minecraft.world.entity.ai.goal.WrappedGoal' }}; do
+            NAME=${C##*.}
+            CLS=$(find "$WORK" -name "$NAME.class" | head -1)
+            if [ -z "$CLS" ]; then echo "=== $C: CLASS NOT FOUND ==="; continue; fi
+            echo "=== javap $C ($(dirname "$CLS" | sed "s|$WORK/||")) ==="
+            if [ -n "${{ inputs.method }}" ]; then
+              # method slice: javap signatures start with 2 spaces, method
+              # bodies with 4+ — stop at the next 2-space signature line
+              javap -p -c -cp "$WORK" "$C" 2>&1 | awk 'f{if ($0 ~ /^  [a-z]/) exit; print; next} /${{ inputs.method }}\(/{f=1; print}'
+            else
+              javap -p -c -cp "$WORK" "$C" 2>&1 | grep -v "^Constant pool" | head -400 || true
+            fi
+          done
+      - name: Upload .class files (for re-javap without a re-boot)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mapped-goal-classes
+          path: build/paperboot/versions/
+          retention-days: 30
+          if-no-files-found: ignore

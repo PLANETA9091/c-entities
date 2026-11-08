@@ -14,14 +14,22 @@ use std::collections::BTreeSet;
 /// KEEP IN SYNC — the test fails on any drift from either direction.
 fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     let mut s = BTreeSet::new();
+    // PARITY ORDER (doc 36b): the query natives carry the per-entry (sy, seq)
+    // stamp arrays (B_SY/B_SEQ) alongside ids+boxes.
     s.insert(("queryNative", "(IDDDDDD[JI[J[D[I[I)I"));
     s.insert(("queryNative2", "(IDDDDDDI[J[D[I[I)I"));
     s.insert(("nativeSetOutBuffer", "(Ljava/nio/ByteBuffer;)I"));
     // L12: the flush carries the push-state extension + the delta batch
     // L37: + the vanilla-order keys (sy, seq int arrays per entry)
     s.insert(("nativeFlush", "(I[J[D[I[D[D[I[I[II[J[D)V"));
-    s.insert(("nativePush", "(IIIIIIII)J"));
-    s.insert(("nativePushNcol", "(I)I"));
+    // L50: + realNcol — the REAL numCollisions field the cap replay reads
+    // ADDENDUM-18e: + diag — the KPI per-candidate intersect dump flag
+    s.insert(("nativePush", "(IIIIIIIIII)J"));
+    s.insert(("nativePushNcol", "(II)I"));
+    // L53-diag: the marginExtra sample's Rust side — the INDEX box of
+    // (world, id) into a double[6] (CE_FQ_IBOX=1; read-only, never creates
+    // the state).
+    s.insert(("nativeIndexBox", "(IJ[D)I"));
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
     s.insert(("nativeRemoveDirect", "(J)V"));
     s.insert(("nativeReset", "()V"));
@@ -29,6 +37,10 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeItemInvalidate", "(II[I[I[I)V"));
     // L22a: the native goal engine
     s.insert(("nativeMobAiFloor", "([I[I)I"));
+    // doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) arm+drain
+    s.insert(("nativeMobLedgerTake", "(I)[J"));
+    // L89: the gate ledger — per-class canUse census read+reset
+    s.insert(("nativeGlTake", "(I)[I"));
     s
 }
 
