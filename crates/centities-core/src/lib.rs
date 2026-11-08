@@ -433,8 +433,10 @@ pub struct EntityIndex {
     // the same neighbor sequence as the vanilla server.
     sy: Vec<i32>,       // per-slot section Y stamp
     seq: Vec<i64>,      // per-slot insertion seq stamp
-    cell_ov: Vec<u64>,  // per-cell order version (bumped on order change)
-    cell_sv: Vec<u64>,  // per-cell version the layout was last sorted to
+    cell_vers: Vec<u64>, // packed order-version word: low32 = current
+                         // order version (bumped on change), high32 = the
+                         // version the layout was last sorted to. One load
+                         // + one compare per query cell (was two loads).
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
     cell_ids: Vec<Vec<i64>>,
     cell_box: Vec<Vec<f32>>,   // blocked-SoA: blocks of 48 f32 (simd.rs)
@@ -456,8 +458,7 @@ impl EntityIndex {
             cpos: Vec::new(),
             sy: Vec::new(),
             seq: Vec::new(),
-            cell_ov: vec![0], // cell 0 unused
-            cell_sv: vec![0],
+            cell_vers: vec![0], // cell 0 unused
             cell_ids: vec![Vec::new()], // cell 0 unused
             cell_box: vec![Vec::new()],
             cell_slots: vec![Vec::new()],
@@ -528,20 +529,20 @@ impl EntityIndex {
                 if self.sy[slot as usize] != sy || self.seq[slot as usize] != seq {
                     self.sy[slot as usize] = sy;
                     self.seq[slot as usize] = seq;
-                    self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+                    let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
                 }
                 return UpsertEv::Same;
             }
             // moved cell (or world): O(1) swap-remove + push
             self.cell_remove(home, self.cpos[slot as usize] as usize);
-            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+            let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             let new_home = self.cell_id(world, ncx, ncz);
             self.cell_add(new_home, slot as usize, b, ncx, ncz);
             self.homes[slot as usize] = new_home;
             self.worlds[slot as usize] = world;
             self.sy[slot as usize] = sy;
             self.seq[slot as usize] = seq;
-            self.cell_ov[new_home as usize] = self.cell_ov[new_home as usize].wrapping_add(1);
+            let v = &mut self.cell_vers[new_home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             return UpsertEv::Moved {
                 old: home,
                 new: new_home,
@@ -568,7 +569,7 @@ impl EntityIndex {
             self.homes[slot as usize] = home;
             self.idmap.insert(id, slot);
             self.stats.entities += 1;
-            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+            let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             return UpsertEv::New {
                 cell: home,
                 from_oversize,
@@ -579,7 +580,7 @@ impl EntityIndex {
     pub fn remove(&mut self, id: i64) -> RemoveEv {
         if let Some(slot) = self.idmap.find(id) {
             let home = self.homes[slot as usize];
-            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+            let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
             self.free_slot(slot as usize);
@@ -638,10 +639,8 @@ impl EntityIndex {
         self.cell_ids.truncate(1);
         self.cell_box.truncate(1);
         self.cell_slots.truncate(1);
-        self.cell_ov.truncate(1);
-        self.cell_ov[0] = 0;
-        self.cell_sv.truncate(1);
-        self.cell_sv[0] = 0;
+        self.cell_vers.truncate(1);
+        self.cell_vers[0] = 0;
         self.cellmap = CellMap::new(1 << 12);
         self.idmap = IdMap::new(1 << 12);
         self.oversize.clear();
@@ -773,8 +772,9 @@ impl EntityIndex {
     /// actual order changes, not once per query.
     fn ensure_cell_order(&mut self, cell: u32) {
         let c = cell as usize;
-        if self.cell_sv[c] == self.cell_ov[c] {
-            return;
+        let v = self.cell_vers[c];
+        if (v >> 32) == (v & 0xFFFF_FFFF) {
+            return; // layout already sorted to the current order version
         }
         let n = self.cell_ids[c].len();
         if n > 1 {
@@ -792,7 +792,8 @@ impl EntityIndex {
             let order: Vec<u32> = rows.into_iter().map(|(s, _)| s).collect();
             self.write_cell_layout(c, &order);
         }
-        self.cell_sv[c] = self.cell_ov[c];
+        let v = self.cell_vers[c] & 0xFFFF_FFFF;
+        self.cell_vers[c] = v | (v << 32);
     }
 
     /// Physically rebuild one cell's blocked-SoA arrays in the given slot
@@ -999,8 +1000,7 @@ impl EntityIndex {
         self.cell_box.push(Vec::new());
         self.cell_slots.push(Vec::new());
         self.cell_keys.push(key);
-        self.cell_ov.push(0);
-        self.cell_sv.push(0);
+        self.cell_vers.push(0);
         let id = (self.cell_keys.len() - 1) as u32;
         self.cellmap.insert(key, id);
         self.stats.cells += 1;
@@ -1103,7 +1103,7 @@ impl EntityIndex {
         if let Some(slot) = self.idmap.find(id) {
             // was a normal entity: detach it first
             let home = self.homes[slot as usize];
-            self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
+            let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | ((*v).wrapping_add(1) & 0xFFFF_FFFF);
             self.cell_remove(home, self.cpos[slot as usize] as usize);
             self.idmap.remove(id);
             self.free_slot(slot as usize);
@@ -1214,6 +1214,51 @@ pub fn key_coords(key: u64) -> (i32, i32) {
 
 #[doc(hidden)]
 impl EntityIndex {
+    /// ISO BENCH: walk phase only — the chunkZ-major cell walk with the
+    /// cellmap probes, no order check, no scan. Returns cells visited.
+    pub fn iso_walk_only(&mut self, world: u16, b: &Aabb) -> usize {
+        let ex = self.max_half_span + MARGIN as f64;
+        let cx0 = ((b.x0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cx1 = ((b.x1 + ex).floor() as i32) >> CELL_SHIFT;
+        let cz0 = ((b.z0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cz1 = ((b.z1 + ex).floor() as i32) >> CELL_SHIFT;
+        let mut visited = 0usize;
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
+                if let Some(cid) = self.cellmap.find(cell_key(world, cx, cz)) {
+                    let n = self.cell_ids[cid as usize].len();
+                    if n != 0 {
+                        visited += n;
+                    }
+                }
+            }
+        }
+        visited
+    }
+
+    /// ISO BENCH: walk + versioned order check, no scan.
+    pub fn iso_no_scan(&mut self, world: u16, b: &Aabb) -> usize {
+        let ex = self.max_half_span + MARGIN as f64;
+        let cx0 = ((b.x0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cx1 = ((b.x1 + ex).floor() as i32) >> CELL_SHIFT;
+        let cz0 = ((b.z0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cz1 = ((b.z1 + ex).floor() as i32) >> CELL_SHIFT;
+        let mut visited = 0usize;
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
+                if let Some(cid) = self.cellmap.find(cell_key(world, cx, cz)) {
+                    let cid = cid as usize;
+                    let n = self.cell_ids[cid].len();
+                    if n != 0 {
+                        self.ensure_cell_order(cid as u32);
+                        visited += n;
+                    }
+                }
+            }
+        }
+        visited
+    }
+
     /// Deep invariant check: cells, homes, cpos, idmap all consistent.
     pub fn check_invariants(&self) {
         use std::collections::HashSet as HS;

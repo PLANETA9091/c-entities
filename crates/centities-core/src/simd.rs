@@ -155,7 +155,10 @@ mod avx2 {
         let vy0 = _mm256_set1_ps(py0);
         let vy1 = _mm256_set1_ps(py1);
 
-        for blk in 0..n_blocks {
+        // full blocks run unmasked; the tail block is handled once, after
+        // the loop — the per-block `if blk+1==n_blocks` branch is gone
+        let full = n_blocks.saturating_sub(1);
+        for blk in 0..full {
             let p = bx.as_ptr().add(blk * 48);
             let x0 = _mm256_loadu_ps(p);
             let y0 = _mm256_loadu_ps(p.add(8));
@@ -178,9 +181,6 @@ mod avx2 {
             );
             let m = _mm256_and_ps(mx, _mm256_and_ps(mz, my));
             let mut bits = _mm256_movemask_ps(m) as u32;
-            if blk + 1 == n_blocks {
-                bits &= last_lane_mask; // stale/garbage lanes past n: unreachable
-            }
             let base = blk << 3;
             while bits != 0 {
                 let j = bits.trailing_zeros() as usize;
@@ -189,6 +189,38 @@ mod avx2 {
                 if super::exact_keep(bx, k, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
                     out.push(ids[k]);
                 }
+            }
+        }
+        let blk = full; // the tail block (mask applies even when n%8==0:
+        // lanes of the last block beyond `rem` may hold stale post-swap data)
+        let p = bx.as_ptr().add(blk * 48);
+        let x0 = _mm256_loadu_ps(p);
+        let y0 = _mm256_loadu_ps(p.add(8));
+        let z0 = _mm256_loadu_ps(p.add(16));
+        let x1 = _mm256_loadu_ps(p.add(24));
+        let y1 = _mm256_loadu_ps(p.add(32));
+        let z1 = _mm256_loadu_ps(p.add(40));
+        let mx = _mm256_and_ps(
+            _mm256_cmp_ps(x0, vx1, _CMP_LT_OS),
+            _mm256_cmp_ps(x1, vx0, _CMP_GT_OS),
+        );
+        let mz = _mm256_and_ps(
+            _mm256_cmp_ps(z0, vz1, _CMP_LT_OS),
+            _mm256_cmp_ps(z1, vz0, _CMP_GT_OS),
+        );
+        let my = _mm256_and_ps(
+            _mm256_cmp_ps(y0, vy1, _CMP_LT_OS),
+            _mm256_cmp_ps(y1, vy0, _CMP_GT_OS),
+        );
+        let m = _mm256_and_ps(mx, _mm256_and_ps(mz, my));
+        let mut bits = _mm256_movemask_ps(m) as u32 & last_lane_mask;
+        let base = blk << 3;
+        while bits != 0 {
+            let j = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let k = base + j;
+            if super::exact_keep(bx, k, ox, oz, qx0, qx1, qz0, qz1, my0, my1) {
+                out.push(ids[k]);
             }
         }
     }
