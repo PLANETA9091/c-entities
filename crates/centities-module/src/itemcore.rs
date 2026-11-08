@@ -1277,7 +1277,7 @@ unsafe fn n_item_invalidate_impl(
         let sz = (vz[k] << 4) as f64;
         let box_ = centities_core::Aabb::new(sx, sy, sz, sx + 16.0, sy + 16.0, sz + 16.0);
         let mut hits: Vec<i64> = Vec::with_capacity(64);
-        cst.idx.query(wid as u16, &box_, &mut hits);
+        cst.idx.query(wid as u16, &box_, &mut hits, centities_core::TICK_UNKNOWN);
         for id in hits {
             let slot = (id as u64 & STORE_MASK) as usize;
             let tag = (id as u64 >> 17) | 1;

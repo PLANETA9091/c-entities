@@ -5,7 +5,7 @@
 //!
 //! Usage: cargo run --release -p centities-core --example query_bench
 
-use centities_core::{Aabb, EntityIndex};
+use centities_core::{TICK_UNKNOWN, }; use centities_core::{Aabb, EntityIndex};
 use std::time::Instant;
 
 fn bench(label: &str, idx: &mut EntityIndex, boxes: &[Aabb], iters: usize) {
@@ -13,13 +13,13 @@ fn bench(label: &str, idx: &mut EntityIndex, boxes: &[Aabb], iters: usize) {
     let mut sink = 0usize;
     // warmup
     for b in boxes.iter().take(256) {
-        idx.query(0, b, &mut out);
+        idx.query(0, b, &mut out, TICK_UNKNOWN);
         sink += out.len();
     }
     let t0 = Instant::now();
     for _ in 0..iters {
         for b in boxes {
-            idx.query(0, b, &mut out);
+            idx.query(0, b, &mut out, TICK_UNKNOWN);
             sink += out.len();
         }
     }
@@ -121,6 +121,6 @@ fn main() {
 
     // candidate-count probe for context
     let mut out = Vec::new();
-    idx.query(0, &qboxes[0], &mut out);
+    idx.query(0, &qboxes[0], &mut out, TICK_UNKNOWN);
     println!("sample dense query candidates: {}", out.len());
 }
