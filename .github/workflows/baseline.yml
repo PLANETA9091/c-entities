@@ -23,6 +23,9 @@ on:
       ce_merge:
         description: 'CE_MERGE for the mod leg (1=on, 0=merge fast path off — bisect knob)'
         default: '1'
+      ce_extra_env:
+        description: 'extra KEY=VAL pairs exported to the mod leg (space-separated, e.g. "CE_L108B=1")'
+        default: ''
 
 permissions:
   contents: write
@@ -117,7 +120,7 @@ jobs:
         if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: |
           bash scripts/run-baseline.sh
-          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
+          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} ${{ github.event.inputs.ce_extra_env || '' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
         if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh

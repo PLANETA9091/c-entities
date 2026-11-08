@@ -588,7 +588,7 @@ mod tests {
                 z as f64 + BOX_H,
             );
             let mut out = Vec::new();
-            eng.index.query(0, &b, &mut out);
+            eng.index.query(0, &b, &mut out, centities_core::TICK_UNKNOWN);
             assert!(
                 out.contains(&id),
                 "materialized id {id} not queryable at its slot box"

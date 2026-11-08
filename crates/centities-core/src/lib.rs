@@ -41,6 +41,14 @@ pub const MARGIN: f32 = 1.0e-3;
 /// Entities whose AABB half-span exceeds this live in the oversize list.
 pub const MAX_HALF_SPAN: f64 = CELL as f64 / 2.0;
 
+/// L107 EXACT FRESH FILTER: the freshness sentinel — a slot upserted by a
+/// tickless caller (tests, pidx view) never matches a real query tick.
+pub const TICK_UNKNOWN: i32 = i32::MIN;
+/// L107: the out-stream bit marking a candidate whose exact live f64 box was
+/// intersect-tested in Rust this tick — Java skips its live-box re-check.
+/// Bits 32..63 of the out ids are otherwise unused (entity ids are ints).
+pub const FRESH_BIT: i64 = 1 << 40;
+
 /// Blocked-SoA geometry (doc 21): one block of 8 candidates, six contiguous
 /// segments of 8 f32 (x0,y0,z0,x1,y1,z1). Same bytes-per-candidate as the
 /// old stride-6 layout, but the query scan reads each segment as a single
@@ -443,6 +451,27 @@ pub struct EntityIndex {
     // the same neighbor sequence as the vanilla server.
     sy: Vec<i32>,      // per-slot section Y stamp
     seq: Vec<i64>,     // per-slot insertion seq stamp
+    // L107 EXACT F64 ROW BOXES: the exact live AABB in absolute f64 (the
+    // cell_box SoA stays f32 cell-relative — it is the SIMD prefilter; this
+    // array is the exact mirror the doc-41 exact-f64-query move needs).
+    // Maintained on every upsert; freed/reset on slot release so a reused
+    // slot can never inherit a stale box or freshness stamp.
+    slot_bb: Vec<[f64; 6]>,   // per-slot exact [x0,y0,z0,x1,y1,z1]
+    slot_tick: Vec<i32>,      // per-slot freshness stamp (tick of last upsert)
+    // L108a: scratch parallel to the query's out stream — one global slot
+    // per survivor, filled by scan_cells (empty for oversize survivors, whose
+    // path keeps the hash filter). Reused across queries, never cleared: the
+    // non-oversize path overwrites [0..out.len()) on every call.
+    slots_scratch: Vec<u32>,
+    // L108b (CE_L108B=1, set once at arm time by the module layer): trust the
+    // exact f64 decision for STALE slots too. The index box at query time is
+    // post-flush-merge current for essentially every candidate (marginExtra
+    // ~0.00007% says the f32 index box and the live box agree), so the 214
+    // sim drift cases were stamp-boundary artifacts, not index staleness.
+    // CI parity referees the contract: PASS kills the Java live-box trim for
+    // every candidate (getBoundingBox 10.64% top-2), FAIL pins the drift
+    // sites and they keep the legacy fallback.
+    trust_stale_exact: bool,
     cell_ov: Vec<u64>, // per-cell order version (bumped on order change)
     cell_sv: Vec<u64>, // per-cell version the layout was last sorted to
     // per-cell contiguous SoA (1-based cell ids, parallel to cell_keys)
@@ -466,6 +495,10 @@ impl EntityIndex {
             cpos: Vec::new(),
             sy: Vec::new(),
             seq: Vec::new(),
+            slot_bb: Vec::new(),
+            slot_tick: Vec::new(),
+            slots_scratch: Vec::new(),
+            trust_stale_exact: false,
             cell_ov: vec![0], // cell 0 unused
             cell_sv: vec![0],
             cell_ids: vec![Vec::new()], // cell 0 unused
@@ -492,7 +525,7 @@ impl EntityIndex {
     /// Insert or update an entity's AABB without order stamps (pidx view /
     /// tests). The cell layout of this index is then order-insensitive.
     pub fn upsert(&mut self, id: i64, world: u16, b: &Aabb) -> UpsertEv {
-        self.upsert_ord(id, world, b, 0, 0)
+        self.upsert_ord(id, world, b, 0, 0, TICK_UNKNOWN)
     }
 
     /// Insert or update an entity's AABB with its vanilla scan-order stamps.
@@ -502,7 +535,21 @@ impl EntityIndex {
     /// O(1) typical (same-cell update is 6 stores into the cell's
     /// contiguous arrays). `world` is a caller-assigned small id per Level
     /// instance. Returns the cell-level change (see [`UpsertEv`]).
-    pub fn upsert_ord(&mut self, id: i64, world: u16, b: &Aabb, sy: i32, seq: i64) -> UpsertEv {
+    /// `tick` = the caller's freshness stamp (Java CUR_TICK at probe
+    /// emission; [`TICK_UNKNOWN`] for tickless callers). Stored per-slot and
+    /// consulted by [`EntityIndex::query`] — a candidate whose stamp equals
+    /// the query tick carries an EXACT live box (the probe wrote it, the
+    /// flush applied it, the single-threaded tick loop cannot mutate it
+    /// between the flush and the scan) and may be exact-filtered in Rust.
+    pub fn upsert_ord(
+        &mut self,
+        id: i64,
+        world: u16,
+        b: &Aabb,
+        sy: i32,
+        seq: i64,
+        tick: i32,
+    ) -> UpsertEv {
         let hx = (b.x1 - b.x0) * 0.5;
         let hz = (b.z1 - b.z0) * 0.5;
         let half = hx.max(hz);
@@ -557,6 +604,9 @@ impl EntityIndex {
                     self.seq[slot as usize] = seq;
                     self.cell_ov[home as usize] = self.cell_ov[home as usize].wrapping_add(1);
                 }
+                // L107: exact f64 mirror + freshness stamp (same-cell path).
+                self.slot_bb[slot as usize] = [b.x0, b.y0, b.z0, b.x1, b.y1, b.z1];
+                self.slot_tick[slot as usize] = tick;
                 let _ = home;
                 return UpsertEv::BoxChanged { cell: home };
             }
@@ -569,6 +619,9 @@ impl EntityIndex {
             self.worlds[slot as usize] = world;
             self.sy[slot as usize] = sy;
             self.seq[slot as usize] = seq;
+            // L107: exact f64 mirror + freshness stamp (moved-cell path).
+            self.slot_bb[slot as usize] = [b.x0, b.y0, b.z0, b.x1, b.y1, b.z1];
+            self.slot_tick[slot as usize] = tick;
             self.cell_ov[new_home as usize] = self.cell_ov[new_home as usize].wrapping_add(1);
             return UpsertEv::Moved {
                 old: home,
@@ -589,6 +642,8 @@ impl EntityIndex {
                 self.cpos.push(0);
                 self.sy.push(sy);
                 self.seq.push(seq);
+                self.slot_bb.push([b.x0, b.y0, b.z0, b.x1, b.y1, b.z1]);
+                self.slot_tick.push(tick);
                 (self.ids.len() - 1) as u32
             };
             let home = self.cell_id(world, ncx, ncz);
@@ -652,6 +707,9 @@ impl EntityIndex {
         self.cpos.clear();
         self.sy.clear();
         self.seq.clear();
+        self.slot_bb.clear();
+        self.slot_tick.clear();
+        self.slots_scratch.clear();
         for v in self.cell_ids.iter_mut() {
             v.clear();
         }
@@ -702,8 +760,24 @@ impl EntityIndex {
     /// amortized once-per-cell-between-changes operation — so scan_cells
     /// streams survivors in the vanilla order and the concatenated stream
     /// across the chunkZ-major cell walk is bit-identical to vanilla's.
-    pub fn query(&mut self, world: u16, b: &Aabb, out: &mut Vec<i64>) {
+    ///
+    /// L107 EXACT FRESH FILTER: `tick` = the caller's current tick
+    /// ([`TICK_UNKNOWN`] disables the filter). Candidates whose slot was
+    /// upserted on EXACTLY this tick carry the exact live f64 box, so the
+    /// exact AABB.intersects test decides in Rust: an exact miss is dropped
+    /// (Java never derefs it), a hit is handed over with [`FRESH_BIT`] set
+    /// (Java skips its live-box re-check). Everything else keeps the
+    /// legacy Java trim. Runs AFTER the oversize merge so the order-key
+    /// rebuild sees plain ids; the filter itself is a stable in-place
+    /// compaction (skip preserves relative order — the L106 argument).
+    pub fn query(&mut self, world: u16, b: &Aabb, out: &mut Vec<i64>, tick: i32) {
         out.clear();
+        // L108a: the slot scratch is append-only (parallel to out, one slot
+        // per scan survivor); drop it wholesale when the accumulated stream
+        // outgrows the cap — the next query's window base simply resets to 0.
+        if self.slots_scratch.len() > (4 << 20) {
+            self.slots_scratch.clear();
+        }
         // L60 SCAN-BOUNDS SPLIT. `ex` expands ONLY the cell WALK (which
         // cells host a box that can reach the query: a homed entity's box
         // reaches <= max_half_span from its center cell). The per-cell SCAN
@@ -747,8 +821,19 @@ impl EntityIndex {
                 self.ensure_cell_order(cid as u32);
                 let ids = &self.cell_ids[cid];
                 let bx = &self.cell_box[cid];
+                let slots = &self.cell_slots[cid];
                 let (ox, oz) = cell_origin(cx, cz);
-                simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out);
+                if tick > 0 {
+                    // L108a: record each survivor's global slot next to its
+                    // id — the freshness filter below becomes an array read.
+                    simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out,
+                        slots, &mut self.slots_scratch);
+                } else {
+                    // Filter disarmed (knob off / early boot): zero scratch
+                    // traffic, byte-identical L107a legacy behavior.
+                    simd::scan_cells(bx, ids, n, ox, oz, b.x0, b.x1, b.z0, b.z1, my0, my1, out,
+                        &[], &mut Vec::new());
+                }
             }
         }
         let mut any_ov = false;
@@ -773,6 +858,87 @@ impl EntityIndex {
             out.clear();
             out.extend(keyed.into_iter().map(|(_, _, id)| id));
         }
+        // L107/L108: the exact freshness filter (see the field docs above).
+        // Oversize ids carry no slot (idmap miss) and stay unfresh — Java
+        // trims them exactly as before; benches carry none.
+        if tick > 0 {
+            if !any_ov {
+                // L108a COMMON PATH: slots_scratch is aligned with out (one
+                // global slot per survivor, same stream order, fully
+                // overwritten by this query's scan) — the freshness decision
+                // is a plain array read; the per-candidate idmap.find hash
+                // (measured +108-145 ns/query warm, cache-cold ×20-40 in CI,
+                // run 42430395165) is gone.
+                let trust_all = self.trust_stale_exact;
+                // The window this query wrote: the scratch is append-only,
+                // so this query's slots start at len - out.len() (every out
+                // entry in the non-oversize path pushed exactly one slot).
+                let base = self.slots_scratch.len() - out.len();
+                let mut w = 0usize;
+                for r in 0..out.len() {
+                    let id = out[r];
+                    let s = self.slots_scratch[base + r] as usize;
+                    let mut keep = id;
+                    if trust_all || self.slot_tick[s] == tick {
+                        let bb = &self.slot_bb[s];
+                        // AABB.intersects(box), the vanilla predicate — the
+                        // exact same 6-compare shape as the Java live-box
+                        // trim (CeHooks fastQuery/rowQuery resolve loops).
+                        let hit = bb[0] < b.x1
+                            && bb[3] > b.x0
+                            && bb[1] < b.y1
+                            && bb[4] > b.y0
+                            && bb[2] < b.z1
+                            && bb[5] > b.z0;
+                        if hit {
+                            keep = id | FRESH_BIT;
+                        } else {
+                            continue; // exact miss: never handed to Java
+                        }
+                    }
+                    out[w] = keep;
+                    w += 1;
+                }
+                out.truncate(w);
+            } else {
+                // L108a RARE PATH: the oversize merge re-sorted out — the
+                // slot scratch no longer aligns with it. Unchanged L107
+                // hash-based filter (oversize is empty in every bench and
+                // near-empty in production; correctness over speed here).
+                let trust_all = self.trust_stale_exact;
+                let mut w = 0usize;
+                for r in 0..out.len() {
+                    let id = out[r];
+                    let mut keep = id;
+                    if let Some(slot) = self.idmap.find(id) {
+                        let s = slot as usize;
+                        if trust_all || self.slot_tick[s] == tick {
+                            let bb = &self.slot_bb[s];
+                            let hit = bb[0] < b.x1
+                                && bb[3] > b.x0
+                                && bb[1] < b.y1
+                                && bb[4] > b.y0
+                                && bb[2] < b.z1
+                                && bb[5] > b.z0;
+                            if hit {
+                                keep = id | FRESH_BIT;
+                            } else {
+                                continue; // exact miss: never handed to Java
+                            }
+                        }
+                    }
+                    out[w] = keep;
+                    w += 1;
+                }
+                out.truncate(w);
+            }
+        }
+    }
+
+    /// L108b: arm the stale-slot trust contract (module layer, once at
+    /// startup, from CE_L108B=1). See the field doc on `trust_stale_exact`.
+    pub fn set_trust_stale_exact(&mut self, on: bool) {
+        self.trust_stale_exact = on;
     }
 
     /// The two-long vanilla order key of `id` — ka = (chunkZ biased)<<22 |
@@ -925,7 +1091,8 @@ impl EntityIndex {
         let qz1 = z1 + QEPS;
         let my0 = (y0 - QEPS) as f32;
         let my1 = (y1 + QEPS) as f32;
-        simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out);
+        simd::scan_cells(bx, ids, n, ox, oz, qx0, qx1, qz0, qz1, my0, my1, out, &[],
+            &mut Vec::new());
     }
 
     /// L12 push kernel: the public cell-key builder (module-side sort
@@ -1136,6 +1303,14 @@ impl EntityIndex {
         self.cpos.pop();
         self.sy.pop();
         self.seq.pop();
+        // L107: mirror the ids/worlds/... swap-remove — when slot != last
+        // the tail entity's exact box + stamp move down with it, when
+        // slot == last the tail is dropped. A later slot reuse goes through
+        // the upsert push path, which writes both arrays — no stale leak.
+        self.slot_bb.swap_remove(slot);
+        self.slot_tick.swap_remove(slot);
+        debug_assert_eq!(self.slot_bb.len(), self.ids.len());
+        debug_assert_eq!(self.slot_tick.len(), self.ids.len());
     }
 
     fn upsert_oversize_ord(&mut self, id: i64, world: u16, b: Aabb, sy: i32, seq: i64) -> UpsertEv {
