@@ -1,0 +1,161 @@
+# 42. The native pivot — Horizon study and the zero-Java entity architecture
+
+Date: 2026-11-08. Status: DECISION + first slice landed (L110 = crate
+`centities-native`, branch `l110-native`). Owner directive: rebuild the
+acceleration architecture after the Horizon (github.com/horizon-rust/horizon)
+study — entities ticked ENTIRELY in Rust, zero Java in the entity path,
+then profile RUST functions and optimize the top of that profile.
+
+## 1. What Horizon is
+
+Minecraft 26.3 rewritten from scratch in Rust (MIT), verified against
+vanilla with ~600 differential harnesses (per-tick AI-visible state
+transcripts from a headless Java oracle vs the Rust probe — the same
+discipline as our parity family, at engine scale). Key architecture facts
+(all file refs = horizon-study clone):
+
+- **Single-threaded, vanilla-ordered entity tick** (game/creatures.rs:1251,
+  the comment at :1468 states the contract we already enforce: later mobs
+  observe earlier mobs' tick results).
+- **Plain AoS `Vec<Mob>`** (~3 KB per mob, insertion order) + `FxHashMap`
+  id→slot cache (game/mob_index.rs:18) + per-tick flattened `Seen`
+  snapshot (~40 fields) indexed by a **uniform 4.0-block XZ grid**
+  (`SeenGrid`, seen_grid.rs:12, candidates() = guaranteed superset).
+- **Attributes designed away**: flat `Copy` struct `Attrs` (mobs.rs:1017)
+  copied from the immutable per-type `MobType` (Arc-shared); modifier math
+  inlined per read (`Mob::movement_speed` mobs.rs:4100). No AttributeMap.
+- **Block access = O(1) fact rows**: `BlockFacts` per block state (path
+  type, collision top, flags), chunk hash-map + section palettes; A* uses
+  precomputed `PathType` malus tables, not shape queries.
+- **Side effects deferred**: goals push `MobEvent` (~110 variants) into one
+  Vec, drained ONCE per tick by the host (handle_mob_events_reusable,
+  creatures.rs:2322). The tick stays pure and diffable.
+- **Built-in Rust profiler from day one**: thread-local span sampling
+  (tick_profile.rs samples 1 tick in 17, per (level, mob kind) cost maps)
+  + span traces; horizon-bench is just the report format.
+
+## 2. What we already owned vs what the pivot adds
+
+We had the hard parts and did not know their final shape:
+
+| layer | status before the pivot |
+|---|---|
+| goal-selector floor | bit-exact vs Paper 1.21.8 (goals.rs, CI run #369) — but driven PER MOB PER ROUND through JNI (aiPack → nativeMobAiFloor → aiApply → resolve) |
+| travel slice / push kernel / item tick | parity-proven in centities-core; items already ~100% native |
+| world seam | resolved by JAVA inside the request loop (the L107 lesson: JNI calls invisible to JFR; fastMs/qMs timers are the only truth) |
+| profiling | JFR = Java frames only; Rust-side cost invisible behind JNI |
+
+The pivot (this branch): make the SAME floor the production executor with
+the Horizon storage shape around it — the JNI round-trips collapse from
+per-mob-per-round to ONE call per tick, and the world seam resolves in
+Rust.
+
+## 3. The new crate: `centities-native`
+
+- **store.rs — MobStore**: persistent AoS `Vec<MobSlot>` (each slot = the
+  parity-proven `MobAI` state + alive flag + grid cell) in vanilla
+  insertion order; `HashMap` id→slot; tombstone compaction when free slots
+  exceed `compact_at` (256). Tests: order stability, double-add guard.
+- **store.rs — SeenGrid**: the Horizon 4.0-block XZ grid port; per-tick
+  O(N) rebuild (their incremental re-bucket is the documented N1
+  optimization); candidates() = superset with the >1024-cell overflow
+  fallback to a full walk. Test: superset property incl. boundary cells.
+- **world.rs — WorldRes**: the Resolver (swarm-sim's five-method protocol
+  extended with two optional player-facing predicates — lookat/find-target
+  — default false, so the sim is untouched semantically). Player targeting
+  answers from the REAL pushed snapshot (O(P), the Horizon `players()`
+  contract); `BlockFacts` is the seam where the N1 section-copy protocol
+  plugs in (v0 = `OpenGround`, the named honest constructor).
+- **exec.rs — NativeTick**: one call ticks the whole population: grid
+  rebuild → player pack build → approach refresh → THE LOOP (ai_tick per
+  mob, vanilla insertion order; the floor picks targets via
+  ACT_REF_SET_PLAYER and apply_actions sets target+approach) → travel pass
+  → compaction. The L111 bridge (Java side) will call this once per tick
+  and becomes a COPY layer: push players + add/remove diffs, read back
+  positions + events. No entity logic in Java.
+- **profile.rs**: the phase ledger — ai/travel/grid/apply nanoseconds,
+  sampled 1 tick in 17 (prime stride, the Horizon SAMPLE_EVERY trick),
+  atomics, near-zero steady-state cost. `drain()` → report string.
+
+## 4. First numbers (this sandbox, release build, single thread)
+
+native_bench 25000 zombies + 1 player (the mobs-25k shape), 400 ticks,
+warmup 50:
+
+| metric | value |
+|---|---|
+| p50 / p90 / p99 | **8.79 / 9.48 / 12.28 ms/tick** |
+| target acquisition | 3080 mobs chasing (find_target → ACT_REF_SET_PLAYER → chase confirmed) |
+| phases (est) | ai 6.10, travel 2.12, grid 2.06, apply 0.11 ms/tick |
+
+Reference points: vanilla Paper mobs-25k ≈ 494 ms/tick (2026-10-31 table,
+doc 41); the current shipped module ≈ 240–260 ms/tick on that scenario
+(the L109-era dAB ≈ +18–33% vs vanilla). The native executor is
+**~28× under the module** and **~56× under vanilla** on the same shape —
+the architecture headroom the pivot is built to harvest. The remaining
+cost sits in ai (the floor walk) and travel/grid — exactly what
+rust_perf_top.py now ranks per function.
+
+9/9 tests green: store order/compaction, grid superset, executor
+(no-players stroll, target acquisition + chase, bitwise determinism per
+seed, remove/re-add exactness), profile ledger.
+
+## 5. The profiler the user demanded
+
+Two layers, both landed:
+
+1. **Phase ledger** (in-crate, always on): the four phases above; sampled
+   1-in-17; the bench prints it after every run.
+2. **scripts/rust_perf_top.py + native-profile.yml CI job**: perf record
+   `-e cycles:u` on the release bench (single-threaded, allocation-free
+   steady loop) → parsed `perf report --no-children -s symbol,dso` → TOP-40
+   RUST symbols by self-time; when the runner blocks perf_event_open the
+   script falls back to the phase ledger automatically. The report goes to
+   the job summary + artifact `native-profile-<run>`.
+
+From this point every optimization claim can cite a RUST function line,
+not a Java frame hidden behind JNI (the L107 discipline lesson, now
+obsoleted — the executor is Rust end to end).
+
+## 6. The N1..N4 phases (the rest of the pivot)
+
+- **N1 — block facts for real**: the host pushes per-section copies (packed
+  palettes) for the sections the managed population's boxes touch; a
+  version stamp per section; `BlockFacts` impl reads palettes in Rust
+  (Horizon's O(1) row contract). This replaces `OpenGround` — stroll
+  targets get real safety checks, LoS gets the DDA walk.
+- **N2 — the L111 bridge (Java copy layer)**: `CE_NATIVE_MOB=1` — the mob
+  tick list collects add/remove diff + player snapshot + section
+  subscriptions; one JNI call per tick (`nativeMobBatch`); read-back =
+  positions/yaw/nav targets/events; vanilla predicates (see-through walls,
+  despawn) ride the events. The Java body is NEVER entered for native
+  mobs — the skip happens at the dispatch weave, before commonTick.
+- **N3 — events outbox**: NativeEvent kinds (sound, drop, target set,
+  despawn, damage) drained once per tick by the host applier — the
+  Horizon handle_mob_events contract; this is also where vanilla side
+  effects (zombie reinforcements, drops) get their exact semantics.
+- **N4 — parity transcripts for the native path**: per-tick AI-visible
+  state (position, motion, rotations, running goals, target, nav state)
+  for every native mob, compared against the existing parity harness's
+  A/B legs — the same bit-identical gates, now at the executor boundary.
+
+## 7. Honesty ledger (the pivot's standing disclosure)
+
+- EXACT (parity-proven machinery, unchanged): the goal-selector walk, the
+  RNG stream semantics, the action set, the travel slice math, the
+  push-kernel contract.
+- v0 SCRIPTED (declared in code, changes WHERE mobs walk, never the cost
+  structure): stroll target = splitmix draw + OpenGround facts (vanilla:
+  10×7 draws with block-safety); LoS always true; path model = straight
+  line (the open-ground routing proof); MeleeAttack approach = the target's
+  live position.
+- The stroll stream is a separate splitmix (swarm-sim honesty note 1);
+  the L111 bridge hands the real per-mob seeds.
+
+## 8. Verdict discipline (unchanged)
+
+No production claim until the N2 bridge runs under the existing gates:
+parity bit-identical legs + baseline within-run dAB + native-profile
+artifact. Until then `centities-native` is the kernel + bench + profiler
+layer, additive only: nothing in the shipped config changes (main's
+shipped stack stays L104+L104b+L106+L109).

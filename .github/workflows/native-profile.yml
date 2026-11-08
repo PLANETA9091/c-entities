@@ -1,0 +1,82 @@
+name: native-profile
+
+# The L110 pivot's profiler job: build centities-native, run the native
+# bench (the zero-Java full-tick executor) and publish a Rust per-function
+# self-time report. On ubuntu runners perf_event_open is usually restricted
+# (paranoid >= 1, in-container), so the job:
+#   1. tries perf record -e cycles:u (works on some runners with
+#      linux-tools installed),
+#   2. falls back to the crate's built-in phase ledger (always available),
+#   3. additionally records a dhat-style allocation note via the bench's
+#      steady-state contract (no allocations in the loop).
+# The report lands in the job summary and as an artifact native-profile-<run>.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mobs:
+        description: 'mob count for the native bench pile'
+        default: '25000'
+      ticks:
+        description: 'measured ticks'
+        default: '400'
+      seed:
+        description: 'stroll/target stream seed (int)'
+        default: '194531'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, minimal)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Try installing perf (best effort)
+        run: |
+          # best effort: the runner kernel's linux-tools package rarely
+          # matches exactly; a miss is fine (the ledger fallback covers us)
+          K=$(uname -r | cut -d. -f1,2)
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq "linux-tools-${K}" "linux-tools-generic" >/dev/null 2>&1 || true
+          sudo sysctl kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
+          perf --version || echo "perf unavailable — ledger fallback"
+
+      - name: Build the native bench
+        run: cargo build --release -p centities-native --example native_bench
+
+      - name: Run the profiler script
+        id: prof
+        run: |
+          python3 scripts/rust_perf_top.py \
+            --mobs "${{ inputs.mobs || 25000 }}" \
+            --ticks "${{ inputs.ticks || 400 }}" \
+            --seed "${{ inputs.seed || 194531 }}" \
+            --top 40 \
+            --out native-profile.md
+          mkdir -p reports/native
+          cp native-profile.md "reports/native/native-profile-${GITHUB_RUN_ID}.md"
+          cat native-profile.md
+
+      - name: Job summary
+        run: |
+          {
+            echo "# native-profile (run ${GITHUB_RUN_ID})"
+            echo
+            cat native-profile.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-profile-${{ github.run_id }}
+          path: |
+            native-profile.md
+            reports/native/native-profile-${{ github.run_id }}.md
+          retention-days: 30
