@@ -231,3 +231,102 @@ mobs the per-event clocking costs more than the phases it measures.
 The honest per-function TIME split needs perf (root) or a sampler with
 patched entry; until then: interleaved p50 pairs + phase ledger + PGO
 counts are the evidence, in that order of trust.
+
+### 9.2 L111e/f/g — the dead-work deletion, the one-pass tick, the INLINE floor
+
+The user directive this round: "-100% on everything, do until done" (the
+standing rule: parallelism is NOT acceleration; acceleration is hard
+arithmetic — laziness IS: not computing what nobody reads is the purest
+form of it).
+
+**L111e — dead work deleted** (pure perf, zero semantics):
+- `SeenGrid` rebuild is LAZY: epoch-stamped, rebuilt on the FIRST query.
+  The v0 executor's AI never queries candidates (player scans walk the
+  snapshot O(P)) — the per-tick rebuild was 0.94 ms/tick of nothing. The
+  push kernel (N1+) pays for the build at its first query per tick.
+- The per-tick `Vec<AiStat>` return allocated ~800KB EVERY tick (mmap +
+  200 first-touch page faults); the buffer is now reused.
+- Interleaved A/B: p50 7.24/7.37/7.32 -> 6.46/6.55/6.38 (**-12%**), grid
+  phase 0.94 -> 0.00, chasing 3027 identical.
+
+**L111f — one-pass tick**: AI + travel run per mob in ONE iteration (the
+vanilla per-entity shape; the old two-pass shape touched every mob's
+~11MB of cache lines twice per tick, the second pass cold, and violated
+the "later mobs observe earlier mobs' POST-TRAVEL positions" contract).
+Interleaved A/B: travel 2.0 -> 1.75-1.84, p50 -5%.
+
+**L111g — the INLINE floor**: the parked protocol's per-request cost was
+a FULL repack (114 words) + a floor re-entry (ctx rebuild + lock
+rebuild); ~0.9 parks per mob-tick -> ~1.9 ai_floor entries. The new
+`ai_floor_inline` resolves every request INSIDE the walk through the
+`InlineRes` trait; the decision code is SHARED (one `run_mode`,
+Mode::Parked | Mode::Inline) — the parked entry stays for the Java
+bridge and the fixture. Live-state visibility (what the parked
+protocol's apply-then-repack made visible to later rounds of the same
+tick) is carried by two shadows + two hooks:
+- `mf_live` (the MF_HAS_TARGET shadow): combat LOS winners set it, null
+  results and the ZA/NEAREST canContinueToUse failures clear it —
+  exactly the places the repack would have reflected them;
+- `na_live` (the noActionTime shadow): every ACT_GOAL_START and every
+  start body resets it (the parked repack made that visible to the
+  STROLL canUse gate in the same tick);
+- `ref_set_player` runs synchronously on the resolver (the later
+  canuse_vanilla of the same walk reads the fresh target);
+- `start_vanilla` draws through `&mut shared_seed` — the walk's LIVE
+  SHARED_RANDOM position continues through the start bodies exactly
+  where vanilla runs start() inline between the gates.
+
+**THREE LATENT PARKED-PROTOCOL BUGS the fixture caught on the way** (all
+fixed in the shared floor, both modes benefit):
+1. **The cursor sentinel collision**: the resume token encoded 0 for the
+   (TARGET, CLEANUP, gi=0) park — the HurtByTargetGoal
+   canContinueToUse — indistinguishable from "fresh start": every
+   re-entry re-parked the SAME request until the 32-round cap
+   (FB_JAVA_ROUND_CAP). Bit-10 resume-valid added; the Java packer
+   echoes the token verbatim, so this is transparent to CeHooks. The
+   benches never hit it (their mobs are never hurt).
+2. **The staging/action overlap**: `park_los` staged the candidate list
+   at out[8..] — the SAME slots action 0 occupies. An LOS park that
+   followed ANY action of the same walk (e.g. the CC resume's displaced
+   stop) clobbered that action, and the executor's apply executed the
+   staging bytes as opcodes (the fixture caught cands [len=1, idx=2]
+   decoded as ACT_GOAL_START(goal 2)). The staging moved beyond the
+   action region (`OUT_STAGE`, CeHooks AI_OUT mirrors the offset).
+3. **The stale candidate-count read**: the parked LOS resolver read
+   `n = out[8]` (now the action slot); reads `out[OUT_STAGE]`.
+
+**The differential fixture** (`centities-native/tests/inline_parity.rs`):
+3000 randomized single-tick scenarios + 200 chained 40-tick runs —
+random players (0-3, mixed alive/spectator), random running sets
+(flag-collision-free by construction), random state words, noActionTime
+sweeping the 100 gate, nav states — asserts same status, same fallback
+reason, same per-goal running/state, same targets, same seed, bit-equal
+positions. On the FULL 400-tick bench: chasing 3740 = 3740 = 3740 (the
+parked and inline executors produce bit-identical trajectories).
+
+**Clean same-floor A/B** (both binaries carry the three fixes; the only
+variable is Parked vs Inline):
+| metric | new-PARKED | INLINE | delta |
+|---|---|---|---|
+| p50 ms/tick | 5.75 / 5.72 / 5.86 | 5.46 / 5.28 / 5.26 | **-7..-10%** |
+| ai phase | 5.44 / 5.36 / 5.44 | 5.04 / 4.94 / 4.91 | **-8..-10%** |
+| chasing | 3740 | 3740 | identical |
+
+PGO counters after (25k x 450): `ai_floor_inline` 12.5M = **1.11
+entries per mob-tick** (was ~1.9 re-entries), pack_into 2.13G block
+execs (~189/mob-tick — one pack, still the top COUNT, measured free in
+time: the L1 store stream), can_use_inner 179M (~16/mob-tick),
+stop_goal 20.7M (~1.8 — the CC stops).
+
+**The chasing shift 3027 -> 3740 is a CORRECTION, declared**: the old
+bench trajectory carried the staging-overlap bug (garbage opcodes
+applied) and the round-cap fallbacks suppressed acquisitions; the fixed
+floor lets the correct acquisitions through. The L111b precedent
+applies: the scripting shapes where mobs walk, never the cost
+structure — and here the WHERE moved because the bugs moved.
+
+**Session cumulative** (in-window comparisons, L110 baseline 8.41
+ms/tick): 8.41 -> ~5.3 (-37%); the phase split now ai 4.9-5.0 (the
+floor walk + the one pack), travel 1.72-1.74, grid 0.00, apply ~0.11.
+The next big fish stays the same: the pack (114 words per mob-tick for
+a walk that reads most of it) and the floor's gate walk itself.
