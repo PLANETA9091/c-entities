@@ -358,3 +358,26 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
   ×3-4 прохода ≈ 50–60МБ/тик — travel 2.05ms в основном это), nextInt(bound)
   дивид (50k runtime div/тик, u128 ceil-magic + thread-local кэш), perf-таблица
   с CI-раннера.
+
+## Task 32b — L112 wave4b: division-free nextInt(bound) (2026-11-09)
+
+- goals.rs::next_int_bound: runtime `bits % bound` (nextInt(10)×3 +
+  nextInt(60) на моба на чётную ветку ≈ 37k+ div/тик) → точный ceil-magic
+  (Hacker's Delight 10-9): INV = ceil(2^64/bound) = u64::MAX/bound+1,
+  q = (bits·INV)>>64 через u128, val = bits − q·bound. Доказательство в доке:
+  e = INV·b − 2^64 < bound; bits·e < 2^62 < 2^64 ⇒ q_est == floor(bits/bound)
+  ТОЧНО. bound=1/2 не доходят до магии (pow2-арм), overflow невозможен.
+- Мемо: per-thread 4-slot [(bound, INV)] через Cell<(i32,u64)> (get — 16Б,
+  НЕ take/set 40Б×2 — первая версия копировала весь массив на каждый draw и
+  подозрительно просела); после прогрева ноль div, hit ≈ 2 get + mulhi.
+- ГЕЙТЫ: sweep-тест ~83M проверок (границы 0/q·b/2^30/2^31−1, края
+  ванильной зоны отбраковки 2^31−(2^31 mod bound), страт-свипы ×598
+  bound, фат-свипы реальных 10/60/20/7/999999) — 0.14s в release; тест
+  observation-free: замкнутый референс с plain % на 2000 seed × 5 bound.
+- ЧЕСТНЫЙ A/B интерливом двух бинарников (A,B,A,B,A,B без пересборок):
+  magic 4.56/4.03/4.03 vs plain % 4.57/4.00/4.02 — дельта НИЖЕ шумового
+  пола этой коробки (±5%; первый «A/B» 4.19 vs 4.37 был артефактом
+  дрейфа окна — урок: сравнивать только интерливом готовых бинарей).
+  Оставлено: mulhi ≤ div по определению, точность пришита свипом,
+  наблюдаемое поведение нулевое.
+- chasing 3036 бит-в-бит на всех армах; workspace зелёный (release+debug).
