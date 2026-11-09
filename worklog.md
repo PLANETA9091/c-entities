@@ -381,3 +381,57 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
   Оставлено: mulhi ≤ div по определению, точность пришита свипом,
   наблюдаемое поведение нулевое.
 - chasing 3036 бит-в-бит на всех армах; workspace зелёный (release+debug).
+
+## Task 33 — L113 wave6: the fold (no-park resolutions) + phantom-start fix (2026-11-09)
+
+- ДИРЕКТИВА: «парарельность это не ускорение на самом деле. ускорение это
+  реально писать код жосткий математический» — незакоммиченный WAVE5
+  (scoped-threads по чанкам) ОТБРОШЕН (exec.rs откат, ledger-фикс тени
+  метра остался: 25k locked RMW + 25k store/тик на несемплированных мобах
+  → один relaxed load).
+- СТРУКТУРА: floor-парки (park → executor резолвит → resume) стоили по
+  полному раунду каждый: 46-словный repack + ре-вход (ctx rebuild + resume
+  lock rebuild). Профиль staged-requests при 25k мобах ≈ 10k раунд-трипов
+  на тик (find_target 1-в-10 на каждый Nearest ×2 non-player, LOS, stroll,
+  RLA start, cleanup cc). Резолвер теперь объявляет FoldCtx
+  (Resolver::fold_ctx) — и ai_floor_ext решает ЧИСТЫЕ v0-предикаты НА МЕСТЕ:
+  find_target (alive&&!spectator по упакованному снапшоту, гейт
+  find_target_fold — контракт FlatWorld иной и паркует), LOS all-pass (общий
+  los_apply для фолда и resume-армы — один источник), stroll-цель (внешний
+  стрим: splitmix16/LCG-16 флейвор; продвинутый сид возвращается через EXT
+  хвост; действия STROLL_SET(pend) → lock_only GOAL_START(nav=pend) — тот же
+  порядок resolution→start), RLA start body (DRAW-EXACT javap: nextDouble +
+  nextInt(20) на СОБСТВЕННОМ LCG пола — та же позиция стрима, rel/state через
+  ACT_RLA_START), cleanup cc (v0-ответ из пака + перенос target/approach).
+  FoldCtx::off() (JNI-путь, фикстуры, твин) воспроизводит parked-семантику
+  слово-в-слово.
+- БАГ (pre-existing, фолд его вымыл): LOS-парк писал список кандидатов в
+  out[8..] = СЛОТ ДЕЙСТВИЯ 0. Действие того же раунда (cc stop) + LOS-парк →
+  apply_actions читал кандидатов как ACT_GOAL_START p0=0 — ФАНТОМНЫЙ старт
+  HurtBy на каждом затронутом моб-тике, затем FB_LOCK_COLLIDE на rebuild.
+  CI-паритет не видел: JNI-сценарии не цепляют cc-stop → LOS-park в одном
+  раунде (HurtBy требует бой); нативный бенч цеплял постоянно. Фикс: нативные
+  кандидаты через EXT-хвост за областью действий (FoldCtx::ext_cands),
+  JNI-провод не тронут (776-словный буфер Java падает в legacy-арм). Мир:
+  chasing 10292 → 12592 — фантом молча давил ~2300 корректных захватов.
+- ЛОВУШКИ ИЗМЕРЕНИЯ (съели час бисекта, три stash-цикла): (1) отладочные
+  env::var_os-зонды, забытые в hot path, стоили +1.1ms/тик (environ lock +
+  линейный поиск × сотни тысяч вызовов); (2) per-call Lcg-мемо — регресс
+  (холодные слоты перекупывали INV-деление на каждый вызов пола; откат к
+  thread-local таблице, теперь CONST-init — без lazy-init ветки wave4b);
+  (3) absolute-числа коробки дрейфуют ±0.3ms — честные дельты только
+  same-binary A/B (CE_NO_FOLD-крюк в бенче) и candfix-база (HEAD + фикс
+  коллизии, тот же chasing-мир): 100k 15.72 → 14.73 (-6.3%).
+- АРИФМЕТИКА: открытая travel-цепь (friction/drag ~10 flops + 2 cast на
+  моб-тик) свернута в const OG_* (const-fn float IEEE-точно); пин-тест
+  пришивает биты + факт округления: 1-(1-0.6f32) возвращает РОВНО 0.6f32,
+  гейт скорости `> 0.6` — арм 0.23.
+- РЕЗУЛЬТАТ: 25k p50 4.00 → 3.74 (-6.5% vs wave4; -16% против pre-wave6 в
+  том же окне; 100k 17.06 → 14.73, -13.7%). reslv-фаза 9% → 0% (парки
+  исчезли), floor потяжелел на работу резолвера (ожидаемо). ВСЕ 97 тестов
+  зелёные: твин folded-vs-parked 400 тиков бит-в-бит (fnv по всему стору),
+  FlatWorld-твин, стрим-пины 5000 seed, travel-консты, все старые
+  паритетные гейты. doc 45. Pack-провод НЕ менялся (фикстуры целы).
+- Wave7-кандидаты: REQ_CANUSE_VANILLA-фолд (нужен target-index в контексте),
+  переразметка resident pack после падения раунд-рейта (~40%), cc-фолд с
+  обновлением approach в раунде.
