@@ -30,6 +30,9 @@ pub struct NativeTick {
     /// split stays until the L111 bridge replaces it with the real
     /// per-mob stream handoff)
     pub target_rng: u64,
+    /// reused (slot, x, z) triples for the grid rebuild (zero steady-
+    /// state allocation — the L111 line)
+    triples: Vec<(u32, f64, f64)>,
 }
 
 impl NativeTick {
@@ -40,6 +43,7 @@ impl NativeTick {
             mth: Mth::new(),
             compact_at: 256,
             target_rng: target_seed,
+            triples: Vec::new(),
         }
     }
 
@@ -64,17 +68,17 @@ impl NativeTick {
     /// The whole managed tick. Returns the per-mob AI accounting.
     pub fn tick(&mut self, game_time: i32) -> Vec<AiStat> {
         // grid refresh (the Horizon per-tick rebuild; the profile shows
-        // its real share — O(N))
+        // its real share — O(N)); the triples slice is a reused buffer
         {
             let _g = grid_guard();
-            self.grid.rebuild(
-                self.store
-                    .mobs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| m.alive)
-                    .map(|(i, m)| (i as u32, m.mob.x, m.mob.z)),
-            );
+            self.triples.clear();
+            for (i, m) in self.store.mobs.iter().enumerate() {
+                if m.alive {
+                    self.triples.push((i as u32, m.mob.x, m.mob.z));
+                }
+            }
+            let tr = &self.triples;
+            self.grid.rebuild(tr);
         }
         // players -> the pack snapshot (the floor borrows it per mob;
         // built once per tick, P is small)

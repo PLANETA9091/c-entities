@@ -28,33 +28,192 @@ pub struct MobSlot {
     pub grid_cell: (i64, i64),
 }
 
-/// The uniform 2-D XZ grid over mob slots. Cells are `HashMap<(i64,i64),
-/// Vec<u32>)` — at 25k mobs in a pile the hot cells hold thousands of slots;
-/// the candidates() contract is a SUPERSET (never misses a mob whose box
-/// touches the area), which is all the floor's queries need (they re-test
-/// exact boxes themselves).
-#[derive(Default)]
+/// The uniform 2-D XZ grid over mob slots — the L111 flat rewrite. No
+/// HashMap, no per-cell Vec: one open-addressed table (zigzag-packed u64
+/// cell keys, murmur finalizer, linear probing, power-of-two capacity),
+/// occupied slots stamped with a per-rebuild GENERATION (no per-tick
+/// memset — stale entries are dead by stamp, not by clearing), parallel
+/// (start,len) ranges into ONE contiguous slot-id Vec built by a
+/// counting-scatter (three cache-sequential passes). Every steady-state
+/// cost is a multiply, a shift, a mask or a contiguous walk.
+///
+/// The candidates() contract is unchanged: a SUPERSET of the mobs whose
+/// position could touch the XZ area (the floor's queries re-test exact
+/// boxes themselves); cell contents are unordered.
 pub struct SeenGrid {
-    cells: HashMap<(i64, i64), Vec<u32>>,
+    /// open-addressed cell keys (valid only where gens == cur_gen)
+    keys: Vec<u64>,
+    /// per-slot generation stamp (0 = never used; 0 is never a cur_gen)
+    gens: Vec<u32>,
+    /// per-slot (start, len) into `vals` (valid where gens == cur_gen)
+    rngs: Vec<(u32, u32)>,
+    /// per-slot scatter cursor (pass 3 scratch)
+    cursor: Vec<u32>,
+    /// capacity - 1 (power of two)
+    mask: usize,
+    /// current generation stamp
+    cur_gen: u32,
+    /// compact list of occupied table slots for the current generation
+    occ: Vec<u32>,
+    /// flat slot-id list, per-cell contiguous
+    vals: Vec<u32>,
+    /// per-mob cell keys + table slots (pass scratch, parallel to the
+    /// triples slice)
+    kbuf: Vec<u64>,
+    tmp_cell: Vec<u32>,
     pub population: u64,
 }
 
+impl Default for SeenGrid {
+    fn default() -> Self {
+        SeenGrid {
+            keys: Vec::new(),
+            gens: Vec::new(),
+            rngs: Vec::new(),
+            cursor: Vec::new(),
+            mask: 0,
+            cur_gen: 1,
+            occ: Vec::new(),
+            vals: Vec::new(),
+            kbuf: Vec::new(),
+            tmp_cell: Vec::new(),
+            population: 0,
+        }
+    }
+}
+
+/// murmur3-64 finalizer — multiply-xor mix, no tables, no branches.
+#[inline]
+fn cell_hash(k: u64) -> u64 {
+    let mut h = k;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 32;
+    h
+}
+
+#[inline]
+fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
 impl SeenGrid {
+    /// floor(v / 4.0) — the multiply by 0.25 is an EXACT power-of-two
+    /// scale (IEEE-754: x*0.25 and x/4.0 are the same correctly-rounded
+    /// value), so this is bit-identical to `v.div_euclid(GRID_CELL)` at a
+    /// fraction of the latency (no divide unit, no floor libm call on
+    /// x86-64 SSE4.1: roundss).
     #[inline]
-    pub fn cell_of(x: f64, z: f64) -> (i64, i64) {
-        (x.div_euclid(GRID_CELL) as i64, z.div_euclid(GRID_CELL) as i64)
+    fn cell_i64(v: f64) -> i64 {
+        (v * 0.25).floor() as i64
     }
 
-    /// Full rebuild — O(N) per tick, the Horizon shape (their update(i,b)
-    /// incremental re-bucket is the N1 optimization; at 25k the rebuild is
-    /// ~microseconds and the honest baseline for the profile).
-    pub fn rebuild<'a, I: Iterator<Item = (u32, f64, f64)>>(&mut self, it: I) {
-        self.cells.clear();
-        self.population = 0;
-        for (slot, x, z) in it {
-            let c = Self::cell_of(x, z);
-            self.cells.entry(c).or_default().push(slot);
-            self.population += 1;
+    /// The (i64, i64) cell of a position (kept for diagnostics).
+    #[inline]
+    pub fn cell_of(x: f64, z: f64) -> (i64, i64) {
+        (Self::cell_i64(x), Self::cell_i64(z))
+    }
+
+    /// Zigzag-pack a cell pair into one u64 (order-preserving, collision-
+    /// free for the full i32 block range — the world border is ±30M).
+    #[inline]
+    fn cell_key_cc(cx: i64, cz: i64) -> u64 {
+        (zigzag(cx) << 32) | zigzag(cz)
+    }
+
+    #[inline]
+    fn cell_key(x: f64, z: f64) -> u64 {
+        Self::cell_key_cc(Self::cell_i64(x), Self::cell_i64(z))
+    }
+
+    /// Full rebuild from a (slot, x, z) triples slice — three sequential
+    /// passes (probe-count, prefix-sum over the compact occupied list,
+    /// scatter). O(N) with zero per-tick table clearing: the generation
+    /// stamp retires the whole previous tick in one integer add.
+    pub fn rebuild(&mut self, tr: &[(u32, f64, f64)]) {
+        // retire the previous tick's stamping
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        if self.cur_gen == 0 {
+            self.gens.fill(0);
+            self.cur_gen = 1;
+        }
+        // pre-size for the worst case (all cells unique, load <= 0.5):
+        // growth happens before any stamping, so stale entries need no
+        // rehash — just bigger arrays.
+        let want = (tr.len() * 2).max(64).next_power_of_two();
+        if want > self.keys.len() {
+            self.keys = vec![0u64; want];
+            self.gens = vec![0u32; want];
+            self.rngs = vec![(0u32, 0u32); want];
+            self.cursor = vec![0u32; want];
+            self.mask = want - 1;
+        }
+        self.occ.clear();
+        self.vals.clear();
+        self.population = tr.len() as u64;
+        // one exact multiply+floor per axis per mob
+        self.kbuf.clear();
+        for &(_, x, z) in tr {
+            self.kbuf.push(Self::cell_key(x, z));
+        }
+        // pass 1: probe/insert, count per cell
+        self.tmp_cell.clear();
+        self.tmp_cell.resize(tr.len(), 0);
+        for (j, &k) in self.kbuf.iter().enumerate() {
+            let mut i = (cell_hash(k) as usize) & self.mask;
+            loop {
+                if self.gens[i] == self.cur_gen {
+                    if self.keys[i] == k {
+                        break; // found
+                    }
+                } else {
+                    // claim an empty slot for the new generation
+                    self.keys[i] = k;
+                    self.gens[i] = self.cur_gen;
+                    self.rngs[i] = (0, 0);
+                    self.occ.push(i as u32);
+                    break;
+                }
+                i = (i + 1) & self.mask;
+            }
+            self.tmp_cell[j] = i as u32;
+            self.rngs[i].1 += 1;
+        }
+        // pass 2: prefix sums over the COMPACT occupied list — no table
+        // walk, the cost is proportional to the unique cells, not capacity
+        let mut run = 0u32;
+        for &i in &self.occ {
+            let iu = i as usize;
+            let c = self.rngs[iu].1;
+            self.rngs[iu] = (run, c);
+            self.cursor[iu] = run;
+            run += c;
+        }
+        self.vals.resize(run as usize, 0);
+        // pass 3: scatter the slot ids into their cell ranges
+        for (j, &(slot, _, _)) in tr.iter().enumerate() {
+            let iu = self.tmp_cell[j] as usize;
+            let p = self.cursor[iu];
+            self.vals[p as usize] = slot;
+            self.cursor[iu] = p + 1;
+        }
+    }
+
+    /// Probe a packed cell: its (start, len) range when occupied this
+    /// generation.
+    #[inline]
+    fn range_of(&self, k: u64) -> Option<(u32, u32)> {
+        let mut i = (cell_hash(k) as usize) & self.mask;
+        loop {
+            if self.gens[i] != self.cur_gen {
+                return None;
+            }
+            if self.keys[i] == k {
+                return Some(self.rngs[i]);
+            }
+            i = (i + 1) & self.mask;
         }
     }
 
@@ -70,24 +229,25 @@ impl SeenGrid {
         out: &mut Vec<u32>,
     ) {
         out.clear();
-        let cx0 = min_x.div_euclid(GRID_CELL) as i64;
-        let cx1 = max_x.div_euclid(GRID_CELL) as i64;
-        let cz0 = min_z.div_euclid(GRID_CELL) as i64;
-        let cz1 = max_z.div_euclid(GRID_CELL) as i64;
+        let cx0 = Self::cell_i64(min_x);
+        let cx1 = Self::cell_i64(max_x);
+        let cz0 = Self::cell_i64(min_z);
+        let cz1 = Self::cell_i64(max_z);
         // the overflow guard: an area spanning too many columns falls back
-        // to a full walk of the cells map (Horizon seen_grid.rs:69)
+        // to a walk of the COMPACT occupied list (Horizon seen_grid.rs:69)
         let span_x = (cx1 - cx0).saturating_add(1) as usize;
         let span_z = (cz1 - cz0).saturating_add(1) as usize;
         if span_x.saturating_mul(span_z) > 1024 {
-            for cell in self.cells.values() {
-                out.extend_from_slice(cell);
+            for &i in &self.occ {
+                let (s, l) = self.rngs[i as usize];
+                out.extend_from_slice(&self.vals[s as usize..(s + l) as usize]);
             }
             return;
         }
         for cz in cz0..=cz1 {
             for cx in cx0..=cx1 {
-                if let Some(cell) = self.cells.get(&(cx, cz)) {
-                    out.extend_from_slice(cell);
+                if let Some((s, l)) = self.range_of(Self::cell_key_cc(cx, cz)) {
+                    out.extend_from_slice(&self.vals[s as usize..(s + l) as usize]);
                 }
             }
         }
@@ -95,11 +255,17 @@ impl SeenGrid {
 
     #[inline]
     pub fn cell_len(&self, cx: i64, cz: i64) -> usize {
-        self.cells.get(&(cx, cz)).map_or(0, |c| c.len())
+        match self.range_of(Self::cell_key_cc(cx, cz)) {
+            Some((_, l)) => l as usize,
+            None => 0,
+        }
     }
 
     pub fn clear(&mut self) {
-        self.cells.clear();
+        self.gens.fill(0);
+        self.cur_gen = 1;
+        self.occ.clear();
+        self.vals.clear();
         self.population = 0;
     }
 }
@@ -241,12 +407,13 @@ mod tests {
         s.add(mk(2, 3.9, 0.0));
         s.add(mk(3, 4.1, 0.0));
         let mut g = SeenGrid::default();
-        g.rebuild(
-            s.mobs
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (i as u32, m.mob.x, m.mob.z)),
-        );
+        let tr: Vec<(u32, f64, f64)> = s
+            .mobs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i as u32, m.mob.x, m.mob.z))
+            .collect();
+        g.rebuild(&tr);
         let mut out = Vec::new();
         g.candidates(-1.0, -1.0, 3.5, 1.0, &mut out);
         out.sort_unstable();

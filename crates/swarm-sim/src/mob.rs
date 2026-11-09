@@ -148,6 +148,10 @@ pub struct MobAI {
     /// per round from the snapshot)
     pub approach_x: f64,
     pub approach_z: f64,
+    /// reused aiPack wire buffer — filled by pack_into, owned across
+    /// rounds/ticks so the steady-state loop performs ZERO allocations
+    /// (the L111 cost line: pack allocation was per-round-per-mob before).
+    pub scratch: Vec<i32>,
 }
 
 impl MobAI {
@@ -176,6 +180,7 @@ impl MobAI {
             pend_z: 0.0,
             approach_x: 0.0,
             approach_z: 0.0,
+            scratch: Vec::new(),
         }
     }
 
@@ -373,7 +378,8 @@ pub struct AiStat {
 const OUT_LEN: usize = g::OUT_HEADER + g::MAX_ACTS * g::OUT_ACT;
 
 impl MobAI {
-    /// Pack the aiPack wire format from the live state.
+    /// Pack the aiPack wire format from the live state (allocating form —
+    /// kept for the parity fixtures; the hot path uses pack_into).
     #[allow(clippy::too_many_arguments)]
     pub fn pack(
         &self,
@@ -386,8 +392,38 @@ impl MobAI {
         ry: f64,
         rz: f64,
     ) -> Vec<i32> {
-        let mut b =
-            vec![0i32; g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE];
+        let mut b = Vec::new();
+        self.pack_into(players, game_time, cursor, res, req_op, rx, ry, rz, &mut b);
+        b
+    }
+
+    /// Pack the aiPack wire format into a REUSED buffer. Byte-identical
+    /// output to `pack` — the same words in the same order — with zero
+    /// steady-state allocation: the buffer is resized and re-zeroed in
+    /// place (one memset over the needed length per round, no heap).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_into(
+        &self,
+        players: &[PlayerSnap],
+        game_time: i32,
+        cursor: i32,
+        res: i32,
+        req_op: i32,
+        rx: f64,
+        ry: f64,
+        rz: f64,
+        buf: &mut Vec<i32>,
+    ) {
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        if buf.len() < need {
+            buf.resize(need, 0);
+        } else if buf.len() > need {
+            buf.truncate(need);
+        }
+        for w in buf.iter_mut() {
+            *w = 0;
+        }
+        let b = buf;
         b[0] = cursor;
         let mut mf = MF_BASE;
         if self.target_player >= 0 {
@@ -408,17 +444,17 @@ impl MobAI {
         b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
         b[g::IN_RES] = res;
         b[g::IN_RES_OP] = req_op;
-        put_f64(&mut b, g::IN_RES_X, rx);
-        put_f64(&mut b, g::IN_RES_X + 2, ry);
-        put_f64(&mut b, g::IN_RES_X + 4, rz);
+        put_f64(b, g::IN_RES_X, rx);
+        put_f64(b, g::IN_RES_X + 2, ry);
+        put_f64(b, g::IN_RES_X + 4, rz);
         b[22] = 0; // lastHurtByMobTimestamp (the bench mob is never hurt)
         b[23] = game_time;
         b[g::IN_PCOUNT] = players.len() as i32;
         b[g::IN_FOLLOW] = FOLLOW_RANGE.to_bits() as i32;
-        put_f64(&mut b, g::IN_MOBX, self.x);
-        put_f64(&mut b, g::IN_MOBY, self.y);
-        put_f64(&mut b, g::IN_MOBZ, self.z);
-        put_f64(&mut b, g::IN_EYEY, self.y + EYE_Y);
+        put_f64(b, g::IN_MOBX, self.x);
+        put_f64(b, g::IN_MOBY, self.y);
+        put_f64(b, g::IN_MOBZ, self.z);
+        put_f64(b, g::IN_EYEY, self.y + EYE_Y);
         // goal records (mirror of aiPackSel's live state words)
         let base = g::IN_HEADER;
         for (i, rec) in self.goals.iter().enumerate() {
@@ -461,15 +497,14 @@ impl MobAI {
         let pb = base + N_GOALS * g::GOAL_STRIDE;
         for (i, p) in players.iter().enumerate() {
             let o = pb + i * g::PSTRIDE;
-            put_f64(&mut b, o, p.x);
-            put_f64(&mut b, o + 2, p.y);
-            put_f64(&mut b, o + 4, p.z);
-            put_f64(&mut b, o + 6, p.y + EYE_Y);
-            put_f64(&mut b, o + 8, 1.0); // visibility 100%
+            put_f64(b, o, p.x);
+            put_f64(b, o + 2, p.y);
+            put_f64(b, o + 4, p.z);
+            put_f64(b, o + 6, p.y + EYE_Y);
+            put_f64(b, o + 8, 1.0); // visibility 100%
             b[o + 10] = p.flags;
             b[o + 11] = p.id;
         }
-        b
     }
 
     /// Apply the emitted actions to the live state (the aiApply mirror).
@@ -559,11 +594,28 @@ impl MobAI {
 
     /// One full AI tick: the aiRun round loop (cap 32) with the resolver
     /// in the request arm. Returns the accounting.
+    ///
+    /// The aiPack wire buffer is the mob's persistent `scratch` (taken out
+    /// for the body so the resolver borrows don't alias it): the steady
+    /// state performs ZERO heap allocations — the L111 line.
     pub fn ai_tick(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
         r: &mut dyn Resolver,
+    ) -> AiStat {
+        let mut buf = std::mem::take(&mut self.scratch);
+        let stat = self.ai_tick_inner(players, game_time, r, &mut buf);
+        self.scratch = buf;
+        stat
+    }
+
+    fn ai_tick_inner(
+        &mut self,
+        players: &[PlayerSnap],
+        game_time: i32,
+        r: &mut dyn Resolver,
+        buf: &mut Vec<i32>,
     ) -> AiStat {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.no_action = self.no_action.saturating_add(1);
@@ -572,8 +624,8 @@ impl MobAI {
         let (mut rx, mut ry, mut rz) = (0f64, 0f64, 0f64);
         let mut out = [0i32; OUT_LEN];
         for _round in 0..32 {
-            let inb = self.pack(players, game_time, cursor, res, req_op, rx, ry, rz);
-            let st = g::ai_floor(&inb, &mut out);
+            self.pack_into(players, game_time, cursor, res, req_op, rx, ry, rz, buf);
+            let st = g::ai_floor(buf, &mut out);
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
