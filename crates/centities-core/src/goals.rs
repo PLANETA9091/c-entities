@@ -330,6 +330,56 @@ pub struct Lcg {
     pub draws: u32,
 }
 
+// ---------------------------------------------------------------------------
+// WAVE4b: division-free exact modulus for the biased nextInt(bound) loop.
+// ---------------------------------------------------------------------------
+
+/// (bound, INV) memo — 4 per-thread slots, linear scan. The goal cfg
+/// bounds (randomInterval 10, stroll interval 60) repeat across EVERY
+/// floor call of every mob, so the table self-anneals after the first
+/// call; each hit replaces a runtime division with a mulhi. Per-slot
+/// `Cell::get()` (16 B) — NOT a whole-array take/set, whose 2×40 B copies
+/// cost more than the division they save. Pure memoization of a pure
+/// function — the returned value is bit-identical with or without the
+/// cache (parity holds by construction; the sweep test proves the magic).
+thread_local! {
+    static DIV_SLOTS: [std::cell::Cell<(i32, u64)>; 4] = [
+        std::cell::Cell::new((-1i32, 0u64)),
+        std::cell::Cell::new((-1i32, 0u64)),
+        std::cell::Cell::new((-1i32, 0u64)),
+        std::cell::Cell::new((-1i32, 0u64)),
+    ];
+}
+
+/// `bits % bound` for bits ∈ [0, 2^31), bound non-pow2 ≥ 3 — the exact
+/// ceil-magic (Hacker's Delight 10-9, Granlund–Montgomery):
+/// INV = ceil(2^64 / bound) = u64::MAX / bound + 1;
+/// q = floor(bits * INV / 2^64); val = bits − q·bound.
+/// Correctness: e = INV·bound − 2^64 ∈ [0, bound); q_est =
+/// floor(bits/bound + bits·e / 2^64); bits·e < 2^31·2^31 = 2^62 < 2^64,
+/// so q_est == floor(bits/bound) EXACTLY, and val == bits mod bound.
+/// (bound ≥ 3 on this path: 1 and 2 are powers of two and ride the
+/// vanilla mul-shift arm in next_int_bound, so INV never overflows.)
+#[inline]
+fn div_mod_u31(bits: i32, bound: i32) -> i32 {
+    let b = bound as u32 as u64;
+    let mut inv: u64 = 0;
+    DIV_SLOTS.with(|slots| {
+        for slot in slots.iter() {
+            let (sb, si) = slot.get();
+            if sb == bound {
+                inv = si;
+                return;
+            }
+        }
+        // miss: compute once per (thread, bound) and anneal slot 0
+        inv = u64::MAX / b + 1; // ceil(2^64 / b), no overflow for b ≥ 3
+        slots[0].set((bound, inv));
+    });
+    let q = (((bits as u64 as u128) * (inv as u128)) >> 64) as u64;
+    ((bits as u64).wrapping_sub(q.wrapping_mul(b))) as i32
+}
+
 impl Lcg {
     #[inline]
     fn advance(&mut self) -> u64 {
@@ -353,7 +403,7 @@ impl Lcg {
         }
         loop {
             let bits = self.next(31);
-            let val = bits % bound;
+            let val = div_mod_u31(bits, bound);
             if bits.wrapping_sub(val).wrapping_add(bound - 1) >= 0 {
                 return val;
             }
@@ -1579,6 +1629,128 @@ fn tick_ported(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the wave4b magic sweep -------------------------------------------
+
+    /// The magic modulus must equal `%` EXACTLY for every bits the biased
+    /// loop can draw ([0, 2^31)) and every non-pow2 bound the gates use:
+    /// boundary neighborhoods (0, q·bound edges), the vanilla REJECTION
+    /// zone edges (bits ≥ 2^31 − 2^31 mod bound re-draw — the mod value
+    /// there must still be exact for the loop math), and two stratified
+    /// sweeps. ~83M exactness checks.
+    #[test]
+    fn div_mod_u31_matches_remainder_exactly() {
+        let mut checked: u64 = 0;
+        for bound in 3i32..=600 {
+            if bound & (bound - 1) == 0 {
+                continue; // pow2 bounds ride the vanilla mul-shift arm
+            }
+            let edges = [
+                0i32,
+                1,
+                bound - 1,
+                bound,
+                bound + 1,
+                (1 << 30) - 1,
+                1 << 30,
+                i32::MAX,
+            ];
+            for s in edges {
+                assert_eq!(
+                    div_mod_u31(s, bound),
+                    s % bound,
+                    "magic drift: bound {bound} bits {s}"
+                );
+                checked += 1;
+            }
+            // the rejection-zone edges: rz = 2^31 mod bound; bits ≥ 2^31-rz
+            // are rejected (rz ≥ 1 for every non-pow2 bound — no i32 overflow)
+            let rz = (1i64 << 31) % bound as i64;
+            let rs = ((1i64 << 31) - rz) as i32;
+            for s in [rs - 1, rs] {
+                assert_eq!(
+                    div_mod_u31(s, bound),
+                    s % bound,
+                    "magic drift at rejection edge: bound {bound} bits {s}"
+                );
+                checked += 1;
+            }
+            if rs < i32::MAX {
+                assert_eq!(
+                    div_mod_u31(rs + 1, bound),
+                    (rs + 1) % bound,
+                    "magic drift at rejection edge+1: bound {bound}"
+                );
+                checked += 1;
+            }
+            // stratified sweep (add-mul scatter, ~131k per bound)
+            let mut x = 0u32;
+            for _ in 0..131072 {
+                let s = (x & 0x7FFF_FFFF) as i32;
+                assert_eq!(
+                    div_mod_u31(s, bound),
+                    s % bound,
+                    "magic drift (sweep): bound {bound} bits {s}"
+                );
+                checked += 1;
+                x = x.wrapping_add(0x51ED_270B).rotate_left(11);
+            }
+        }
+        // fat samples of the REAL gate bounds
+        for bound in [10i32, 60, 20, 7, 999_999] {
+            for i in 0..1_000_000u32 {
+                let s = (i.wrapping_mul(2654435761) & 0x7FFF_FFFF) as i32;
+                assert_eq!(
+                    div_mod_u31(s, bound),
+                    s % bound,
+                    "magic drift (fat): bound {bound} bits {s}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 80_000_000, "sweep too thin: {checked}");
+    }
+
+    /// The thread-local memo must be OBSERVATION-FREE: the same LCG stream
+    /// through cached and uncached paths yields identical draws (fresh
+    /// thread = cold cache; the sweep above already warmed it — re-derive
+    /// the reference values with plain `%`).
+    #[test]
+    fn next_int_bound_magic_is_observation_free() {
+        // reference: the biased loop with plain % (the pre-wave4b body)
+        let ref_draw = |seed: u64, bound: i32| -> (i32, u64) {
+            let mut v = seed & 0xFFFF_FFFF_FFFF;
+            let mut step = || {
+                v = v.wrapping_mul(25214903917).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
+                v
+            };
+            if bound <= 0 {
+                return (0, v);
+            }
+            if bound & (bound - 1) == 0 {
+                let r = (((bound as i64) * ((step() >> (48 - 31)) as i64)) >> 31) as i32;
+                return (r, v);
+            }
+            loop {
+                let bits = (step() >> (48 - 31)) as i32;
+                let val = bits % bound;
+                if bits.wrapping_sub(val).wrapping_add(bound - 1) >= 0 {
+                    return (val, v);
+                }
+            }
+        };
+        for bound in [3i32, 10, 60, 99, 12345] {
+            for seed in 1u64..2000 {
+                let mut l = Lcg {
+                    value: seed & 0xFFFF_FFFF_FFFF,
+                    draws: 0,
+                };
+                let got = l.next_int_bound(bound);
+                let (want, _) = ref_draw(seed, bound);
+                assert_eq!(got, want, "bound {bound} seed {seed}");
+            }
+        }
+    }
 
     // -- buffer builders (mirror the Java packer) -------------------------
 
