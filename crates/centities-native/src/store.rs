@@ -24,8 +24,6 @@ pub struct MobSlot {
     pub mob: MobAI,
     /// alive=false entries are tombstones awaiting the between-tick compact.
     pub alive: bool,
-    /// grid bucket index (usize::MAX = unbuilt), refreshed per tick.
-    pub grid_cell: (i64, i64),
 }
 
 /// The uniform 2-D XZ grid over mob slots — the L111 flat rewrite. No
@@ -308,19 +306,11 @@ impl MobStore {
         }
         let slot = match self.free.pop() {
             Some(s) => {
-                self.mobs[s as usize] = MobSlot {
-                    mob,
-                    alive: true,
-                    grid_cell: (i64::MAX, i64::MAX),
-                };
+                self.mobs[s as usize] = MobSlot { mob, alive: true };
                 s
             }
             None => {
-                self.mobs.push(MobSlot {
-                    mob,
-                    alive: true,
-                    grid_cell: (i64::MAX, i64::MAX),
-                });
+                self.mobs.push(MobSlot { mob, alive: true });
                 (self.mobs.len() - 1) as u32
             }
         };

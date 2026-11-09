@@ -36,6 +36,20 @@ pub struct NativeTick {
     /// the executor's ONE shared aiPack wire buffer (L111c): ~456B in L1
     /// across the whole AI loop
     ai_scratch: Vec<i32>,
+    /// bumped every tick; the grid rebuild LAZY stamp — the grid is
+    /// rebuilt on the FIRST query after the bump, never eagerly (L111e:
+    /// nothing in the v0 executor queries candidates — the AI's player
+    /// scans walk the snapshot O(P) — so the per-tick rebuild was pure
+    /// dead work; the future push kernel pays for the build at its first
+    /// query of the tick)
+    tick_epoch: u32,
+    /// the epoch the grid was last rebuilt for (0 = never built)
+    grid_built_epoch: u32,
+    /// the per-tick AI accounting, reused across ticks (the old
+    /// `Vec::with_capacity` + return allocated ~800KB per tick — mmap
+    /// + 200 first-touch page faults EVERY tick, pure overhead: the
+    /// bench and the tests discard the value)
+    stats_scratch: Vec<AiStat>,
 }
 
 impl NativeTick {
@@ -48,6 +62,9 @@ impl NativeTick {
             target_rng: target_seed,
             triples: Vec::new(),
             ai_scratch: Vec::new(),
+            tick_epoch: 0,
+            grid_built_epoch: 0,
+            stats_scratch: Vec::new(),
         }
     }
 
@@ -69,21 +86,15 @@ impl NativeTick {
         self.store.remove(id);
     }
 
-    /// The whole managed tick. Returns the per-mob AI accounting.
-    pub fn tick(&mut self, game_time: i32) -> Vec<AiStat> {
-        // grid refresh (the Horizon per-tick rebuild; the profile shows
-        // its real share — O(N)); the triples slice is a reused buffer
-        {
-            let _g = grid_guard();
-            self.triples.clear();
-            for (i, m) in self.store.mobs.iter().enumerate() {
-                if m.alive {
-                    self.triples.push((i as u32, m.mob.x, m.mob.z));
-                }
-            }
-            let tr = &self.triples;
-            self.grid.rebuild(tr);
-        }
+    /// The whole managed tick. Returns the per-mob AI accounting (a slice
+    /// into the executor's reused buffer — valid until the next tick).
+    pub fn tick(&mut self, game_time: i32) -> &[AiStat] {
+        // the grid is LAZY now (L111e): no per-tick rebuild. The executor
+        // bumps the epoch and the first query of the tick pays for the
+        // build. The v0 executor's AI never queries candidates (player
+        // scans walk the snapshot), so the steady-state grid cost is zero.
+        crate::profile::tick_open();
+        self.tick_epoch = self.tick_epoch.wrapping_add(1);
         // players -> the pack snapshot (the floor borrows it per mob;
         // built once per tick, P is small)
         let players: Vec<PlayerSnap> = {
@@ -126,11 +137,8 @@ impl NativeTick {
         // store (Horizon creatures.rs:1468). The resolver borrows the
         // snapshot (immutable) while the mob mutates — disjoint fields,
         // the borrow splits cleanly.
-        let mut stats: Vec<AiStat> = Vec::with_capacity(self.store.mobs.len());
-        // disjoint field borrows: the snapshot is read-only during the
-        // loop (it is only REPLACED between ticks through push_players),
-        // the mobs mutate by slot. ONE shared aiPack scratch: the ~456B
-        // wire stays L1-hot across the whole AI loop (L111c).
+        let mut stats = std::mem::take(&mut self.stats_scratch);
+        stats.clear();
         let snapshot: &crate::world::Snapshot = &self.store.snapshot;
         let scratch = &mut self.ai_scratch;
         for slot in self.store.mobs.iter_mut() {
@@ -146,6 +154,7 @@ impl NativeTick {
             self.target_rng = res.target_rng;
             stats.push(stat);
         }
+        self.stats_scratch = stats;
         // travel pass (vanilla: the movement runs inside the same body
         // after the AI; the split here is the profile's honesty — ai and
         // travel are separable costs of the same tick)
@@ -161,7 +170,48 @@ impl NativeTick {
             self.store.compact();
         }
         self.store.game_time = game_time;
-        stats
+        &self.stats_scratch
+    }
+
+    /// Lazy grid build: rebuilds the grid for the CURRENT tick epoch on
+    /// the first query (the epoch stamp makes the check one integer
+    /// compare). Consumers call the query helpers below; nothing here
+    /// runs unless a consumer exists.
+    fn ensure_grid(&mut self) {
+        if self.grid_built_epoch == self.tick_epoch {
+            return;
+        }
+        let _g = grid_guard();
+        self.triples.clear();
+        for (i, m) in self.store.mobs.iter().enumerate() {
+            if m.alive {
+                self.triples.push((i as u32, m.mob.x, m.mob.z));
+            }
+        }
+        let tr = &self.triples;
+        self.grid.rebuild(tr);
+        self.grid_built_epoch = self.tick_epoch;
+    }
+
+    /// The candidates superset for the XZ area (rebuilds lazily on the
+    /// first query of the tick). The push kernel's entry point.
+    pub fn grid_candidates(
+        &mut self,
+        min_x: f64,
+        min_z: f64,
+        max_x: f64,
+        max_z: f64,
+        out: &mut Vec<u32>,
+    ) {
+        self.ensure_grid();
+        self.grid.candidates(min_x, min_z, max_x, max_z, out);
+    }
+
+    /// Mob count in one grid cell (rebuilds lazily on the first query of
+    /// the tick).
+    pub fn grid_cell_len(&mut self, cx: i64, cz: i64) -> usize {
+        self.ensure_grid();
+        self.grid.cell_len(cx, cz)
     }
 }
 
@@ -263,6 +313,29 @@ mod tests {
         };
         assert_eq!(run(777), run(777), "same seed -> bitwise same positions");
         assert_ne!(run(777), run(778), "different stroll stream -> different path");
+    }
+
+    #[test]
+    fn grid_rebuild_is_lazy_and_query_fresh() {
+        let mut nt = NativeTick::new(9);
+        for i in 0..8 {
+            nt.add_mob(mk(i, i as f64 * 5.0, 0.0));
+        }
+        nt.tick(1);
+        // no consumer queried -> the grid was NEVER built this tick
+        assert_eq!(nt.grid.population, 0, "lazy grid must not build eagerly");
+        // the first query builds for the current tick and answers exactly
+        let mut out = Vec::new();
+        nt.grid_candidates(-1.0, -1.0, 100.0, 1.0, &mut out);
+        out.sort_unstable();
+        assert_eq!(out, (0..8).collect::<Vec<u32>>());
+        // a mob moves; the NEXT tick's query must see the fresh position
+        // (the epoch stamp invalidates the previous build)
+        nt.store.mobs[0].mob.x = 500.0;
+        nt.tick(2);
+        nt.grid_candidates(495.0, -1.0, 505.0, 1.0, &mut out);
+        assert!(out.contains(&0), "moved mob must be found at its new cell");
+        assert_eq!(nt.grid_cell_len(125, 0), 1);
     }
 
     #[test]

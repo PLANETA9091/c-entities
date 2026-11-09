@@ -73,11 +73,16 @@ impl Drop for PhaseGuard {
 }
 
 /// Begin a sampled phase. Cheap: one relaxed load + (rare) Instant::now.
+/// L111e: the tick opener is an EXPLICIT call at the top of the executor's
+/// tick (it used to ride the grid guard — the guard became lazy and the
+/// opener must fire every tick regardless of consumers).
 #[inline]
-pub fn phase(cell: &'static AtomicU64, tick_opener: bool) -> PhaseGuard {
-    if tick_opener {
-        begin_tick();
-    }
+pub fn tick_open() {
+    begin_tick();
+}
+
+#[inline]
+fn phase(cell: &'static AtomicU64) -> PhaseGuard {
     let on = sampled();
     PhaseGuard {
         cell,
@@ -88,19 +93,19 @@ pub fn phase(cell: &'static AtomicU64, tick_opener: bool) -> PhaseGuard {
 
 #[inline]
 pub fn ai_guard() -> PhaseGuard {
-    phase(&AI_NS, false)
+    phase(&AI_NS)
 }
 #[inline]
 pub fn travel_guard() -> PhaseGuard {
-    phase(&TRAVEL_NS, false)
+    phase(&TRAVEL_NS)
 }
 #[inline]
 pub fn grid_guard() -> PhaseGuard {
-    phase(&GRID_NS, true)
+    phase(&GRID_NS)
 }
 #[inline]
 pub fn apply_guard() -> PhaseGuard {
-    phase(&APPLY_NS, false)
+    phase(&APPLY_NS)
 }
 
 /// The rolled-up ledger snapshot.
