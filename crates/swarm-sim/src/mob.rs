@@ -370,7 +370,7 @@ pub struct AiStat {
     pub last_req: (i32, usize),
 }
 
-const OUT_LEN: usize = g::OUT_HEADER + g::MAX_ACTS * g::OUT_ACT;
+const OUT_LEN: usize = g::OUT_MIN_LEN; // actions + the LOS staging tail
 
 impl MobAI {
     /// Pack the aiPack wire format from the live state (allocating form —
@@ -594,13 +594,13 @@ impl MobAI {
         }
     }
 
-    /// One full AI tick: the aiRun round loop (cap 32) with the resolver
-    /// in the request arm. Returns the accounting.
-    ///
-    /// The aiPack wire buffer is the CALLER's shared scratch: one executor
-    /// -level buffer makes the ~456-byte wire stay in L1 across the whole
-    /// AI loop (per-mob buffers were 25k scattered cold regions — the
-    /// L111c line). Wire bytes are identical either way.
+    /// One full AI tick: ONE pack, ONE inline floor walk (L111g). The
+    /// parked protocol's round loop — park, repack the 114-word wire,
+    /// re-enter, resume — collapses into a single pass: the floor's
+    /// request arms resolve through the InlineAdapter below and the walk
+    /// continues from the same (sel, phase, gi). Decision-identical to
+    /// `ai_tick_parked` (the differential fixture pins it: same actions,
+    /// same seed out, same final state over randomized scenarios).
     pub fn ai_tick(
         &mut self,
         players: &[PlayerSnap],
@@ -608,10 +608,58 @@ impl MobAI {
         r: &mut dyn Resolver,
         buf: &mut Vec<i32>,
     ) -> AiStat {
-        self.ai_tick_inner(players, game_time, r, buf)
+        self.tick_count = self.tick_count.wrapping_add(1);
+        self.no_action = self.no_action.saturating_add(1);
+        self.pack_into(players, game_time, 0, 0, 0, 0.0, 0.0, 0.0, buf);
+        let mut out = [0i32; OUT_LEN];
+        let mut stat = AiStat::default();
+        let started;
+        {
+            let mut ad = InlineAdapter {
+                r,
+                mob: self,
+                players,
+                game_time,
+                resolves: 0,
+                started: Vec::new(),
+            };
+            stat.status = g::ai_floor_inline(buf, &mut out, &mut ad);
+            stat.rounds = 1;
+            stat.requests = ad.resolves;
+            if stat.status == g::ST_FALLBACK {
+                stat.fallback = out[7];
+            }
+            started = std::mem::take(&mut ad.started);
+        }
+        // seed handoff (aiRun: out -> SHARED_RANDOM)
+        self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+        self.apply_actions(&out, players);
+        // the start bodies ran MID-WALK (before this apply) — their
+        // running=true is the last writer, exactly like the parked
+        // protocol's resolve-after-apply order (see InlineAdapter.started)
+        for gi in &started {
+            if *gi < N_GOALS {
+                self.goals[*gi].running = true;
+            }
+        }
+        stat
     }
 
-    fn ai_tick_inner(
+    /// The PARKED protocol tick — the L111g baseline the inline walk is
+    /// proven against: the aiRun round loop (cap 32) with the resolver in
+    /// the request arm, a FULL repack + floor re-entry per park. Kept for
+    /// the differential fixture and the Java-shape path.
+    pub fn ai_tick_parked(
+        &mut self,
+        players: &[PlayerSnap],
+        game_time: i32,
+        r: &mut dyn Resolver,
+        buf: &mut Vec<i32>,
+    ) -> AiStat {
+        self.ai_tick_parked_inner(players, game_time, r, buf)
+    }
+
+    fn ai_tick_parked_inner(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
@@ -657,7 +705,9 @@ impl MobAI {
             stat.last_req = (req_op, gi);
             (res, rx, ry, rz) = match req_op {
                 g::REQ_LOS_SCAN => {
-                    let n = out[8].max(0) as usize;
+                    // the staged candidate count lives BEYOND the action
+                    // region (OUT_STAGE — the L111g staging move)
+                    let n = out[g::OUT_STAGE].max(0) as usize;
                     (r.los(n), 0.0, 0.0, 0.0)
                 }
                 g::REQ_STROLL_POS => match r.stroll_pos(self) {
@@ -799,6 +849,145 @@ impl MobAI {
                 ang = -ang;
             }
             self.yaw = (ang * (180.0f64 / std::f64::consts::PI)) as f32;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L111g — the inline resolver adapter: bridges the floor's InlineRes seam to
+// the executor's Resolver trait. Every method mirrors the parked protocol's
+// executor-side resolver arm (ai_tick_parked_inner's match) so the decisions
+// AND the side effects are identical; `resolves` feeds the AiStat.requests
+// accounting (one per parked request the walk would have made).
+// ---------------------------------------------------------------------------
+
+struct InlineAdapter<'a, 'b> {
+    r: &'a mut dyn Resolver,
+    mob: &'b mut MobAI,
+    players: &'a [PlayerSnap],
+    game_time: i32,
+    resolves: u32,
+    /// the goals whose start() body ran through the resolver MID-WALK
+    /// (start_vanilla). The parked protocol applies the round's actions
+    /// BEFORE the resolver runs, so a start body's `running=true` is the
+    /// LAST writer for that goal; the inline walk applies the whole action
+    /// list at TICK END, after the resolver — a cleanup STOP of the same
+    /// goal earlier in the walk would otherwise clobber the start (the
+    /// expired-RandomLookAround-restart flow the fixture caught). The
+    /// tick-end apply re-asserts these after apply_actions.
+    started: Vec<usize>,
+}
+
+impl<'a, 'b> InlineAdapter<'a, 'b> {
+    #[inline]
+    fn trace(&self, what: &str) {
+    }
+}
+
+impl<'a, 'b> g::InlineRes for InlineAdapter<'a, 'b> {
+    fn cc_vanilla(&mut self, kind: i32) -> bool {
+        self.resolves += 1;
+        // the parked protocol's executor arm resolves the CC request ONLY
+        // for the MeleeAttack/Target pair — every other kind FAILS CLOSED
+        // (res=0, the floor stops the goal). Mirroring the discriminant
+        // keeps the inline walk decision-identical (the fixture caught it:
+        // a running HurtBy goal kept running inline, parked stopped it).
+        if kind != g::GK_ZOMBIE_ATTACK && kind != g::GK_NEAREST_TARGET {
+            self.trace("cc fail-closed");
+            return false;
+        }
+        self.trace("cc resolve");
+        let cont = self.r.cc_vanilla(self.mob, kind);
+        if !cont {
+            // the parked protocol's resolver arm: the target/attack chain
+            // drops; the engine's next walk stops the goals
+            self.mob.target_player = -1;
+        }
+        cont
+    }
+
+    fn canuse_vanilla(&mut self, kind: i32, gi: usize) -> bool {
+        self.resolves += 1;
+        self.trace("canuse");
+        let pass = self.r.canuse_vanilla(self.mob, kind);
+        // the 26.3 MeleeAttackGoal.canUse sets lastCanUseCheck AFTER the
+        // throttle gate — the state word is the executor's (the parked
+        // protocol writes it in the resolver arm; aiPackSel reads it live)
+        if pass && kind == g::GK_ZOMBIE_ATTACK && gi < N_GOALS {
+            self.mob.goals[gi].state = self.game_time;
+        }
+        pass
+    }
+
+    fn stroll_pos(&mut self) -> Option<(f64, f64, f64)> {
+        self.resolves += 1;
+        self.trace("stroll");
+        match self.r.stroll_pos(self.mob) {
+            Some((x, y, z)) => {
+                // stash for the start resolution (the ACT_GOAL_START apply
+                // reads the pend values)
+                self.mob.pend_x = x;
+                self.mob.pend_z = z;
+                Some((x, y, z))
+            }
+            None => None,
+        }
+    }
+
+    fn lookat_query(&mut self) -> bool {
+        self.resolves += 1;
+        self.trace("lookat_query");
+        self.r.lookat_query(self.mob, self.players)
+    }
+
+    fn find_target(&mut self) -> bool {
+        self.resolves += 1;
+        self.trace("find_target");
+        self.r.find_target(self.mob, self.players)
+    }
+
+    fn los(&mut self, n_cands: usize) -> i32 {
+        self.resolves += 1;
+        let m = self.r.los(n_cands);
+        m
+    }
+
+    fn start_vanilla(&mut self, _kind: i32, gi: usize, shared_seed: &mut u64) {
+        self.resolves += 1;
+        // the start body draws from the SHARED stream — the walk's live
+        // LCG position continues through the mob mirror (the parked
+        // protocol does this through the per-round seed handoff)
+        self.mob.seed = *shared_seed;
+        self.r.start_vanilla(self.mob, gi);
+        *shared_seed = self.mob.seed;
+        self.started.push(gi);
+    }
+
+    fn ref_set_player(&mut self, gi: usize, winner: i32) {
+        // mirror of apply_actions' ACT_REF_SET_PLAYER — the parked
+        // protocol applies the action between rounds, so LATER resolver
+        // calls of the same tick see the new target/lookat/approach; the
+        // inline adapter applies it at the same decision point. The
+        // end-of-tick apply_actions re-applies the same values.
+        if gi < N_GOALS {
+            match self.mob.goals[gi].kind {
+                g::GK_LOOKAT_PLAYER => {
+                    self.mob.lookat_player = winner;
+                    if winner < 0 {
+                        self.mob.goals[gi].state &= !((1 << 31) | (1 << 30));
+                    }
+                }
+                g::GK_NEAREST_TARGET => {
+                    self.mob.target_player = winner;
+                    if winner >= 0 {
+                        if let Some(p) = self.players.get(winner as usize) {
+                            self.mob.approach_x = p.x;
+                            self.mob.approach_z = p.z;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

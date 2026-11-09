@@ -265,6 +265,18 @@ pub const IN_RES_X: usize = 16;
 pub const OUT_HEADER: usize = 8;
 pub const OUT_ACT: usize = 8;
 pub const MAX_ACTS: usize = 96;
+/// The REQ_LOS_SCAN staging area: candidate count + up to 31 snapshot
+/// indices, parked BEYOND the action region. The old layout staged at
+/// out[OUT_ACT..] — the SAME slots action 0 occupies — so an LOS park that
+/// followed any action of the same walk (e.g. the CC resume's displaced
+/// stop) clobbered action 0 with the staging bytes, and the executor's
+/// apply executed them as garbage opcodes (the L111g fixture caught it:
+/// cands [len=1, idx=2] decoded as ACT_GOAL_START(goal 2), the displaced
+/// stop was lost and the next resume hit FB_LOCK_COLLIDE). The Java packer
+/// mirrors the same offset (CeHooks AI_OUT / the REQ_LOS_SCAN resolver).
+pub const OUT_STAGE: usize = OUT_HEADER + MAX_ACTS * OUT_ACT;
+pub const OUT_STAGE_CAP: usize = 32;
+pub const OUT_MIN_LEN: usize = OUT_STAGE + OUT_STAGE_CAP;
 
 /// fallback reason codes (out[7]) — the Java floor logs the first one so a
 /// classified-mob fallback is diagnosable from the CI log alone.
@@ -306,7 +318,15 @@ const PH_TICK_RUNNING: i32 = 3;
 pub const MAX_GOALS: usize = 16;
 
 fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
-    ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)
+    // bit 10 = RESUME-VALID. The token must never encode 0 — that is the
+    // fresh-start sentinel — and the (TARGET, CLEANUP, gi=0) park (the
+    // HurtByTargetGoal canContinueToUse) used to encode EXACTLY 0: every
+    // re-entry looked fresh, the same CC park re-fired until the round cap
+    // (the L111g fixture caught it: fb_p=101 with a running HurtBy goal;
+    // the benches never hit it — their mobs are never hurt). The Java
+    // packer echoes the token verbatim, so the added bit is transparent
+    // to the Java side.
+    0x400 | ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +464,18 @@ struct Ctx<'a> {
     lcg: Lcg,
     lock: [[i32; MAX_GOALS]; 2], // flag bit -> goal idx, -1 = free
     running: [[bool; MAX_GOALS]; 2],
+    /// the LIVE mob-flags shadow (L111g): the parked protocol's repack
+    /// between rounds picks up the executor's apply mutations (a failed
+    /// canContinueToUse drops the target -> MF_HAS_TARGET clears; a
+    /// combat LOS winner sets it); the inline walk sees the same
+    /// visibility through this shadow, updated at exactly the places the
+    /// repack would have reflected them.
+    mf_live: i32,
+    /// the LIVE noActionTime shadow: the apply of every ACT_GOAL_START
+    /// (and every start_vanilla body) resets noActionTime to 0, and the
+    /// parked protocol's repack makes that visible to the STROLL canUse
+    /// gate (inb[4] >= 100) in the SAME tick's later rounds.
+    na_live: i32,
 }
 
 impl<'a> Ctx<'a> {
@@ -499,7 +531,7 @@ impl<'a> Ctx<'a> {
     }
     #[inline]
     fn flag(&self, bit: i32) -> bool {
-        self.inb[1] & bit != 0
+        self.mf_live & bit != 0
     }
     // ---- player snapshot accessors (v3 native scans) ----
     #[inline]
@@ -813,15 +845,83 @@ pub static ML_EVAL_SWAPS: AtomicU32 = AtomicU32::new(0);
 
 /// The floor entry. Returns the status written to out_buf[0].
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
-    let st = ai_floor_run(in_buf, out_buf);
+    let st = run_mode(in_buf, out_buf, Mode::Parked);
     if ML_ON.load(Ordering::Relaxed) {
         ml_record(in_buf, out_buf, st);
     }
     st
 }
 
+// ---------------------------------------------------------------------------
+// L111g — the INLINE floor: the native executor resolves the parked requests
+// INSIDE the walk (a resolver callback instead of the park / repack / resume
+// round-trip). The decision code is SHARED — the same cleanup / lock-rebuild
+// / update walk, the same gates, the same RNG order; only the STAGING
+// mechanism differs: where the parked floor returns ST_REQUEST, the inline
+// floor asks the InlineRes trait and continues the walk from the same
+// (sel, phase, gi).
+//
+// The two live-state rules that keep the walk identical to the parked
+// protocol (whose every park is followed by a FULL repack + re-entry):
+//  1. MF live shadow (`mf_live`): the parked protocol's apply-then-repack
+//     makes ACT_REF_SET_PLAYER(target) and a failed canContinueToUse visible
+//     to LATER gates of the same tick through the MF_HAS_TARGET bit. The
+//     inline floor keeps the same visibility in `mf_live` (one OR / AND-NOT
+//     at the exact places the repack would have observed the change).
+//  2. REF_SET side effects run synchronously on the resolver
+//     (`ref_set_player`): the parked protocol applies the action before the
+//     next round, so a LATER resolver call in the same tick (ZombieAttack's
+//     canUse tail reads the freshly acquired target) sees the new
+//     target/approach. The inline adapter applies it immediately; the
+//     end-of-tick apply_actions re-applies the same values (idempotent).
+//     All other apply mutations (running bits, start bodies' state words,
+//     nav state, noActionTime) are NOT re-read by the floor within the same
+//     walk after their park site (each park advances gi past the goal;
+//     the phases that re-read them run in a LATER ai_floor entry, which the
+//     inline path replaces with a fresh pack anyway).
+// ---------------------------------------------------------------------------
+
+/// The inline resolution seam. Every method mirrors the parked protocol's
+/// request the name is derived from; `shared_seed` is the walk's LIVE
+/// SHARED_RANDOM value (the drawing start bodies — RandomLookAround's
+/// nextDouble + nextInt(20) — continue THE SAME stream mid-walk, exactly
+/// where vanilla runs start() inline between the gates).
+pub trait InlineRes {
+    /// REQ_CC_VANILLA — the vanilla canContinueToUse tail. false = drop.
+    fn cc_vanilla(&mut self, kind: i32) -> bool;
+    /// REQ_CANUSE_VANILLA — the vanilla canUse tail. true = lock in.
+    fn canuse_vanilla(&mut self, kind: i32, gi: usize) -> bool;
+    /// REQ_STROLL_POS — the getPosition() chain (None = fail the canUse).
+    fn stroll_pos(&mut self) -> Option<(f64, f64, f64)>;
+    /// REQ_LOOKAT_QUERY — the getNearestPlayer conditions.
+    fn lookat_query(&mut self) -> bool;
+    /// REQ_FIND_TARGET — the findTarget() conditions.
+    fn find_target(&mut self) -> bool;
+    /// REQ_LOS_SCAN — the Sensing LoS mask over the staged candidates.
+    fn los(&mut self, n_cands: usize) -> i32;
+    /// REQ_START_VANILLA — the real start() body. Draws continue the
+    /// shared stream through `shared_seed` in/out.
+    fn start_vanilla(&mut self, kind: i32, gi: usize, shared_seed: &mut u64);
+    /// ACT_REF_SET_PLAYER applied synchronously (the parked protocol's
+    /// apply-then-repack visibility; see the module comment above).
+    fn ref_set_player(&mut self, gi: usize, winner: i32);
+}
+
+enum Mode<'r> {
+    Parked,
+    Inline(&'r mut dyn InlineRes),
+}
+
+pub fn ai_floor_inline(in_buf: &[i32], out_buf: &mut [i32], res: &mut dyn InlineRes) -> i32 {
+    run_mode(in_buf, out_buf, Mode::Inline(res))
+}
+
 fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
-    if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
+    run_mode(in_buf, out_buf, Mode::Parked)
+}
+
+fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
+    if in_buf.len() < IN_HEADER || out_buf.len() < OUT_MIN_LEN {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
         return ST_FALLBACK;
@@ -856,6 +956,8 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         },
         lock: [[-1; MAX_GOALS]; 2],
         running: [[false; MAX_GOALS]; 2],
+        mf_live: in_buf[1],
+        na_live: in_buf[4],
     };
     for sel in 0..2usize {
         for i in 0..ctx.counts[sel] {
@@ -942,34 +1044,16 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // eyeY, mz)) runs here; a winner gets its reference written
                 // (goal.lookAt / goal.target) BEFORE the lock transition —
                 // the vanilla start() bodies read those fields.
-                if res_mask != 0 {
-                    let kind = ctx.kind(sel, gi);
-                    let combat = kind == GK_NEAREST_TARGET;
-                    let not_riding = kind == GK_LOOKAT_PLAYER;
-                    let range = if combat {
-                        f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
-                    } else {
-                        f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
-                    };
-                    if let Some(winner) =
-                        ctx.best_from_mask(res_mask as u32, combat, not_riding, range)
-                    {
-                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), winner as i32, 0, 0);
-                        if lock_only(&mut ctx, &mut out, sel, gi).is_err() {
-                            return fallback(&mut out, FB_STATE_MISMATCH);
-                        }
-                    } else if combat {
-                        // every candidate failed the Sensing LoS — vanilla's
-                        // findTarget wrote null into the goal's target field
-                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
-                    }
+                if apply_los_resolution(&mut ctx, &mut out, sel, gi, in_buf[IN_RES], &mut mode)
+                    .is_err()
+                {
+                    return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
             _ => {}
         }
         gi += 1;
     }
-
     loop {
         let count = ctx.counts[sel];
         match phase {
@@ -981,7 +1065,33 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
                             }
                         } else if needs_cc_vanilla(ctx.kind(sel, gi)) {
-                            return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
+                            match &mut mode {
+                                Mode::Parked => {
+                                    return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
+                                }
+                                Mode::Inline(res) => {
+                                    // the parked protocol: park -> resolve ->
+                                    // resume re-enters, `!res` stops the goal.
+                                    // ONLY the ZA/NEAREST CC failures drop the
+                                    // target chain (the parked executor's
+                                    // resolver arm mutates target_player for
+                                    // exactly those kinds; the fail-closed
+                                    // kinds leave it untouched, so the
+                                    // MeleeAttack MF_HAS_TARGET gate of the
+                                    // same walk must keep seeing the bit).
+                                    let kind = ctx.kind(sel, gi);
+                                    if !res.cc_vanilla(kind) {
+                                        if kind == GK_ZOMBIE_ATTACK
+                                            || kind == GK_NEAREST_TARGET
+                                        {
+                                            ctx.mf_live &= !MF_HAS_TARGET;
+                                        }
+                                        if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
+                                            return fallback(&mut out, FB_STATE_MISMATCH);
+                                        }
+                                    }
+                                }
+                            }
                         } else if !cc_ported(&ctx, sel, gi) {
                             if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
@@ -1020,7 +1130,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                     if !ctx.running[sel][gi] {
                         let fl = ctx.flags(sel, gi);
                         if fl & ctx.disabled[sel] == 0 && can_replace_all(&ctx, sel, gi) {
-                            match can_use(&mut ctx, &mut out, sel, gi, phase) {
+                            match can_use(&mut ctx, &mut out, sel, gi, phase, &mut mode) {
                                 Ok(Cu::No) => {}
                                 Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
                                     return out.buf[0]; // parked
@@ -1115,6 +1225,54 @@ fn fallback(out: &mut Out, reason: i32) -> i32 {
     ST_FALLBACK
 }
 
+/// The LOS resolution shared by the parked resume arm and the inline
+/// walk: best-from-mask + the reference write + the lock transition.
+/// `MF_HAS_TARGET` updates mirror the parked protocol's repack exactly:
+/// the WINNER case sets it (the parked apply lands between rounds, so a
+/// LATER park call's pack carries the bit for the MeleeAttack canUse
+/// target gate), the null case clears it; both cases sync the resolver
+/// so later inline resolutions see the new target/approach exactly like
+/// the parked protocol's apply-then-resolve sequence.
+fn apply_los_resolution(
+    ctx: &mut Ctx,
+    out: &mut Out,
+    sel: usize,
+    gi: usize,
+    res_mask: i32,
+    mode: &mut Mode<'_>,
+) -> Result<(), ()> {
+    if res_mask == 0 {
+        return Ok(());
+    }
+    let kind = ctx.kind(sel, gi);
+    let combat = kind == GK_NEAREST_TARGET;
+    let not_riding = kind == GK_LOOKAT_PLAYER;
+    let range = if combat {
+        f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
+    } else {
+        f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
+    };
+    if let Some(winner) = ctx.best_from_mask(res_mask as u32, combat, not_riding, range) {
+        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), winner as i32, 0, 0);
+        if combat {
+            ctx.mf_live |= MF_HAS_TARGET;
+        }
+        if let Mode::Inline(res) = mode {
+            res.ref_set_player(ctx.global(sel, gi) as usize, winner as i32);
+        }
+        lock_only(ctx, out, sel, gi)?;
+    } else if combat {
+        // every candidate failed the Sensing LoS — vanilla's
+        // findTarget wrote null into the goal's target field
+        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+        ctx.mf_live &= !MF_HAS_TARGET;
+        if let Mode::Inline(res) = mode {
+            res.ref_set_player(ctx.global(sel, gi) as usize, -1);
+        }
+    }
+    Ok(())
+}
+
 fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
     ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_REQUEST;
@@ -1132,9 +1290,11 @@ fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -
 /// cache and resumes with res = a bitmask over the same indices.
 fn park_los(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, cands: &[usize]) -> i32 {
     let st = park(ctx, out, sel, phase, gi, REQ_LOS_SCAN);
-    out.buf[OUT_ACT] = cands.len() as i32;
-    for (i, c) in cands.iter().enumerate() {
-        out.buf[OUT_ACT + 1 + i] = *c as i32;
+    // the staging lives BEYOND the action region — an LOS park may follow
+    // actions of the same walk (see OUT_STAGE)
+    out.buf[OUT_STAGE] = cands.len() as i32;
+    for (i, c) in cands.iter().enumerate().take(OUT_STAGE_CAP - 1) {
+        out.buf[OUT_STAGE + 1 + i] = *c as i32;
     }
     st
 }
@@ -1179,7 +1339,14 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 /// L89: the ledgered canUse entry — one relaxed atomic add per eval, only
 /// while the dump window holds (GL_ON); the wrapper is transparent
 /// otherwise.
-fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+fn can_use(
+    ctx: &mut Ctx,
+    out: &mut Out,
+    sel: usize,
+    gi: usize,
+    phase: i32,
+    mode: &mut Mode<'_>,
+) -> Result<Cu, ()> {
     // the eval-mask stamp (see ML_EVAL_SWAPS): one relaxed OR per eval —
     // zero cost when the ledger is disarmed (the load in the wrapper
     // short-circuits the record, the OR itself is negligible).
@@ -1190,11 +1357,11 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
         }
     }
     if !GL_ON.load(Ordering::Relaxed) {
-        return can_use_inner(ctx, out, sel, gi, phase);
+        return can_use_inner(ctx, out, sel, gi, phase, mode);
     }
     let kind = ctx.kind(sel, gi);
     let d0 = ctx.lcg.draws;
-    let r = can_use_inner(ctx, out, sel, gi, phase);
+    let r = can_use_inner(ctx, out, sel, gi, phase, mode);
     let k = kind.clamp(0, 8) as usize;
     GL_EVALS[k].fetch_add(1, Ordering::Relaxed);
     GL_ROLLS[k].fetch_add(ctx.lcg.draws - d0, Ordering::Relaxed);
@@ -1216,6 +1383,7 @@ fn can_use_inner(
     sel: usize,
     gi: usize,
     phase: i32,
+    mode: &mut Mode<'_>,
 ) -> Result<Cu, ()> {
     match ctx.kind(sel, gi) {
         GK_SPEAR_USE => {
@@ -1225,8 +1393,18 @@ fn can_use_inner(
             if ctx.flag(MF_MAINHAND_EMPTY) {
                 Ok(Cu::No)
             } else {
-                park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
-                Ok(Cu::Staged)
+                match mode {
+                    Mode::Parked => {
+                        park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                        Ok(Cu::Staged)
+                    }
+                    Mode::Inline(res) => {
+                        if res.canuse_vanilla(GK_SPEAR_USE, gi) {
+                            lock_only(ctx, out, sel, gi)?;
+                        }
+                        Ok(Cu::No)
+                    }
+                }
             }
         }
         GK_ZOMBIE_ATTACK => {
@@ -1243,8 +1421,18 @@ fn can_use_inner(
             if !ctx.flag(MF_HAS_TARGET) {
                 return Ok(Cu::No);
             }
-            park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.canuse_vanilla(GK_ZOMBIE_ATTACK, ctx.global(sel, gi) as usize) {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_HURT_BY => {
             // HurtByTargetGoal.canUse: the gate is
@@ -1256,8 +1444,18 @@ fn can_use_inner(
             if mobTs == ctx.state(sel, gi) || !ctx.flag(MF_LAST_HURT_BY) {
                 return Ok(Cu::No);
             }
-            park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.canuse_vanilla(GK_HURT_BY, gi) {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_MOVE_THROUGH_VILLAGE => {
             // MoveThroughVillageGoal.canUse: updateVisited() is a no-op
@@ -1268,8 +1466,18 @@ fn can_use_inner(
             // A grown visited list parks (vanilla mutates it); the
             // pathfinding tail stages. No RNG consumed before those.
             if ctx.state(sel, gi) > 15 {
-                park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
-                return Ok(Cu::Staged);
+                match mode {
+                    Mode::Parked => {
+                        park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                        return Ok(Cu::Staged);
+                    }
+                    Mode::Inline(res) => {
+                        if res.canuse_vanilla(GK_MOVE_THROUGH_VILLAGE, gi) {
+                            lock_only(ctx, out, sel, gi)?;
+                        }
+                        return Ok(Cu::No);
+                    }
+                }
             }
             let only_at_night = ctx.cfg(sel, gi) & 1 != 0;
             // vanilla: if (this.onlyAtNight && this.mob.level().isBrightOutside()) return false;
@@ -1280,8 +1488,18 @@ fn can_use_inner(
             if !ctx.flag(MF_NEAR_VILLAGE) {
                 return Ok(Cu::No);
             }
-            park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.canuse_vanilla(GK_MOVE_THROUGH_VILLAGE, gi) {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_NEAREST_TARGET => {
             // if (randomInterval > 0 && nextInt(randomInterval) != 0) false
@@ -1306,6 +1524,13 @@ fn can_use_inner(
             // engine's profile.
             if ctx.pcount() == 0 {
                 out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                // the parked protocol: the apply lands AFTER this call, the
+                // next round's repack clears MF_HAS_TARGET for the later
+                // gates; the inline walk mirrors it on the live shadow.
+                ctx.mf_live &= !MF_HAS_TARGET;
+                if let Mode::Inline(res) = mode {
+                    res.ref_set_player(ctx.global(sel, gi) as usize, -1);
+                }
                 return Ok(Cu::No);
             }
             // Player-typed target (cfg SIGN bit — bit1 collided with the
@@ -1326,17 +1551,40 @@ fn can_use_inner(
                     // NearestAttackableTargetGoal has no stop() clear for the
                     // field, so the null write is observable
                     out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+                    ctx.mf_live &= !MF_HAS_TARGET;
+                    if let Mode::Inline(res) = mode {
+                        res.ref_set_player(ctx.global(sel, gi) as usize, -1);
+                    }
                     return Ok(Cu::No);
                 }
-                park_los(ctx, out, sel, phase, gi, &cands);
-                return Ok(Cu::Staged);
+                match mode {
+                    Mode::Parked => {
+                        park_los(ctx, out, sel, phase, gi, &cands);
+                        return Ok(Cu::Staged);
+                    }
+                    Mode::Inline(res) => {
+                        let mask = res.los(cands.len());
+                        apply_los_resolution(ctx, out, sel, gi, mask, mode)?;
+                        return Ok(Cu::No);
+                    }
+                }
             }
             // findTarget() — a level query, staged (the gate pull already
             // happened; the seed handoff keeps the stream exact). Only
             // reachable for non-player-typed target goals or the
             // team/many-players worlds now.
-            park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.find_target() {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_STROLL => {
             // RandomStrollGoal.canUse: passenger → noActionTime ≥ 100 →
@@ -1345,7 +1593,9 @@ fn can_use_inner(
                 return Ok(Cu::No);
             }
             // checkNoActionTime is always on for the classified stroll
-            if ctx.inb[4] >= 100 {
+            // (na_live: the parked repack reflects the mid-walk ACT_GOAL_START
+            // resets — see Ctx.na_live)
+            if ctx.na_live >= 100 {
                 return Ok(Cu::No);
             }
             let interval = ctx.cfg(sel, gi) & 0xFFFF;
@@ -1354,8 +1604,18 @@ fn can_use_inner(
             }
             // forceTrigger == false for the classified goal (verified at
             // classification; a triggered stroll routes vanilla forever)
-            park(ctx, out, sel, phase, gi, REQ_STROLL_POS);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_STROLL_POS);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.stroll_pos().is_some() {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_LOOKAT_PLAYER => {
             // nextFloat() >= probability → false
@@ -1373,11 +1633,30 @@ fn can_use_inner(
                 if cands.is_empty() {
                     return Ok(Cu::No); // getNearestPlayer -> null
                 }
-                park_los(ctx, out, sel, phase, gi, &cands);
-                return Ok(Cu::Staged);
+                match mode {
+                    Mode::Parked => {
+                        park_los(ctx, out, sel, phase, gi, &cands);
+                        return Ok(Cu::Staged);
+                    }
+                    Mode::Inline(res) => {
+                        let mask = res.los(cands.len());
+                        apply_los_resolution(ctx, out, sel, gi, mask, mode)?;
+                        return Ok(Cu::No);
+                    }
+                }
             }
-            park(ctx, out, sel, phase, gi, REQ_LOOKAT_QUERY);
-            Ok(Cu::Staged)
+            match mode {
+                Mode::Parked => {
+                    park(ctx, out, sel, phase, gi, REQ_LOOKAT_QUERY);
+                    Ok(Cu::Staged)
+                }
+                Mode::Inline(res) => {
+                    if res.lookat_query() {
+                        lock_only(ctx, out, sel, gi)?;
+                    }
+                    Ok(Cu::No)
+                }
+            }
         }
         GK_LOOKAROUND => {
             // nextFloat() < 0.02F → start (staged — start() writes
@@ -1393,8 +1672,25 @@ fn can_use_inner(
                     out.buf[7] = FB_STATE_MISMATCH;
                     return Ok(Cu::No);
                 }
-                park(ctx, out, sel, phase, gi, REQ_START_VANILLA);
-                Ok(Cu::StartStaged)
+                match mode {
+                    Mode::Parked => {
+                        park(ctx, out, sel, phase, gi, REQ_START_VANILLA);
+                        Ok(Cu::StartStaged)
+                    }
+                    Mode::Inline(res) => {
+                        // the real start() body HERE — vanilla runs it
+                        // inline between the gates; the draws continue the
+                        // walk's LIVE SHARED_RANDOM position
+                        let mut shared = ctx.lcg.value;
+                        res.start_vanilla(GK_LOOKAROUND, ctx.global(sel, gi) as usize, &mut shared);
+                        ctx.lcg.value = shared;
+                        // the start body resets noActionTime (the parked
+                        // protocol: the resolver mutates the mob between
+                        // rounds, the repack reflects it)
+                        ctx.na_live = 0;
+                        Ok(Cu::No)
+                    }
+                }
             } else {
                 Ok(Cu::No)
             }
@@ -1472,6 +1768,10 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
     }
     ctx.running[sel][gi] = true;
     out.push(ACT_GOAL_START, ctx.global(sel, gi), 0, 0, 0);
+    // the apply of ACT_GOAL_START resets noActionTime — the parked
+    // protocol's repack makes it visible to the SAME tick's later rounds
+    // (the STROLL canUse gate); the inline walk mirrors it live (L111g)
+    ctx.na_live = 0;
     Ok(())
 }
 
@@ -1612,12 +1912,13 @@ mod tests {
             b[12] = seed as i32;
             b[13] = (seed >> 32) as i32;
             // even tick
-            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let mut out = vec![0i32; OUT_MIN_LEN];
             let st = ai_floor(&b, &mut out);
             if st == ST_REQUEST && out[1] == REQ_LOS_SCAN && out[2] == 5 {
                 // the LOOKAT goal's scan (gi=5); candidate 0 staged
-                assert_eq!(out[8], 1);
-                assert_eq!(out[9], 0);
+                // (the staging lives BEYOND the action region — OUT_STAGE)
+                assert_eq!(out[OUT_STAGE], 1);
+                assert_eq!(out[OUT_STAGE + 1], 0);
                 break b;
             }
             assert!(st == ST_DONE || st == ST_REQUEST, "status {st}");
@@ -1626,8 +1927,8 @@ mod tests {
         };
         // Java resolves the Sensing LoS: player 0 passed — emulate aiRun's
         // resume (cursor + op + mask) on a fresh re-run of the same seed
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
-        let mut out2 = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
+        let mut out2 = vec![0i32; OUT_MIN_LEN];
         let st = ai_floor(&inb, &mut out2);
         assert_eq!(st, ST_REQUEST);
         assert_eq!(out2[1], REQ_LOS_SCAN);
@@ -1668,7 +1969,7 @@ mod tests {
             let mut b = snapshot_one_player(10.0, 0.0, 0.0); // d2 = 100 < 1225
             b[12] = seed as i32;
             b[13] = (seed >> 32) as i32;
-            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let mut out = vec![0i32; OUT_MIN_LEN];
             let st = ai_floor(&b, &mut out);
             if st == ST_REQUEST && out[1] == REQ_LOS_SCAN {
                 assert_eq!(out[2], 1, "global goal idx of the Player nearest goal");
@@ -1745,7 +2046,7 @@ mod tests {
         for seed in 1u64..200 {
             let inb = build_in(seed, 100, 2, 42); // even tick, stroll gate reached
             let before = ML_DRAW_SWAPS.load(Ordering::SeqCst);
-            let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+            let mut out = vec![0i32; OUT_MIN_LEN];
             let st = ai_floor(&inb, &mut out);
             let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst) - before;
             if st == ST_DONE {
@@ -1789,7 +2090,7 @@ mod tests {
         // nextFloat (lookaround) — staged goals pull NOTHING.
         let seed0 = 777u64;
         let mut inb = build_in(seed0, 100, 2, 42);
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_DONE);
 
@@ -1823,7 +2124,7 @@ mod tests {
         let off = IN_HEADER + 10 * GOAL_STRIDE; // the lookaround, running
         inb[off + 4] = 1;
         inb[off + 5] = 7; // lookTime 7
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let st = ai_floor(&inb, &mut out);
         assert_eq!(st, ST_DONE);
         assert_eq!(out[5], 0, "NO tick actions on an even tick");
@@ -1860,7 +2161,7 @@ mod tests {
         let off = IN_HEADER + 10 * GOAL_STRIDE;
         inb[off + 4] = 1;
         inb[off + 5] = 7;
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let st = ai_floor(&inb, &mut out);
         assert_eq!(st, ST_DONE);
         assert_eq!(out[5], 1, "exactly one action: the lookaround tick port");
@@ -1893,7 +2194,7 @@ mod tests {
             seed += 1;
         }
         let mut inb = build_in(seed, 100, 2, 42);
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         // only the stroll's getPosition succeeds — every staged canUse says no
         let st = drive_res(&mut inb, &mut out, &|req| {
             if req == REQ_STROLL_POS {
@@ -1922,7 +2223,7 @@ mod tests {
         // nextInt pull (the vanilla body returns false without consuming RNG)
         let seed0 = 555u64;
         let mut inb = build_in(seed0, 100, 2, 200);
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_DONE);
         // reference: 3 nearest gates + lookat + lookaround (NO stroll pull)
@@ -1943,7 +2244,7 @@ mod tests {
     fn fallback_on_unknown_kind() {
         let mut inb = build_in(1, 100, 2, 0);
         inb[IN_HEADER] = GK_UNKNOWN; // the first target goal's kind slot
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let st = drive(&mut inb, &mut out, 0);
         assert_eq!(st, ST_FALLBACK);
     }
@@ -1996,7 +2297,7 @@ mod tests {
         // test's own record identifiable regardless of interleaving.
         let seed: u64 = 0x1234_5678_9ABC_DEF0;
         let inb = build_in(seed, 100, 42, 3);
-        let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
+        let mut out = vec![0i32; OUT_MIN_LEN];
         let _ = mob_ledger_take(true); // clear + arm
         let st = ai_floor(&inb, &mut out);
         let recs = mob_ledger_take(false).unwrap();

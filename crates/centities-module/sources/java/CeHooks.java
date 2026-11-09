@@ -8635,6 +8635,12 @@ public final class CeHooks {
     static final int REQ_LOS_SCAN = 7;
     static final int NAV_NONE = 0, NAV_PATH_DONE = 1, NAV_PATH_ACTIVE = 2;
     static final int MAX_GOALS = 16, GOAL_STRIDE = 8, IN_HEADER = 34, OUT_HEADER = 8;
+    // the REQ_LOS_SCAN staging lives BEYOND the action region (mirrors
+    // goals.rs OUT_STAGE/OUT_STAGE_CAP) — the old layout staged at
+    // AI_OUT[8..], the same slots action 0 occupies, so an LOS park that
+    // followed any action of the same walk clobbered that action and the
+    // apply executed the staging bytes as garbage opcodes
+    static final int OUT_STAGE = OUT_HEADER + MAX_ACTS * 8, OUT_STAGE_CAP = 32;
     static final int IN_PCOUNT = 24, IN_FOLLOW = 25, IN_MOBX = 26, IN_MOBY = 28,
             IN_MOBZ = 30, IN_EYEY = 32;
     static final int PSTRIDE = 12, PX_LO = 0, PY_LO = 2, PZ_LO = 4, PEYE_LO = 6,
@@ -8736,7 +8742,7 @@ public final class CeHooks {
 
     // scratch buffers (server-thread confined — one mob at a time)
     private static int[] AI_IN = new int[IN_HEADER + 2 * MAX_GOALS * GOAL_STRIDE];
-    private static int[] AI_OUT = new int[OUT_HEADER + 96 * 8];
+    private static int[] AI_OUT = new int[OUT_STAGE + OUT_STAGE_CAP];
 
     /** One-time handle/offset resolution. Called via prove_handles at
      *  precompute time; sets MOB_AI_HANDLES_OK. */
@@ -9785,11 +9791,11 @@ public final class CeHooks {
                     // one through the Sensing cache (vanilla getNearestPlayer
                     // has no early exit) and resume with a bitmask over the
                     // SNAPSHOT indices
-                    int cands = AI_OUT[8];
+                    int cands = AI_OUT[OUT_STAGE];
                     int mask = 0;
                     net.minecraft.world.entity.ai.sensing.Sensing sensing = mob.getSensing();
                     for (int c = 0; c < cands; c++) {
-                        int pi = AI_OUT[9 + c];
+                        int pi = AI_OUT[OUT_STAGE + 1 + c];
                         if (pi < 0 || pi >= AI_PLAYERS_N) continue;
                         if (sensing.hasLineOfSight(AI_PLAYERS[pi])) {
                             mask |= (1 << pi);
