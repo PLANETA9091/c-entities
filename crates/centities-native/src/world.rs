@@ -48,6 +48,9 @@ pub struct WorldRes<'a, F: BlockFacts> {
     /// follow range for the target/attack contracts (the zombie default the
     /// parity legs used)
     pub follow_range: f64,
+    /// WAVE6 twin hook: true = fold_ctx returns None — every request parks
+    /// (the exact pre-fold semantics; the A/B gate drives both modes).
+    pub fold_off: bool,
 }
 
 impl WorldRes<'_, OpenGround> {
@@ -60,6 +63,7 @@ impl WorldRes<'_, OpenGround> {
             target_rng: target_seed,
             stroll_radius: 10.0,
             follow_range: 35.0,
+            fold_off: false,
         }
     }
 }
@@ -74,6 +78,7 @@ impl<'a, F: BlockFacts> WorldRes<'a, F> {
             target_rng: target_seed,
             stroll_radius: 10.0,
             follow_range: 35.0,
+            fold_off: false,
         }
     }
 
@@ -104,6 +109,30 @@ impl<'a, F: BlockFacts> WorldRes<'a, F> {
 }
 
 impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
+    fn fold_ctx(&self, mob: &swarm_sim::mob::MobAI) -> Option<centities_core::goals::FoldCtx> {
+        if self.fold_off {
+            return None;
+        }
+        Some(centities_core::goals::FoldCtx {
+            on: true,
+            los_all_pass: true,
+            stroll_seed: self.target_rng,
+            stroll_lcg16: true,
+            stroll_radius: self.stroll_radius,
+            follow_range: self.follow_range,
+            target_player: mob.target_player,
+            approach_x: mob.approach_x,
+            approach_z: mob.approach_z,
+            stroll_drew: false,
+            ext_cands: false,
+            find_target_fold: true, // WorldRes.find_target = any alive && !spectator
+        })
+    }
+
+    fn set_target_rng(&mut self, s: u64) {
+        self.target_rng = s;
+    }
+
     fn stroll_pos(&mut self, mob: &mut swarm_sim::mob::MobAI) -> Option<(f64, f64, f64)> {
         // v0: the splitmix circle draw, gated by BlockFacts. The vanilla
         // body (WaterAvoidingRandomStrollGoal) draws 10x7 attempts with

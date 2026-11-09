@@ -49,6 +49,10 @@ pub struct NativeTick {
     /// WAVE4: the per-tick PlayerSnap staging buffer (the old code
     /// allocated a fresh Vec every tick).
     players_buf: Vec<PlayerSnap>,
+    /// WAVE6 twin hook: true = the resolver's fold contract is OFF — every
+    /// request parks (the exact pre-fold semantics; the A/B gate drives
+    /// both modes over the same population).
+    fold_off: bool,
 }
 
 impl NativeTick {
@@ -64,7 +68,13 @@ impl NativeTick {
             stats_buf: Vec::new(),
             pack: PackState::default(),
             players_buf: Vec::new(),
+            fold_off: false,
         }
+    }
+
+    /// WAVE6 twin hook: force the parked (pre-fold) semantics.
+    pub fn set_fold_off(&mut self, on: bool) {
+        self.fold_off = on;
     }
 
     /// WAVE4 twin hook: force the wave3 full-pack-every-round semantics
@@ -172,6 +182,7 @@ impl NativeTick {
         // constructed a fresh WorldRes per mob — a useless 5-word shuffle
         // x N) and its target stream advances through the tick.
         let mut res = WorldRes::open_ground_v0(snapshot, self.target_rng);
+        res.fold_off = self.fold_off;
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
                 continue;
@@ -394,5 +405,104 @@ mod tests {
             .filter(|m| m.mob.target_player >= 0)
             .count();
         assert!(chasing > 0, "the twin scenario must acquire targets");
+    }
+
+    /// THE WAVE6 executor gate: the FOLDED executor (find_target/LOS/stroll/
+    /// RLA-start/cc resolved IN PLACE, zero park round-trips) must be
+    /// BIT-IDENTICAL to the PARKED executor (every request staged + resumed —
+    /// the pre-fold semantics) over the same chased/strolling/looking
+    /// population: positions, seeds, goal states, nav, targets — the whole
+    /// store, word for word, 400 ticks.
+    #[test]
+    fn folded_executor_matches_parked_executor() {
+        let build = |fold_off: bool| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_fold_off(fold_off);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let mut parked = build(true);
+        let mut folded = build(false);
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.rel_x.to_bits(),
+                    m.rel_z.to_bits(),
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.pend_x.to_bits(),
+                    m.pend_z.to_bits(),
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            let _ = pop;
+            [h, nt.target_rng, pop].to_vec()
+        };
+        for t in 0..400 {
+            parked.tick(t);
+            folded.tick(t);
+            assert_eq!(
+                dump(&parked),
+                dump(&folded),
+                "tick {t}: the folded executor diverged from the parked twin"
+            );
+        }
+        // the scenario must exercise the folds: goals running + targets held
+        let chasing = folded
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        let running = folded
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.goals.iter().any(|g| g.running))
+            .count();
+        assert!(chasing > 0, "the folded twin must acquire targets: {chasing}");
+        assert!(running > 0, "the folded twin must run goals: {running}");
     }
 }

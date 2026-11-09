@@ -265,6 +265,18 @@ pub const IN_RES_X: usize = 16;
 pub const OUT_HEADER: usize = 8;
 pub const OUT_ACT: usize = 8;
 pub const MAX_ACTS: usize = 96;
+/// WAVE6: the EXTENSION tail of the out buffer — past the action area:
+///   [OUT_EXT_LO, +1]  the external stream handoff (the stroll fold's
+///                     advanced resolver stream; written only when drew)
+///   [OUT_EXT_LO + 2]  the LOS candidate count (native ext_cands mode)
+///   [OUT_EXT_LO + 3..] the candidate indices (up to 32)
+/// The JNI wire keeps the legacy slot out[8] ( FoldCtx::off → ext_cands
+/// false); the native executor runs ext_cands = true — the legacy slot
+/// OVERLAPS action slot 0 and poisoned apply_actions when a same-round
+/// action preceded the park (the phantom ACT_GOAL_START p0=0 bug).
+pub const OUT_EXT_LO: usize = OUT_HEADER + MAX_ACTS * OUT_ACT;
+/// The full native out-buffer tail: stream(2) + cand count(1) + 32 cands.
+pub const OUT_EXT_LEN: usize = OUT_EXT_LO + 3 + 32;
 
 /// fallback reason codes (out[7]) — the Java floor logs the first one so a
 /// classified-mob fallback is diagnosable from the CI log alone.
@@ -296,6 +308,14 @@ pub const ACT_LOOK_COOL_VANILLA: i32 = 9; // lookControl.tick routes vanilla (co
 pub const ACT_REF_SET_PLAYER: i32 = 10; // goal.lookAt/target = players[p1] (p0 = global goalIdx)
 pub const ACT_GOAL_LOCK_MAP: i32 = 11; // lockedFlags.put(flag, wg) ONLY — the start body runs at the REQ_START_VANILLA resolution (L102)
 pub const ACT_NOOP: i32 = 0;
+/// WAVE6 stroll fold: pend = (p1..p4 = two f64 lo/hi pairs) — the splitmix/
+/// LCG-16 stroll target the floor drew INLINE (no park); the executor
+/// stashes it so the paired ACT_GOAL_START (nav = pend) lands in order.
+pub const ACT_STROLL_SET: i32 = 12;
+/// WAVE6 RLA start fold: the DRAW-EXACT RandomLookAround start body run by
+/// the floor on its own LCG (no park): rel = (p1..p4 f64 pair),
+/// lookTime/state = p5. running/no_action flip here too.
+pub const ACT_RLA_START: i32 = 13;
 
 // phases within one selector tick
 const PH_CLEANUP: i32 = 0;
@@ -313,6 +333,128 @@ pub const MAX_GOALS: usize = 16;
 /// over — the same outcome a lock collision produces) instead of silently
 /// indexing the wide table; bits 0..4 behave exactly as before.
 pub const MAX_LOCK_FLAGS: usize = 5;
+
+// ---------------------------------------------------------------------------
+// WAVE6: the native FOLD — the executor's no-park contract for the requests
+// whose v0 answers are pure functions of the pack + the streams the floor
+// already carries. The park/resume round-trip costs a full 46-word repack +
+// a floor re-entry (ctx rebuild + resume lock rebuild) per staged predicate;
+// at 25k mobs the staged-requests profile (find_target 1-in-10 per Nearest
+// goal, LOS scans, stroll targets, RLA starts, cleanup cc checks) was worth
+// ~10k round-trips per tick. The fold resolves them IN PLACE, bit-identically:
+// every fold body is the exact v0 resolver math (WorldRes / FlatWorld),
+// fed from the same state. `on = false` (or FoldCtx::off()) reproduces the
+// parked semantics word-for-word — the twin gate drives both modes.
+// ---------------------------------------------------------------------------
+
+/// The per-call fold ENABLE mask the floor snapshots from the FoldCtx —
+/// BY VALUE in the Ctx (one u8 load per site instead of a pointer deref
+/// chain through the executor-owned struct; the sites are the hottest
+/// branches in can_use).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FoldMask {
+    /// the LOS all-pass fold (combat + lookat scan arms)
+    pub los: bool,
+    /// the find_target fold (gated by the resolver's contract)
+    pub fnd: bool,
+    /// the stroll-target fold
+    pub strl: bool,
+    /// the RLA start-body fold
+    pub rla: bool,
+    /// the cleanup cc fold
+    pub cc: bool,
+}
+
+/// The per-mob fold context the RESOLVER builds (trait Resolver::fold_ctx).
+/// None = always park (the Java-mirror twin, the fixtures, team/v1 worlds).
+#[derive(Debug, Clone, Copy)]
+pub struct FoldCtx {
+    /// master switch — false reproduces the parked path exactly
+    pub on: bool,
+    /// v0 open-ground Sensing: every staged candidate passes (los() = all-mask)
+    pub los_all_pass: bool,
+    /// the external stroll target stream (the resolver's own — NOT the mob LCG)
+    pub stroll_seed: u64,
+    /// false = splitmix16 (FlatWorld), true = ThreadUnsafeRandom-16 (WorldRes)
+    pub stroll_lcg16: bool,
+    pub stroll_radius: f64,
+    /// the follow range the v0 cc contract bounds (35.0)
+    pub follow_range: f64,
+    /// the carried mob target (the pack has no target-index word; the
+    /// resolver reads mob.target_player at ai_tick entry — exact)
+    pub target_player: i32,
+    pub approach_x: f64,
+    pub approach_z: f64,
+    /// set by the floor when the stroll fold drew — gates the ext-word write
+    pub stroll_drew: bool,
+    /// WAVE6 FIX: the native executor exchanges the LOS candidates through
+    /// the EXT tail (beyond the action area) instead of the JNI wire slot
+    /// out[8] — the wire slot OVERLAPS action slot 0, so a same-round
+    /// action (e.g. the cleanup cc stop) followed by a LOS park made
+    /// apply_actions read the candidate list as ACT_GOAL_START p0=0 — a
+    /// phantom HurtBy start + the next rebuild's FB_LOCK_COLLIDE. The JNI
+    /// path (FoldCtx::off) keeps the wire; the native buffer is long
+    /// enough for both. Read by the executor's REQ_LOS_SCAN arm.
+    pub ext_cands: bool,
+    /// WAVE6: the RESOLVER-declared find_target fold enable — the fold
+    /// answers "any alive && !spectator player" (the WorldRes contract);
+    /// a resolver whose find_target differs (FlatWorld: no targets, always
+    /// false) must leave this OFF and keep the park.
+    pub find_target_fold: bool,
+}
+
+impl FoldCtx {
+    #[inline]
+    pub fn off() -> Self {
+        FoldCtx {
+            on: false,
+            los_all_pass: false,
+            stroll_seed: 0,
+            stroll_lcg16: false,
+            stroll_radius: 10.0,
+            follow_range: 35.0,
+            target_player: -1,
+            approach_x: 0.0,
+            approach_z: 0.0,
+            stroll_drew: false,
+            ext_cands: false,
+            find_target_fold: false,
+        }
+    }
+}
+
+/// The exact splitmix64 (the same constants the swarm executor's private
+/// splitmix uses — pinned equal by swarm-sim's fold_streams test).
+#[inline]
+pub fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ z >> 31
+}
+
+/// The 16-bit stroll draw, FlatWorld flavor (splitmix & 0xFFFF).
+#[inline]
+pub fn stroll_draw_splitmix16(seed: &mut u64) -> i32 {
+    (splitmix64(seed) & 0xFFFF) as i32
+}
+
+/// The 16-bit stroll draw, WorldRes flavor (ThreadUnsafeRandom next(16)).
+#[inline]
+pub fn stroll_draw_lcg16(seed: &mut u64) -> i32 {
+    *seed = seed.wrapping_mul(25214903917).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
+    (*seed >> (48 - 16)) as i32
+}
+
+#[inline]
+fn stroll_draw16(seed: &mut u64, lcg16: bool) -> i32 {
+    if lcg16 {
+        stroll_draw_lcg16(seed)
+    } else {
+        stroll_draw_splitmix16(seed)
+    }
+}
 
 fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
     ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)
@@ -332,23 +474,28 @@ pub struct Lcg {
 
 // ---------------------------------------------------------------------------
 // WAVE4b: division-free exact modulus for the biased nextInt(bound) loop.
+// WAVE6 LESSON: a per-floor-call memo is a REGRESSION — the context is
+// rebuilt per call, so every call re-paid the INV division (50k+ divisions
+// per tick at 25k mobs). The memo returns to the thread-local table —
+// now CONST-initialized, which removes the lazy-init branch the wave4b
+// shape paid on EVERY access (the wave4b A/B was noise-blind to it).
 // ---------------------------------------------------------------------------
 
-/// (bound, INV) memo — 4 per-thread slots, linear scan. The goal cfg
-/// bounds (randomInterval 10, stroll interval 60) repeat across EVERY
-/// floor call of every mob, so the table self-anneals after the first
-/// call; each hit replaces a runtime division with a mulhi. Per-slot
-/// `Cell::get()` (16 B) — NOT a whole-array take/set, whose 2×40 B copies
-/// cost more than the division they save. Pure memoization of a pure
-/// function — the returned value is bit-identical with or without the
-/// cache (parity holds by construction; the sweep test proves the magic).
 thread_local! {
-    static DIV_SLOTS: [std::cell::Cell<(i32, u64)>; 4] = [
-        std::cell::Cell::new((-1i32, 0u64)),
-        std::cell::Cell::new((-1i32, 0u64)),
-        std::cell::Cell::new((-1i32, 0u64)),
-        std::cell::Cell::new((-1i32, 0u64)),
-    ];
+    /// (bound, INV) memo — 4 per-thread slots, linear scan. The goal cfg
+    /// bounds (randomInterval 10, stroll interval 60) repeat across EVERY
+    /// floor call of every mob, so the table self-anneals; each hit
+    /// replaces a runtime division with a mulhi. Pure memoization of a
+    /// pure function — the returned value is bit-identical with or
+    /// without the cache (the 83M-sweep test pins the magic).
+    static DIV_SLOTS: [std::cell::Cell<(i32, u64)>; 4] = const {
+        [
+            std::cell::Cell::new((-1i32, 0u64)),
+            std::cell::Cell::new((-1i32, 0u64)),
+            std::cell::Cell::new((-1i32, 0u64)),
+            std::cell::Cell::new((-1i32, 0u64)),
+        ]
+    };
 }
 
 /// `bits % bound` for bits ∈ [0, 2^31), bound non-pow2 ≥ 3 — the exact
@@ -493,6 +640,23 @@ impl<'a> Out<'a> {
             self.n_act += 1;
         }
     }
+    /// WAVE6: the 7-word action write (op + 6 payloads) for the fold acts
+    /// (ACT_STROLL_SET / ACT_RLA_START carry f64 pairs + a state word).
+    /// Word b+7 stays untouched — no reader ever sees it.
+    #[inline]
+    fn push7(&mut self, op: i32, p0: i32, p1: i32, p2: i32, p3: i32, p4: i32, p5: i32) {
+        if self.n_act < MAX_ACTS {
+            let b = self.n_act * OUT_ACT + OUT_HEADER;
+            self.buf[b] = op;
+            self.buf[b + 1] = p0;
+            self.buf[b + 2] = p1;
+            self.buf[b + 3] = p2;
+            self.buf[b + 4] = p3;
+            self.buf[b + 5] = p4;
+            self.buf[b + 6] = p5;
+            self.n_act += 1;
+        }
+    }
 }
 
 struct Ctx<'a> {
@@ -503,6 +667,11 @@ struct Ctx<'a> {
     lcg: Lcg,
     lock: [[i32; MAX_LOCK_FLAGS]; 2], // flag bit -> goal idx, -1 = free (WAVE4: 5 flag bits, was 16)
     running: [[bool; MAX_GOALS]; 2],
+    /// WAVE6: the fold contract (the executor-owned struct; the stroll fold
+    /// advances its stream and the cc/los folds read its carried state).
+    fold: &'a mut FoldCtx,
+    /// WAVE6: the SNAPSHOT enables — by value, one load per site.
+    fm: FoldMask,
 }
 
 impl<'a> Ctx<'a> {
@@ -729,6 +898,43 @@ impl<'a> Ctx<'a> {
     fn seed(&self) -> i64 {
         ((self.inb[IN_SEED_HI] as i64) << 32) | (self.inb[IN_SEED_LO] as i64 as u64) as i64
     }
+
+    /// WAVE6 fold helper: the v0 find_target conditions over the packed
+    /// snapshot (alive && !spectator, ANY player — the exact WorldRes /
+    /// FlatWorld find_target body, which ignores the goal's target kind by
+    /// the swarm-honesty v0 contract).
+    fn any_targetable(&self) -> bool {
+        for i in 0..self.pcount() {
+            let fl = self.pflags(i);
+            if fl & PF_ALIVE != 0 && fl & PF_SPECTATOR == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// WAVE6 fold helper: the v0 canContinueToUse answer for the
+    /// needs_cc_vanilla kinds — the exact WorldRes/FlatWorld cc_vanilla
+    /// body fed from the FoldCtx-carried target/approach (mob.target_player
+    /// and mob.approach_x/z at ai_tick entry; the refresh loop keeps them
+    /// current between ticks and no fold can acquire a target before the
+    /// cleanup pass runs, so the snapshot is exact).
+    fn fold_cc(&self, sel: usize, gi: usize) -> bool {
+        let f = &*self.fold;
+        if f.target_player < 0 {
+            return false;
+        }
+        match self.kind(sel, gi) {
+            GK_NEAREST_TARGET => {
+                let (mx, _my, mz, _eyey) = self.mob_pos();
+                let (dx, dz) = (f.approach_x - mx, f.approach_z - mz);
+                dx * dx + dz * dz <= f.follow_range * f.follow_range
+            }
+            // MeleeAttack chases without a range cutoff (the open-ground
+            // straight line is the proven path); HurtBy/MTV ditto
+            _ => true,
+        }
+    }
 }
 
 enum Cu {
@@ -738,6 +944,10 @@ enum Cu {
     StartStaged,
     /// the canUse body itself needs the vanilla call (side effects / queries)
     Staged,
+    /// WAVE6: the fold resolved the request IN PLACE (no park) — the walk
+    /// continues at gi+1, exactly the parked flow's resume semantics
+    /// (predicate arm + gi += 1) minus the round-trip.
+    Continue,
 }
 
 // ---------------------------------------------------------------------------
@@ -881,15 +1091,29 @@ pub static ML_DRAW_SWAPS: AtomicU32 = AtomicU32::new(0);
 pub static ML_EVAL_SWAPS: AtomicU32 = AtomicU32::new(0);
 
 /// The floor entry. Returns the status written to out_buf[0].
+/// The PARKED entry: fold off — the Java mirror and the fixtures ride here
+/// (the out buffer is their own; the ext tail is never written).
 pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
-    let st = ai_floor_run(in_buf, out_buf);
+    let mut fold = FoldCtx::off();
+    ai_floor_ext(in_buf, out_buf, &mut fold)
+}
+
+/// WAVE6: the NATIVE entry — the resolver's FoldCtx enables the no-park
+/// resolutions. The advanced external stream (stroll fold) rides the ext
+/// tail words [OUT_EXT_LO, OUT_EXT_LO+1] when stroll_drew is set.
+pub fn ai_floor_ext(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    let st = ai_floor_run(in_buf, out_buf, fold);
+    if fold.stroll_drew && out_buf.len() >= OUT_EXT_LO + 2 {
+        out_buf[OUT_EXT_LO] = fold.stroll_seed as i32;
+        out_buf[OUT_EXT_LO + 1] = (fold.stroll_seed >> 32) as i32;
+    }
     if ML_ON.load(Ordering::Relaxed) {
         ml_record(in_buf, out_buf, st);
     }
     st
 }
 
-fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
+fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
@@ -925,6 +1149,14 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         },
         lock: [[-1; MAX_LOCK_FLAGS]; 2],
         running: [[false; MAX_GOALS]; 2],
+        fm: FoldMask {
+            los: fold.on && fold.los_all_pass,
+            fnd: fold.on && fold.find_target_fold,
+            strl: fold.on,
+            rla: fold.on,
+            cc: fold.on,
+        },
+        fold,
     };
     for sel in 0..2usize {
         for i in 0..ctx.counts[sel] {
@@ -984,7 +1216,6 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
             }
         }
         let res = in_buf[IN_RES] != 0;
-        let res_mask = in_buf[IN_RES];
         match in_buf[IN_RES_OP] {
             REQ_CC_VANILLA => {
                 if !res && stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
@@ -1011,27 +1242,9 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 // eyeY, mz)) runs here; a winner gets its reference written
                 // (goal.lookAt / goal.target) BEFORE the lock transition —
                 // the vanilla start() bodies read those fields.
-                if res_mask != 0 {
-                    let kind = ctx.kind(sel, gi);
-                    let combat = kind == GK_NEAREST_TARGET;
-                    let not_riding = kind == GK_LOOKAT_PLAYER;
-                    let range = if combat {
-                        f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
-                    } else {
-                        f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
-                    };
-                    if let Some(winner) =
-                        ctx.best_from_mask(res_mask as u32, combat, not_riding, range)
-                    {
-                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), winner as i32, 0, 0);
-                        if lock_only(&mut ctx, &mut out, sel, gi).is_err() {
-                            return fallback(&mut out, FB_STATE_MISMATCH);
-                        }
-                    } else if combat {
-                        // every candidate failed the Sensing LoS — vanilla's
-                        // findTarget wrote null into the goal's target field
-                        out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
-                    }
+                let res_mask = in_buf[IN_RES];
+                if los_apply(&mut ctx, &mut out, sel, gi, res_mask).is_err() {
+                    return fallback(&mut out, FB_STATE_MISMATCH);
                 }
             }
             _ => {}
@@ -1050,7 +1263,19 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
                             }
                         } else if needs_cc_vanilla(ctx.kind(sel, gi)) {
-                            return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
+                            if ctx.fm.cc {
+                                // WAVE6 cc fold: the v0 answer is a pure
+                                // function of the pack + the carried
+                                // target/approach — continue or stop in
+                                // place, no park/resume round-trip.
+                                if !ctx.fold_cc(sel, gi)
+                                    && stop_goal(&mut ctx, &mut out, sel, gi).is_err()
+                                {
+                                    return fallback(&mut out, FB_STATE_MISMATCH);
+                                }
+                            } else {
+                                return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
+                            }
                         } else if !cc_ported(&ctx, sel, gi) {
                             if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
@@ -1091,10 +1316,26 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                         if fl & ctx.disabled[sel] == 0 && can_replace_all(&ctx, sel, gi) {
                             match can_use(&mut ctx, &mut out, sel, gi, phase) {
                                 Ok(Cu::No) => {}
+                                Ok(Cu::Continue) => {
+                                    // WAVE6: the fold resolved in place — the
+                                    // walk continues at gi+1 (the parked flow's
+                                    // resume semantics: predicate arm + gi += 1)
+                                }
                                 Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
                                     return out.buf[0]; // parked
                                 }
-                                Err(()) => return fallback(&mut out, FB_UNKNOWN_KIND),
+                                Err(()) => {
+                                    // the fold presets FB_STATE_MISMATCH when
+                                    // its lock transition collided (out[7] is
+                                    // zeroed by OUT_RESET at entry, so only the
+                                    // fold can have set it)
+                                    let reason = if out.buf[7] != 0 {
+                                        out.buf[7]
+                                    } else {
+                                        FB_UNKNOWN_KIND
+                                    };
+                                    return fallback(&mut out, reason);
+                                }
                             }
                         }
                     }
@@ -1201,6 +1442,18 @@ fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -
 /// cache and resumes with res = a bitmask over the same indices.
 fn park_los(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, cands: &[usize]) -> i32 {
     let st = park(ctx, out, sel, phase, gi, REQ_LOS_SCAN);
+    if ctx.fold.ext_cands {
+        // WAVE6 FIX: the native exchange rides the EXT tail — the legacy
+        // out[8] slot IS action slot 0 and collides with same-round actions
+        debug_assert!(cands.len() <= 32, "cand overflow");
+        if out.buf.len() >= OUT_EXT_LEN {
+            out.buf[OUT_EXT_LO + 2] = cands.len() as i32;
+            for (i, c) in cands.iter().enumerate() {
+                out.buf[OUT_EXT_LO + 3 + i] = *c as i32;
+            }
+            return st;
+        }
+    }
     out.buf[OUT_ACT] = cands.len() as i32;
     for (i, c) in cands.iter().enumerate() {
         out.buf[OUT_ACT + 1 + i] = *c as i32;
@@ -1273,6 +1526,9 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
     match &r {
         Ok(Cu::No) => {
             GL_NO[k].fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Cu::Continue) => {
+            GL_STAGED[k].fetch_add(1, Ordering::Relaxed);
         }
         Ok(Cu::StartStaged) | Ok(Cu::Staged) => {
             GL_STAGED[k].fetch_add(1, Ordering::Relaxed);
@@ -1401,6 +1657,16 @@ fn can_use_inner(
                     out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
                     return Ok(Cu::No);
                 }
+                // WAVE6 LOS fold: the v0 Sensing answer (all-pass) is known
+                // to the executor — resolve the mask + winner + lock IN PLACE
+                if ctx.fm.los {
+                    let mask = if n >= 32 { -1i32 } else { (1i32 << n) - 1 };
+                    if los_apply(ctx, out, sel, gi, mask).is_err() {
+                        out.buf[7] = FB_STATE_MISMATCH;
+                        return Err(());
+                    }
+                    return Ok(Cu::Continue);
+                }
                 park_los(ctx, out, sel, phase, gi, &cbuf[..n]);
                 return Ok(Cu::Staged);
             }
@@ -1408,6 +1674,19 @@ fn can_use_inner(
             // happened; the seed handoff keeps the stream exact). Only
             // reachable for non-player-typed target goals or the
             // team/many-players worlds now.
+            // WAVE6 FIND_TARGET fold: the v0 conditions are a pure read of
+            // the packed snapshot — resolve in place (res 1 = the predicate
+            // arm's lock_only + continue; res 0 = plain canUse-false).
+            // GATED by the resolver's find_target_fold (FlatWorld's
+            // find_target contract differs — it parks).
+            if ctx.fm.fnd {
+                let res = ctx.any_targetable();
+                if res && lock_only(ctx, out, sel, gi).is_err() {
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return Err(());
+                }
+                return Ok(if res { Cu::Continue } else { Cu::No });
+            }
             park(ctx, out, sel, phase, gi, REQ_FIND_TARGET);
             Ok(Cu::Staged)
         }
@@ -1427,6 +1706,41 @@ fn can_use_inner(
             }
             // forceTrigger == false for the classified goal (verified at
             // classification; a triggered stroll routes vanilla forever)
+            // WAVE6 STROLL fold: the v0 target draw rides the FoldCtx's
+            // external stream (splitmix16 or LCG-16 — the resolver's flavor),
+            // the can_stand seam is the fold's open-ground contract. The
+            // advanced stream returns via the ext tail; the actions order
+            // STROLL_SET (pend) before the lock_only GOAL_START (nav = pend)
+            // — the same resolution→start order the parked flow produces.
+            if ctx.fm.strl {
+                let (mx, _my, mz, _eyey) = ctx.mob_pos();
+                let (v1, v2, rad) = {
+                    let f = &mut *ctx.fold;
+                    let v1 = stroll_draw16(&mut f.stroll_seed, f.stroll_lcg16);
+                    let v2 = stroll_draw16(&mut f.stroll_seed, f.stroll_lcg16);
+                    f.stroll_drew = true;
+                    (v1, v2, f.stroll_radius)
+                };
+                let dx = ((v1 as f64) / 65535.0) * 2.0 * rad - rad;
+                let dz = ((v2 as f64) / 65535.0) * 2.0 * rad - rad;
+                let (x, z) = (mx + dx, mz + dz);
+                let xb = x.to_bits();
+                let zb = z.to_bits();
+                out.push7(
+                    ACT_STROLL_SET,
+                    ctx.global(sel, gi),
+                    xb as i32,
+                    (xb >> 32) as i32,
+                    zb as i32,
+                    (zb >> 32) as i32,
+                    0,
+                );
+                if lock_only(ctx, out, sel, gi).is_err() {
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return Err(());
+                }
+                return Ok(Cu::Continue);
+            }
             park(ctx, out, sel, phase, gi, REQ_STROLL_POS);
             Ok(Cu::Staged)
         }
@@ -1447,6 +1761,17 @@ fn can_use_inner(
                 if n == 0 {
                     return Ok(Cu::No); // getNearestPlayer -> null
                 }
+                // WAVE6 LOS fold (the lookat flavor: combat=false,
+                // not_riding=true, range = lookDistance) — same in-place
+                // resolution as the combat arm.
+                if ctx.fm.los {
+                    let mask = if n >= 32 { -1i32 } else { (1i32 << n) - 1 };
+                    if los_apply(ctx, out, sel, gi, mask).is_err() {
+                        out.buf[7] = FB_STATE_MISMATCH;
+                        return Err(());
+                    }
+                    return Ok(Cu::Continue);
+                }
                 park_los(ctx, out, sel, phase, gi, &cbuf[..n]);
                 return Ok(Cu::Staged);
             }
@@ -1466,6 +1791,30 @@ fn can_use_inner(
                     out.buf[0] = ST_FALLBACK;
                     out.buf[7] = FB_STATE_MISMATCH;
                     return Ok(Cu::No);
+                }
+                // WAVE6 RLA-START fold: the DRAW-EXACT RandomLookAround
+                // start body (javap 26.3: nextDouble + nextInt(20)) runs on
+                // the floor's OWN LCG — the same stream position the parked
+                // flow's resolution draws from (the mob seed mirror). The
+                // rel/state ride ACT_RLA_START; the apply mirrors the packed
+                // words. No park, no round-trip, identical stream.
+                if ctx.fm.rla {
+                    let d0 = std::f64::consts::PI * 2.0 * ctx.lcg.next_f64();
+                    let rx = d0.cos();
+                    let rz = d0.sin();
+                    let look_time = 20 + ctx.lcg.next_int_bound(20);
+                    let xb = rx.to_bits();
+                    let zb = rz.to_bits();
+                    out.push7(
+                        ACT_RLA_START,
+                        ctx.global(sel, gi),
+                        xb as i32,
+                        (xb >> 32) as i32,
+                        zb as i32,
+                        (zb >> 32) as i32,
+                        look_time,
+                    );
+                    return Ok(Cu::Continue);
                 }
                 park(ctx, out, sel, phase, gi, REQ_START_VANILLA);
                 Ok(Cu::StartStaged)
@@ -1580,6 +1929,38 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
     }
     ctx.running[sel][gi] = true;
     out.push(ACT_GOAL_LOCK_MAP, ctx.global(sel, gi), 0, 0, 0);
+    Ok(())
+}
+
+/// The REQ_LOS_SCAN resolution, shared by the parked resume arm and the
+/// WAVE6 fold (single source — no drift): best-selection over the passing
+/// mask + the winner's ref write + the lock transition. Err = lock collide
+/// (the caller turns it into the FB_STATE_MISMATCH fallback).
+fn los_apply(
+    ctx: &mut Ctx,
+    out: &mut Out,
+    sel: usize,
+    gi: usize,
+    res_mask: i32,
+) -> Result<(), ()> {
+    if res_mask != 0 {
+        let kind = ctx.kind(sel, gi);
+        let combat = kind == GK_NEAREST_TARGET;
+        let not_riding = kind == GK_LOOKAT_PLAYER;
+        let range = if combat {
+            f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
+        } else {
+            f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
+        };
+        if let Some(winner) = ctx.best_from_mask(res_mask as u32, combat, not_riding, range) {
+            out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), winner as i32, 0, 0);
+            lock_only(ctx, out, sel, gi)?;
+        } else if combat {
+            // every candidate failed the Sensing LoS — vanilla's
+            // findTarget wrote null into the goal's target field
+            out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
+        }
+    }
     Ok(())
 }
 

@@ -22,6 +22,10 @@ fn main() {
     let seed: u64 = args.get(3).map_or(0xC0FFEE, |s| s.parse().unwrap_or(0xC0FFEE));
 
     let mut nt = NativeTick::new(seed);
+    // the WAVE6 A/B knob: CE_NO_FOLD=1 forces the parked (pre-fold) semantics
+    if std::env::var_os("CE_NO_FOLD").is_some() {
+        nt.set_fold_off(true);
+    }
     // the mobs-25k stand: a pile around the spawn column, flat ground
     for i in 0..n_mobs {
         let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;

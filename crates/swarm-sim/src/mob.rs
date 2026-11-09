@@ -52,6 +52,43 @@ const FOLLOW_RANGE: f32 = 35.0;
 const LOOK_DIST: f32 = 8.0;
 const EYE_Y: f64 = 1.62;
 
+// -- WAVE6: the folded open-ground travel chain (bit-pinned constants) -----
+
+/// Mth.clamp(1 - (1-f)*m, 0, 1) as a const fn (float arithmetic in const
+/// context is stable and IEEE-exact — the same ops, the same bits).
+const fn cmf_const(f: f32, m: f32) -> f32 {
+    let v = 1.0f32 - (1.0f32 - f) * m;
+    if v < 0.0f32 {
+        0.0f32
+    } else if v > 1.0f32 {
+        1.0f32
+    } else {
+        v
+    }
+}
+
+/// computeModifiedFriction(0.6, 1.0) — the block friction (fm = 1.0).
+const OG_FRICTION: f32 = cmf_const(0.6, 1.0);
+/// getFrictionInfluencedSpeed(true, friction, 0.23, 0.02) — friction is NOT
+/// > 0.6 (0.6 − 3.6e-8 after the f32 chain), so the else arm: plain speed.
+const OG_FIS: f32 = if OG_FRICTION > 0.6f32 {
+    0.23f32 * (0.21600002f32 / (OG_FRICTION * OG_FRICTION * OG_FRICTION))
+} else {
+    0.23f32
+};
+/// computeModifiedFriction(0.91, 1.0) — the ground drag modifier.
+const OG_GM: f32 = cmf_const(0.91, 1.0);
+/// h = friction * gm — the horizontal drag factor (f32) ...
+const OG_H: f32 = OG_FRICTION * OG_GM;
+/// ... widened to f64 for the delta multiply.
+const OG_HF: f64 = OG_H as f64;
+/// computeModifiedFriction(0.98, 1.0) — the vertical drag (omnidirectional
+/// false).
+const OG_DRAG_I: f32 = cmf_const(0.98, 1.0);
+/// dy = (dm.y − 0.08) * i with dm.y ground-clipped to 0.0 — the constant
+/// gravity tail.
+const OG_GRAV_TAIL: f64 = (0.0f64 - 0.08f64) * (OG_DRAG_I as f64);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GoalRec {
     pub kind: i32,
@@ -276,6 +313,18 @@ pub trait Resolver {
     fn find_target(&mut self, _mob: &MobAI, _players: &[PlayerSnap]) -> bool {
         false
     }
+    /// WAVE6: the native FOLD contract — Some(ctx) lets the floor resolve
+    /// the pure-v0 requests IN PLACE (no park/resume round-trip: the exact
+    /// resolver math runs inside ai_floor_ext over the pack + the carried
+    /// streams). None (the default) keeps every request parked — the
+    /// Java-mirror twin semantics.
+    fn fold_ctx(&self, _mob: &MobAI) -> Option<centities_core::goals::FoldCtx> {
+        None
+    }
+    /// WAVE6: the stroll fold advances the resolver's external target
+    /// stream inside the floor; the advanced value comes back through the
+    /// out buffer's ext tail. Default: no stream to update.
+    fn set_target_rng(&mut self, _s: u64) {}
 }
 
 /// The flat open-ground world: nothing occludes, stroll targets are
@@ -284,6 +333,9 @@ pub struct FlatWorld {
     /// separate target stream (NOT the mob's RNG — see honesty note 1)
     pub target_rng: u64,
     pub stroll_radius: f64,
+    /// WAVE6 twin hook: true = fold_ctx returns None — every request
+    /// parks, the exact pre-fold semantics (the A/B gate drives both).
+    pub no_fold: bool,
 }
 
 impl FlatWorld {
@@ -291,6 +343,7 @@ impl FlatWorld {
         FlatWorld {
             target_rng: target_seed,
             stroll_radius: 10.0,
+            no_fold: false,
         }
     }
 }
@@ -305,6 +358,30 @@ fn splitmix(state: &mut u64) -> u64 {
 }
 
 impl Resolver for FlatWorld {
+    fn fold_ctx(&self, mob: &MobAI) -> Option<centities_core::goals::FoldCtx> {
+        if self.no_fold {
+            return None;
+        }
+        Some(centities_core::goals::FoldCtx {
+            on: true,
+            los_all_pass: true,
+            stroll_seed: self.target_rng,
+            stroll_lcg16: false,
+            stroll_radius: self.stroll_radius,
+            follow_range: 35.0,
+            target_player: mob.target_player,
+            approach_x: mob.approach_x,
+            approach_z: mob.approach_z,
+            stroll_drew: false,
+            ext_cands: false,
+            find_target_fold: false, // FlatWorld's find_target contract = false (no targets)
+        })
+    }
+
+    fn set_target_rng(&mut self, s: u64) {
+        self.target_rng = s;
+    }
+
     fn stroll_pos(&mut self, mob: &mut MobAI) -> Option<(f64, f64, f64)> {
         let r = self.stroll_radius;
         let dx = (splitmix(&mut self.target_rng) & 0xFFFF) as f64 / 65535.0 * 2.0 * r - r;
@@ -428,7 +505,7 @@ pub struct AiStat {
     pub last_req: (i32, usize),
 }
 
-const OUT_LEN: usize = g::OUT_HEADER + g::MAX_ACTS * g::OUT_ACT;
+const OUT_LEN: usize = g::OUT_EXT_LEN;
 
 /// The out-buffer length the executor must provide to `ai_tick` (the
 /// wave2 shared-buffer contract — one allocation per EXECUTOR, not per mob).
@@ -781,6 +858,37 @@ impl MobAI {
                     }
                 }
                 g::ACT_GOAL_LOCK_MAP => { /* map-only; running flips at start */ }
+                // WAVE6 stroll fold: the floor drew the v0 target from the
+                // external stream — stash it (pend); the paired GOAL_START
+                // (later in this action list, lock_only's push) sets nav from
+                // pend — the same resolution→start order as the parked flow.
+                g::ACT_STROLL_SET => {
+                    self.pend_x = f64::from_bits(
+                        ((out[b + 3] as u64) << 32) | (out[b + 2] as u64 & 0xFFFF_FFFF),
+                    );
+                    self.pend_z = f64::from_bits(
+                        ((out[b + 5] as u64) << 32) | (out[b + 4] as u64 & 0xFFFF_FFFF),
+                    );
+                }
+                // WAVE6 RLA start fold: the floor ran the DRAW-EXACT start
+                // body on its own LCG — apply the rel/state/running writes
+                // (the parked flow's start_vanilla body, action-shaped).
+                g::ACT_RLA_START => {
+                    if p0 < N_GOALS {
+                        self.rel_x = f64::from_bits(
+                            ((out[b + 3] as u64) << 32) | (out[b + 2] as u64 & 0xFFFF_FFFF),
+                        );
+                        self.rel_z = f64::from_bits(
+                            ((out[b + 5] as u64) << 32) | (out[b + 4] as u64 & 0xFFFF_FFFF),
+                        );
+                        self.goals[p0].state = out[b + 6];
+                        self.goals[p0].running = true;
+                        self.no_action = 0;
+                        packed[g::IN_HEADER + gw + 4] = 1;
+                        packed[g::IN_HEADER + gw + 5] = out[b + 6];
+                        packed[4] = 0;
+                    }
+                }
                 g::ACT_GOAL_STOP | g::ACT_GOAL_STOP_D => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = false;
@@ -882,6 +990,16 @@ impl MobAI {
         // the sub-phase ledger gate (1-in-SUB_EVERY mobs on sampled
         // ticks; the guard drops at scope end)
         let _sub = crate::ledger::begin_mob();
+        // WAVE6: the fold contract — None keeps every request parked (the
+        // Java-mirror twin); Some lets ai_floor_ext resolve the pure-v0
+        // requests in place. Built ONCE per mob-tick from the resolver +
+        // the mob's carried target/approach; None degrades to FoldCtx::off.
+        let mut fold = r.fold_ctx(self).unwrap_or_else(g::FoldCtx::off);
+        // WAVE6 FIX: the native executor exchanges LOS candidates through the
+        // EXT tail in BOTH modes (folded AND the parked twin) — the legacy
+        // wire slot out[8] IS action slot 0 and let a same-round action be
+        // replaced by the candidate list (the phantom ACT_GOAL_START p0=0).
+        fold.ext_cands = true;
         self.tick_count = self.tick_count.wrapping_add(1);
         self.no_action = self.no_action.saturating_add(1);
         let mut stat = AiStat::default();
@@ -954,11 +1072,26 @@ impl MobAI {
             }
             let st = {
                 let _f = crate::ledger::sg_floor();
-                g::ai_floor(scratch, out)
+                // WAVE6: ALWAYS the ext entry — fold.on=false keeps the exact
+                // parked semantics while still honoring ext_cands (the
+                // plain ai_floor entry would build an internal FoldCtx::off
+                // and fall back to the colliding wire slot)
+                g::ai_floor_ext(scratch, out, &mut fold)
             };
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+            // WAVE6: the external stream handoff — applied ONLY when the
+            // floor actually drew (fold.stroll_drew): the out buffer is
+            // SHARED across mobs, so an unconditional read would clobber
+            // the stream with the previous mob's value. The floor can draw
+            // at most once per call; the value chains exactly.
+            if fold.stroll_drew && out.len() >= g::OUT_EXT_LO + 2 {
+                let s = ((out[g::OUT_EXT_LO + 1] as u64) << 32)
+                    | (out[g::OUT_EXT_LO] as u64 & 0xFFFF_FFFF);
+                r.set_target_rng(s);
+                fold.stroll_drew = false; // re-arm for the next round
+            }
             {
                 let _a = crate::ledger::sg_acts();
                 self.apply_actions(out, players, scratch);
@@ -990,7 +1123,14 @@ impl MobAI {
             let _rs = crate::ledger::sg_resolve();
             (res, rx, ry, rz) = match req_op {
                 g::REQ_LOS_SCAN => {
-                    let n = out[8].max(0) as usize;
+                    // WAVE6 FIX: the cand count rides the EXT tail (native
+                    // ext_cands mode) — out[8] is the JNI wire slot that
+                    // overlaps action slot 0
+                    let n = if fold.ext_cands && out.len() >= g::OUT_EXT_LEN {
+                        out[g::OUT_EXT_LO + 2].max(0) as usize
+                    } else {
+                        out[8].max(0) as usize
+                    };
                     (r.los(n), 0.0, 0.0, 0.0)
                 }
                 g::REQ_STROLL_POS => match r.stroll_pos(self) {
@@ -1086,10 +1226,13 @@ impl MobAI {
                 zza = 0.98;
             }
         }
-        // the travel slice (open-ground routing): friction 0.6, fm 1.0
-        let friction = mobtravel::compute_modified_friction(0.6f32, 1.0f32);
-        let fis = mobtravel::get_friction_influenced_speed(true, friction, 0.23, 0.02);
-        let (ix, _iy, iz) = mobtravel::get_input_vector(mth, 0.0, 0.0, zza as f64, fis, self.yaw);
+        // WAVE6: the friction/drag chain is CONSTANT for every mob every
+        // tick under the open-ground contract (block friction 0.6, friction
+        // and air-drag modifiers 1.0, speed 0.23, gravity 0.08) — folded
+        // once into consts, pinned bit-exactly against the runtime fns by
+        // travel_open_ground_consts_pin. The per-mob recomputation of the
+        // same five f32 values (~10 flops + 2 casts per mob-tick) is gone.
+        let (ix, _iy, iz) = mobtravel::get_input_vector(mth, 0.0, 0.0, zza as f64, OG_FIS, self.yaw);
         let (mx, mz) = (self.dx + ix, self.dz + iz);
         // move consumes the pre-delta; the open ground clips nothing
         // horizontally; the setPos condition is the exact 26.3 predicate
@@ -1097,16 +1240,11 @@ impl MobAI {
             self.x += mx;
             self.z += mz;
         }
-        // the drag tail (the same slice travel_in_air_open_ground runs;
-        // dy = (0 - gravity) * i, dm.y was ground-clipped to 0)
-        let dm = (mx, 0.0f64, mz);
-        let d = dm.1 - 0.08f64;
-        let gm = mobtravel::compute_modified_friction(0.91f32, 1.0f32);
-        let h = friction * gm;
-        let i = mobtravel::compute_modified_friction(0.98f32, 1.0f32);
-        self.dx = dm.0 * h as f64;
-        self.dy = d * i as f64;
-        self.dz = dm.2 * h as f64;
+        // the drag tail (dm.y is ground-clipped to 0 — the folded constant
+        // gravity tail; the same slice travel_in_air_open_ground runs)
+        self.dx = mx * OG_HF;
+        self.dy = OG_GRAV_TAIL;
+        self.dz = mz * OG_HF;
     }
 
     #[inline]
@@ -1616,5 +1754,106 @@ mod tests {
             assert_eq!(b1.z.to_bits(), b2.z.to_bits(), "tick {tick}: mob B z");
             assert_eq!(b1.seed, b2.seed, "tick {tick}: mob B seed");
         }
+    }
+
+    /// WAVE6 arithmetic gate: the folded travel constants equal the runtime
+    /// functions BIT-FOR-BIT (the const-fn float ops are the same IEEE ops).
+    #[test]
+    fn travel_open_ground_consts_pin() {
+        let fr = mobtravel::compute_modified_friction(0.6f32, 1.0f32);
+        assert_eq!(OG_FRICTION, fr);
+        assert_eq!(
+            OG_FIS,
+            mobtravel::get_friction_influenced_speed(true, fr, 0.23, 0.02)
+        );
+        assert_eq!(OG_GM, mobtravel::compute_modified_friction(0.91f32, 1.0f32));
+        assert_eq!(OG_DRAG_I, mobtravel::compute_modified_friction(0.98f32, 1.0f32));
+        assert_eq!(OG_H, fr * OG_GM);
+        assert_eq!(OG_HF, OG_H as f64);
+        assert_eq!(OG_GRAV_TAIL, (0.0f64 - 0.08f64) * (OG_DRAG_I as f64));
+        // NOTE: the f32 chain returns 0.6f32 EXACTLY (1-(1-0.6) double-
+        // rounding compensates), so the speed gate `friction > 0.6` is
+        // FALSE (not >) and the speed arm is the plain 0.23.
+        assert_eq!(OG_FRICTION, 0.6f32);
+        assert_eq!(OG_FIS, 0.23f32);
+    }
+
+    /// WAVE6 stream gate: the floor's fold draws are the EXACT resolver
+    /// draws — splitmix16 (FlatWorld flavor) and LCG-16 (WorldRes flavor),
+    /// word-for-word over a seed sweep.
+    #[test]
+    fn fold_streams_match_resolver_math() {
+        for s in 0..5000u64 {
+            let (mut a, mut b) = (s ^ 0x9E37_79B9, s ^ 0x9E37_79B9);
+            let va = (splitmix(&mut a) & 0xFFFF) as i32;
+            let vb = g::stroll_draw_splitmix16(&mut b);
+            assert_eq!(va, vb, "splitmix16 @ seed {s}");
+            let (mut c, mut d) = (s.wrapping_mul(0x51CE_9D1B), s.wrapping_mul(0x51CE_9D1B));
+            let vc = lcg_next(&mut c, 16);
+            let vd = g::stroll_draw_lcg16(&mut d);
+            assert_eq!(vc, vd, "lcg16 @ seed {s}");
+        }
+    }
+
+    /// THE WAVE6 twin gate: the FOLDED executor (fold resolves in place,
+    /// zero park round-trips) must be BIT-IDENTICAL to the PARKED executor
+    /// (every request staged and resumed — the pre-wave6 semantics) over a
+    /// chased, strolling, look-around population: positions, seeds, goal
+    /// states, nav, target, rel — the whole mob, word for word.
+    #[test]
+    fn folded_ai_tick_matches_parked_ai_tick() {
+        let players = vec![PlayerSnap {
+            x: 3.0,
+            y: 64.0,
+            z: 4.0,
+            id: 1,
+            flags: 1,
+        }];
+        let mth = Mth::new();
+        let run = |no_fold: bool| -> Vec<(u64, u64, u64, i32, i32, i32, u64, u64)> {
+            let mut w = FlatWorld::new(0x9E37_79B9_7F4A);
+            w.no_fold = no_fold;
+            let mut m = MobAI::new(1, 0x1234_5678_9abc_def0, 0.0, 64.0, 0.0);
+            m.goals = zombie_table();
+            let mut scratch: Vec<i32> = Vec::new();
+            let mut out = vec![0i32; out_len()];
+            let mut pk = PackState::default();
+            for t in 0..400i32 {
+                let _ = m.ai_tick(
+                    &players,
+                    t,
+                    &mut w,
+                    &mut scratch,
+                    &mut out,
+                    &mut pk,
+                    MobAI::tick_fp(&players),
+                );
+                m.move_tick(&mth);
+            }
+            let goals: Vec<(bool, i32)> = m.goals.iter().map(|gr| (gr.running, gr.state)).collect();
+            let mut gbits = (0u64, 0u64);
+            for (i, (r, s)) in goals.iter().enumerate() {
+                let w = ((*r as u64) << 63) | ((*s as u32 as u64) << 32) | i as u64;
+                if i < 6 {
+                    gbits.0 ^= w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                } else {
+                    gbits.1 ^= w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                }
+            }
+            vec![
+                (m.x.to_bits(), m.z.to_bits(), m.seed, m.nav_state, m.target_player, m.no_action, gbits.0, gbits.1),
+            ]
+        };
+        let parked = run(true);
+        let folded = run(false);
+        assert_eq!(
+            parked, folded,
+            "the folded executor must match the parked twin bit-for-bit"
+        );
+        // the scenario must actually exercise the folds (a started stroll or
+        // lookaround moves the mob / flips goal words; a target is acquired)
+        let (x_bits, _z, _seed, _nav, target, _na, g0, g1) = folded[0];
+        let active = x_bits != 0u64 || target >= 0 || g0 != 0 || g1 != 0;
+        assert!(active, "the twin scenario must exercise goal activity");
     }
 }

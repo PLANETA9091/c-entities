@@ -27,17 +27,32 @@ pub const SUB_EVERY: u32 = 17;
 
 /// The host's sampled-tick switch (1-in-SAMPLE_EVERY in the native
 /// executor). Off everywhere else — the counters then stay zero.
+/// WAVE5: an OFF switch resets SUB — begin_mob's zero-write fast path
+/// leaves it stale, and a stale true would make the guards pay
+/// Instant::now on UNSAMPLED mobs (the meter's shadow, wave2 lesson).
 #[inline]
 pub fn set_on(on: bool) {
     ON.store(on, Relaxed);
+    if !on {
+        SUB.store(false, Relaxed);
+    }
 }
 
 /// Called ONCE per mob at ai_tick entry: picks whether THIS mob's
 /// sub-phases are clocked. Returns the same decision (for callers that
 /// want it); the guards read the SUB flag (one relaxed load).
+/// WAVE5: the DISARMED fast path pays ONE relaxed load and ZERO writes —
+/// the old shape ran a locked fetch_add + a store PER MOB PER TICK
+/// (~25k locked RMW + 25k stores per tick) to count samples that would
+/// never be taken (ON is true 1 tick in 17). The counters now move only
+/// inside a sampled tick; set_on resets SUB so the guards never fire on
+/// an unsampled tick's stale flag.
 #[inline]
 pub fn begin_mob() -> bool {
-    let sub = ON.load(Relaxed) && MOB_N.fetch_add(1, Relaxed) % SUB_EVERY == 0;
+    if !ON.load(Relaxed) {
+        return false;
+    }
+    let sub = MOB_N.fetch_add(1, Relaxed) % SUB_EVERY == 0;
     SUB.store(sub, Relaxed);
     sub
 }
