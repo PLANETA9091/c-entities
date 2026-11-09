@@ -132,39 +132,41 @@ impl NativeTick {
                 }
             }
         }
-        // THE LOOP — vanilla order (insertion), one mob at a time: the
-        // mobs after this one observe its tick results through the same
-        // store (Horizon creatures.rs:1468). The resolver borrows the
-        // snapshot (immutable) while the mob mutates — disjoint fields,
-        // the borrow splits cleanly.
+        // THE LOOP — vanilla order (insertion), ONE mob at a time, AI
+        // before movement INSIDE the same iteration (L111f: the old shape
+        // ran two passes over the ~11MB mob array — every mob's cache
+        // lines were touched twice per tick, the second pass cold; the
+        // vanilla body ticks each entity's AI and travel together, so
+        // the merged shape is ALSO the more vanilla-exact one: a later
+        // mob's AI now observes the earlier mobs' POST-TRAVEL positions,
+        // the Horizon creatures.rs:1468 contract, not just their
+        // post-AI/pre-travel ones). The resolver borrows the snapshot
+        // (immutable) while the mob mutates — disjoint fields, the
+        // borrow splits cleanly.
         let mut stats = std::mem::take(&mut self.stats_scratch);
         stats.clear();
         let snapshot: &crate::world::Snapshot = &self.store.snapshot;
         let scratch = &mut self.ai_scratch;
+        let mth = &self.mth;
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
                 continue;
             }
-            let mut res = WorldRes::open_ground_v0(snapshot, 0);
-            res.target_rng = self.target_rng;
             let stat = {
                 let _g = ai_guard();
-                slot.mob.ai_tick(&players, game_time, &mut res, scratch)
+                let mut res = WorldRes::open_ground_v0(snapshot, 0);
+                res.target_rng = self.target_rng;
+                let st = slot.mob.ai_tick(&players, game_time, &mut res, scratch);
+                self.target_rng = res.target_rng;
+                st
             };
-            self.target_rng = res.target_rng;
+            {
+                let _g = travel_guard();
+                slot.mob.move_tick(mth);
+            }
             stats.push(stat);
         }
         self.stats_scratch = stats;
-        // travel pass (vanilla: the movement runs inside the same body
-        // after the AI; the split here is the profile's honesty — ai and
-        // travel are separable costs of the same tick)
-        for slot in self.store.mobs.iter_mut() {
-            if !slot.alive {
-                continue;
-            }
-            let _g = travel_guard();
-            slot.mob.move_tick(&self.mth);
-        }
         // tombstone compaction (between ticks, the Horizon lazy compact)
         if self.store.free.len() > self.compact_at {
             self.store.compact();
