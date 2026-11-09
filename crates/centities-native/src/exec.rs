@@ -8,7 +8,7 @@
 //! order, one mob at a time, AI before movement, later mobs observe earlier
 //! mobs' results. The profile phases (ai/travel/grid/apply) split the same
 //! body the way Horizon's spans do.
-use swarm_sim::mob::{AiStat, MobAI, PlayerSnap};
+use swarm_sim::mob::{AiStat, MobAI, PackState, PlayerSnap};
 use swarm_sim::mob::TravelMth as Mth;
 
 use crate::profile::{ai_guard, apply_guard, grid_guard, travel_guard};
@@ -43,6 +43,12 @@ pub struct NativeTick {
     /// OUT_RESET; the 3 KiB per-mob memset is gone). Bit-identical per
     /// the `reused_out_buffer_matches_fresh_zero` gate.
     out_buf: Vec<i32>,
+    /// WAVE4: the resident-pack state (fp + tick stamps live here — ONE
+    /// per executor; the scratch's static/tick halves outlive any mob).
+    pack: PackState,
+    /// WAVE4: the per-tick PlayerSnap staging buffer (the old code
+    /// allocated a fresh Vec every tick).
+    players_buf: Vec<PlayerSnap>,
 }
 
 impl NativeTick {
@@ -56,6 +62,20 @@ impl NativeTick {
             pack_scratch: Vec::new(),
             out_buf: vec![0i32; swarm_sim::mob::out_len()],
             stats_buf: Vec::new(),
+            pack: PackState::default(),
+            players_buf: Vec::new(),
+        }
+    }
+
+    /// WAVE4 twin hook: force the wave3 full-pack-every-round semantics
+    /// (the resident-vs-full bit test drives one executor per mode).
+    pub fn set_full_pack(&mut self, on: bool) {
+        self.pack.full = on;
+        if on {
+            // the stamps describe the resident content — drop them so the
+            // full path is also COLD
+            self.pack.fp = None;
+            self.pack.tick = None;
         }
     }
 
@@ -94,22 +114,29 @@ impl NativeTick {
             self.grid.rebuild(&mut self.store.mobs);
         }
         // players -> the pack snapshot (the floor borrows it per mob;
-        // built once per tick, P is small)
-        let players: Vec<PlayerSnap> = {
+        // WAVE4: built into a REUSED buffer, not a fresh Vec per tick)
+        let players: &[PlayerSnap] = {
             let _g = apply_guard();
-            self.store
-                .snapshot
-                .players
-                .iter()
-                .map(|p: &PlayerTick| PlayerSnap {
-                    x: p.x,
-                    y: p.y,
-                    z: p.z,
-                    id: p.id,
-                    flags: p.flags,
-                })
-                .collect()
+            let pb = &mut self.players_buf;
+            pb.clear();
+            pb.extend(
+                self.store
+                    .snapshot
+                    .players
+                    .iter()
+                    .map(|p: &PlayerTick| PlayerSnap {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z,
+                        id: p.id,
+                        flags: p.flags,
+                    }),
+            );
+            &*pb
         };
+        // WAVE4: the tick-level player fingerprint (computed ONCE per tick;
+        // the stamp check in ai_tick is free per mob)
+        let tfp = MobAI::tick_fp(players);
         // the melee approach refresh: the floor reads approach_x/z live —
         // they must track the target's CURRENT position (vanilla reads
         // getTarget().position() per round through the pack). One pass
@@ -153,7 +180,7 @@ impl NativeTick {
             let stat = {
                 let _g = ai_guard();
                 slot.mob
-                    .ai_tick(&players, game_time, &mut res, &mut self.pack_scratch, &mut self.out_buf)
+                    .ai_tick(players, game_time, &mut res, &mut self.pack_scratch, &mut self.out_buf, &mut self.pack, tfp)
             };
             self.target_rng = res.target_rng;
             stats.push(stat);
@@ -305,5 +332,67 @@ mod tests {
         nt.store.compact();
         assert_eq!(nt.store.len(), 100);
         assert_eq!(nt.store.mobs.len(), 100);
+    }
+
+    /// THE wave4 executor gate: the resident-pack executor (stamps, shared
+    /// scratch) must be BIT-IDENTICAL to the wave3 full-pack executor over
+    /// a chased, strolling, target-locked population — positions, seeds,
+    /// goal states, nav, the whole store, word for word.
+    #[test]
+    fn resident_executor_matches_full_pack_executor() {
+        let build = |full: bool| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_full_pack(full);
+            for i in 0..64 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 8) as f64 * 3.0,
+                    64.0,
+                    (i / 8) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let mut a = build(false); // resident (production)
+        let mut b = build(true); // wave3 full-pack twin
+        for t in 0..400 {
+            a.tick(t);
+            b.tick(t);
+            assert_eq!(a.store.len(), b.store.len(), "tick {t}: population");
+            for (ma, mb) in a.store.mobs.iter().zip(b.store.mobs.iter()) {
+                assert_eq!(ma.mob.id, mb.mob.id, "tick {t}: id order");
+                assert_eq!(ma.mob.x.to_bits(), mb.mob.x.to_bits(), "tick {t}: mob {} x", ma.mob.id);
+                assert_eq!(ma.mob.y.to_bits(), mb.mob.y.to_bits(), "tick {t}: mob {} y", ma.mob.id);
+                assert_eq!(ma.mob.z.to_bits(), mb.mob.z.to_bits(), "tick {t}: mob {} z", ma.mob.id);
+                assert_eq!(ma.mob.seed, mb.mob.seed, "tick {t}: mob {} seed", ma.mob.id);
+                assert_eq!(ma.mob.yaw.to_bits(), mb.mob.yaw.to_bits(), "tick {t}: mob {} yaw", ma.mob.id);
+                assert_eq!(ma.mob.nav_state, mb.mob.nav_state, "tick {t}: mob {} nav", ma.mob.id);
+                assert_eq!(ma.mob.target_player, mb.mob.target_player, "tick {t}: mob {} target", ma.mob.id);
+                assert_eq!(ma.mob.dx.to_bits(), mb.mob.dx.to_bits(), "tick {t}: mob {} dx", ma.mob.id);
+                assert_eq!(ma.mob.dz.to_bits(), mb.mob.dz.to_bits(), "tick {t}: mob {} dz", ma.mob.id);
+                for (ga, gb) in ma.mob.goals.iter().zip(mb.mob.goals.iter()) {
+                    assert_eq!(ga.running, gb.running, "tick {t}: mob {} goal running", ma.mob.id);
+                    assert_eq!(ga.state, gb.state, "tick {t}: mob {} goal state", ma.mob.id);
+                }
+            }
+        }
+        // the resident twin must actually chase (the live-path exercise)
+        let chasing = a
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        assert!(chasing > 0, "the twin scenario must acquire targets");
     }
 }

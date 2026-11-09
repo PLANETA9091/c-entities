@@ -115,6 +115,39 @@ pub struct PlayerSnap {
     pub flags: i32,
 }
 
+/// WAVE4: the RESIDENT-PACK state — ONE per EXECUTOR (it identifies the
+/// SHARED scratch's static content, which spans mobs and ticks).
+///
+/// The aiPack wire buffer splits into three word classes:
+/// - STATIC per mob TYPE (goal cfg words, counts, follow, lastHurt) —
+///   written once per fingerprint change (`pack_state_static`), never
+///   mutated afterward (the goal table is fixed at add_mob — the same
+///   contract the wave3 delta-pack already relies on);
+/// - TICK-static (game_time, player count, the player snapshot block) —
+///   written ONCE per tick by the executor (`pack_tick_words`); identical
+///   for every mob;
+/// - PER-MOB round words (cursor/mf/counts/no_action/nav/seed/res/pos/
+///   running/state) — written per mob per round-1 (`pack_into_resident`)
+///   and delta-maintained on rounds 2+ (wave3).
+///
+/// The invariant "scratch == what a fresh pack_into would write" holds by
+/// construction and is verified by (a) the debug probe (full pack word-
+/// compare EVERY round), (b) the resident-vs-full twin gate in tests.
+#[derive(Debug, Default)]
+pub struct PackState {
+    /// Some(fp) = the scratch's static half matches this mob-type fp
+    pub fp: Option<u64>,
+    /// Some((game_time, pcount, player-word hash)) = the scratch's tick
+    /// half (game_time, player count, the player block) is current. The
+    /// hash covers MOVING players even when game_time/pcount repeat (the
+    /// vanilla game_time advances per tick, but the stamp does not rely
+    /// on it).
+    pub tick: Option<(i32, usize, u64)>,
+    /// twin gate: force the FULL pack every round-1 (the wave3 semantics —
+    /// used by the resident-vs-full bit test; production keeps false)
+    pub full: bool,
+}
+
 /// Persistent per-mob state — everything the Java executor holds on the
 /// live Mob object, in the same shape aiPack reads.
 pub struct MobAI {
@@ -148,9 +181,33 @@ pub struct MobAI {
     /// per round from the snapshot)
     pub approach_x: f64,
     pub approach_z: f64,
+    /// WAVE4: the static-pack fingerprint (fnv1a over the goal cfg words
+    /// + counts/follow/lastHurt header trio). Computed ONCE at
+    /// construction — the goal table is fixed at add_mob (the executor
+    /// contract; the wave3 delta-pack already assumes the cfg words never
+    /// mutate). A stale fp after a post-construction goals swap is caught
+    /// by the debug probe (full-pack word compare every round).
+    pub pack_fp: u64,
 }
 
 impl MobAI {
+    /// WAVE4: fnv1a over the words the resident path leaves to the static
+    /// writer (goal cfg {0,1,2,3,6,7} per record + counts + follow bits +
+    /// the static-zero lastHurtByMobTimestamp). Two mobs share the static
+    /// scratch iff this matches.
+    fn static_fp(goals: &[GoalRec; N_GOALS]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for grec in goals.iter() {
+            for w in [grec.kind as u64, grec.prio as u64, grec.flags as u64, grec.cfg as u64, grec.cfg2 as u64, grec.cfg3 as u64] {
+                h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        for w in [4u64, 7, FOLLOW_RANGE.to_bits() as u64, 0] {
+            h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    }
+
     pub fn new(id: i64, seed: u64, x: f64, y: f64, z: f64) -> Self {
         MobAI {
             id,
@@ -176,6 +233,7 @@ impl MobAI {
             pend_z: 0.0,
             approach_x: 0.0,
             approach_z: 0.0,
+            pack_fp: Self::static_fp(&zombie_table()),
         }
     }
 
@@ -516,6 +574,89 @@ impl MobAI {
         }
     }
 
+    /// WAVE4: the STATIC pack half — the words that never change while the
+    /// mob lives (goal cfg words, selector counts, follow range, the
+    /// static-zero lastHurtByMobTimestamp). Written into the shared scratch
+    /// ONCE per mob-type fingerprint, never touched afterward. Words 7..10
+    /// (the disabled-flags pair) stay the scratch's zeros — pack_into never
+    /// writes them either; the floor reads zeros from both paths.
+    fn pack_state_static(&self, b: &mut [i32]) {
+        let end = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE;
+        debug_assert!(b.len() >= end, "pack scratch too small");
+        b[5] = 4; // target selector count
+        b[6] = 7; // goal selector count
+        b[22] = 0; // lastHurtByMobTimestamp (the bench mob is never hurt)
+        b[g::IN_FOLLOW] = FOLLOW_RANGE.to_bits() as i32;
+        let base = g::IN_HEADER;
+        for (i, rec) in self.goals.iter().enumerate() {
+            let o = base + i * g::GOAL_STRIDE;
+            b[o] = rec.kind;
+            b[o + 1] = rec.prio;
+            b[o + 2] = rec.flags as i32;
+            b[o + 3] = rec.cfg;
+            b[o + 6] = rec.cfg2;
+            b[o + 7] = rec.cfg3;
+        }
+    }
+
+    /// WAVE4: the RESIDENT round pack — writes ONLY the per-mob round
+    /// words into a scratch whose static half (pack_state_static) and tick
+    /// half (pack_tick_words) are already current: ~46 words instead of
+    /// pack_into's 134, EVERY round (fresh OR resumed — the wave3 delta
+    /// arm subsumed; the probe's first catch was a resumed round with the
+    /// park token 0 = SEL_TARGET/PH_CLEANUP/gi0 whose request words MUST
+    /// ride the pack, not zeros).
+    #[allow(clippy::too_many_arguments)]
+    fn pack_into_resident(
+        &self,
+        b: &mut [i32],
+        players: &[PlayerSnap],
+        cursor: i32,
+        res: i32,
+        req_op: i32,
+        rx: f64,
+        ry: f64,
+        rz: f64,
+    ) {
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        debug_assert!(b.len() >= need, "pack scratch too small");
+        b[0] = cursor;
+        b[1] = MF_BASE
+            | if self.target_player >= 0 {
+                g::MF_HAS_TARGET
+            } else {
+                0
+            };
+        b[2] = self.tick_count;
+        b[3] = self.id as i32;
+        b[4] = self.no_action;
+        b[11] = self.nav_state;
+        b[g::IN_SEED_LO] = self.seed as i32;
+        b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
+        b[g::IN_RES] = res;
+        b[g::IN_RES_OP] = req_op;
+        put_f64(b, g::IN_RES_X, rx);
+        put_f64(b, g::IN_RES_X + 2, ry);
+        put_f64(b, g::IN_RES_X + 4, rz);
+        put_f64(b, g::IN_MOBX, self.x);
+        put_f64(b, g::IN_MOBY, self.y);
+        put_f64(b, g::IN_MOBZ, self.z);
+        put_f64(b, g::IN_EYEY, self.y + EYE_Y);
+        let base = g::IN_HEADER;
+        for (i, rec) in self.goals.iter().enumerate() {
+            let o = base + i * g::GOAL_STRIDE;
+            b[o + 4] = rec.running as i32;
+            b[o + 5] = match rec.kind {
+                g::GK_LOOKAROUND
+                | g::GK_ZOMBIE_ATTACK
+                | g::GK_HURT_BY
+                | g::GK_MOVE_THROUGH_VILLAGE => rec.state,
+                g::GK_LOOKAT_PLAYER => self.packed_lookat_state(i, players),
+                _ => 0,
+            };
+        }
+    }
+
     /// Pack the aiPack wire format from the live state (exact-len Vec;
     /// the parity-fixture and hot-path-test entry — the executor's hot
     /// path uses `pack_into` with a shared scratch).
@@ -537,6 +678,50 @@ impl MobAI {
         b
     }
 
+    /// WAVE4: fnv1a over the player words the tick half owns (x/y/z/id/
+    /// flags) — computed ONCE PER TICK by the caller (the executor / test
+    /// driver) and passed to ai_tick as `tfp`: the tick-half stamp's third
+    /// member, so MOVING players with a repeated (game_time, pcount) still
+    /// invalidate. The per-mob loop pays ZERO hash cost.
+    pub fn tick_fp(players: &[PlayerSnap]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for p in players {
+            for w in [
+                p.x.to_bits(),
+                p.y.to_bits(),
+                p.z.to_bits(),
+                p.id as u32 as u64,
+                p.flags as u32 as u64,
+            ] {
+                h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// WAVE4: the TICK-static pack half — game_time, the player count and
+    /// the player snapshot block. Identical for every mob in the tick;
+    /// written ONCE per tick into the shared scratch when the stamp says
+    /// stale (the old path rewrote it per mob — 12+ words × 25k mobs =
+    /// 300k+ redundant writes per tick at one player).
+    fn pack_tick_words(b: &mut [i32], players: &[PlayerSnap], game_time: i32) {
+        let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
+        debug_assert!(b.len() >= need, "pack scratch too small for players");
+        b[23] = game_time;
+        b[g::IN_PCOUNT] = players.len() as i32;
+        let pb = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE;
+        for (i, p) in players.iter().enumerate() {
+            let o = pb + i * g::PSTRIDE;
+            put_f64(b, o, p.x);
+            put_f64(b, o + 2, p.y);
+            put_f64(b, o + 4, p.z);
+            put_f64(b, o + 6, p.y + EYE_Y);
+            put_f64(b, o + 8, 1.0); // visibility 100%
+            b[o + 10] = p.flags;
+            b[o + 11] = p.id;
+        }
+    }
+
     /// Apply the emitted actions to the live state (the aiApply mirror).
     /// WAVE3: `packed` — the shared aiPack scratch; EVERY mutation here
     /// mirrors into the packed word(s) it owns, so the next round's
@@ -544,13 +729,18 @@ impl MobAI {
     /// "scratch == what pack_into would write" holds by construction
     /// (single write site per field). The twin gate
     /// (reused_out_buffer_matches_fresh_zero) pins this bit-for-bit.
+    /// WAVE4: `packed` is a plain `&mut [i32]` (the Option dance cost a
+    /// branch per mirrored action; the executor always has the scratch).
     fn apply_actions(
         &mut self,
         out: &[i32],
         players: &[PlayerSnap],
-        mut packed: Option<&mut [i32]>,
+        packed: &mut [i32],
     ) {
         let n = out[5].max(0) as usize;
+        if n == 0 {
+            return;
+        }
         for a in 0..n {
             let b = g::OUT_HEADER + a * g::OUT_ACT;
             let op = out[b];
@@ -564,10 +754,8 @@ impl MobAI {
                     if p0 < N_GOALS {
                         self.goals[p0].running = true;
                         self.no_action = 0;
-                        if let Some(b) = packed.as_deref_mut() {
-                            b[g::IN_HEADER + gw + 4] = 1;
-                            b[4] = self.no_action;
-                        }
+                        packed[g::IN_HEADER + gw + 4] = 1;
+                        packed[4] = self.no_action;
                         // the start BODIES the executor runs itself (the
                         // engine emitted the transition, vanilla runs
                         // start() inline — aiApply: lockWrite + wg.start()):
@@ -576,10 +764,8 @@ impl MobAI {
                             // adjustedTickDelay(40), no RNG (javap 26.3)
                             g::GK_LOOKAT_PLAYER => {
                                 self.goals[p0].state = 40;
-                                if let Some(b) = packed.as_deref_mut() {
-                                    b[g::IN_HEADER + gw + 5] =
-                                        self.packed_lookat_state(p0, players);
-                                }
+                                packed[g::IN_HEADER + gw + 5] =
+                                    self.packed_lookat_state(p0, players);
                             }
                             // RandomStrollGoal.start(): navigation.moveTo(
                             //   wantedPos, speedModifier) — the position the
@@ -588,9 +774,7 @@ impl MobAI {
                                 self.nav_state = g::NAV_PATH_ACTIVE;
                                 self.nav_x = self.pend_x;
                                 self.nav_z = self.pend_z;
-                                if let Some(b) = packed.as_deref_mut() {
-                                    b[11] = self.nav_state;
-                                }
+                                packed[11] = self.nav_state;
                             }
                             _ => {}
                         }
@@ -600,16 +784,12 @@ impl MobAI {
                 g::ACT_GOAL_STOP | g::ACT_GOAL_STOP_D => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = false;
-                        if let Some(b) = packed.as_deref_mut() {
-                            b[g::IN_HEADER + gw + 4] = 0;
-                        }
+                        packed[g::IN_HEADER + gw + 4] = 0;
                         if self.goals[p0].kind == g::GK_STROLL
                             && self.nav_state == g::NAV_PATH_ACTIVE
                         {
                             self.nav_state = g::NAV_NONE;
-                            if let Some(b) = packed.as_deref_mut() {
-                                b[11] = self.nav_state;
-                            }
+                            packed[11] = self.nav_state;
                         }
                     }
                 }
@@ -617,17 +797,13 @@ impl MobAI {
                 g::ACT_LOOK_TICK_AROUND => {
                     if p0 < N_GOALS {
                         self.goals[p0].state = p1;
-                        if let Some(b) = packed.as_deref_mut() {
-                            b[g::IN_HEADER + gw + 5] = p1;
-                        }
+                        packed[g::IN_HEADER + gw + 5] = p1;
                     }
                 }
                 g::ACT_LOOK_TICK_AT => {
                     if p0 < N_GOALS {
                         self.goals[p0].state = p1;
-                        if let Some(b) = packed.as_deref_mut() {
-                            b[g::IN_HEADER + gw + 5] = self.packed_lookat_state(p0, players);
-                        }
+                        packed[g::IN_HEADER + gw + 5] = self.packed_lookat_state(p0, players);
                     }
                 }
                 g::ACT_REF_SET_PLAYER => {
@@ -638,10 +814,8 @@ impl MobAI {
                                 if p1 < 0 {
                                     self.goals[p0].state &= !((1 << 31) | (1 << 30));
                                 }
-                                if let Some(b) = packed.as_deref_mut() {
-                                    b[g::IN_HEADER + gw + 5] =
-                                        self.packed_lookat_state(p0, players);
-                                }
+                                packed[g::IN_HEADER + gw + 5] =
+                                    self.packed_lookat_state(p0, players);
                             }
                             g::GK_NEAREST_TARGET => {
                                 self.target_player = p1;
@@ -652,14 +826,12 @@ impl MobAI {
                                     }
                                 }
                                 // the mf word rides target_player
-                                if let Some(b) = packed.as_deref_mut() {
-                                    b[1] = MF_BASE
-                                        | if self.target_player >= 0 {
-                                            g::MF_HAS_TARGET
-                                        } else {
-                                            0
-                                        };
-                                }
+                                packed[1] = MF_BASE
+                                    | if self.target_player >= 0 {
+                                        g::MF_HAS_TARGET
+                                    } else {
+                                        0
+                                    };
                             }
                             _ => {}
                         }
@@ -689,6 +861,13 @@ impl MobAI {
     ///   handoff pair on the fallback path) lets us reset just
     ///   `out[..OUT_RESET]` per mob instead of memsetting 3 KiB per mob.
     ///   `reused_out_buffer_matches_fresh_zero` gates this bit-for-bit.
+    /// WAVE4: `pack` — the resident-pack state (ONE per executor; see the
+    /// PackState doc for the static/tick/round word split). `pack.full =
+    /// true` restores the wave3 full-pack semantics (the twin gate).
+    /// `tfp` — the caller's per-tick player fingerprint (`MobAI::tick_fp`
+    /// over THIS tick's players slice; the stamp check is free in the
+    /// mob loop).
+    #[allow(clippy::too_many_arguments)]
     pub fn ai_tick<R: Resolver + ?Sized>(
         &mut self,
         players: &[PlayerSnap],
@@ -696,6 +875,8 @@ impl MobAI {
         r: &mut R,
         scratch: &mut Vec<i32>,
         out: &mut [i32],
+        pack: &mut PackState,
+        tfp: u64,
     ) -> AiStat {
         debug_assert!(out.len() >= OUT_LEN, "out buffer too small");
         // the sub-phase ledger gate (1-in-SUB_EVERY mobs on sampled
@@ -711,67 +892,63 @@ impl MobAI {
         if scratch.len() < need {
             scratch.resize(need, 0);
         }
+        // WAVE4: the static + tick halves are stamped BEFORE the round loop
+        // (constant across rounds; the stamp checks cost nothing per mob
+        // once the caller hoisted tfp to the tick level)
+        if !pack.full {
+            if pack.fp != Some(self.pack_fp) {
+                self.pack_state_static(scratch);
+                pack.fp = Some(self.pack_fp);
+            }
+            if pack.tick != Some((game_time, players.len(), tfp)) {
+                Self::pack_tick_words(scratch, players, game_time);
+                pack.tick = Some((game_time, players.len(), tfp));
+            }
+        }
         for _round in 0..32 {
             {
                 let _p = crate::ledger::sg_pack();
-                if cursor == 0 {
+                if pack.full {
                     self.pack_into(
                         scratch, players, game_time, cursor, res, req_op, rx, ry, rz,
                     );
                 } else {
-                    // WAVE3 delta-pack: rounds 2+ rewrite ONLY the round-
-                    // variable words. Everything else is either static per
-                    // tick (id/tick_count/counts/game_time/positions/
-                    // players/goal cfg words) or mirrored into the scratch
-                    // by apply_actions at the exact mutation site (running,
-                    // states, no_action, nav_state, mf) — the invariant
-                    // "scratch == what pack_into would write" holds by
-                    // construction. DEBUG probe below fails any drift.
-                    let b: &mut [i32] = scratch;
-                    b[0] = cursor;
-                    b[1] = MF_BASE
-                        | if self.target_player >= 0 {
-                            g::MF_HAS_TARGET
-                        } else {
-                            0
-                        };
-                    b[4] = self.no_action;
-                    b[11] = self.nav_state;
-                    b[g::IN_SEED_LO] = self.seed as i32;
-                    b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
-                    b[g::IN_RES] = res;
-                    b[g::IN_RES_OP] = req_op;
-                    put_f64(b, g::IN_RES_X, rx);
-                    put_f64(b, g::IN_RES_X + 2, ry);
-                    put_f64(b, g::IN_RES_X + 4, rz);
-                    #[cfg(debug_assertions)]
-                    {
-                        // the wave3 invariant probe: a fresh FULL pack must
-                        // equal the delta-maintained scratch, word for word
-                        // (the round-variable words differ ONLY where the
-                        // resolution result landed — which this fresh pack
-                        // also carries)
-                        let mut probe = scratch.to_vec();
-                        self.pack_into(
-                            &mut probe,
-                            players,
-                            game_time,
-                            cursor,
-                            res,
-                            req_op,
-                            rx,
-                            ry,
-                            rz,
+                    // WAVE4 resident round pack: statics + tick half already
+                    // stamped above; the ~46 per-mob round words
+                    // (cursor/res/op/seed/mf/pos/goals) are written EVERY
+                    // round, fresh OR resumed (the wave3 delta arm is
+                    // subsumed; a park token of 0 — SEL_TARGET/PH_CLEANUP/
+                    // gi0 — resumes through THIS same arm and carries its
+                    // request words).
+                    self.pack_into_resident(
+                        scratch, players, cursor, res, req_op, rx, ry, rz,
+                    );
+                }
+                #[cfg(debug_assertions)]
+                {
+                    // the wave3+wave4 invariant probe: a fresh FULL pack must
+                    // equal the maintained scratch, word for word, EVERY
+                    // round (covers the resident round-1 arm AND the delta
+                    // arm; the round-variable words differ ONLY where the
+                    // resolution result landed — which this fresh pack also
+                    // carries)
+                    let mut probe = scratch.to_vec();
+                    self.pack_into(
+                        &mut probe,
+                        players,
+                        game_time,
+                        cursor,
+                        res,
+                        req_op,
+                        rx,
+                        ry,
+                        rz,
+                    );
+                    for i in 0..need {
+                        assert_eq!(
+                            scratch[i], probe[i],
+                            "pack drift at word {i} (round {cursor:x})"
                         );
-                        let need =
-                            g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
-                        for i in 0..need {
-                            assert_eq!(
-                                scratch[i],
-                                probe[i],
-                                "delta-pack drift at word {i} (round {cursor:x})"
-                            );
-                        }
                     }
                 }
             }
@@ -784,7 +961,7 @@ impl MobAI {
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
             {
                 let _a = crate::ledger::sg_acts();
-                self.apply_actions(out, players, Some(scratch));
+                self.apply_actions(out, players, scratch);
             }
             if st == g::ST_FALLBACK {
                 stat.status = st;
@@ -1082,7 +1259,7 @@ mod tests {
         m.no_action = 41; // packs 42
         let mut scratch = Vec::new();
         let mut out = vec![0i32; out_len()];
-        let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out);
+        let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
         assert_eq!(stat.status, g::ST_DONE, "stat {stat:?}");
         assert_eq!(stat.fallback, 0);
         let mut r = 777u64;
@@ -1108,7 +1285,7 @@ mod tests {
             let mut m = MobAI::new(i + 1, 0x1000 + i as u64, i as f64, 0.0, -i as f64);
             m.tick_count = 99;
             for _ in 0..400 {
-                let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out);
+                let stat = m.ai_tick(&[], 0, &mut Zero, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
                 assert_eq!(stat.status, g::ST_DONE, "mob {i} stat {stat:?}");
                 m.move_tick(&mth);
             }
@@ -1129,8 +1306,8 @@ mod tests {
         let mut scratch = Vec::new();
         let mut out = vec![0i32; out_len()];
         for _ in 0..600 {
-            a.ai_tick(&[], 0, &mut w1, &mut scratch, &mut out);
-            b.ai_tick(&[], 0, &mut w2, &mut scratch, &mut out);
+            a.ai_tick(&[], 0, &mut w1, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
+            b.ai_tick(&[], 0, &mut w2, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
             a.move_tick(&mth);
             b.move_tick(&mth);
         }
@@ -1181,7 +1358,7 @@ mod tests {
         for seed in 1..200u64 {
             let mut m = MobAI::new(1, seed, 0.0, 64.0, 0.0);
             for t in 0..90i32 {
-                m.ai_tick(&[], t, &mut East, &mut scratch, &mut out);
+                m.ai_tick(&[], t, &mut East, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
                 if m.nav_state == g::NAV_PATH_ACTIVE {
                     mob = Some(m);
                     break;
@@ -1193,7 +1370,7 @@ mod tests {
         }
         let mut m = mob.expect("no seed in 1..200 passes the stroll gate");
         for _ in 0..600 {
-            m.ai_tick(&[], 200, &mut East, &mut scratch, &mut out);
+            m.ai_tick(&[], 200, &mut East, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&[]));
             let (x0, z0) = (m.x, m.z);
             m.move_tick(&mth);
             if (m.x - x0).abs() + (m.z - z0).abs() > 1e-4 {
@@ -1234,7 +1411,7 @@ mod tests {
         let mut scratch = Vec::new();
         let mut out = vec![0i32; out_len()];
         for tick in 0..400i32 {
-            m.ai_tick(&players, tick, &mut w, &mut scratch, &mut out);
+            m.ai_tick(&players, tick, &mut w, &mut scratch, &mut out, &mut PackState::default(), MobAI::tick_fp(&players));
             m.move_tick(&mth);
             if m.target_player >= 0 {
                 if !saw_target {
@@ -1304,8 +1481,8 @@ mod tests {
         let mut dirty = vec![0x7BAD_C0DEi32; out_len() * 2]; // over-long + garbage
         for tick in 0..400i32 {
             let mut fresh = vec![0i32; out_len()];
-            let sa = a.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut fresh);
-            let sb = b.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut dirty);
+            let sa = a.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut fresh, &mut PackState::default(), MobAI::tick_fp(&players));
+            let sb = b.ai_tick(&players, tick, &mut FlatWorld::new(0xC0FFEE), &mut scratch, &mut dirty, &mut PackState::default(), MobAI::tick_fp(&players));
             assert_eq!(sa.rounds, sb.rounds, "tick {tick}: rounds diverged");
             assert_eq!(sa.requests, sb.requests, "tick {tick}: requests diverged");
             assert_eq!(sa.status, sb.status, "tick {tick}: status diverged");
@@ -1323,6 +1500,121 @@ mod tests {
                 assert_eq!(a.goals[i].running, b.goals[i].running, "tick {tick}: goal {i} running");
                 assert_eq!(a.goals[i].state, b.goals[i].state, "tick {tick}: goal {i} state");
             }
+        }
+    }
+
+    /// THE wave4 gate: the resident pack (static half via fp, tick half
+    /// via the game_time/pcount/player-hash stamp, ~46-word round-1) must
+    /// be BIT-IDENTICAL to the wave3 full-pack-every-round semantics
+    /// across a chased, strolling, looking population.
+    #[test]
+    fn resident_pack_matches_full_pack_twin() {
+        let mth = Mth::new();
+        let players = [PlayerSnap {
+            x: 15.0,
+            y: 64.0,
+            z: 3.0,
+            id: 1,
+            flags: g::PF_ALIVE,
+        }];
+        let mut a = MobAI::new(9, 0xABCD_1234, 5.0, 64.0, -3.0);
+        a.goals = zombie_table();
+        let mut b = MobAI::new(9, 0xABCD_1234, 5.0, 64.0, -3.0);
+        b.goals = zombie_table();
+        let mut scratch_a = Vec::new();
+        let mut scratch_b = Vec::new();
+        let mut out_a = vec![0i32; out_len()];
+        let mut out_b = vec![0i32; out_len()];
+        let mut pa = PackState {
+            fp: None,
+            tick: None,
+            full: true,
+        };
+        let mut pb = PackState::default();
+        for tick in 0..400i32 {
+            let sa = a.ai_tick(
+                &players,
+                tick,
+                &mut FlatWorld::new(0xC0FFEE),
+                &mut scratch_a,
+                &mut out_a,
+                &mut pa,
+                MobAI::tick_fp(&players),
+            );
+            let sb = b.ai_tick(
+                &players,
+                tick,
+                &mut FlatWorld::new(0xC0FFEE),
+                &mut scratch_b,
+                &mut out_b,
+                &mut pb,
+                MobAI::tick_fp(&players),
+            );
+            assert_eq!(sa.rounds, sb.rounds, "tick {tick}: rounds");
+            assert_eq!(sa.status, sb.status, "tick {tick}: status");
+            a.move_tick(&mth);
+            b.move_tick(&mth);
+            assert_eq!(a.x.to_bits(), b.x.to_bits(), "tick {tick}: x");
+            assert_eq!(a.z.to_bits(), b.z.to_bits(), "tick {tick}: z");
+            assert_eq!(a.seed, b.seed, "tick {tick}: seed");
+            assert_eq!(a.yaw.to_bits(), b.yaw.to_bits(), "tick {tick}: yaw");
+            assert_eq!(a.nav_state, b.nav_state, "tick {tick}: nav");
+            assert_eq!(a.target_player, b.target_player, "tick {tick}: target");
+            assert_eq!(a.lookat_player, b.lookat_player, "tick {tick}: lookat");
+            for i in 0..N_GOALS {
+                assert_eq!(a.goals[i].running, b.goals[i].running, "tick {tick}: goal {i} running");
+                assert_eq!(a.goals[i].state, b.goals[i].state, "tick {tick}: goal {i} state");
+            }
+        }
+        // the twin must actually exercise the live paths (starts, locks,
+        // the target chain) — otherwise the gate proves nothing
+        assert!(
+            b.target_player >= 0 || b.goals.iter().any(|gr| gr.running),
+            "twin never exercised a start/lock"
+        );
+    }
+
+    /// The production scratch is SHARED across mobs: the resident path
+    /// must rewrite every per-mob word (id/seed/pos/goal live state) when
+    /// the scratch switches owners mid-tick. Two mobs alternating on ONE
+    /// scratch vs each on its own — bit-equal outcomes.
+    #[test]
+    fn resident_pack_survives_mob_switching() {
+        let players = [PlayerSnap {
+            x: 8.0,
+            y: 64.0,
+            z: -2.0,
+            id: 3,
+            flags: g::PF_ALIVE,
+        }];
+        let mk = |id: i64| -> MobAI {
+            let mut m = MobAI::new(id, 0x5EED_0000 + id as u64, id as f64 * 4.0, 64.0, id as f64);
+            m.goals = zombie_table();
+            m
+        };
+        // shared-scratch pair
+        let (mut a1, mut b1) = (mk(1), mk(2));
+        // per-scratch control pair
+        let (mut a2, mut b2) = (mk(1), mk(2));
+        let mut shared = Vec::new();
+        let (mut sa2, mut sb2): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
+        let mut out = vec![0i32; out_len()];
+        let mut pk_shared = PackState::default();
+        let (mut pk_a2, mut pk_b2) = (PackState::default(), PackState::default());
+        for tick in 0..300i32 {
+            let st1 = a1.ai_tick(&players, tick, &mut FlatWorld::new(0xBEEF), &mut shared, &mut out, &mut pk_shared, MobAI::tick_fp(&players));
+            let st1b = b1.ai_tick(&players, tick, &mut FlatWorld::new(0xBEEF), &mut shared, &mut out, &mut pk_shared, MobAI::tick_fp(&players));
+            let _ = st1;
+            let _ = st1b;
+            let mut out2 = vec![0i32; out_len()];
+            a2.ai_tick(&players, tick, &mut FlatWorld::new(0xBEEF), &mut sa2, &mut out2, &mut pk_a2, MobAI::tick_fp(&players));
+            b2.ai_tick(&players, tick, &mut FlatWorld::new(0xBEEF), &mut sb2, &mut out2, &mut pk_b2, MobAI::tick_fp(&players));
+            assert_eq!(a1.x.to_bits(), a2.x.to_bits(), "tick {tick}: mob A x");
+            assert_eq!(a1.z.to_bits(), a2.z.to_bits(), "tick {tick}: mob A z");
+            assert_eq!(a1.seed, a2.seed, "tick {tick}: mob A seed");
+            assert_eq!(b1.x.to_bits(), b2.x.to_bits(), "tick {tick}: mob B x");
+            assert_eq!(b1.z.to_bits(), b2.z.to_bits(), "tick {tick}: mob B z");
+            assert_eq!(b1.seed, b2.seed, "tick {tick}: mob B seed");
         }
     }
 }

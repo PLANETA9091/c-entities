@@ -305,6 +305,15 @@ const PH_TICK_RUNNING: i32 = 3;
 
 pub const MAX_GOALS: usize = 16;
 
+/// WAVE4: the lock table is per FLAG BIT, and vanilla Goal.Flag has FIVE
+/// ordinals (MOVE/LOOK/JUMP/TARGET/UNKNOWN) — the classified set uses bits
+/// 0..3 only. The table shrinks 16→5 per selector (the per-round rebuild
+/// wrote 32 dead words per floor call). A flag bit ≥ 5 in a RUNNING goal's
+/// mask now collides-fallbacks at the rebuild (the vanilla mirror takes
+/// over — the same outcome a lock collision produces) instead of silently
+/// indexing the wide table; bits 0..4 behave exactly as before.
+pub const MAX_LOCK_FLAGS: usize = 5;
+
 fn cursor(sel: usize, phase: i32, gi: usize) -> i32 {
     ((sel as i32 & 1) << 9) | ((phase & 7) << 6) | (gi as i32 & 63)
 }
@@ -442,7 +451,7 @@ struct Ctx<'a> {
     counts: [usize; 2], // [SEL_TARGET, SEL_GOAL]
     disabled: [i64; 2],
     lcg: Lcg,
-    lock: [[i32; MAX_GOALS]; 2], // flag bit -> goal idx, -1 = free
+    lock: [[i32; MAX_LOCK_FLAGS]; 2], // flag bit -> goal idx, -1 = free (WAVE4: 5 flag bits, was 16)
     running: [[bool; MAX_GOALS]; 2],
 }
 
@@ -559,13 +568,22 @@ impl<'a> Ctx<'a> {
     /// snapshot, in the vanilla level.players() order. combat = isCombat
     /// (canAttack/isAlliedTo checks); not_riding = the notRiding selector;
     /// range = the conditions range (lookDistance or followDistance).
-    /// Returns the candidate list (snapshot indices) that passed everything
-    /// except the Sensing LoS — the caller stages REQ_LOS_SCAN with them
-    /// (or Cu::No when there are none: vanilla would return null).
-    fn scan_players(&self, combat: bool, not_riding: bool, range: f64) -> Vec<usize> {
+    /// WAVE4: writes the passing candidate indices into the CALLER's stack
+    /// buffer and returns the count (the old shape allocated a fresh Vec
+    /// per scan — 2 scans per mob per even tick at 25k mobs = 20M mallocs
+    /// per bench, each a heap round-trip inside the floor phase). The scan
+    /// runs only under the MF_MANY_PLAYERS guard (P ≤ 30), so 32 slots is
+    /// a hard cap (debug-asserted).
+    fn scan_players_into(
+        &self,
+        combat: bool,
+        not_riding: bool,
+        range: f64,
+        out: &mut [usize; 32],
+    ) -> usize {
         let (mx, my, mz, _eyey) = self.mob_pos();
         let peaceful = self.flag(MF_PEACEFUL);
-        let mut cands = Vec::new();
+        let mut n = 0usize;
         for i in 0..self.pcount() {
             let fl = self.pflags(i);
             // test() line 2: !canBeSeenByAnyone -> false
@@ -599,9 +617,10 @@ impl<'a> Ctx<'a> {
             if d2 > vd * vd {
                 continue;
             }
-            cands.push(i);
+            out[n] = i;
+            n += 1;
         }
-        cands
+        n
     }
 
     /// The getNearestPlayer best-selection: nearest passing candidate by
@@ -854,7 +873,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
             value: ((in_buf[IN_SEED_HI] as u64) << 32) | (in_buf[IN_SEED_LO] as u64 & 0xFFFF_FFFF),
             draws: 0,
         },
-        lock: [[-1; MAX_GOALS]; 2],
+        lock: [[-1; MAX_LOCK_FLAGS]; 2],
         running: [[false; MAX_GOALS]; 2],
     };
     for sel in 0..2usize {
@@ -898,7 +917,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
         // window is theoretical today; if a family ever hits it, the pack
         // must carry the displaced flags explicitly.
         let count = ctx.counts[sel];
-        for bit in 0..MAX_GOALS {
+        for bit in 0..MAX_LOCK_FLAGS {
             ctx.lock[sel][bit] = -1;
         }
         for i in 0..count {
@@ -906,7 +925,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 let mut fl = ctx.flags(sel, i);
                 while fl != 0 {
                     let bit = fl.trailing_zeros() as usize;
-                    if bit >= MAX_GOALS || ctx.lock[sel][bit] != -1 {
+                    if bit >= MAX_LOCK_FLAGS || ctx.lock[sel][bit] != -1 {
                         return fallback(&mut out, FB_LOCK_COLLIDE);
                     }
                     ctx.lock[sel][bit] = i as i32;
@@ -994,7 +1013,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                 gi = 0;
             }
             PH_LOCK_REBUILD => {
-                for bit in 0..MAX_GOALS {
+                for bit in 0..MAX_LOCK_FLAGS {
                     ctx.lock[sel][bit] = -1;
                 }
                 for i in 0..count {
@@ -1002,7 +1021,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
                         let mut fl = ctx.flags(sel, i);
                         while fl != 0 {
                             let bit = fl.trailing_zeros() as usize;
-                            if bit >= MAX_GOALS || ctx.lock[sel][bit] != -1 {
+                            if bit >= MAX_LOCK_FLAGS || ctx.lock[sel][bit] != -1 {
                                 // two running goals on one flag — impossible
                                 // under vanilla semantics; fall back
                                 return fallback(&mut out, FB_LOCK_COLLIDE);
@@ -1180,12 +1199,15 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 /// while the dump window holds (GL_ON); the wrapper is transparent
 /// otherwise.
 fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
-    // the eval-mask stamp (see ML_EVAL_SWAPS): one relaxed OR per eval —
-    // zero cost when the ledger is disarmed (the load in the wrapper
-    // short-circuits the record, the OR itself is negligible).
-    {
+    // the eval-mask stamp (see ML_EVAL_SWAPS). WAVE4: GATED by ML_ON —
+    // the unconditional fetch_or paid a locked RMW on ONE cacheline for
+    // EVERY can_use eval even with the ledger disarmed (~275k locked
+    // RMWs/tick at 25k mobs × 11 gates — measured into the floor phase).
+    // The gate costs one relaxed load; the OR fires only inside a dump
+    // window.
+    if ML_ON.load(Ordering::Relaxed) {
         let k = ctx.kind(sel, gi);
-        if (0..9).contains(&k) {
+        if (k as u32) < 9 {
             ML_EVAL_SWAPS.fetch_or(1u32 << k, Ordering::Relaxed);
         }
     }
@@ -1320,15 +1342,16 @@ fn can_use_inner(
                 && !ctx.flag(MF_MANY_PLAYERS)
             {
                 let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
-                let cands = ctx.scan_players(true, false, range);
-                if cands.is_empty() {
+                let mut cbuf = [0usize; 32];
+                let n = ctx.scan_players_into(true, false, range, &mut cbuf);
+                if n == 0 {
                     // vanilla: this.target = getNearestPlayer(...) -> null —
                     // NearestAttackableTargetGoal has no stop() clear for the
                     // field, so the null write is observable
                     out.push(ACT_REF_SET_PLAYER, ctx.global(sel, gi), -1, 0, 0);
                     return Ok(Cu::No);
                 }
-                park_los(ctx, out, sel, phase, gi, &cands);
+                park_los(ctx, out, sel, phase, gi, &cbuf[..n]);
                 return Ok(Cu::Staged);
             }
             // findTarget() — a level query, staged (the gate pull already
@@ -1369,11 +1392,12 @@ fn can_use_inner(
             // selector + range = lookDistance), LoS staged.
             if ctx.cfg3(sel, gi) & 1 != 0 && !ctx.flag(MF_MANY_PLAYERS) && ctx.pcount() > 0 {
                 let range = f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32));
-                let cands = ctx.scan_players(false, true, range);
-                if cands.is_empty() {
+                let mut cbuf = [0usize; 32];
+                let n = ctx.scan_players_into(false, true, range, &mut cbuf);
+                if n == 0 {
                     return Ok(Cu::No); // getNearestPlayer -> null
                 }
-                park_los(ctx, out, sel, phase, gi, &cands);
+                park_los(ctx, out, sel, phase, gi, &cbuf[..n]);
                 return Ok(Cu::Staged);
             }
             park(ctx, out, sel, phase, gi, REQ_LOOKAT_QUERY);
@@ -1423,7 +1447,7 @@ fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
-        if bit < MAX_GOALS {
+        if bit < MAX_LOCK_FLAGS {
             let locked = ctx.lock[sel][bit];
             if locked != -1 && ctx.prio(sel, gi) >= ctx.prio(sel, locked as usize) {
                 return false;
@@ -1452,7 +1476,7 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
-        if bit >= MAX_GOALS {
+        if bit >= MAX_LOCK_FLAGS {
             return Err(());
         }
         let cur = ctx.lock[sel][bit];
@@ -1490,7 +1514,7 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
-        if bit >= MAX_GOALS {
+        if bit >= MAX_LOCK_FLAGS {
             return Err(());
         }
         let cur = ctx.lock[sel][bit];
@@ -1511,7 +1535,7 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
 
 fn stop_goal(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
     ctx.running[sel][gi] = false;
-    for bit in 0..MAX_GOALS {
+    for bit in 0..MAX_LOCK_FLAGS {
         if ctx.lock[sel][bit] == gi as i32 {
             ctx.lock[sel][bit] = -1;
         }

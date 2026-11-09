@@ -30,7 +30,7 @@ use centities_core::Aabb;
 use std::time::Instant;
 use swarm_sim::mob::out_len;
 use swarm_core::ChunkDelta;
-use swarm_sim::mob::{FlatWorld, MobAI, PlayerSnap};
+use swarm_sim::mob::{FlatWorld, MobAI, PackState, PlayerSnap};
 use swarm_sim::{HotRing, SwarmEngine};
 
 // the push kernel is the JNI-serving crate's own component; the example
@@ -138,7 +138,7 @@ fn main() {
                 let m = mobs.get_mut(&id).unwrap();
                 // 1. the selector walk (the parity-proven ai_floor)
                 let t = Instant::now();
-                let stat = m.ai_tick(&players, tick as i32, &mut world, &mut ai_scratch, &mut ai_out);
+                let stat = m.ai_tick(&players, tick as i32, &mut world, &mut ai_scratch, &mut ai_out, &mut PackState::default(), MobAI::tick_fp(&players));
                 stage[2] += t.elapsed().as_nanos();
                 debug_assert_eq!(stat.status, g::ST_DONE);
                 if m.target_player >= 0 {
