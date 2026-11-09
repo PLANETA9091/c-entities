@@ -201,3 +201,33 @@ within-run phase ledgers are evidence):
 - The ai phase is now 75% of the tick (5.99/7.98) — the goal-selector
   VM walk is the next and only remaining big fish; the N1 block-facts
   and N2 bridge work continues on top of it.
+
+### 9.1 The no-root profile: PGO counters (L111d)
+
+`perf` is unavailable in the sandbox (no root, no perf_event_open). The
+working per-function instrument is PGO instrumentation + llvm-profdata
+(rustup llvm-tools-preview, no root):
+
+```sh
+RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" cargo build --release -p centities-native --example native_bench
+target/release/examples/native_bench 25000 400 12648430
+~/.rustup/.../bin/llvm-profdata merge -o /tmp/bench.profdata /tmp/pgo-data/*.profraw
+~/.rustup/.../bin/llvm-profdata show --all-functions --counts /tmp/bench.profdata
+```
+
+Top of the profile (25k mobs x 450 ticks incl. warmup): the pack_into
+zero-fill block 2.46G execs, `ai_floor` 201M, `can_use_inner` 51M,
+`stop_goal` 16.6M, SeenGrid::rebuild 11.25M (= 25k x 450 — post-rewrite),
+`exec::tick` 11.25M. Startup-only costs (MobStore index hash ~78k,
+RawVec growth 25k) are already out of the steady state.
+
+**LESSON (measured twice): block COUNT is not TIME.** The 2.46G block is
+the buf zero-fill store loop (114 words x ~1.9 rounds ≈ 217/mob-tick —
+exact match); deleting it measured ZERO in the interleaved A/B (§9
+negative result) — a pure store loop on L1-hot lines is free. The
+sub-phase Instant::now instrumentation attempt (guards per round) added
+~190k clock calls/tick ≈ +7 ms/tick to the ai phase — REVERTED: at 25k
+mobs the per-event clocking costs more than the phases it measures.
+The honest per-function TIME split needs perf (root) or a sampler with
+patched entry; until then: interleaved p50 pairs + phase ledger + PGO
+counts are the evidence, in that order of trust.
