@@ -33,6 +33,9 @@ pub struct NativeTick {
     /// reused (slot, x, z) triples for the grid rebuild (zero steady-
     /// state allocation — the L111 line)
     triples: Vec<(u32, f64, f64)>,
+    /// the executor's ONE shared aiPack wire buffer (L111c): ~456B in L1
+    /// across the whole AI loop
+    ai_scratch: Vec<i32>,
 }
 
 impl NativeTick {
@@ -44,6 +47,7 @@ impl NativeTick {
             compact_at: 256,
             target_rng: target_seed,
             triples: Vec::new(),
+            ai_scratch: Vec::new(),
         }
     }
 
@@ -125,8 +129,10 @@ impl NativeTick {
         let mut stats: Vec<AiStat> = Vec::with_capacity(self.store.mobs.len());
         // disjoint field borrows: the snapshot is read-only during the
         // loop (it is only REPLACED between ticks through push_players),
-        // the mobs mutate by slot.
+        // the mobs mutate by slot. ONE shared aiPack scratch: the ~456B
+        // wire stays L1-hot across the whole AI loop (L111c).
         let snapshot: &crate::world::Snapshot = &self.store.snapshot;
+        let scratch = &mut self.ai_scratch;
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
                 continue;
@@ -135,7 +141,7 @@ impl NativeTick {
             res.target_rng = self.target_rng;
             let stat = {
                 let _g = ai_guard();
-                slot.mob.ai_tick(&players, game_time, &mut res)
+                slot.mob.ai_tick(&players, game_time, &mut res, scratch)
             };
             self.target_rng = res.target_rng;
             stats.push(stat);

@@ -148,10 +148,6 @@ pub struct MobAI {
     /// per round from the snapshot)
     pub approach_x: f64,
     pub approach_z: f64,
-    /// reused aiPack wire buffer — filled by pack_into, owned across
-    /// rounds/ticks so the steady-state loop performs ZERO allocations
-    /// (the L111 cost line: pack allocation was per-round-per-mob before).
-    pub scratch: Vec<i32>,
 }
 
 impl MobAI {
@@ -180,7 +176,6 @@ impl MobAI {
             pend_z: 0.0,
             approach_x: 0.0,
             approach_z: 0.0,
-            scratch: Vec::new(),
         }
     }
 
@@ -602,19 +597,18 @@ impl MobAI {
     /// One full AI tick: the aiRun round loop (cap 32) with the resolver
     /// in the request arm. Returns the accounting.
     ///
-    /// The aiPack wire buffer is the mob's persistent `scratch` (taken out
-    /// for the body so the resolver borrows don't alias it): the steady
-    /// state performs ZERO heap allocations — the L111 line.
+    /// The aiPack wire buffer is the CALLER's shared scratch: one executor
+    /// -level buffer makes the ~456-byte wire stay in L1 across the whole
+    /// AI loop (per-mob buffers were 25k scattered cold regions — the
+    /// L111c line). Wire bytes are identical either way.
     pub fn ai_tick(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
         r: &mut dyn Resolver,
+        buf: &mut Vec<i32>,
     ) -> AiStat {
-        let mut buf = std::mem::take(&mut self.scratch);
-        let stat = self.ai_tick_inner(players, game_time, r, &mut buf);
-        self.scratch = buf;
-        stat
+        self.ai_tick_inner(players, game_time, r, buf)
     }
 
     fn ai_tick_inner(
@@ -966,7 +960,7 @@ mod tests {
         let mut m = MobAI::new(2, 777, 0.0, 0.0, 0.0);
         m.tick_count = 99; // packs 100; (100 + 2) even, > 1
         m.no_action = 41; // packs 42
-        let stat = m.ai_tick(&[], 0, &mut Zero);
+        let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new());
         assert_eq!(stat.status, g::ST_DONE, "stat {stat:?}");
         assert_eq!(stat.fallback, 0);
         let mut r = 777u64;
@@ -988,7 +982,7 @@ mod tests {
             let mut m = MobAI::new(i + 1, 0x1000 + i as u64, i as f64, 0.0, -i as f64);
             m.tick_count = 99;
             for _ in 0..400 {
-                let stat = m.ai_tick(&[], 0, &mut Zero);
+                let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new());
                 assert_eq!(stat.status, g::ST_DONE, "mob {i} stat {stat:?}");
                 m.move_tick(&mth);
             }
@@ -1007,8 +1001,8 @@ mod tests {
         let mut w1 = FlatWorld::new(0xBEEF);
         let mut w2 = FlatWorld::new(0xBEEF);
         for _ in 0..600 {
-            a.ai_tick(&[], 0, &mut w1);
-            b.ai_tick(&[], 0, &mut w2);
+            a.ai_tick(&[], 0, &mut w1, &mut Vec::new());
+            b.ai_tick(&[], 0, &mut w2, &mut Vec::new());
             a.move_tick(&mth);
             b.move_tick(&mth);
         }
@@ -1057,7 +1051,7 @@ mod tests {
         for seed in 1..200u64 {
             let mut m = MobAI::new(1, seed, 0.0, 64.0, 0.0);
             for t in 0..90i32 {
-                m.ai_tick(&[], t, &mut East);
+                m.ai_tick(&[], t, &mut East, &mut Vec::new());
                 if m.nav_state == g::NAV_PATH_ACTIVE {
                     mob = Some(m);
                     break;
@@ -1069,7 +1063,7 @@ mod tests {
         }
         let mut m = mob.expect("no seed in 1..200 passes the stroll gate");
         for _ in 0..600 {
-            m.ai_tick(&[], 200, &mut East);
+            m.ai_tick(&[], 200, &mut East, &mut Vec::new());
             let (x0, z0) = (m.x, m.z);
             m.move_tick(&mth);
             if (m.x - x0).abs() + (m.z - z0).abs() > 1e-4 {
@@ -1108,7 +1102,7 @@ mod tests {
         let mut lock_tick = 0i32;
         let mut d_start = 0.0f64;
         for tick in 0..400i32 {
-            m.ai_tick(&players, tick, &mut w);
+            m.ai_tick(&players, tick, &mut w, &mut Vec::new());
             m.move_tick(&mth);
             if m.target_player >= 0 {
                 if !saw_target {
