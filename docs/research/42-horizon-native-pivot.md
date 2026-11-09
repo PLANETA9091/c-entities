@@ -149,6 +149,12 @@ obsoleted — the executor is Rust end to end).
   10×7 draws with block-safety); LoS always true; path model = straight
   line (the open-ground routing proof); MeleeAttack approach = the target's
   live position.
+- **L111b scripting addition**: `face()` yaw from the octant-folded
+  minimax atan (atan(x) ≈ (π/4)x − x(|x|−1)(0.2447 + 0.0663|x|)),
+  measured max reconstruction error 0.086° over all quadrants, quadrant
+  edges exact. atan2's scale-invariance folds the normalization away —
+  no sqrt, no divides, no libm atan2 per moving mob per tick. Chase
+  timing shifts (3036 → 3027 chasing on the bench seed) — declared.
 - The stroll stream is a separate splitmix (swarm-sim honesty note 1);
   the L111 bridge hands the real per-mob seeds.
 
@@ -159,3 +165,39 @@ parity bit-identical legs + baseline within-run dAB + native-profile
 artifact. Until then `centities-native` is the kernel + bench + profiler
 layer, additive only: nothing in the shipped config changes (main's
 shipped stack stays L104+L104b+L106+L109).
+
+## 9. L111a/L111b — the first math pass over the executor profile
+
+The user's rule from the directive chain: parallelism is NOT
+acceleration; acceleration is hard arithmetic. Two pure-math moves,
+measured by interleaved A/B in ONE window (the sandbox absolute p50
+drifts ~10% across minutes — 7.44/7.85/8.05/9.51 on near-identical
+code; cross-window comparisons are noise. Only interleaved pairs and
+within-run phase ledgers are evidence):
+
+| phase (ms/tick, same window) | L110 | L111a/b | Δ |
+|---|---|---|---|
+| ai | 6.22 | 5.99 | −4% |
+| travel | 2.31 | 1.91 | **−17%** |
+| grid | 2.15 | 0.94 | **−56%** |
+| p50 | 9.51 | 7.98 | **−16%** |
+
+- **L111a (pure perf, no semantics)**: `pack_into` — the aiPack wire
+  buffer is the mob's persistent scratch; the steady-state AI loop does
+  ZERO heap allocations (was one Vec per round per mob). Byte-identical
+  wire format, contract test pins it. `SeenGrid` — HashMap<(i64,i64),
+  Vec<u32>> + SipHash + `div_euclid` → flat open-addressed table
+  (zigzag u64 keys, murmur3 finalizer, linear probing), GENERATION
+  stamps retire the previous tick with one integer add (no memset),
+  counting-scatter into one contiguous vals Vec with prefix sums over
+  the compact occupied list. `floor(x*0.25)` replaces the f64 divide —
+  bit-identical (exact power-of-two scaling), roundss on x86-64.
+  9/9 + 15/15 tests green; chasing count identical.
+- **L111b (declared)**: the face() rewrite above. Plus a negative
+  result recorded: removing pack_into's per-round zero-fill (words are
+  all overwritten) measures ZERO in an interleaved A/B (7.96 vs
+  7.99) — the sequential store pass is effectively free and the
+  earlier regression reading was drift. The zero-fill stays.
+- The ai phase is now 75% of the tick (5.99/7.98) — the goal-selector
+  VM walk is the next and only remaining big fish; the N1 block-facts
+  and N2 bridge work continues on top of it.
