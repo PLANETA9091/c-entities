@@ -174,6 +174,50 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             // tick numbers in both legs, and from there the single global
             // stream evolves identically tick-by-tick. Any behavioral
             // difference (extra draw, different decision) diverges it.
+            // CHUNK-TICKING DETERMINISM (the sandbox finding): with NO
+            // players on the server, whether a chunk's entities tick at all
+            // depends on the async chunk system's ticket state — WHICH
+            // entities tick was observed to differ BETWEEN TWO VANILLA LEGS
+            // (174 vs 185 frozen zombies at T261, scale 500). A frozen
+            // zombie draws no SHARED_RANDOM, so the per-tick draw sequence
+            // — and from there the whole stream — desyncs before the
+            // module is even considered. Fix: pin SPAWN_CHUNK_RADIUS wide
+            // enough to cover the whole fill area BEFORE the fill starts.
+            // Spawn chunks are loaded + entity-ticking deterministically at
+            // boot, so every spawned entity ticks in both legs from the
+            // same tick on. Radius covers AREA/2 plus a chunk of margin.
+            try {
+                int radius = Math.max(2, ((int) (this.area / 2.0) + 32) >> 4);
+                var gr = (org.bukkit.GameRule<java.lang.Integer>) org.bukkit.GameRule.SPAWN_RADIUS;
+                for (var wl : Bukkit.getWorlds()) {
+                    wl.setGameRule(gr, radius);
+                }
+                getLogger().info("PARITY: spawn-chunk radius pinned to " + radius
+                        + " (area=" + this.area + ") — chunk-ticking determinism belt");
+            } catch (Throwable t) {
+                getLogger().warning("PARITY: cannot pin spawn-chunk radius: " + t);
+            }
+            // FORCE-LOAD the fill area: spawn-chunk radius alone did NOT make
+            // the covered chunks entity-tick (observed: frozen counts
+            // unchanged with the gamerule set). setForceLoaded chunks are
+            // full-ticking like /forceload. The fill starts at a fixed tick
+            // ~100 ticks after this, so the async load has settled in both
+            // legs before the first entity exists.
+            try {
+                World w0 = Bukkit.getWorlds().get(0);
+                int halfChunks = ((int) (this.area / 2.0) + 48) >> 4;
+                int forced = 0;
+                for (int cx = -halfChunks; cx <= halfChunks; cx++) {
+                    for (int cz = -halfChunks; cz <= halfChunks; cz++) {
+                        w0.setChunkForceLoaded(cx, cz, true);
+                        forced++;
+                    }
+                }
+                getLogger().info("PARITY: force-loaded " + forced
+                        + " chunks (±" + halfChunks + ") — entity-ticking determinism belt");
+            } catch (Throwable t) {
+                getLogger().warning("PARITY: cannot force-load the fill area: " + t);
+            }
             boolean seeded = seedSharedRandom("onEnable");
             getLogger().info("PARITY harness armed: seed=" + paritySeed
                     + " seeded=" + seeded
@@ -277,9 +321,60 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         Bukkit.getScheduler().runTaskTimer(this, this::fillStep, 40L, 1L);
     }
 
+    /** PARITY-RNG probe: a stable fingerprint of the shared RandomSource's
+     *  internal object state (all primitive fields, BFS up to 2 object hops).
+     *  Any difference between two legs localizes the exact tick where the
+     *  SHARED_RANDOM stream diverged — the fill itself is deterministic
+     *  (same spawns in the same order), so a state split means the per-tick
+     *  draw COUNT or ORDER differs. Diagnostic only; harmless in vanilla
+     *  (reflection reads, no writes, no RNG draws of its own). */
+    private String rngState() {
+        StringBuilder sb = new StringBuilder(96);
+        try {
+            java.util.ArrayDeque<Object> q = new java.util.ArrayDeque<>();
+            java.util.IdentityHashMap<Object, Boolean> seen = new java.util.IdentityHashMap<>();
+            if (sharedRandom != null) q.add(sharedRandom);
+            int hops = 0;
+            while (!q.isEmpty() && hops < 6) {
+                int width = q.size();
+                for (int w2 = 0; w2 < width; w2++) {
+                    Object o = q.poll();
+                    if (o == null || seen.put(o, Boolean.TRUE) != null) continue;
+                    for (Class<?> c = o.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                        for (Field f : c.getDeclaredFields()) {
+                            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                            f.setAccessible(true);
+                            Class<?> ft = f.getType();
+                            String p = "h" + hops + "." + f.getName();
+                            if (ft == long.class) sb.append(p).append('=').append(Long.toHexString(f.getLong(o))).append(';');
+                            else if (ft == int.class) sb.append(p).append('=').append(Integer.toHexString(f.getInt(o))).append(';');
+                            else if (ft == boolean.class) sb.append(p).append('=').append(f.getBoolean(o) ? '1' : '0').append(';');
+                            else if (ft == double.class) sb.append(p).append('=').append(Double.toHexString(f.getDouble(o))).append(';');
+                            else if (ft == float.class) sb.append(p).append('=').append(Float.toHexString(f.getFloat(o))).append(';');
+                            else if (!ft.isPrimitive() && hops < 5) {
+                                Object v = f.get(o);
+                                if (v != null && !v.getClass().isArray()) q.add(v);
+                            }
+                        }
+                    }
+                }
+                hops++;
+            }
+        } catch (Throwable t) {
+            sb.append("ERR:").append(t.getClass().getSimpleName());
+        }
+        return sb.toString();
+    }
+
     private void fillStep() {
         World w = Bukkit.getWorlds().get(0);
         if (tickNo < 1) return;
+        // PARITY-RNG: fingerprint the shared RandomSource every 10 ticks —
+        // the first tick whose fingerprints differ between two legs is the
+        // stream divergence point.
+        if (parity && tickNo % 10 == 0 && sharedRandom != null) {
+            getLogger().info("PARITY-RNG tick=" + tickNo + " " + rngState());
+        }
 
         // --- entities ---
         if (spawnedItems + spawnedStands + spawnedZombies < scale) {

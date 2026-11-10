@@ -22,7 +22,7 @@ impl Rng {
     }
 }
 
-fn compare_paths(label: &str, idx: &EntityIndex, boxes: &[Aabb]) {
+fn compare_paths(label: &str, idx: &mut EntityIndex, boxes: &[Aabb]) {
     let mut out_simd: Vec<i64> = Vec::new();
     let mut out_scalar: Vec<i64> = Vec::new();
     for (qi, b) in boxes.iter().enumerate() {
@@ -79,7 +79,7 @@ fn simd_scalar_parity_dense_and_boundary() {
         qboxes.push(b);
         id += 1;
     }
-    compare_paths("dense", &idx, &qboxes);
+    compare_paths("dense", &mut idx, &qboxes);
     idx.check_invariants();
 }
 
@@ -122,7 +122,7 @@ fn simd_scalar_parity_exact_boundaries() {
     // also a couple of zero-height and inverted-ish degenerate boxes (vanilla
     // never sends them, but the index must not disagree between paths)
     qboxes.push(Aabb::new(0.0, 64.0, 0.0, 0.0, 64.0, 0.0));
-    compare_paths("boundary", &idx, &qboxes);
+    compare_paths("boundary", &mut idx, &qboxes);
     idx.check_invariants();
 }
 
@@ -181,7 +181,7 @@ fn simd_scalar_parity_after_mutation_storm() {
                 let hw = rng.f64_in(0.2, 4.0);
                 qboxes.push(Aabb::new(cx - hw, 63.0, cz - hw, cx + hw, 67.0, cz + hw));
             }
-            compare_paths("storm", &idx, &qboxes);
+            compare_paths("storm", &mut idx, &qboxes);
         }
     }
     idx.check_invariants();
