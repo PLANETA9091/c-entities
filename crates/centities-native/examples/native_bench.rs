@@ -31,6 +31,11 @@ fn main() {
     if std::env::var_os("CE_FULL_PACK").is_some() {
         nt.set_full_pack(true);
     }
+    // the WAVE9 A/B knob: CE_SPLIT_TRAVEL=1 restores the pre-wave9 two-pass
+    // walk (all AI, then all travel) — the fused-vs-split twin arm
+    if std::env::var_os("CE_SPLIT_TRAVEL").is_some() {
+        nt.set_split_travel(true);
+    }
     // the mobs-25k stand: a pile around the spawn column, flat ground
     for i in 0..n_mobs {
         let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;

@@ -53,6 +53,9 @@ pub struct NativeTick {
     /// request parks (the exact pre-fold semantics; the A/B gate drives
     /// both modes over the same population).
     fold_off: bool,
+    /// WAVE9 twin hook: true = the pre-wave9 two-pass walk (the A/B arm).
+    /// False = the fused vanilla-order walk (one DRAM stream per tick).
+    split_travel: bool,
 }
 
 impl NativeTick {
@@ -69,12 +72,22 @@ impl NativeTick {
             pack: PackState::default(),
             players_buf: Vec::new(),
             fold_off: false,
+            split_travel: false,
         }
     }
 
     /// WAVE6 twin hook: force the parked (pre-fold) semantics.
     pub fn set_fold_off(&mut self, on: bool) {
         self.fold_off = on;
+    }
+
+    /// WAVE9 twin hook: restore the pre-wave9 SPLIT shape (all AI first,
+    /// then all travel — the two-pass walk). The production default is the
+    /// FUSED walk: vanilla runs each mob's movement inside the same
+    /// serverAiStep body, so the fused order is the vanilla order — and
+    /// the 25k × ~568 B population streams ONCE per tick instead of twice.
+    pub fn set_split_travel(&mut self, on: bool) {
+        self.split_travel = on;
     }
 
     /// WAVE4 twin hook: force the wave3 full-pack-every-round semantics
@@ -126,7 +139,13 @@ impl NativeTick {
         // overhead (~0.7ms/tick at 25k). The grid dirty-flag fires on the
         // first actual query (the JNI production scans route through
         // candidates()); see SeenGrid::candidates.
-        let _ = grid_guard; // the phase bracket stays for the query-time cost
+        // the phase bracket (the tick opener — arms the 1-in-17 sample;
+        // WAVE8c FIX: `let _ = grid_guard` MOVED the fn item without
+        // calling it — the whole ledger measured zero ticks since wave8c.
+        // The guard drops IMMEDIATELY: the grid is lazy (wave8c), its
+        // query-time cost lives inside the folds — a live bracket here
+        // would book the WHOLE tick into the grid cell)
+        drop(grid_guard());
         // players -> the pack snapshot (the floor borrows it per mob;
         // WAVE4: built into a REUSED buffer, not a fresh Vec per tick)
         let players: &[PlayerSnap] = {
@@ -199,16 +218,32 @@ impl NativeTick {
             };
             self.target_rng = res.target_rng;
             stats.push(stat);
-        }
-        // travel pass (vanilla: the movement runs inside the same body
-        // after the AI; the split here is the profile's honesty — ai and
-        // travel are separable costs of the same tick)
-        for slot in self.store.mobs.iter_mut() {
-            if !slot.alive {
-                continue;
+            // WAVE9 FUSED TRAVEL: the movement runs in the SAME pass, right
+            // after this mob's AI — the vanilla body order (serverAiStep:
+            // AI then travel per mob, one mob at a time). No cross-mob reads
+            // exist (the folds answer every scan over the packed players;
+            // move_tick touches self fields only), so the fused order is
+            // bit-identical to the split two-pass walk — proven by the
+            // fused-vs-split executor twin. The population's ~14.2 MB
+            // (25k × ~568 B) streams ONCE per tick instead of twice: the
+            // second pass re-fetched every mob from DRAM/L3 after the AI
+            // pass evicted it.
+            if !self.split_travel {
+                let _g = travel_guard();
+                slot.mob.move_tick(&self.mth);
             }
-            let _g = travel_guard();
-            slot.mob.move_tick(&self.mth);
+        }
+        // the WAVE9 twin arm: the pre-wave9 SPLIT shape (all AI first, then
+        // all travel) — kept for the interleaved A/B and the fused-vs-split
+        // parity twin.
+        if self.split_travel {
+            for slot in self.store.mobs.iter_mut() {
+                if !slot.alive {
+                    continue;
+                }
+                let _g = travel_guard();
+                slot.mob.move_tick(&self.mth);
+            }
         }
         // tombstone compaction (between ticks, the Horizon lazy compact).
         // WAVE2: compact RENUMBERS slots — the grid's stored indices all
@@ -410,6 +445,103 @@ mod tests {
             .filter(|m| m.mob.target_player >= 0)
             .count();
         assert!(chasing > 0, "the twin scenario must acquire targets");
+    }
+
+    /// THE WAVE9 executor gate: the FUSED walk (AI + travel per mob, the
+    /// vanilla body order, one DRAM stream) must be BIT-IDENTICAL to the
+    /// SPLIT two-pass walk (the pre-wave9 shape) over the same chased/
+    /// strolling/looking population — positions, seeds, goal states, nav,
+    /// targets, the whole store, word for word, 400 ticks. The fusion is
+    /// legal because no cross-mob reads exist (the folds answer every scan
+    /// over the packed players; move_tick touches self fields only) — this
+    /// twin PROVES that claim every CI run.
+    #[test]
+    fn fused_executor_matches_split_executor() {
+        let build = |split: bool| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_split_travel(split);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let mut split = build(true);
+        let mut fused = build(false);
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.rel_x.to_bits(),
+                    m.rel_z.to_bits(),
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.pend_x.to_bits(),
+                    m.pend_z.to_bits(),
+                    m.approach_x.to_bits(),
+                    m.approach_z.to_bits(),
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            [h, nt.target_rng, pop].to_vec()
+        };
+        for t in 0..400 {
+            split.tick(t);
+            fused.tick(t);
+            assert_eq!(
+                dump(&split),
+                dump(&fused),
+                "tick {t}: the fused executor diverged from the split twin"
+            );
+        }
+        // the scenario must move (the fused travel actually runs)
+        let moved = fused
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.x != m.mob.x.trunc() || m.mob.goals.iter().any(|g| g.running))
+            .count();
+        assert!(moved > 0, "the fused twin must walk/stroll: {moved}");
     }
 
     /// THE WAVE6 executor gate: the FOLDED executor (find_target/LOS/stroll/
