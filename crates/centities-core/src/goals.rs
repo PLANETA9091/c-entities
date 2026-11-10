@@ -1251,7 +1251,13 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
 fn done(ctx: &mut Ctx, out: &mut Out) -> i32 {
     // the engine's ported control decisions ride the actions; the executor's
     // Java tail (nav tick++, look idle rotate, jump reset) finishes the rest.
-    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
+    // L112d: the draw stamp is the ML ledger's INPUT — gate it behind the
+    // arm like the wrapper itself; the unconditional atomic add cost the
+    // bench one RMW per walk (~25k/tick) while the counter's reader
+    // (ml_record) only runs under ML_ON.
+    if ML_ON.load(Ordering::Relaxed) {
+        ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
+    }
     out.buf[0] = ST_DONE;
     out.buf[1] = 0;
     out.buf[2] = 0;
@@ -1318,7 +1324,11 @@ fn apply_los_resolution(
 }
 
 fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
-    ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
+    // L112d: the ML stamp rides the arm (see done()) — the parked protocol
+    // pays it only while the ledger window holds.
+    if ML_ON.load(Ordering::Relaxed) {
+        ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
+    }
     out.buf[0] = ST_REQUEST;
     out.buf[1] = req;
     out.buf[2] = gi as i32;
@@ -1392,9 +1402,11 @@ fn can_use(
     mode: &mut Mode<'_>,
 ) -> Result<Cu, ()> {
     // the eval-mask stamp (see ML_EVAL_SWAPS): one relaxed OR per eval —
-    // zero cost when the ledger is disarmed (the load in the wrapper
-    // short-circuits the record, the OR itself is negligible).
-    {
+    // L112d: the stamp is the ledger's INPUT and ml_record (its only
+    // reader) runs under ML_ON; the old shape paid an unconditional RMW
+    // per canUse eval (~5.5 per mob-tick) with nobody draining it. The
+    // arm check short-circuits the whole stamp.
+    if ML_ON.load(Ordering::Relaxed) {
         let k = ctx.kind(sel, gi);
         if (0..9).contains(&k) {
             ML_EVAL_SWAPS.fetch_or(1u32 << k, Ordering::Relaxed);
@@ -2097,6 +2109,9 @@ mod tests {
     /// stroll gate draws. Counts the LCG draws via ML_DRAW_SWAPS.
     #[test]
     fn l103_idle_walk_draw_count() {
+        // L112d: the draw stamp rides the ML arm — arm it for the probe
+        // (and disarm before returning; the ledger tests share the flag).
+        ML_ON.store(true, Ordering::Relaxed);
         for seed in 1u64..200 {
             let inb = build_in(seed, 100, 2, 42); // even tick, stroll gate reached
             let before = ML_DRAW_SWAPS.load(Ordering::SeqCst);
@@ -2104,6 +2119,7 @@ mod tests {
             let st = ai_floor(&inb, &mut out);
             let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst) - before;
             if st == ST_DONE {
+                ML_ON.store(false, Ordering::Relaxed);
                 // diagnostic only: ML_DRAW_SWAPS is process-global and
                 // cargo runs tests in parallel — the delta is meaningful
                 // only in isolation (--test-threads=1). The contract
@@ -2113,6 +2129,7 @@ mod tests {
                 return;
             }
         }
+        ML_ON.store(false, Ordering::Relaxed);
         panic!("no ST_DONE seed in 1..200");
     }
 

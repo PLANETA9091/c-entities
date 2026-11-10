@@ -421,3 +421,20 @@ exercises the stamp-hit path: reusing ONE scratch across mobs with
 different live states must still produce the fresh-pack bytes).
 Phases after: ai 3.87 / travel 1.70 / grid 0.00 / apply 0.12. Session
 cumulative: 8.41 -> 4.37 (**-48%**).
+
+### 9.6 L112d — the ledger stamps ride the arm
+
+The doc-41/101 mob ledger promised "zero cost when disarmed (one
+relaxed load per call)" — but three of its stamp sites paid the atomic
+RMW UNCONDITIONALLY: the draw stamp in done() (one per walk), the draw
+stamp in park(), and the eval-mask OR in can_use (one per eval — ~5.5
+per mob-tick on the bench). ~165k uncontended RMWs per tick at 25k mobs
+(~15-20 cycles each with the surrounding dependency chain) while their
+only reader (ml_record) runs strictly under ML_ON. All three stamps
+gate behind the same ML_ON load the wrapper already paid for; the
+diagnostic probe test arms the flag around its probe.
+
+**Interleaved A/B** (one window): p50 4.61 / 4.33 / 4.37 ->
+**3.88 / 3.88 / 3.88** (**-12.6%** — the biggest single cut of the
+session), chasing 3740 identical in all six runs, tests green.
+Session cumulative: 8.41 -> 3.88 (**-54%**).
