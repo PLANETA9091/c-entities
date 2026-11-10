@@ -8,7 +8,7 @@
 //! order, one mob at a time, AI before movement, later mobs observe earlier
 //! mobs' results. The profile phases (ai/travel/grid/apply) split the same
 //! body the way Horizon's spans do.
-use swarm_sim::mob::{AiStat, MobAI, PlayerSnap};
+use swarm_sim::mob::{AiStat, MobAI, PackScratch, PlayerSnap};
 use swarm_sim::mob::TravelMth as Mth;
 
 use centities_core::goals as g;
@@ -35,9 +35,9 @@ pub struct NativeTick {
     /// reused (slot, x, z) triples for the grid rebuild (zero steady-
     /// state allocation — the L111 line)
     triples: Vec<(u32, f64, f64)>,
-    /// the executor's ONE shared aiPack wire buffer (L111c): ~456B in L1
-    /// across the whole AI loop
-    ai_scratch: Vec<i32>,
+    /// the executor's ONE shared aiPack wire scratch (L111c + the L112c
+    /// static stamp): ~456B in L1 across the whole AI loop
+    ai_scratch: PackScratch,
     /// the executor's ONE shared floor OUT buffer (L112): the old shape
     /// zeroed an 808-word stack array PER MOB PER TICK (25k mobs x 808
     /// words = 20M dead stores per tick). One persistent buffer serves
@@ -70,7 +70,7 @@ impl NativeTick {
             compact_at: 256,
             target_rng: target_seed,
             triples: Vec::new(),
-            ai_scratch: Vec::new(),
+            ai_scratch: PackScratch::new(),
             out_scratch: vec![0i32; g::OUT_MIN_LEN],
             tick_epoch: 0,
             grid_built_epoch: 0,

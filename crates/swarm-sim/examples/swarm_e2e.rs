@@ -37,7 +37,7 @@ use swarm_sim::{HotRing, SwarmEngine};
 use centities_core::pushcore::{push_tick, PushCore, PushOut, GATE_MIN, PF_PUSHABLE};
 
 fn main() {
-    let mut ai_scratch: Vec<i32> = Vec::new();
+    let mut ai_scratch = swarm_sim::mob::PackScratch::new();
     let mut ai_out: Vec<i32> = vec![0i32; g::OUT_MIN_LEN];
     let farm = std::env::args().any(|a| a == "--farm");
     let (chunks_side, per_chunk, hot_dense) = if farm { (200, 25, 1100) } else { (5000, 40, 0) };

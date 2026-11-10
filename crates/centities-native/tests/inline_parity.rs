@@ -230,8 +230,8 @@ fn run_scenario(r: &mut Rng, ticks: i32) -> (u32, u32) {
         // the pack scratch stays per-round fresh (it is FULLY overwritten
         // by pack_into anyway); the OUT buffers are the chain-long reuse
         // above
-        let mut buf_p: Vec<i32> = Vec::new();
-        let mut buf_i: Vec<i32> = Vec::new();
+        let mut buf_p = swarm_sim::mob::PackScratch::new();
+        let mut buf_i = swarm_sim::mob::PackScratch::new();
         // two INDEPENDENT resolvers with the SAME stroll stream seed (the
         // streams must advance identically while the decisions match; any
         // decision divergence shifts the draws and the state check fires)

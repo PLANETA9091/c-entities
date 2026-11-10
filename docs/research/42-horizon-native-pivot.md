@@ -391,3 +391,33 @@ count) and never read (every reader bounds by count or the walk's gi).
 **Interleaved A/B** (one window): p50 4.70 / 4.67 / 4.75 ->
 **4.56 / 4.60 / 4.54** (**-3.1%**), chasing 3740 identical in all six
 runs, 86/86 tests green. Session cumulative: 8.41 -> 4.57 (**-45.7%**).
+
+### 9.5 L112c — the pack's static region dies (the stamp)
+
+The pack was the profile's top COUNT block: a 134-word zero-fill pass +
+134 written words per mob-tick for a scratch shared across the whole
+loop. But 69 of the written words are the goal-table STATIC region
+(per goal kind/prio/flags/cfg/cfg2/cfg3, the selector counts, the
+follow range) — identical across the mob's lifetime and, on the
+table-uniform bench, identical across ALL mobs. The scratch now carries
+a STAMP: the fingerprint (murmur-style fold) of the table whose statics
+are resident in the buffer; the fingerprint lives on the mob (computed
+once at construction, `rebuild_static_stamp` for exotic consumers). A
+stamp HIT skips the 69 static stores AND the zero-fill pass (which rode
+the same branch) — the dynamic words (~65) are all unconditionally
+written; the pack-never-written b[7..10] disabled masks stay 0 from the
+initial resize in both paths. Pack stores per mob-tick: ~268 -> ~65.
+
+The stamp persists ACROSS ticks on the shared scratch, so the steady
+state never re-writes statics — the L111a zero-fill prefetch note rides
+along: the fill itself only runs on the miss branch (fresh buffer,
+player-count change), and the hit path's store pattern was re-measured
+clean (below).
+
+**Interleaved A/B** (one window): p50 4.81 / 4.87 / 4.79 ->
+**4.38 / 4.36 / 4.37** (**-9.3%**), chasing 3740 identical in all six
+runs, 86/86 tests green (the byte-identical wire contract test now
+exercises the stamp-hit path: reusing ONE scratch across mobs with
+different live states must still produce the fresh-pack bytes).
+Phases after: ai 3.87 / travel 1.70 / grid 0.00 / apply 0.12. Session
+cumulative: 8.41 -> 4.37 (**-48%**).
