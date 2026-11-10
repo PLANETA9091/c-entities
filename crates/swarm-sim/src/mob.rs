@@ -92,11 +92,16 @@ const OG_GRAV_TAIL: f64 = (0.0f64 - 0.08f64) * (OG_DRAG_I as f64);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GoalRec {
-    pub kind: i32,
-    pub prio: i32,
-    pub flags: i64,
-    pub cfg: i32,
+    /// WAVE11c: the packed resident layout — 20 B per record (the wire
+    /// words are DERIVED by pack_into, byte-identical: kind/prio/flags
+    /// widen to i32 on write; the small-const domains make the lossless:
+    /// kinds 0..9, prios 1..9, flags bits 0..4). The wire fixture
+    /// (pack_matches_parity_fixture) pins the byte identity.
+    pub kind: u8,
+    pub prio: u8,
+    pub flags: u8,
     pub running: bool,
+    pub cfg: i32,
     pub state: i32,
     pub cfg2: i32,
     pub cfg3: i32,
@@ -106,15 +111,21 @@ impl GoalRec {
     #[inline]
     const fn rec(kind: i32, prio: i32, flags: i64, cfg: i32) -> Self {
         GoalRec {
-            kind,
-            prio,
-            flags,
+            kind: kind as u8,
+            prio: prio as u8,
+            flags: flags as u8,
             cfg,
             running: false,
             state: 0,
             cfg2: 0,
             cfg3: 0,
         }
+    }
+    /// the wire-domain widenings (the parity fixture + the pack write
+    /// these; the engine reads via the Src accessors)
+    #[inline]
+    pub const fn kind32(&self) -> i32 {
+        self.kind as i32
     }
 }
 
@@ -225,6 +236,11 @@ pub struct MobAI {
     /// ai_tick); the bit is maintained at every start/stop and policed
     /// by the odd_skip_matches_full_floor_executor twin.
     pub et_running: bool,
+    /// WAVE11b: the maintained any-running bit (the z0/z1 gate — the
+    /// 11-record scan per even tick was ~25 cycles of the B-tail). Set at
+    /// every running=true write; RECOMPUTED at every stop (the stops are
+    /// rare — the stroll/RLA lifetimes). debug_assert-pinned at the gate.
+    pub ar_running: bool,
     /// WAVE4: the static-pack fingerprint (fnv1a over the goal cfg words
     /// + counts/follow/lastHurt header trio). Computed ONCE at
     /// construction — the goal table is fixed at add_mob (the executor
@@ -249,6 +265,16 @@ impl MobAI {
         if kind == g::GK_LOOKAROUND || kind == g::GK_ZOMBIE_ATTACK {
             self.et_running = false;
         }
+    }
+    /// WAVE11b: the any-running bit maintenance (see ar_running). Starts
+    /// set it unconditionally; stops RECOMPUTE (the stops are rare).
+    #[inline]
+    pub fn ar_note_start(&mut self) {
+        self.ar_running = true;
+    }
+    #[inline]
+    pub fn ar_note_stop(&mut self) {
+        self.ar_running = self.goals.iter().any(|rec| rec.running);
     }
 
     /// WAVE4: fnv1a over the words the resident path leaves to the static
@@ -311,6 +337,7 @@ impl MobAI {
             approach_x: 0.0,
             approach_z: 0.0,
             et_running: false,
+            ar_running: false,
             pack_fp: Self::static_fp(&zombie_table()),
         }
     }
@@ -465,7 +492,7 @@ impl Resolver for FlatWorld {
     }
 
     fn start_vanilla(&mut self, mob: &mut MobAI, gi: usize) {
-        match mob.goals[gi].kind {
+        match mob.goals[gi].kind as i32 {
             g::GK_STROLL => {
                 // WaterAvoidingRandomStrollGoal.start(): navigation.moveTo(
                 //   wantedX, wantedY, wantedZ, speedModifier) — the open
@@ -475,6 +502,7 @@ impl Resolver for FlatWorld {
                 mob.nav_z = mob.pend_z;
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                mob.ar_note_start();
             }
             g::GK_LOOKAROUND => {
                 // RandomLookAroundGoal.start() — the DRAW-EXACT body
@@ -486,11 +514,13 @@ impl Resolver for FlatWorld {
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
                 mob.et_note_start(g::GK_LOOKAROUND);
+                mob.ar_note_start();
             }
             g::GK_ZOMBIE_ATTACK => {
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
                 mob.et_note_start(g::GK_ZOMBIE_ATTACK);
+                mob.ar_note_start();
             }
             _ => {}
         }
@@ -683,16 +713,16 @@ impl EngineSrc for ResSrc<'_> {
     }
     #[inline]
     fn kind(&self, sel: usize, i: usize) -> i32 {
-        self.mob.goals[self.offset_of(sel) + i].kind
+        self.mob.goals[self.offset_of(sel) + i].kind as i32
     }
     #[inline]
     fn prio(&self, sel: usize, i: usize) -> i32 {
-        self.mob.goals[self.offset_of(sel) + i].prio
+        self.mob.goals[self.offset_of(sel) + i].prio as i32
     }
     #[inline]
     fn flags(&self, sel: usize, i: usize) -> i64 {
         // the wire truncates flags to the low word and sign-extends back
-        self.mob.goals[self.offset_of(sel) + i].flags as i32 as i64
+        self.mob.goals[self.offset_of(sel) + i].flags as i64
     }
     #[inline]
     fn cfg(&self, sel: usize, i: usize) -> i32 {
@@ -716,7 +746,7 @@ impl EngineSrc for ResSrc<'_> {
         // source of truth with the wire path
         let flat = self.offset_of(sel) + i;
         let rec = &self.mob.goals[flat];
-        match rec.kind {
+        match rec.kind as i32 {
             g::GK_LOOKAROUND
             | g::GK_ZOMBIE_ATTACK
             | g::GK_HURT_BY
@@ -832,7 +862,7 @@ impl MobAI {
     fn repack_goal_words(&self, gi: usize, b: &mut [i32], players: &[PlayerSnap]) {
         let o = g::IN_HEADER + gi * g::GOAL_STRIDE;
         b[o + 4] = self.goals[gi].running as i32;
-        b[o + 5] = match self.goals[gi].kind {
+        b[o + 5] = match self.goals[gi].kind as i32 {
             g::GK_LOOKAROUND
             | g::GK_ZOMBIE_ATTACK
             | g::GK_HURT_BY
@@ -906,12 +936,12 @@ impl MobAI {
         let base = g::IN_HEADER;
         for (i, rec) in self.goals.iter().enumerate() {
             let o = base + i * g::GOAL_STRIDE;
-            b[o] = rec.kind;
-            b[o + 1] = rec.prio;
+            b[o] = rec.kind as i32;
+            b[o + 1] = rec.prio as i32;
             b[o + 2] = rec.flags as i32;
             b[o + 3] = rec.cfg;
             b[o + 4] = rec.running as i32;
-            b[o + 5] = match rec.kind {
+            b[o + 5] = match rec.kind as i32 {
                 g::GK_LOOKAROUND
                 | g::GK_ZOMBIE_ATTACK
                 | g::GK_HURT_BY
@@ -952,8 +982,8 @@ impl MobAI {
         let base = g::IN_HEADER;
         for (i, rec) in self.goals.iter().enumerate() {
             let o = base + i * g::GOAL_STRIDE;
-            b[o] = rec.kind;
-            b[o + 1] = rec.prio;
+            b[o] = rec.kind as i32;
+            b[o + 1] = rec.prio as i32;
             b[o + 2] = rec.flags as i32;
             b[o + 3] = rec.cfg;
             b[o + 6] = rec.cfg2;
@@ -998,7 +1028,7 @@ impl MobAI {
         for (i, rec) in self.goals.iter().enumerate() {
             let o = base + i * g::GOAL_STRIDE;
             b[o + 4] = rec.running as i32;
-            b[o + 5] = match rec.kind {
+            b[o + 5] = match rec.kind as i32 {
                 g::GK_LOOKAROUND
                 | g::GK_ZOMBIE_ATTACK
                 | g::GK_HURT_BY
@@ -1106,7 +1136,8 @@ impl MobAI {
                     if p0 < N_GOALS {
                         self.goals[p0].running = true;
                         self.no_action = 0;
-                        self.et_note_start(self.goals[p0].kind);
+                        self.et_note_start(self.goals[p0].kind as i32);
+                        self.ar_note_start();
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 1;
                             packed[4] = self.no_action;
@@ -1114,7 +1145,7 @@ impl MobAI {
                         // the start BODIES the executor runs itself (the
                         // engine emitted the transition, vanilla runs
                         // start() inline — aiApply: lockWrite + wg.start()):
-                        match self.goals[p0].kind {
+                        match self.goals[p0].kind as i32 {
                             // LookAtPlayerGoal.start(): lookTime =
                             // adjustedTickDelay(40), no RNG (javap 26.3)
                             g::GK_LOOKAT_PLAYER => {
@@ -1188,7 +1219,8 @@ impl MobAI {
                         self.goals[p0].state = out[b + 6];
                         self.goals[p0].running = true;
                         self.no_action = 0;
-                        self.et_note_start(self.goals[p0].kind);
+                        self.et_note_start(self.goals[p0].kind as i32);
+                        self.ar_note_start();
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 1;
                             packed[g::IN_HEADER + gw + 5] = out[b + 6];
@@ -1199,11 +1231,12 @@ impl MobAI {
                 g::ACT_GOAL_STOP | g::ACT_GOAL_STOP_D => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = false;
-                        self.et_note_stop(self.goals[p0].kind);
+                        self.et_note_stop(self.goals[p0].kind as i32);
+                        self.ar_note_stop();
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 0;
                         }
-                        if self.goals[p0].kind == g::GK_STROLL
+                        if self.goals[p0].kind as i32 == g::GK_STROLL
                             && self.nav_state == g::NAV_PATH_ACTIVE
                         {
                             self.nav_state = g::NAV_NONE;
@@ -1232,7 +1265,7 @@ impl MobAI {
                 }
                 g::ACT_REF_SET_PLAYER => {
                     if p0 < N_GOALS {
-                        match self.goals[p0].kind {
+                        match self.goals[p0].kind as i32 {
                             g::GK_LOOKAT_PLAYER => {
                                 self.lookat_player = p1;
                                 if p1 < 0 {
@@ -1356,7 +1389,12 @@ impl MobAI {
         // empty shape rides the skip above). Everything else — parks
         // (mid-stream, the exact park words), non-zombie tables, the
         // parked flow — rides the generic engine bit-for-bit.
-        let any_running = self.goals.iter().any(|rec| rec.running);
+        let any_running = self.ar_running;
+        debug_assert_eq!(
+            any_running,
+            self.goals.iter().any(|rec| rec.running),
+            "the maintained ar_running bit drifted from the live records"
+        );
         let z_strait = resident
             && z0_on()
             && fold.on
@@ -1564,7 +1602,7 @@ impl MobAI {
                 }
                 g::REQ_CANUSE_VANILLA => {
                     if gi < N_GOALS {
-                        let kind = self.goals[gi].kind;
+                        let kind = self.goals[gi].kind as i32;
                         let pass = r.canuse_vanilla(self, kind);
                         // the 26.3 MeleeAttackGoal.canUse sets lastCanUseCheck
                         // AFTER the throttle gate — the state word is the
@@ -1581,7 +1619,7 @@ impl MobAI {
                     }
                 }
                 g::REQ_CC_VANILLA => {
-                    let kind = self.goals.get(gi).map(|rec| rec.kind).unwrap_or(0);
+                    let kind = self.goals.get(gi).map(|rec| rec.kind as i32).unwrap_or(0);
                     if kind == g::GK_ZOMBIE_ATTACK || kind == g::GK_NEAREST_TARGET {
                         let cont = r.cc_vanilla(self, kind);
                         if !cont {
@@ -1958,8 +1996,8 @@ mod tests {
         let t = zombie_table();
         for (i, rec) in t.iter().enumerate() {
             let o = g::IN_HEADER + i * g::GOAL_STRIDE;
-            b[o] = rec.kind;
-            b[o + 1] = rec.prio;
+            b[o] = rec.kind as i32;
+            b[o + 1] = rec.prio as i32;
             b[o + 2] = rec.flags as i32;
             b[o + 3] = rec.cfg;
             b[o + 6] = rec.cfg2;
@@ -2149,12 +2187,13 @@ mod tests {
             }
             fn start_vanilla(&mut self, m: &mut MobAI, gi: usize) {
                 // the FlatWorld stroll start semantics
-                if m.goals[gi].kind == g::GK_STROLL {
+                if m.goals[gi].kind as i32 == g::GK_STROLL {
                     m.nav_state = g::NAV_PATH_ACTIVE;
                     m.nav_x = m.pend_x;
                     m.nav_z = m.pend_z;
                     m.goals[gi].running = true;
                     m.no_action = 0;
+                    m.ar_note_start();
                 }
             }
         }

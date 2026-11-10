@@ -210,7 +210,7 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
 
     fn start_vanilla(&mut self, mob: &mut swarm_sim::mob::MobAI, gi: usize) {
         use centities_core::goals as g;
-        match mob.goals[gi].kind {
+        match mob.goals[gi].kind as i32 {
             g::GK_STROLL => {
                 mob.nav_state = g::NAV_PATH_ACTIVE;
                 mob.nav_x = mob.pend_x;
