@@ -11,6 +11,8 @@
 use swarm_sim::mob::{AiStat, MobAI, PlayerSnap};
 use swarm_sim::mob::TravelMth as Mth;
 
+use centities_core::goals as g;
+
 use crate::profile::{ai_guard, apply_guard, grid_guard, travel_guard};
 use crate::store::{MobStore, SeenGrid};
 use crate::world::{PlayerTick, WorldRes};
@@ -36,6 +38,13 @@ pub struct NativeTick {
     /// the executor's ONE shared aiPack wire buffer (L111c): ~456B in L1
     /// across the whole AI loop
     ai_scratch: Vec<i32>,
+    /// the executor's ONE shared floor OUT buffer (L112): the old shape
+    /// zeroed an 808-word stack array PER MOB PER TICK (25k mobs x 808
+    /// words = 20M dead stores per tick). One persistent buffer serves
+    /// the whole loop: the floor writes every slot the executor reads
+    /// before the read, so stale words beyond the current action count
+    /// are never observed.
+    out_scratch: Vec<i32>,
     /// bumped every tick; the grid rebuild LAZY stamp — the grid is
     /// rebuilt on the FIRST query after the bump, never eagerly (L111e:
     /// nothing in the v0 executor queries candidates — the AI's player
@@ -62,6 +71,7 @@ impl NativeTick {
             target_rng: target_seed,
             triples: Vec::new(),
             ai_scratch: Vec::new(),
+            out_scratch: vec![0i32; g::OUT_MIN_LEN],
             tick_epoch: 0,
             grid_built_epoch: 0,
             stats_scratch: Vec::new(),
@@ -147,6 +157,7 @@ impl NativeTick {
         stats.clear();
         let snapshot: &crate::world::Snapshot = &self.store.snapshot;
         let scratch = &mut self.ai_scratch;
+        let out_scratch = &mut self.out_scratch;
         let mth = &self.mth;
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
@@ -156,7 +167,7 @@ impl NativeTick {
                 let _g = ai_guard();
                 let mut res = WorldRes::open_ground_v0(snapshot, 0);
                 res.target_rng = self.target_rng;
-                let st = slot.mob.ai_tick(&players, game_time, &mut res, scratch);
+                let st = slot.mob.ai_tick(&players, game_time, &mut res, scratch, out_scratch);
                 self.target_rng = res.target_rng;
                 st
             };

@@ -38,6 +38,7 @@ use centities_core::pushcore::{push_tick, PushCore, PushOut, GATE_MIN, PF_PUSHAB
 
 fn main() {
     let mut ai_scratch: Vec<i32> = Vec::new();
+    let mut ai_out: Vec<i32> = vec![0i32; g::OUT_MIN_LEN];
     let farm = std::env::args().any(|a| a == "--farm");
     let (chunks_side, per_chunk, hot_dense) = if farm { (200, 25, 1100) } else { (5000, 40, 0) };
 
@@ -134,7 +135,7 @@ fn main() {
                 let m = mobs.get_mut(&id).unwrap();
                 // 1. the selector walk (the parity-proven ai_floor)
                 let t = Instant::now();
-                let stat = m.ai_tick(&players, tick as i32, &mut world, &mut ai_scratch);
+                let stat = m.ai_tick(&players, tick as i32, &mut world, &mut ai_scratch, &mut ai_out);
                 stage[2] += t.elapsed().as_nanos();
                 debug_assert_eq!(stat.status, g::ST_DONE);
                 if m.target_player >= 0 {

@@ -601,17 +601,27 @@ impl MobAI {
     /// continues from the same (sel, phase, gi). Decision-identical to
     /// `ai_tick_parked` (the differential fixture pins it: same actions,
     /// same seed out, same final state over randomized scenarios).
+    ///
+    /// L112: the OUT buffer is CALLER-OWNED and reused across ticks/mobs —
+    /// the old shape zeroed an 808-word stack array per call (25k mobs x
+    /// 808 words = 20M dead stores per tick). The floor writes every slot
+    /// the caller reads before the read (the header words on every exit
+    /// path, all 8 words of every action in push), so no initialization
+    /// is required — stale words beyond the current action count are never
+    /// read. The executor passes one shared scratch; the fixtures reuse
+    /// theirs, which makes the stale-word discipline part of the pinned
+    /// contract.
     pub fn ai_tick(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
         r: &mut dyn Resolver,
         buf: &mut Vec<i32>,
+        out: &mut [i32],
     ) -> AiStat {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.no_action = self.no_action.saturating_add(1);
         self.pack_into(players, game_time, 0, 0, 0, 0.0, 0.0, 0.0, buf);
-        let mut out = [0i32; OUT_LEN];
         let mut stat = AiStat::default();
         let started;
         {
@@ -621,25 +631,30 @@ impl MobAI {
                 players,
                 game_time,
                 resolves: 0,
-                started: Vec::new(),
+                // L112: a fixed array — the start bodies run at most once
+                // per goal per walk (each canUse evaluates once), so
+                // N_GOALS slots are structurally sufficient; the old Vec
+                // allocated on every start mid-walk.
+                started: [0usize; N_GOALS],
+                started_n: 0,
             };
-            stat.status = g::ai_floor_inline(buf, &mut out, &mut ad);
+            stat.status = g::ai_floor_inline(buf, out, &mut ad);
             stat.rounds = 1;
             stat.requests = ad.resolves;
             if stat.status == g::ST_FALLBACK {
                 stat.fallback = out[7];
             }
-            started = std::mem::take(&mut ad.started);
+            started = (ad.started_n, ad.started);
         }
         // seed handoff (aiRun: out -> SHARED_RANDOM)
         self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
-        self.apply_actions(&out, players);
+        self.apply_actions(out, players);
         // the start bodies ran MID-WALK (before this apply) — their
         // running=true is the last writer, exactly like the parked
         // protocol's resolve-after-apply order (see InlineAdapter.started)
-        for gi in &started {
-            if *gi < N_GOALS {
-                self.goals[*gi].running = true;
+        for &gi in &started.1[..started.0] {
+            if gi < N_GOALS {
+                self.goals[gi].running = true;
             }
         }
         stat
@@ -648,15 +663,17 @@ impl MobAI {
     /// The PARKED protocol tick — the L111g baseline the inline walk is
     /// proven against: the aiRun round loop (cap 32) with the resolver in
     /// the request arm, a FULL repack + floor re-entry per park. Kept for
-    /// the differential fixture and the Java-shape path.
+    /// the differential fixture and the Java-shape path. The OUT buffer is
+    /// caller-owned (reused across rounds and ticks — see ai_tick, L112).
     pub fn ai_tick_parked(
         &mut self,
         players: &[PlayerSnap],
         game_time: i32,
         r: &mut dyn Resolver,
         buf: &mut Vec<i32>,
+        out: &mut [i32],
     ) -> AiStat {
-        self.ai_tick_parked_inner(players, game_time, r, buf)
+        self.ai_tick_parked_inner(players, game_time, r, buf, out)
     }
 
     fn ai_tick_parked_inner(
@@ -665,20 +682,20 @@ impl MobAI {
         game_time: i32,
         r: &mut dyn Resolver,
         buf: &mut Vec<i32>,
+        out: &mut [i32],
     ) -> AiStat {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.no_action = self.no_action.saturating_add(1);
         let mut stat = AiStat::default();
         let (mut cursor, mut res, mut req_op) = (0i32, 0i32, 0i32);
         let (mut rx, mut ry, mut rz) = (0f64, 0f64, 0f64);
-        let mut out = [0i32; OUT_LEN];
         for _round in 0..32 {
             self.pack_into(players, game_time, cursor, res, req_op, rx, ry, rz, buf);
-            let st = g::ai_floor(buf, &mut out);
+            let st = g::ai_floor(buf, out);
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
-            self.apply_actions(&out, players);
+            self.apply_actions(out, players);
             if st == g::ST_FALLBACK {
                 stat.status = st;
                 stat.fallback = out[7];
@@ -875,7 +892,10 @@ struct InlineAdapter<'a, 'b> {
     /// goal earlier in the walk would otherwise clobber the start (the
     /// expired-RandomLookAround-restart flow the fixture caught). The
     /// tick-end apply re-asserts these after apply_actions.
-    started: Vec<usize>,
+    /// L112: fixed storage — one start per goal per walk (each canUse
+    /// evaluates once), N_GOALS slots are structurally exact.
+    started: [usize; N_GOALS],
+    started_n: usize,
 }
 
 impl<'a, 'b> InlineAdapter<'a, 'b> {
@@ -960,7 +980,10 @@ impl<'a, 'b> g::InlineRes for InlineAdapter<'a, 'b> {
         self.mob.seed = *shared_seed;
         self.r.start_vanilla(self.mob, gi);
         *shared_seed = self.mob.seed;
-        self.started.push(gi);
+        if self.started_n < N_GOALS {
+            self.started[self.started_n] = gi;
+            self.started_n += 1;
+        }
     }
 
     fn ref_set_player(&mut self, gi: usize, winner: i32) {
@@ -1149,7 +1172,8 @@ mod tests {
         let mut m = MobAI::new(2, 777, 0.0, 0.0, 0.0);
         m.tick_count = 99; // packs 100; (100 + 2) even, > 1
         m.no_action = 41; // packs 42
-        let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new());
+        let mut out = vec![0i32; g::OUT_MIN_LEN];
+        let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new(), &mut out);
         assert_eq!(stat.status, g::ST_DONE, "stat {stat:?}");
         assert_eq!(stat.fallback, 0);
         let mut r = 777u64;
@@ -1167,11 +1191,12 @@ mod tests {
         // 300 mobs x 400 ticks of the idle stream: the protocol must
         // never fall back (a fallback would be a pack/resume bug)
         let mth = Mth::new();
+        let mut out = vec![0i32; g::OUT_MIN_LEN];
         for i in 0..300i64 {
             let mut m = MobAI::new(i + 1, 0x1000 + i as u64, i as f64, 0.0, -i as f64);
             m.tick_count = 99;
             for _ in 0..400 {
-                let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new());
+                let stat = m.ai_tick(&[], 0, &mut Zero, &mut Vec::new(), &mut out);
                 assert_eq!(stat.status, g::ST_DONE, "mob {i} stat {stat:?}");
                 m.move_tick(&mth);
             }
@@ -1189,9 +1214,12 @@ mod tests {
         let mut b = MobAI::new(7, 0xFEED, 1000.0, 64.0, 1000.0);
         let mut w1 = FlatWorld::new(0xBEEF);
         let mut w2 = FlatWorld::new(0xBEEF);
+        // the SHARED out buffer across both mobs: the stale-word discipline
+        // (no read of an unwritten slot) is part of the executor contract
+        let mut out = vec![0i32; g::OUT_MIN_LEN];
         for _ in 0..600 {
-            a.ai_tick(&[], 0, &mut w1, &mut Vec::new());
-            b.ai_tick(&[], 0, &mut w2, &mut Vec::new());
+            a.ai_tick(&[], 0, &mut w1, &mut Vec::new(), &mut out);
+            b.ai_tick(&[], 0, &mut w2, &mut Vec::new(), &mut out);
             a.move_tick(&mth);
             b.move_tick(&mth);
         }
@@ -1237,10 +1265,11 @@ mod tests {
         let mut arrived = false;
         // seed scan: the first seed whose stroll gate fires early enough
         let mut mob: Option<MobAI> = None;
+        let mut out = vec![0i32; g::OUT_MIN_LEN];
         for seed in 1..200u64 {
             let mut m = MobAI::new(1, seed, 0.0, 64.0, 0.0);
             for t in 0..90i32 {
-                m.ai_tick(&[], t, &mut East, &mut Vec::new());
+                m.ai_tick(&[], t, &mut East, &mut Vec::new(), &mut out);
                 if m.nav_state == g::NAV_PATH_ACTIVE {
                     mob = Some(m);
                     break;
@@ -1252,7 +1281,7 @@ mod tests {
         }
         let mut m = mob.expect("no seed in 1..200 passes the stroll gate");
         for _ in 0..600 {
-            m.ai_tick(&[], 200, &mut East, &mut Vec::new());
+            m.ai_tick(&[], 200, &mut East, &mut Vec::new(), &mut out);
             let (x0, z0) = (m.x, m.z);
             m.move_tick(&mth);
             if (m.x - x0).abs() + (m.z - z0).abs() > 1e-4 {
@@ -1287,11 +1316,12 @@ mod tests {
             flags: g::PF_ALIVE,
         }];
         let mut w = FlatWorld::new(0xC0FFEE);
+        let mut out = vec![0i32; g::OUT_MIN_LEN];
         let mut saw_target = false;
         let mut lock_tick = 0i32;
         let mut d_start = 0.0f64;
         for tick in 0..400i32 {
-            m.ai_tick(&players, tick, &mut w, &mut Vec::new());
+            m.ai_tick(&players, tick, &mut w, &mut Vec::new(), &mut out);
             m.move_tick(&mth);
             if m.target_player >= 0 {
                 if !saw_target {

@@ -594,10 +594,17 @@ impl<'a> Ctx<'a> {
     /// Returns the candidate list (snapshot indices) that passed everything
     /// except the Sensing LoS — the caller stages REQ_LOS_SCAN with them
     /// (or Cu::No when there are none: vanilla would return null).
-    fn scan_players(&self, combat: bool, not_riding: bool, range: f64) -> Vec<usize> {
+    fn scan_players(&self, combat: bool, not_riding: bool, range: f64) -> ([usize; 32], usize) {
         let (mx, my, mz, _eyey) = self.mob_pos();
         let peaceful = self.flag(MF_PEACEFUL);
-        let mut cands = Vec::new();
+        // L112: the candidate list is a STACK ARRAY — the scans only run
+        // under !MF_MANY_PLAYERS (>=31 players parks before this point),
+        // so pcount <= 30 and the 32-slot bound is structural. The old
+        // Vec allocated once per goal eval per mob-tick (three Player-typed
+        // gates) — ~75k heap round-trips per tick at 25k mobs, dead work
+        // the caller consumes immediately.
+        let mut cands = [0usize; 32];
+        let mut n = 0usize;
         for i in 0..self.pcount() {
             let fl = self.pflags(i);
             // test() line 2: !canBeSeenByAnyone -> false
@@ -631,9 +638,12 @@ impl<'a> Ctx<'a> {
             if d2 > vd * vd {
                 continue;
             }
-            cands.push(i);
+            if n < 32 {
+                cands[n] = i;
+                n += 1;
+            }
         }
-        cands
+        (cands, n)
     }
 
     /// The getNearestPlayer best-selection: nearest passing candidate by
@@ -1545,8 +1555,8 @@ fn can_use_inner(
                 && !ctx.flag(MF_MANY_PLAYERS)
             {
                 let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
-                let cands = ctx.scan_players(true, false, range);
-                if cands.is_empty() {
+                let (cands, n_cands) = ctx.scan_players(true, false, range);
+                if n_cands == 0 {
                     // vanilla: this.target = getNearestPlayer(...) -> null —
                     // NearestAttackableTargetGoal has no stop() clear for the
                     // field, so the null write is observable
@@ -1559,11 +1569,11 @@ fn can_use_inner(
                 }
                 match mode {
                     Mode::Parked => {
-                        park_los(ctx, out, sel, phase, gi, &cands);
+                        park_los(ctx, out, sel, phase, gi, &cands[..n_cands]);
                         return Ok(Cu::Staged);
                     }
                     Mode::Inline(res) => {
-                        let mask = res.los(cands.len());
+                        let mask = res.los(n_cands);
                         apply_los_resolution(ctx, out, sel, gi, mask, mode)?;
                         return Ok(Cu::No);
                     }
@@ -1629,17 +1639,17 @@ fn can_use_inner(
             // selector + range = lookDistance), LoS staged.
             if ctx.cfg3(sel, gi) & 1 != 0 && !ctx.flag(MF_MANY_PLAYERS) && ctx.pcount() > 0 {
                 let range = f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32));
-                let cands = ctx.scan_players(false, true, range);
-                if cands.is_empty() {
+                let (cands, n_cands) = ctx.scan_players(false, true, range);
+                if n_cands == 0 {
                     return Ok(Cu::No); // getNearestPlayer -> null
                 }
                 match mode {
                     Mode::Parked => {
-                        park_los(ctx, out, sel, phase, gi, &cands);
+                        park_los(ctx, out, sel, phase, gi, &cands[..n_cands]);
                         return Ok(Cu::Staged);
                     }
                     Mode::Inline(res) => {
-                        let mask = res.los(cands.len());
+                        let mask = res.los(n_cands);
                         apply_los_resolution(ctx, out, sel, gi, mask, mode)?;
                         return Ok(Cu::No);
                     }
@@ -1811,10 +1821,20 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
 
 fn stop_goal(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
     ctx.running[sel][gi] = false;
-    for bit in 0..MAX_GOALS {
-        if ctx.lock[sel][bit] == gi as i32 {
+    // L112: release ONLY the flag bits the goal itself holds. Every lock
+    // entry lock[sel][bit] == gi was written by (a) the rebuild loops —
+    // iterating exactly the running goal's own flag bits, or (b) this
+    // goal's lock_only/lock_only_resolved — the same bit set; so
+    // lock[sel][bit] == gi implies bit in flags(gi) and the flag-bit walk
+    // covers every releasable slot. The old shape scanned all 16 entries
+    // per stop (16 loads + compares, ~3.5 stops per mob-tick).
+    let mut fl = ctx.flags(sel, gi);
+    while fl != 0 {
+        let bit = fl.trailing_zeros() as usize;
+        if bit < MAX_GOALS && ctx.lock[sel][bit] == gi as i32 {
             ctx.lock[sel][bit] = -1;
         }
+        fl &= fl - 1;
     }
     out.push(ACT_GOAL_STOP, ctx.global(sel, gi), 0, 0, 0);
     Ok(())

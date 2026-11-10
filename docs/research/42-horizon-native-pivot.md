@@ -330,3 +330,39 @@ ms/tick): 8.41 -> ~5.3 (-37%); the phase split now ai 4.9-5.0 (the
 floor walk + the one pack), travel 1.72-1.74, grid 0.00, apply ~0.11.
 The next big fish stays the same: the pack (114 words per mob-tick for
 a walk that reads most of it) and the floor's gate walk itself.
+
+### 9.3 L112a — the dead stores die (out-scratch reuse, the alloc-free scans)
+
+The directive stands: -100% on every phase, do until done. Three
+allocation/store sinks left in the steady-state AI loop, all eliminated
+with zero semantic movement:
+
+- **The OUT buffer is caller-owned** (exec.rs `out_scratch`): the old
+  shape zeroed an 808-word stack array (`[0i32; OUT_LEN]` = 3.2KB) PER
+  MOB PER TICK — 25k mobs x 808 words = **20M dead stores per tick**
+  (~80MB of store traffic). The floor writes every slot the caller reads
+  before the read (header words on every exit path, all 8 words of every
+  pushed action; out[7] only under ST_FALLBACK where it is written), so
+  the initialization was pure dead work. One persistent buffer serves
+  the whole loop; the parity fixture now reuses its buffers ACROSS the
+  40-tick chains, which pins the stale-word discipline itself into the
+  contract (a stale read would poison the decisions and the fixture
+  fires).
+- **`scan_players` returns a stack array** `([usize; 32], usize)`: the
+  scans run only under !MF_MANY_PLAYERS (>=31 players parks before the
+  scan), so the bound is structural. The old `Vec<usize>` allocated once
+  per Player-typed goal eval per mob-tick (three gates) — heap
+  round-trips in the "zero steady-state allocation" executor.
+- **`stop_goal` releases by flag bits**: lock[sel][bit] == gi implies
+  bit in flags(gi) (every lock write site iterates the goal's own flag
+  bits — the rebuild loops and lock_only), so the release walks 2-3
+  trailing-zero bits instead of scanning all 16 lock slots per stop.
+  Plus the inline adapter's `started` Vec -> a fixed `[usize; N_GOALS]`
+  (one start per goal per walk — each canUse evaluates once).
+
+**Interleaved A/B** (one window, alternating binaries, 25k x 400):
+p50 5.18 / 5.16 / 5.17 -> **4.64 / 4.63 / 4.61** (**-10.4%**), wall
+2180 -> 1945 ms, chasing **3740 = 3740 = 3740** (bit-identical
+trajectories in all six runs). 86/86 tests green (the 3000-scenario
+inline fixture included). Session cumulative against the L110 baseline:
+8.41 -> 4.63 (**-45%**).

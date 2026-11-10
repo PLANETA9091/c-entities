@@ -206,6 +206,13 @@ fn run_scenario(r: &mut Rng, ticks: i32) -> (u32, u32) {
     };
     let mut total_req_p = 0u32;
     let mut total_req_i = 0u32;
+    // L112: the OUT buffers live across the WHOLE chain — every tick reuses
+    // the previous tick's words, so the stale-word discipline (the floor
+    // writes every slot the executor reads before the read) is itself part
+    // of the pinned contract. A stale read would poison the decisions and
+    // the assert_same check fires.
+    let mut out_p = vec![0i32; g::OUT_MIN_LEN];
+    let mut out_i = vec![0i32; g::OUT_MIN_LEN];
     for t in 0..ticks {
         let game_time = gt0 + t;
         // the executor's per-tick approach refresh (both sides identical)
@@ -220,6 +227,9 @@ fn run_scenario(r: &mut Rng, ticks: i32) -> (u32, u32) {
                 }
             }
         }
+        // the pack scratch stays per-round fresh (it is FULLY overwritten
+        // by pack_into anyway); the OUT buffers are the chain-long reuse
+        // above
         let mut buf_p: Vec<i32> = Vec::new();
         let mut buf_i: Vec<i32> = Vec::new();
         // two INDEPENDENT resolvers with the SAME stroll stream seed (the
@@ -227,8 +237,8 @@ fn run_scenario(r: &mut Rng, ticks: i32) -> (u32, u32) {
         // decision divergence shifts the draws and the state check fires)
         let mut res_p = WorldRes::<OpenGround>::open_ground_v0(&snapshot, 0xABCD_1234);
         let mut res_i = WorldRes::<OpenGround>::open_ground_v0(&snapshot, 0xABCD_1234);
-        let sp = mob_parked.ai_tick_parked(&psnaps, game_time, &mut res_p, &mut buf_p);
-        let si = mob_inline.ai_tick(&psnaps, game_time, &mut res_i, &mut buf_i);
+        let sp = mob_parked.ai_tick_parked(&psnaps, game_time, &mut res_p, &mut buf_p, &mut out_p);
+        let si = mob_inline.ai_tick(&psnaps, game_time, &mut res_i, &mut buf_i, &mut out_i);
         total_req_p += sp.requests;
         total_req_i += si.requests;
         if sp.status != si.status || sp.fallback != si.fallback {
