@@ -102,3 +102,58 @@ at 100k (-6.3%) on identical worlds.
    ~40% — re-profile the pack share before touching it.
 3. The cc fold currently reads approach from the FoldCtx snapshot; a pack word for
    the target index would let the LOS fold also refresh it in-round.
+
+## WAVE7 (this session): the canuse fold + the cc-fold target-clear fix
+
+Directive: «ДАВАЙ ЕЩЁ ЖОЖЩЕ... максимальное количество арифметики». Scope:
+wave7 candidate 1 (the REQ_CANUSE_VANILLA fold) + the stress-twin harness.
+
+**The canuse fold** (`GK_ZOMBIE_ATTACK` in `can_use_inner`): the parked flow
+staged the MeleeAttackGoal.canUse tail (target alive + reach) through a full
+park/resume round every 20 ticks per attacking mob. The WorldRes v0 answer
+(`matches!(ZOMBIE_ATTACK) && target_player >= 0`) is provable from the
+round's own HAS_TARGET gate — the fold resolves IN PLACE: the
+lastCanUseCheck write rides the new ACT_CANUSE_OK action (p1 = game time,
+the exact resume-arm write), then lock_only — the parked flow's apply order
+(state write at resolution, then the resume round's transition) preserved.
+Enabled by `FoldCtx::canuse_fold` — ON for WorldRes (its canuse_vanilla
+contract is exactly `target_player >= 0`), OFF for FlatWorld (its
+canuse_vanilla is `false` — different contract, keeps the park) and OFF in
+the JNI path (FoldCtx::off).
+
+**The stress twin caught a REAL wave6 latent drift.** The 96-mob fixture
+twins passed, but the bench-shaped stress twin (the exact native_bench
+world, parked vs folded per tick, fnv over the whole store) diverged at
+tick 9: mob 18136, folded tgt=0 vs parked tgt=-1. Root cause — NOT the new
+fold: the WAVE6 cc fold's STOP half never carried the parked flow's
+resolver-side target clear (`target_player = -1; scratch[1] = MF_BASE` at
+the REQ_CC_VANILLA resolution for ZOMBIE_ATTACK/NEAREST_TARGET). The wave6
+fixtures never chain a cc-stop with a live out-of-range target; the dense
+bench does constantly. **Fix**: the fold emits ACT_TARGET_CLEAR (the apply
+mirrors the resolver's clear verbatim) and the Ctx carries an `mf_ov`
+override so the SAME-round gates see the cleared MF word exactly as the
+parked flow's re-packed resume round does. The canuse fold's changed round
+schedule is what EXPOSED the drift — the twin now runs the bench shape as
+a standing gate (`stress_twin` example: parked vs folded, 450 ticks,
+bit-identical, chasing 3745 = 3745).
+
+**Numbers** (this box, interleaved A/B, same binary, seed 0xC0FFEE,
+25000×400): folded **3.85** vs parked **4.14** ms/tick p50 (−7.0%; three
+pairs 3.85/4.10, 3.82/4.14, 3.87/4.16). The box drifts ±0.3 across builds
+— the paired same-binary delta is the honest metric. Chasing 3745 in BOTH
+modes (the wave6 shipped 12592 on the doc's box — the scenario/seed drift
+across boxes is documented above).
+
+## Next (wave8 candidates)
+
+1. The REQ_LOS_SCAN park for LOOKAT_PLAYER still stages every even tick in
+   player-rich worlds — the scan's non-LoS half is native; the fold needs
+   the Sensing contract per candidate family.
+2. The pack round words: with wave7 the round rate dropped further —
+   re-profile the pack share before the direct-read protocol work (the
+   «пол читает MobStore напрямую» lever: the executor consuming MobAI
+   directly, the wire shrinking to per-tick diffs).
+3. The travel pass (2.1 ms/tick, the #2 phase): the AoS MobAI record is
+   ~600B — the travel slice touches ~5 scattered words per mob; a hot SoA
+   mirror (pos/delta/on-ground/friction) would stream 2 cachelines per mob
+   instead of chasing the record.
