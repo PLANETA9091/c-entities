@@ -438,3 +438,34 @@ diagnostic probe test arms the flag around its probe.
 **3.88 / 3.88 / 3.88** (**-12.6%** — the biggest single cut of the
 session), chasing 3740 identical in all six runs, tests green.
 Session cumulative: 8.41 -> 3.88 (**-54%**).
+
+### 9.7 L112e — the variant split, and two honest negative results
+
+**The per-component split** (the stub-variant method: one measurement
+binary with the walk replaced by a done-stub, interleaved against the
+full one in the same window — no per-event clocking): the walk + RNG =
+**~1.6 ms/tick**, the pack + adapter + apply + loop overhead =
+**~1.8 ms/tick**. The walk and the wire bridge now cost the same; both
+are L1-bound streams.
+
+**Kept (measured zero, cleaner code)**: the inline adapter's `started`
+list is a u16 bitmask (was a Vec — L112's fixed array — the zero-init
+was 11 stores), and the world resolver is built ONCE per tick (was per
+mob). Interleaved: 3.75/3.76/3.74 vs 3.78/3.79/3.75 — inside noise;
+the L111b precedent applies.
+
+**Reverted (measured NEGATIVE, +2.4% stable across pairs)**:
+1. the can_replace_all free-lock fast path (one AND against a held-bit
+   mask — the mask's maintenance ORs and the extra branch cost more
+   than the skipped flag walks);
+2. the ledger arm states as Ctx fields (the byte-field loads on the
+   hot can_use path measurably worse than the .bss static loads).
+The bisection was binary-by-binary interleaved; both reverted shapes
+measured slow in their own windows. The negative results are recorded
+so the next session does not re-walk them.
+
+Session cumulative (interleaved pairs, L110 baseline 8.41): 8.41 ->
+3.88 -> **3.75-3.85** (**-55%**); phases ai ~3.3 / travel ~1.7 / grid
+0.00 / apply ~0.13. The next honest levers are architectural: the
+wire bridge itself (the floor reading MobStore directly — a protocol
+change, not a math one) and the travel DRAM stream.

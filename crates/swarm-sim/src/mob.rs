@@ -719,12 +719,11 @@ impl MobAI {
                 players,
                 game_time,
                 resolves: 0,
-                // L112: a fixed array — the start bodies run at most once
-                // per goal per walk (each canUse evaluates once), so
-                // N_GOALS slots are structurally sufficient; the old Vec
-                // allocated on every start mid-walk.
-                started: [0usize; N_GOALS],
-                started_n: 0,
+                // L112/L112e: a BITMASK — the start bodies run at most once
+                // per goal per walk (each canUse evaluates once); the old
+                // shape was a Vec (allocated on every start mid-walk), then
+                // an 11-word zero-init array.
+                started_mask: 0u16,
             };
             stat.status = g::ai_floor_inline(&scr.buf, out, &mut ad);
             stat.rounds = 1;
@@ -732,7 +731,7 @@ impl MobAI {
             if stat.status == g::ST_FALLBACK {
                 stat.fallback = out[7];
             }
-            started = (ad.started_n, ad.started);
+            started = ad.started_mask;
         }
         // seed handoff (aiRun: out -> SHARED_RANDOM)
         self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
@@ -740,10 +739,13 @@ impl MobAI {
         // the start bodies ran MID-WALK (before this apply) — their
         // running=true is the last writer, exactly like the parked
         // protocol's resolve-after-apply order (see InlineAdapter.started)
-        for &gi in &started.1[..started.0] {
+        let mut m = started;
+        while m != 0 {
+            let gi = m.trailing_zeros() as usize;
             if gi < N_GOALS {
                 self.goals[gi].running = true;
             }
+            m &= m - 1;
         }
         stat
     }
@@ -980,10 +982,9 @@ struct InlineAdapter<'a, 'b> {
     /// goal earlier in the walk would otherwise clobber the start (the
     /// expired-RandomLookAround-restart flow the fixture caught). The
     /// tick-end apply re-asserts these after apply_actions.
-    /// L112: fixed storage — one start per goal per walk (each canUse
-    /// evaluates once), N_GOALS slots are structurally exact.
-    started: [usize; N_GOALS],
-    started_n: usize,
+    /// L112e: a u16 bitmask (bit gi set = goal gi's start body ran
+    /// mid-walk) — one start per goal per walk, zero-init is one store.
+    started_mask: u16,
 }
 
 impl<'a, 'b> InlineAdapter<'a, 'b> {
@@ -1068,9 +1069,8 @@ impl<'a, 'b> g::InlineRes for InlineAdapter<'a, 'b> {
         self.mob.seed = *shared_seed;
         self.r.start_vanilla(self.mob, gi);
         *shared_seed = self.mob.seed;
-        if self.started_n < N_GOALS {
-            self.started[self.started_n] = gi;
-            self.started_n += 1;
+        if gi < 16 {
+            self.started_mask |= 1u16 << gi;
         }
     }
 

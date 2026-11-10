@@ -159,13 +159,16 @@ impl NativeTick {
         let scratch = &mut self.ai_scratch;
         let out_scratch = &mut self.out_scratch;
         let mth = &self.mth;
+        // L112e: the resolver is built ONCE per tick (the old shape
+        // re-constructed it per mob — ~6 dead stores per mob-tick); only
+        // the splitmix stream handoff rides the loop.
+        let mut res = WorldRes::open_ground_v0(snapshot, 0);
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
                 continue;
             }
             let stat = {
                 let _g = ai_guard();
-                let mut res = WorldRes::open_ground_v0(snapshot, 0);
                 res.target_rng = self.target_rng;
                 let st = slot.mob.ai_tick(&players, game_time, &mut res, scratch, out_scratch);
                 self.target_rng = res.target_rng;
