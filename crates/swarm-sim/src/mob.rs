@@ -1676,6 +1676,32 @@ impl MobAI {
                 zza = 0.98;
             }
         }
+        // WAVE12b: the STANDING FIXED POINT. When no movement branch fired
+        // (zza == 0.0) and the delta is exactly zero (dx == dz == 0.0), the
+        // whole travel chain below is provably degenerate:
+        //   get_input_vector(0,0,0.0) — lengthSqr 0 < 1e-7 → (0,0,0), no
+        //   LUT, no RNG; mx = mz = 0.0; move_sets_position((0, dy, 0)):
+        //   movement_length 0 > 1e-7 false, delta_length − 0 = dy² — and dy
+        //   is ALWAYS the previous tick's tail OG_GRAV_TAIL = −0.0784
+        //   (dy² ≈ 6.1e-3 ≫ 1e-7 → the predicate is FALSE, no setPos; on a
+        //   fresh mob's first tick dy = 0.0 → the predicate fires, but the
+        //   writes it guards are x += 0.0 / z += 0.0 — bitwise idempotent
+        //   for every x ≠ −0.0, and x = −0.0 is unreachable: the only
+        //   writers are x += mx with mx ≠ −0.0 (the zero-input returns
+        //   +0.0) and RN addition never produces −0.0 from (a) + (+0.0));
+        //   the drag tail dx = 0.0·OG_HF = +0.0, dz likewise — idempotent
+        //   (dx/dz can never be −0.0: their only writers are products with
+        //   the positive constants and additions of the +0.0 zero-input).
+        // The ONLY live state change is dy = OG_GRAV_TAIL — one store.
+        // The prepost/fused/split/strait dump twins hash dx/dy/dz/x/z bits
+        // every tick and pin the identity; CE-side move_tick is shared by
+        // every arm. (The tiny-nonzero-dx mobs — the multiplicative decay
+        // never reaches exact 0.0 — take the full chain: their dx decay IS
+        // observable state.)
+        if zza == 0.0 && self.dx == 0.0 && self.dz == 0.0 {
+            self.dy = OG_GRAV_TAIL;
+            return;
+        }
         // WAVE6: the friction/drag chain is CONSTANT for every mob every
         // tick under the open-ground contract (block friction 0.6, friction
         // and air-drag modifiers 1.0, speed 0.23, gravity 0.08) — folded
