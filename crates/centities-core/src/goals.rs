@@ -463,7 +463,15 @@ struct Ctx<'a> {
     disabled: [i64; 2],
     lcg: Lcg,
     lock: [[i32; MAX_GOALS]; 2], // flag bit -> goal idx, -1 = free
-    running: [[bool; MAX_GOALS]; 2],
+    /// L112b: the running set as a BITMASK per selector (bit i = goal i
+    /// running). The old [[bool; 16]; 2] array cost a 22-slot init pass
+    /// (22 wire loads + 22 stack stores) and 11 test-and-branch goal
+    /// probes per phase to discover the empty/empty and full/full shapes;
+    /// the mask folds the init into register ORs and turns the phase
+    /// skip-decision into ONE compare. Bits >= count are never set (the
+    /// init walks 0..count, lock_only starts goals below count) and never
+    /// read (every reader bounds by count or the walk's gi).
+    run_mask: [u32; 2],
     /// the LIVE mob-flags shadow (L111g): the parked protocol's repack
     /// between rounds picks up the executor's apply mutations (a failed
     /// canContinueToUse drops the target -> MF_HAS_TARGET clears; a
@@ -711,6 +719,13 @@ enum Cu {
     StartStaged,
     /// the canUse body itself needs the vanilla call (side effects / queries)
     Staged,
+}
+
+/// L112b: the low `count` bits of the running mask (count <= MAX_GOALS =
+/// 16 is proven by the entry overflow check, so the shift is exact).
+#[inline]
+fn run_low(count: usize) -> u32 {
+    (1u32 << count) - 1
 }
 
 // ---------------------------------------------------------------------------
@@ -965,13 +980,15 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
             draws: 0,
         },
         lock: [[-1; MAX_GOALS]; 2],
-        running: [[false; MAX_GOALS]; 2],
+        run_mask: [0, 0],
         mf_live: in_buf[1],
         na_live: in_buf[4],
     };
     for sel in 0..2usize {
         for i in 0..ctx.counts[sel] {
-            ctx.running[sel][i] = ctx.is_running(sel, i);
+            if ctx.is_running(sel, i) {
+                ctx.run_mask[sel] |= 1 << i;
+            }
         }
     }
 
@@ -1014,7 +1031,7 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
             ctx.lock[sel][bit] = -1;
         }
         for i in 0..count {
-            if ctx.running[sel][i] {
+            if ctx.run_mask[sel] >> i & 1 != 0 {
                 let mut fl = ctx.flags(sel, i);
                 while fl != 0 {
                     let bit = fl.trailing_zeros() as usize;
@@ -1068,8 +1085,12 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
         let count = ctx.counts[sel];
         match phase {
             PH_CLEANUP => {
-                while gi < count {
-                    if ctx.running[sel][gi] {
+                // L112b: the empty-set skip — nothing running means nothing
+                // to clean; the old loop test-and-branched every goal to
+                // learn that. One masked compare replaces the probes.
+                if ctx.run_mask[sel] & run_low(count) != 0 {
+                    while gi < count {
+                        if ctx.run_mask[sel] >> gi & 1 != 0 {
                         if ctx.flags(sel, gi) & ctx.disabled[sel] != 0 {
                             if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
@@ -1107,8 +1128,9 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
                                 return fallback(&mut out, FB_STATE_MISMATCH);
                             }
                         }
-                    }
+                        }
                     gi += 1;
+                }
                 }
                 phase = PH_LOCK_REBUILD;
                 gi = 0;
@@ -1117,8 +1139,14 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
                 for bit in 0..MAX_GOALS {
                     ctx.lock[sel][bit] = -1;
                 }
-                for i in 0..count {
-                    if ctx.running[sel][i] {
+                // L112b: iterate ONLY the running goals (ascending order —
+                // trailing_zeros walks the set bits lowest-first, the same
+                // order the 0..count probe loop produced). An idle mob
+                // contributes zero iterations instead of count.
+                let mut m = ctx.run_mask[sel] & run_low(count);
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    {
                         let mut fl = ctx.flags(sel, i);
                         while fl != 0 {
                             let bit = fl.trailing_zeros() as usize;
@@ -1131,13 +1159,18 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
                             fl &= fl - 1;
                         }
                     }
+                    m &= m - 1;
                 }
                 phase = PH_UPDATE;
                 gi = 0;
             }
             PH_UPDATE => {
+                // L112b: the full-set skip — every goal running means no
+                // canUse candidate exists; one masked compare replaces the
+                // per-goal probes.
+                if ctx.run_mask[sel] & run_low(count) != run_low(count) {
                 while gi < count {
-                    if !ctx.running[sel][gi] {
+                    if ctx.run_mask[sel] >> gi & 1 == 0 {
                         let fl = ctx.flags(sel, gi);
                         if fl & ctx.disabled[sel] == 0 && can_replace_all(&ctx, sel, gi) {
                             match can_use(&mut ctx, &mut out, sel, gi, phase, &mut mode) {
@@ -1150,6 +1183,7 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
                         }
                     }
                     gi += 1;
+                }
                 }
                 // L82 (the parity fix): the EVEN branch of 26.3
                 // serverAiStep (javap bc 148-191) calls ONLY
@@ -1194,7 +1228,7 @@ fn run_mode(in_buf: &[i32], out_buf: &mut [i32], mut mode: Mode<'_>) -> i32 {
                 // goals with requiresUpdateEveryTick() (LOOKAROUND in the
                 // classified set) tick.
                 while gi < count {
-                    if ctx.running[sel][gi] && every_tick(ctx.kind(sel, gi)) {
+                    if ctx.run_mask[sel] >> gi & 1 != 0 && every_tick(ctx.kind(sel, gi)) {
                         if !tick_ported(&mut ctx, &mut out, sel, gi) {
                             out.push(ACT_GOAL_TICK_V, ctx.global(sel, gi), 0, 0, 0);
                         }
@@ -1764,10 +1798,10 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
         let cur = ctx.lock[sel][bit];
         if cur != -1 {
             let c = cur as usize;
-            if ctx.running[sel][c] {
+            if ctx.run_mask[sel] >> c & 1 != 0 {
                 // first stop on this holder this walk — the vanilla
                 // isRunning-guarded body (goal.stop() + isRunning=false)
-                ctx.running[sel][c] = false;
+                ctx.run_mask[sel] &= !(1u32 << c);
                 out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
             }
             // a !isRunning holder: vanilla stop() is a no-op — the record
@@ -1776,7 +1810,7 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
         ctx.lock[sel][bit] = gi as i32;
         fl &= fl - 1;
     }
-    ctx.running[sel][gi] = true;
+    ctx.run_mask[sel] |= 1u32 << gi;
     out.push(ACT_GOAL_START, ctx.global(sel, gi), 0, 0, 0);
     // the apply of ACT_GOAL_START resets noActionTime — the parked
     // protocol's repack makes it visible to the SAME tick's later rounds
@@ -1806,21 +1840,21 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
         let cur = ctx.lock[sel][bit];
         if cur != -1 {
             let c = cur as usize;
-            if ctx.running[sel][c] {
-                ctx.running[sel][c] = false;
+            if ctx.run_mask[sel] >> c & 1 != 0 {
+                ctx.run_mask[sel] &= !(1u32 << c);
                 out.push(ACT_GOAL_STOP_D, ctx.global(sel, c), 0, 0, 0);
             }
         }
         ctx.lock[sel][bit] = gi as i32;
         fl &= fl - 1;
     }
-    ctx.running[sel][gi] = true;
+    ctx.run_mask[sel] |= 1u32 << gi;
     out.push(ACT_GOAL_LOCK_MAP, ctx.global(sel, gi), 0, 0, 0);
     Ok(())
 }
 
 fn stop_goal(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
-    ctx.running[sel][gi] = false;
+    ctx.run_mask[sel] &= !(1u32 << gi);
     // L112: release ONLY the flag bits the goal itself holds. Every lock
     // entry lock[sel][bit] == gi was written by (a) the rebuild loops —
     // iterating exactly the running goal's own flag bits, or (b) this

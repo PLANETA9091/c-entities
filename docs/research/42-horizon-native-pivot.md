@@ -366,3 +366,28 @@ p50 5.18 / 5.16 / 5.17 -> **4.64 / 4.63 / 4.61** (**-10.4%**), wall
 trajectories in all six runs). 86/86 tests green (the 3000-scenario
 inline fixture included). Session cumulative against the L110 baseline:
 8.41 -> 4.63 (**-45%**).
+
+### 9.4 L112b — the running mask (the walk's set algebra)
+
+The goal-selector walk kept the running set as `[[bool; 16]; 2]`: a
+22-slot init pass (22 wire loads + 22 stack stores) per mob-tick and
+11 test-and-branch goal probes per phase to discover the shapes. The
+set is a bitmask now (`run_mask: [u32; 2]`):
+
+- the init folds into register ORs (the wire loads remain — the pack
+  wrote them);
+- PH_CLEANUP skips entirely when `mask & run_low(count) == 0` (the idle
+  mob shape — 11 probes -> ONE compare);
+- PH_UPDATE skips when `mask & run_low(count) == run_low(count)` (the
+  fully-locked shape — no canUse candidate can exist);
+- PH_LOCK_REBUILD iterates ONLY the running goals via
+  trailing_zeros (ascending order preserved — the lock-collide detection
+  order is the walk order);
+- the stop/start bookkeeping flips single bits.
+
+Bits >= count are never set (init walks 0..count, starts happen below
+count) and never read (every reader bounds by count or the walk's gi).
+
+**Interleaved A/B** (one window): p50 4.70 / 4.67 / 4.75 ->
+**4.56 / 4.60 / 4.54** (**-3.1%**), chasing 3740 identical in all six
+runs, 86/86 tests green. Session cumulative: 8.41 -> 4.57 (**-45.7%**).
