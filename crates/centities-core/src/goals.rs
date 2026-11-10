@@ -646,6 +646,238 @@ fn positive_ceil_div(a: i32, b: i32) -> i32 {
 // the engine
 // ---------------------------------------------------------------------------
 
+/// WAVE9b — THE WIRE-LAYOUT MERGE: the engine's source view. Two
+/// implementations:
+/// - `WireSrc` — the packed aiPack words (the JNI production path, the
+///   fixtures, the parity suite): every read is the historical wire load,
+///   byte-for-byte the pre-merge behavior;
+/// - the RESIDENT source (swarm-sim's `ResSrc` over the live MobAI) — the
+///   native executor reads the fields DIRECTLY and the per-mob-tick pack
+///   (head + static + tick halves + the round words) and the apply-side
+///   packed-word mirrors disappear from the hot path entirely.
+///
+/// The engine (ai_floor_run and everything below it) is generic over this
+/// trait and monomorphizes per source — no vtable in the walk. Bit-parity
+/// contract: every accessor must return THE SAME BITS the wire word
+/// carries (including the historical sign-extension quirks — see the
+/// seed note in swarm-sim's impl). The resident-vs-full executor twin
+/// (exec.rs) proves the contract over 400 ticks every CI run.
+pub trait Src {
+    // -- header --
+    /// in_buf[0]: the resume cursor (0 = fresh tick)
+    fn cursor(&self) -> i32;
+    /// in_buf[1]: the MF_* word
+    fn mf_word(&self) -> i32;
+    fn tick_count(&self) -> i32;
+    fn mob_id(&self) -> i32;
+    fn no_action(&self) -> i32;
+    fn nav_state(&self) -> i32;
+    /// in[22]: lastHurtByMobTimestamp
+    fn mob_ts(&self) -> i32;
+    /// in[23]: the level game time
+    fn game_time(&self) -> i32;
+    /// the LCG seed mirror (IN_SEED_LO/HI on the wire)
+    fn seed(&self) -> u64;
+    /// IN_FOLLOW: the follow-range f32 bit pattern
+    fn follow_bits(&self) -> i32;
+    /// in[5] / in[6]: the selector record counts
+    fn count(&self, sel: usize) -> usize;
+    /// in[7..10]: the disabled-flags pair (the resident executor runs
+    /// with nothing disabled — the executor contract)
+    fn disabled(&self, sel: usize) -> i64;
+    // -- goal records (sel = selector, i = local index) --
+    fn kind(&self, sel: usize, i: usize) -> i32;
+    fn prio(&self, sel: usize, i: usize) -> i32;
+    fn flags(&self, sel: usize, i: usize) -> i64;
+    fn cfg(&self, sel: usize, i: usize) -> i32;
+    fn cfg2(&self, sel: usize, i: usize) -> i32;
+    fn cfg3(&self, sel: usize, i: usize) -> i32;
+    fn g_running(&self, sel: usize, i: usize) -> bool;
+    /// the state word: rec.state for the stateful kinds, the DERIVED
+    /// LOOKAT word for LookAtPlayer, 0 for the cfg-only kinds (the pack
+    /// formula — the resident impl replicates it per read)
+    fn state(&self, sel: usize, i: usize) -> i32;
+    // -- players --
+    fn pcount(&self) -> usize;
+    fn pcoords(&self, i: usize) -> (f64, f64, f64);
+    fn pflags(&self, i: usize) -> i32;
+    fn pvis(&self, i: usize) -> f64;
+    // -- mob --
+    /// (x, y, z, eyeY)
+    fn mob_pos(&self) -> (f64, f64, f64, f64);
+    // -- resume words --
+    /// IN_RES: the predicate answer (0/1) or the LOS bitmask
+    fn res(&self) -> i32;
+    /// IN_RES_OP: the parked request opcode
+    fn res_op(&self) -> i32;
+}
+
+/// The WIRE source: the packed aiPack words. The layout math here is the
+/// historical engine layout (IN_HEADER + GOAL_STRIDE records + PSTRIDE
+/// players), byte-for-byte the pre-merge behavior.
+pub struct WireSrc<'a> {
+    inb: &'a [i32],
+    counts: [usize; 2],
+}
+
+impl<'a> WireSrc<'a> {
+    /// Builds the wire source over a validated pack: the caller (the
+    /// ai_floor entries) owns the buffer-size and count guards.
+    #[inline]
+    pub fn new(inb: &'a [i32]) -> Self {
+        let nt = inb[5].max(0) as usize;
+        let ng = inb[6].max(0) as usize;
+        WireSrc {
+            inb,
+            counts: [nt, ng],
+        }
+    }
+    #[inline]
+    fn off(&self, sel: usize, i: usize) -> usize {
+        IN_HEADER + (self.offset_of(sel) + i) * GOAL_STRIDE
+    }
+    #[inline]
+    fn offset_of(&self, sel: usize) -> usize {
+        if sel == SEL_TARGET {
+            0
+        } else {
+            self.counts[SEL_TARGET]
+        }
+    }
+    #[inline]
+    fn player_base(&self) -> usize {
+        IN_HEADER + (self.counts[0] + self.counts[1]) * GOAL_STRIDE
+    }
+    #[inline]
+    fn pf64(&self, b: usize) -> f64 {
+        f64::from_bits(((self.inb[b + 1] as u64) << 32) | (self.inb[b] as u64 & 0xFFFF_FFFF))
+    }
+}
+
+impl Src for WireSrc<'_> {
+    #[inline]
+    fn cursor(&self) -> i32 {
+        self.inb[0]
+    }
+    #[inline]
+    fn mf_word(&self) -> i32 {
+        self.inb[1]
+    }
+    #[inline]
+    fn tick_count(&self) -> i32 {
+        self.inb[2]
+    }
+    #[inline]
+    fn mob_id(&self) -> i32 {
+        self.inb[3]
+    }
+    #[inline]
+    fn no_action(&self) -> i32 {
+        self.inb[4]
+    }
+    #[inline]
+    fn nav_state(&self) -> i32 {
+        self.inb[11]
+    }
+    #[inline]
+    fn mob_ts(&self) -> i32 {
+        self.inb[22]
+    }
+    #[inline]
+    fn game_time(&self) -> i32 {
+        self.inb[23]
+    }
+    #[inline]
+    fn seed(&self) -> u64 {
+        // the ai_floor_run LCG-init formula, bit-for-bit (zero-extended
+        // low word — NOT the sign-extended shape of the retired Ctx::seed)
+        ((self.inb[IN_SEED_HI] as u64) << 32) | (self.inb[IN_SEED_LO] as u64 & 0xFFFF_FFFF)
+    }
+    #[inline]
+    fn follow_bits(&self) -> i32 {
+        self.inb[IN_FOLLOW]
+    }
+    #[inline]
+    fn count(&self, sel: usize) -> usize {
+        self.counts[sel]
+    }
+    #[inline]
+    fn disabled(&self, sel: usize) -> i64 {
+        let b = 7 + sel * 2;
+        (self.inb[b] as i64) | ((self.inb[b + 1] as i64) << 32)
+    }
+    #[inline]
+    fn kind(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i)]
+    }
+    #[inline]
+    fn prio(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 1]
+    }
+    #[inline]
+    fn flags(&self, sel: usize, i: usize) -> i64 {
+        self.inb[self.off(sel, i) + 2] as i64
+    }
+    #[inline]
+    fn cfg(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 3]
+    }
+    #[inline]
+    fn cfg2(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 6]
+    }
+    #[inline]
+    fn cfg3(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 7]
+    }
+    #[inline]
+    fn g_running(&self, sel: usize, i: usize) -> bool {
+        self.inb[self.off(sel, i) + 4] != 0
+    }
+    #[inline]
+    fn state(&self, sel: usize, i: usize) -> i32 {
+        self.inb[self.off(sel, i) + 5]
+    }
+    #[inline]
+    fn pcount(&self) -> usize {
+        self.inb[IN_PCOUNT] as usize
+    }
+    #[inline]
+    fn pcoords(&self, i: usize) -> (f64, f64, f64) {
+        let b = self.player_base() + i * PSTRIDE;
+        (
+            self.pf64(b + PX_LO),
+            self.pf64(b + PY_LO),
+            self.pf64(b + PZ_LO),
+        )
+    }
+    #[inline]
+    fn pflags(&self, i: usize) -> i32 {
+        self.inb[self.player_base() + i * PSTRIDE + PFLAGS]
+    }
+    #[inline]
+    fn pvis(&self, i: usize) -> f64 {
+        self.pf64(self.player_base() + i * PSTRIDE + PVIS_LO)
+    }
+    #[inline]
+    fn mob_pos(&self) -> (f64, f64, f64, f64) {
+        (
+            self.pf64(IN_MOBX),
+            self.pf64(IN_MOBY),
+            self.pf64(IN_MOBZ),
+            self.pf64(IN_EYEY),
+        )
+    }
+    #[inline]
+    fn res(&self) -> i32 {
+        self.inb[IN_RES]
+    }
+    #[inline]
+    fn res_op(&self) -> i32 {
+        self.inb[IN_RES_OP]
+    }
+}
+
 struct Out<'a> {
     buf: &'a mut [i32],
     n_act: usize,
@@ -686,9 +918,11 @@ impl<'a> Out<'a> {
     }
 }
 
-struct Ctx<'a> {
-    inb: &'a [i32],
-    base: usize,        // goal record base
+struct Ctx<'a, W: Src> {
+    /// WAVE9b: the engine's source view (the wire words or the resident
+    /// MobAI) — every read below delegates to the trait, monomorphized per
+    /// source (no vtable in the walk).
+    src: &'a W,
     counts: [usize; 2], // [SEL_TARGET, SEL_GOAL]
     disabled: [i64; 2],
     lcg: Lcg,
@@ -707,11 +941,7 @@ struct Ctx<'a> {
     mf_ov: Option<i32>,
 }
 
-impl<'a> Ctx<'a> {
-    #[inline]
-    fn off(&self, sel: usize, i: usize) -> usize {
-        self.base + (self.offset_of(sel) + i) * GOAL_STRIDE
-    }
+impl<'a, W: Src> Ctx<'a, W> {
     #[inline]
     fn offset_of(&self, sel: usize) -> usize {
         if sel == SEL_TARGET {
@@ -728,35 +958,35 @@ impl<'a> Ctx<'a> {
     }
     #[inline]
     fn kind(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i)]
+        self.src.kind(sel, i)
     }
     #[inline]
     fn prio(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i) + 1]
+        self.src.prio(sel, i)
     }
     #[inline]
     fn flags(&self, sel: usize, i: usize) -> i64 {
-        self.inb[self.off(sel, i) + 2] as i64
+        self.src.flags(sel, i)
     }
     #[inline]
     fn cfg(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i) + 3]
+        self.src.cfg(sel, i)
     }
     #[inline]
     fn cfg2(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i) + 6]
+        self.src.cfg2(sel, i)
     }
     #[inline]
     fn cfg3(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i) + 7]
+        self.src.cfg3(sel, i)
     }
     #[inline]
     fn is_running(&self, sel: usize, i: usize) -> bool {
-        self.inb[self.off(sel, i) + 4] != 0
+        self.src.g_running(sel, i)
     }
     #[inline]
     fn state(&self, sel: usize, i: usize) -> i32 {
-        self.inb[self.off(sel, i) + 5]
+        self.src.state(sel, i)
     }
     #[inline]
     fn flag(&self, bit: i32) -> bool {
@@ -765,61 +995,59 @@ impl<'a> Ctx<'a> {
         // is the packed load)
         match self.mf_ov {
             Some(w) => w & bit != 0,
-            None => self.inb[1] & bit != 0,
+            None => self.src.mf_word() & bit != 0,
         }
+    }
+    // ---- header accessors (the engine bodies' direct wire reads) ----
+    #[inline]
+    fn tick_count(&self) -> i32 {
+        self.src.tick_count()
+    }
+    #[inline]
+    fn nav_state(&self) -> i32 {
+        self.src.nav_state()
+    }
+    #[inline]
+    fn game_time(&self) -> i32 {
+        self.src.game_time()
+    }
+    #[inline]
+    fn mob_ts(&self) -> i32 {
+        self.src.mob_ts()
+    }
+    #[inline]
+    fn no_action(&self) -> i32 {
+        self.src.no_action()
+    }
+    /// IN_FOLLOW as f64 (the range both target/lookat scans consume)
+    #[inline]
+    fn follow_range(&self) -> f64 {
+        f64::from(f32::from_bits(self.src.follow_bits() as u32))
     }
     // ---- player snapshot accessors (v3 native scans) ----
     #[inline]
     fn pcount(&self) -> usize {
-        self.inb[IN_PCOUNT] as usize
-    }
-    #[inline]
-    fn player_base(&self) -> usize {
-        self.base + (self.counts[0] + self.counts[1]) * GOAL_STRIDE
+        self.src.pcount()
     }
     #[inline]
     fn pcoords(&self, i: usize) -> (f64, f64, f64) {
-        let b = self.player_base() + i * PSTRIDE;
-        (
-            f64::from_bits(
-                ((self.inb[b + PX_LO + 1] as u64) << 32)
-                    | (self.inb[b + PX_LO] as u64 & 0xFFFF_FFFF),
-            ),
-            f64::from_bits(
-                ((self.inb[b + PY_LO + 1] as u64) << 32)
-                    | (self.inb[b + PY_LO] as u64 & 0xFFFF_FFFF),
-            ),
-            f64::from_bits(
-                ((self.inb[b + PZ_LO + 1] as u64) << 32)
-                    | (self.inb[b + PZ_LO] as u64 & 0xFFFF_FFFF),
-            ),
-        )
+        self.src.pcoords(i)
     }
     #[inline]
     fn pflags(&self, i: usize) -> i32 {
-        self.inb[self.player_base() + i * PSTRIDE + PFLAGS]
+        self.src.pflags(i)
     }
     #[inline]
     fn pvis(&self, i: usize) -> f64 {
-        let b = self.player_base() + i * PSTRIDE + PVIS_LO;
-        f64::from_bits(((self.inb[b + 1] as u64) << 32) | (self.inb[b] as u64 & 0xFFFF_FFFF))
+        self.src.pvis(i)
     }
     #[inline]
     fn mob_pos(&self) -> (f64, f64, f64, f64) {
-        (
-            f64::from_bits(
-                ((self.inb[IN_MOBX + 1] as u64) << 32) | (self.inb[IN_MOBX] as u64 & 0xFFFF_FFFF),
-            ),
-            f64::from_bits(
-                ((self.inb[IN_MOBY + 1] as u64) << 32) | (self.inb[IN_MOBY] as u64 & 0xFFFF_FFFF),
-            ),
-            f64::from_bits(
-                ((self.inb[IN_MOBZ + 1] as u64) << 32) | (self.inb[IN_MOBZ] as u64 & 0xFFFF_FFFF),
-            ),
-            f64::from_bits(
-                ((self.inb[IN_EYEY + 1] as u64) << 32) | (self.inb[IN_EYEY] as u64 & 0xFFFF_FFFF),
-            ),
-        )
+        self.src.mob_pos()
+    }
+    #[inline]
+    fn seed(&self) -> i64 {
+        self.src.seed() as i64
     }
 
     /// The native non-LoS half of TargetingConditions.test over the packed
@@ -933,9 +1161,6 @@ impl<'a> Ctx<'a> {
             }
         }
         best
-    }
-    fn seed(&self) -> i64 {
-        ((self.inb[IN_SEED_HI] as i64) << 32) | (self.inb[IN_SEED_LO] as i64 as u64) as i64
     }
 
     /// WAVE6 fold helper: the v0 find_target conditions over the packed
@@ -1141,18 +1366,8 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
 /// resolutions. The advanced external stream (stroll fold) rides the ext
 /// tail words [OUT_EXT_LO, OUT_EXT_LO+1] when stroll_drew is set.
 pub fn ai_floor_ext(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
-    let st = ai_floor_run(in_buf, out_buf, fold);
-    if fold.stroll_drew && out_buf.len() >= OUT_EXT_LO + 2 {
-        out_buf[OUT_EXT_LO] = fold.stroll_seed as i32;
-        out_buf[OUT_EXT_LO + 1] = (fold.stroll_seed >> 32) as i32;
-    }
-    if ML_ON.load(Ordering::Relaxed) {
-        ml_record(in_buf, out_buf, st);
-    }
-    st
-}
-
-fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    // the WIRE guards (the resident entry validates at its constructor
+    // instead — no buffers to size-check)
     if in_buf.len() < IN_HEADER || out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
@@ -1173,17 +1388,51 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
         out_buf[7] = FB_GOAL_OVERFLOW;
         return ST_FALLBACK;
     }
+    let src = WireSrc::new(in_buf);
+    let st = ai_floor_run(&src, out_buf, fold);
+    finish_ext(st, out_buf, fold, Some(in_buf))
+}
+
+/// WAVE9b: the RESIDENT entry — the engine reads the live MobAI fields
+/// through the `Src` impl (the wire-layout merge). Same contract as
+/// ai_floor_ext minus the wire guards; the mob ledger (the wire-side
+/// diagnostic) does not ride this entry.
+pub fn ai_floor_res<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    if out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
+        out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_BUF_TOO_SMALL;
+        return ST_FALLBACK;
+    }
+    let st = ai_floor_run(src, out_buf, fold);
+    finish_ext(st, out_buf, fold, None)
+}
+
+/// The shared exit tail: the stroll-fold ext handoff + the (wire-only)
+/// mob ledger record.
+fn finish_ext(st: i32, out_buf: &mut [i32], fold: &mut FoldCtx, in_buf: Option<&[i32]>) -> i32 {
+    if fold.stroll_drew && out_buf.len() >= OUT_EXT_LO + 2 {
+        out_buf[OUT_EXT_LO] = fold.stroll_seed as i32;
+        out_buf[OUT_EXT_LO + 1] = (fold.stroll_seed >> 32) as i32;
+    }
+    if let (true, Some(inb)) = (ML_ON.load(Ordering::Relaxed), in_buf) {
+        ml_record(inb, out_buf, st);
+    }
+    st
+}
+
+fn ai_floor_run<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    if out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
+        out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_BUF_TOO_SMALL;
+        return ST_FALLBACK;
+    }
 
     let mut ctx = Ctx {
-        inb: in_buf,
-        base: IN_HEADER,
-        counts: [nt, ng],
-        disabled: [
-            (in_buf[7] as i64) | ((in_buf[8] as i64) << 32),
-            (in_buf[9] as i64) | ((in_buf[10] as i64) << 32),
-        ],
+        src,
+        counts: [src.count(0), src.count(1)],
+        disabled: [src.disabled(0), src.disabled(1)],
         lcg: Lcg {
-            value: ((in_buf[IN_SEED_HI] as u64) << 32) | (in_buf[IN_SEED_LO] as u64 & 0xFFFF_FFFF),
+            value: src.seed(),
             draws: 0,
         },
         lock: [[-1; MAX_LOCK_FLAGS]; 2],
@@ -1213,11 +1462,12 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
     // parity: vanilla serverAiStep —
     //   odd  (tickCount+id)%2 != 0 && tickCount > 1: tickRunningGoals(false) only
     //   even (otherwise):                            full tick()
-    let odd_branch = ((ctx.inb[2].wrapping_add(ctx.inb[3])) & 1 != 0) && ctx.inb[2] > 1;
+    let odd_branch =
+        ((src.tick_count().wrapping_add(src.mob_id())) & 1 != 0) && src.tick_count() > 1;
 
-    let resume = in_buf[0] != 0;
+    let resume = src.cursor() != 0;
     let (mut sel, mut phase, mut gi) = if resume {
-        let c = in_buf[0];
+        let c = src.cursor();
         (((c >> 9) & 1) as usize, (c >> 6) & 7, (c & 63) as usize)
     } else {
         (SEL_TARGET, PH_CLEANUP, 0)
@@ -1256,8 +1506,8 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
                 }
             }
         }
-        let res = in_buf[IN_RES] != 0;
-        match in_buf[IN_RES_OP] {
+        let res = src.res() != 0;
+        match src.res_op() {
             REQ_CC_VANILLA => {
                 if !res && stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
                     return fallback(&mut out, FB_STATE_MISMATCH);
@@ -1283,7 +1533,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
                 // eyeY, mz)) runs here; a winner gets its reference written
                 // (goal.lookAt / goal.target) BEFORE the lock transition —
                 // the vanilla start() bodies read those fields.
-                let res_mask = in_buf[IN_RES];
+                let res_mask = src.res();
                 if los_apply(&mut ctx, &mut out, sel, gi, res_mask).is_err() {
                     return fallback(&mut out, FB_STATE_MISMATCH);
                 }
@@ -1461,7 +1711,7 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
     }
 }
 
-fn done(ctx: &mut Ctx, out: &mut Out) -> i32 {
+fn done<W: Src>(ctx: &mut Ctx<W>, out: &mut Out) -> i32 {
     // the engine's ported control decisions ride the actions; the executor's
     // Java tail (nav tick++, look idle rotate, jump reset) finishes the rest.
     ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
@@ -1482,7 +1732,7 @@ fn fallback(out: &mut Out, reason: i32) -> i32 {
     ST_FALLBACK
 }
 
-fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
+fn park<W: Src>(ctx: &Ctx<W>, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -> i32 {
     ML_DRAW_SWAPS.fetch_add(ctx.lcg.draws as u32, Ordering::Relaxed);
     out.buf[0] = ST_REQUEST;
     out.buf[1] = req;
@@ -1497,7 +1747,7 @@ fn park(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, req: i32) -
 /// REQ_LOS_SCAN park: the native non-LoS filter passed `cands` (snapshot
 /// indices, vanilla list order) — Java raycasts each through the Sensing
 /// cache and resumes with res = a bitmask over the same indices.
-fn park_los(ctx: &Ctx, out: &mut Out, sel: usize, phase: i32, gi: usize, cands: &[usize]) -> i32 {
+fn park_los<W: Src>(ctx: &Ctx<W>, out: &mut Out, sel: usize, phase: i32, gi: usize, cands: &[usize]) -> i32 {
     let st = park(ctx, out, sel, phase, gi, REQ_LOS_SCAN);
     if ctx.fold.ext_cands {
         // WAVE6 FIX: the native exchange rides the EXT tail — the legacy
@@ -1539,11 +1789,11 @@ fn every_tick(kind: i32) -> bool {
 }
 
 /// the ported canContinueToUse bodies
-fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
+fn cc_ported<W: Src>(ctx: &Ctx<W>, sel: usize, gi: usize) -> bool {
     match ctx.kind(sel, gi) {
         GK_STROLL => {
             // !nav.isDone() && !hasControllingPassenger()
-            ctx.inb[11] == NAV_PATH_ACTIVE && ctx.flag(MF_NO_PASSENGERS)
+            ctx.nav_state() == NAV_PATH_ACTIVE && ctx.flag(MF_NO_PASSENGERS)
         }
         GK_LOOKAROUND => ctx.state(sel, gi) >= 0,
         GK_LOOKAT_PLAYER => {
@@ -1558,7 +1808,7 @@ fn cc_ported(ctx: &Ctx, sel: usize, gi: usize) -> bool {
 /// L89: the ledgered canUse entry — one relaxed atomic add per eval, only
 /// while the dump window holds (GL_ON); the wrapper is transparent
 /// otherwise.
-fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
+fn can_use<W: Src>(ctx: &mut Ctx<W>, out: &mut Out, sel: usize, gi: usize, phase: i32) -> Result<Cu, ()> {
     // the eval-mask stamp (see ML_EVAL_SWAPS). WAVE4: GATED by ML_ON —
     // the unconditional fetch_or paid a locked RMW on ONE cacheline for
     // EVERY can_use eval even with the ledger disarmed (~275k locked
@@ -1595,8 +1845,8 @@ fn can_use(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize, phase: i32) -> R
     r
 }
 
-fn can_use_inner(
-    ctx: &mut Ctx,
+fn can_use_inner<W: Src>(
+    ctx: &mut Ctx<W>,
     out: &mut Out,
     sel: usize,
     gi: usize,
@@ -1620,7 +1870,7 @@ fn can_use_inner(
             // exact modulo 2^32) and the target-null check are provable
             // natively; the alive+pathfinding tail (only reachable with a
             // live target) stays staged. Vanilla consumes no RNG here.
-            let time = ctx.inb[23] as u32;
+            let time = ctx.game_time() as u32;
             let last = ctx.state(sel, gi) as u32;
             if time.wrapping_sub(last) < 20 {
                 return Ok(Cu::No);
@@ -1637,7 +1887,7 @@ fn can_use_inner(
             // the lock transition (lock_only). Same apply order, zero
             // park/resume round-trips.
             if ctx.fm.canuse {
-                out.push(ACT_CANUSE_OK, ctx.global(sel, gi), ctx.inb[23], 0, 0);
+                out.push(ACT_CANUSE_OK, ctx.global(sel, gi), ctx.game_time(), 0, 0);
                 if lock_only(ctx, out, sel, gi).is_err() {
                     out.buf[7] = FB_STATE_MISMATCH;
                     return Err(());
@@ -1653,7 +1903,7 @@ fn can_use_inner(
             // halves native (goal timestamp via the state word, mob
             // timestamp via in[22]); the anger/ignore-class/canAttack tail
             // (only reachable when the gate opens) stays staged.
-            let mobTs = ctx.inb[22];
+            let mobTs = ctx.mob_ts();
             if mobTs == ctx.state(sel, gi) || !ctx.flag(MF_LAST_HURT_BY) {
                 return Ok(Cu::No);
             }
@@ -1720,7 +1970,7 @@ fn can_use_inner(
                 && !ctx.flag(MF_TEAMS_PRESENT)
                 && !ctx.flag(MF_MANY_PLAYERS)
             {
-                let range = f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32));
+                let range = ctx.follow_range();
                 let mut cbuf = [0usize; 32];
                 let n = ctx.scan_players_into(true, false, range, &mut cbuf);
                 if n == 0 {
@@ -1770,7 +2020,7 @@ fn can_use_inner(
                 return Ok(Cu::No);
             }
             // checkNoActionTime is always on for the classified stroll
-            if ctx.inb[4] >= 100 {
+            if ctx.no_action() >= 100 {
                 return Ok(Cu::No);
             }
             let interval = ctx.cfg(sel, gi) & 0xFFFF;
@@ -1915,7 +2165,7 @@ fn can_use_inner(
 /// Nearest/Float/SpearUse — zero isInterruptable references, the Goal
 /// default true applies); model it as a per-goal cfg bit when a
 /// non-interruptable kind ever enters the classified set.
-fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
+fn can_replace_all<W: Src>(ctx: &Ctx<W>, sel: usize, gi: usize) -> bool {
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
@@ -1930,7 +2180,7 @@ fn can_replace_all(ctx: &Ctx, sel: usize, gi: usize) -> bool {
     true
 }
 
-fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
+fn lock_only<W: Src>(ctx: &mut Ctx<W>, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
     // vanilla update-pass transition (javap 26.3 GoalSelector.tick bc 193-264):
     // for each flag — cur = lockedFlags.getOrDefault(flag, NO_GOAL); cur.stop();
     // lockedFlags.put(flag, goalx) — then goalx.start() AFTER the whole flag
@@ -1982,7 +2232,7 @@ fn lock_only(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
 /// position — the t=157 stroll flip (the engine's stroll gate refused at
 /// position P−2 where vanilla passed at P) and the +10..12/tick roll
 /// surplus the L101 ledger reconciliation measured.
-fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
+fn lock_only_resolved<W: Src>(ctx: &mut Ctx<W>, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
     let mut fl = ctx.flags(sel, gi);
     while fl != 0 {
         let bit = fl.trailing_zeros() as usize;
@@ -2009,8 +2259,8 @@ fn lock_only_resolved(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Re
 /// WAVE6 fold (single source — no drift): best-selection over the passing
 /// mask + the winner's ref write + the lock transition. Err = lock collide
 /// (the caller turns it into the FB_STATE_MISMATCH fallback).
-fn los_apply(
-    ctx: &mut Ctx,
+fn los_apply<W: Src>(
+    ctx: &mut Ctx<W>,
     out: &mut Out,
     sel: usize,
     gi: usize,
@@ -2021,7 +2271,7 @@ fn los_apply(
         let combat = kind == GK_NEAREST_TARGET;
         let not_riding = kind == GK_LOOKAT_PLAYER;
         let range = if combat {
-            f64::from(f32::from_bits(ctx.inb[IN_FOLLOW] as u32))
+            ctx.follow_range()
         } else {
             f64::from(f32::from_bits(ctx.cfg2(sel, gi) as u32))
         };
@@ -2037,7 +2287,7 @@ fn los_apply(
     Ok(())
 }
 
-fn stop_goal(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
+fn stop_goal<W: Src>(ctx: &mut Ctx<W>, out: &mut Out, sel: usize, gi: usize) -> Result<(), ()> {
     ctx.running[sel][gi] = false;
     for bit in 0..MAX_LOCK_FLAGS {
         if ctx.lock[sel][bit] == gi as i32 {
@@ -2049,7 +2299,7 @@ fn stop_goal(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> Result<(), 
 }
 
 /// the ported tick() bodies — false → the virtual call
-fn tick_ported(ctx: &mut Ctx, out: &mut Out, sel: usize, gi: usize) -> bool {
+fn tick_ported<W: Src>(ctx: &mut Ctx<W>, out: &mut Out, sel: usize, gi: usize) -> bool {
     match ctx.kind(sel, gi) {
         GK_LOOKAROUND => {
             // lookTime--; lookControl.setLookAt(x+relX, eyeY, z+relZ)
