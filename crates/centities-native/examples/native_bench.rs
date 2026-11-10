@@ -26,6 +26,11 @@ fn main() {
     if std::env::var_os("CE_NO_FOLD").is_some() {
         nt.set_fold_off(true);
     }
+    // the WAVE8 A/B knob: CE_FULL_PACK=1 forces the full per-round pack
+    // (the exact pre-wave8 semantics — the same-binary resident-vs-full twin)
+    if std::env::var_os("CE_FULL_PACK").is_some() {
+        nt.set_full_pack(true);
+    }
     // the mobs-25k stand: a pile around the spawn column, flat ground
     for i in 0..n_mobs {
         let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;

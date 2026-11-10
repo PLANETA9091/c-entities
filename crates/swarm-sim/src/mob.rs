@@ -564,6 +564,12 @@ impl MobAI {
         };
         b[4] = self.no_action;
         b[11] = self.nav_state;
+        // WAVE8: the seed rides the mirror too — start_vanilla's LOOKAROUND
+        // body consumes mob.seed (the DRAW-EXACT start), and the next
+        // round's floor LCG seeds from the PACKED words (the old per-round
+        // pack rewrote them from mob.seed every round, masking this).
+        b[g::IN_SEED_LO] = self.seed as i32;
+        b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
     }
 
     /// Pack the aiPack wire format into a CALLER buffer (wave2: zero
@@ -677,28 +683,20 @@ impl MobAI {
         }
     }
 
-    /// WAVE4: the RESIDENT round pack — writes ONLY the per-mob round
-    /// words into a scratch whose static half (pack_state_static) and tick
-    /// half (pack_tick_words) are already current: ~46 words instead of
-    /// pack_into's 134, EVERY round (fresh OR resumed — the wave3 delta
-    /// arm subsumed; the probe's first catch was a resumed round with the
-    /// park token 0 = SEL_TARGET/PH_CLEANUP/gi0 whose request words MUST
-    /// ride the pack, not zeros).
-    #[allow(clippy::too_many_arguments)]
-    fn pack_into_resident(
-        &self,
-        b: &mut [i32],
-        players: &[PlayerSnap],
-        cursor: i32,
-        res: i32,
-        req_op: i32,
-        rx: f64,
-        ry: f64,
-        rz: f64,
-    ) {
+    /// WAVE8: the per-mob-tick HEAD write — everything the old resident
+    /// round pack wrote EXCEPT (a) the round words (cursor/res/op/rpos —
+    /// the round loop writes 8 words straight-line now), (b) the seed on
+    /// rounds 2+ (the handoff writes it), (c) the static/tick halves
+    /// (stamped once per fp / per tick above). Runs ONCE per mob-tick;
+    /// the invariant "scratch == what a fresh pack_into would write" is
+    /// maintained by the apply_actions mirrors (every resident-word
+    /// mutation lands in both the live field and the packed word) + the
+    /// handoffs + repack_goal_words — proven word-for-word by the debug
+    /// probe every round and bit-for-bit over 400 ticks by the
+    /// full-vs-resident executor twin.
+    fn pack_head(&self, b: &mut [i32], players: &[PlayerSnap]) {
         let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
         debug_assert!(b.len() >= need, "pack scratch too small");
-        b[0] = cursor;
         b[1] = MF_BASE
             | if self.target_player >= 0 {
                 g::MF_HAS_TARGET
@@ -711,15 +709,13 @@ impl MobAI {
         b[11] = self.nav_state;
         b[g::IN_SEED_LO] = self.seed as i32;
         b[g::IN_SEED_HI] = (self.seed >> 32) as i32;
-        b[g::IN_RES] = res;
-        b[g::IN_RES_OP] = req_op;
-        put_f64(b, g::IN_RES_X, rx);
-        put_f64(b, g::IN_RES_X + 2, ry);
-        put_f64(b, g::IN_RES_X + 4, rz);
         put_f64(b, g::IN_MOBX, self.x);
         put_f64(b, g::IN_MOBY, self.y);
         put_f64(b, g::IN_MOBZ, self.z);
         put_f64(b, g::IN_EYEY, self.y + EYE_Y);
+        // goal live words: running + state (the state word: rec.state for
+        // the stateful kinds, the derived LOOKAT word for LookAtPlayer,
+        // 0 for the cfg-only kinds)
         let base = g::IN_HEADER;
         for (i, rec) in self.goals.iter().enumerate() {
             let o = base + i * g::GOAL_STRIDE;
@@ -1042,6 +1038,19 @@ impl MobAI {
                 pack.tick = Some((game_time, players.len(), tfp));
             }
         }
+        // WAVE8: the mob head write happens ONCE per mob-tick (the old
+        // resident pack rewrote these ~30 words EVERY round — pure
+        // redundancy: every mid-tick mutation of a resident word is
+        // mirrored into the scratch by apply_actions / the handoffs /
+        // repack_goal_words, so the invariant "scratch == what a fresh
+        // pack_into would write" holds by maintenance, not by rewriting).
+        // The static + tick halves are stamped above (per fp / per tick).
+        if !pack.full {
+            {
+                let _p = crate::ledger::sg_pack();
+                self.pack_head(scratch, players);
+            }
+        }
         for _round in 0..32 {
             {
                 let _p = crate::ledger::sg_pack();
@@ -1050,16 +1059,18 @@ impl MobAI {
                         scratch, players, game_time, cursor, res, req_op, rx, ry, rz,
                     );
                 } else {
-                    // WAVE4 resident round pack: statics + tick half already
-                    // stamped above; the ~46 per-mob round words
-                    // (cursor/res/op/seed/mf/pos/goals) are written EVERY
-                    // round, fresh OR resumed (the wave3 delta arm is
-                    // subsumed; a park token of 0 — SEL_TARGET/PH_CLEANUP/
-                    // gi0 — resumes through THIS same arm and carries its
-                    // request words).
-                    self.pack_into_resident(
-                        scratch, players, cursor, res, req_op, rx, ry, rz,
-                    );
+                    // WAVE8 round words ONLY: cursor/res/op/rpos — 8 words,
+                    // straight-line stores, no loop, no call. Round 1's
+                    // seed rides pack_head; rounds 2+ ride the handoff
+                    // write below. The round words MUST be written every
+                    // round (the scratch is shared across mobs — mob N+1's
+                    // round 1 would otherwise read mob N's round words).
+                    scratch[0] = cursor;
+                    scratch[g::IN_RES] = res;
+                    scratch[g::IN_RES_OP] = req_op;
+                    put_f64(scratch, g::IN_RES_X, rx);
+                    put_f64(scratch, g::IN_RES_X + 2, ry);
+                    put_f64(scratch, g::IN_RES_X + 4, rz);
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -1100,6 +1111,12 @@ impl MobAI {
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+            // WAVE8: the seed words land in the scratch HERE (the handoff
+            // is the only per-round seed mutation; the next round's floor
+            // read and the debug probe both see the same bits without a
+            // re-pack). The full-pack twin mode overwrites them again.
+            scratch[g::IN_SEED_LO] = out[3];
+            scratch[g::IN_SEED_HI] = out[4];
             // WAVE6: the external stream handoff — applied ONLY when the
             // floor actually drew (fold.stroll_drew): the out buffer is
             // SHARED across mobs, so an unconditional read would clobber
