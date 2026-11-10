@@ -1954,6 +1954,740 @@ pub fn ai_floor_z0<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> 
     ST_DONE
 }
 
+/// WAVE11 slice two: THE RUNNING-SHAPE WALK — the even-tick floor for the
+/// classified zombie table with ANY running subset (chasers, strollers,
+/// the RLA-active, the lookat-active). The generic engine's three phases
+/// are written straight-line over the table's static record positions:
+///   PH_CLEANUP — the running records' stop bodies in record order (the
+///     disabled gate, the cc fold for the vanilla-cc kinds, the ported cc
+///     for stroll/lookat/lookaround, the ACT_TARGET_CLEAR tail);
+///   PH_LOCK_REBUILD — the running set rebuilds the 5-word local tables
+///     (the FB_LOCK_COLLIDE guard verbatim);
+///   PH_UPDATE — the non-running records' canUse bodies under the rebuilt
+///     locks, INCLUDING the displaced-stop machinery: the table's
+///     single-flag records make a start displace a RUNNING holder exactly
+///     when the candidate's priority is lower (SPEAR(2)/MTV(6) over
+///     RLA(8)/STROLL(7)) — the ACT_GOAL_STOP_D + the map.put, verbatim
+///     lock_only.
+/// The mf word is a mutable local (the generic ctx.mf_ov tail: a cleanup
+/// ACT_TARGET_CLEAR re-bases it for every later gate of the same walk).
+/// Gate (the caller): resident, fold on, the zombie fp, EVEN branch,
+/// cursor 0. Parks write the exact park words and resume through the
+/// generic arm (cursor != 0). The stop_goal lock-clear tail is omitted:
+/// on a fresh tick (cursor 0) the lock tables are untouched-empty at both
+/// cleanup points (target cleanup precedes any target start; the goal
+/// cleanup never sees a goal-selector lock — starts only write locks in
+/// the same selector's update phase, which runs after its cleanup).
+pub fn ai_floor_z1<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    if out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
+        out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_BUF_TOO_SMALL;
+        return ST_FALLBACK;
+    }
+    let mut lcg = Lcg {
+        value: src.seed(),
+        draws: 0,
+    };
+    let mut out = Out {
+        buf: out_buf,
+        n_act: 0,
+    };
+    let game_time = src.game_time();
+    let pcount = src.pcount();
+    let nt = src.count(SEL_TARGET);
+    let ng = src.count(SEL_GOAL);
+    // the live running mirror — the cleanup, the lock rebuild and the
+    // displaced stops all read/write it
+    let mut running = [false; MAX_GOALS];
+    for i in 0..nt {
+        running[i] = src.g_running(SEL_TARGET, i);
+    }
+    for i in 0..ng {
+        running[nt + i] = src.g_running(SEL_GOAL, i);
+    }
+    // the mf word is MUTABLE here — the generic ctx.mf_ov tail
+    let mut mf = src.mf_word();
+    let fm_los = fold.on && fold.los_all_pass;
+    let fm_fnd = fold.on && fold.find_target_fold;
+    let fm_strl = fold.on;
+    let fm_rla = fold.on;
+    let fm_canuse = fold.on && fold.canuse_fold;
+    // the lock tables (one per selector — the walk is sequential)
+    let mut lock_t = [-1i32; MAX_LOCK_FLAGS];
+    let mut lock_g = [-1i32; MAX_LOCK_FLAGS];
+    let dis_t = src.disabled(SEL_TARGET);
+    let dis_g = src.disabled(SEL_GOAL);
+    // the carried fold snapshot (fold_cc's exact inputs — the generic
+    // engine reads the ENTRY values; nothing updates them mid-walk)
+    let f_target = fold.target_player;
+    let f_appx = fold.approach_x;
+    let f_appz = fold.approach_z;
+    let f_follow2 = fold.follow_range * fold.follow_range;
+
+    // ---------- the can_replace_all gate (the per-flag lock check) -----
+    macro_rules! can_replace {
+        ($lock:expr, $sel:expr, $gi:expr) => {{
+            let mut ok = true;
+            let mut fl = src.flags($sel, $gi);
+            while fl != 0 {
+                let bit = fl.trailing_zeros() as usize;
+                if bit < MAX_LOCK_FLAGS {
+                    let locked = $lock[bit];
+                    if locked != -1 && src.prio($sel, $gi) >= src.prio($sel, locked as usize) {
+                        ok = false;
+                        break;
+                    }
+                }
+                fl &= fl - 1;
+            }
+            ok
+        }};
+    }
+    // ---------- lock_only — the FULL update-pass transition ------------
+    // (the displaced stops are REACHABLE in this shape: SPEAR(2)/MTV(6)
+    // start over a running RLA(8)/STROLL(7) holder — ACT_GOAL_STOP_D, the
+    // vanilla map.put; the isRunning guard makes the second stop on the
+    // same holder the no-op the javap read named)
+    macro_rules! lock_only {
+        ($lock:expr, $sel:expr, $gi:expr) => {{
+            let mut fl = src.flags($sel, $gi);
+            let mut ok = true;
+            while fl != 0 {
+                let bit = fl.trailing_zeros() as usize;
+                if bit >= MAX_LOCK_FLAGS {
+                    ok = false;
+                    break;
+                }
+                let cur = $lock[bit];
+                if cur != -1 {
+                    let c = cur as usize;
+                    let cb = base($sel, nt) + c;
+                    if running[cb] {
+                        running[cb] = false;
+                        out.push(ACT_GOAL_STOP_D, cb as i32, 0, 0, 0);
+                    }
+                }
+                $lock[bit] = $gi as i32;
+                fl &= fl - 1;
+            }
+            if ok {
+                running[base($sel, nt) + $gi] = true;
+                out.push(ACT_GOAL_START, (base($sel, nt) + $gi) as i32, 0, 0, 0);
+            }
+            ok
+        }};
+    }
+    // ---------- the cleanup stop body (stop_goal minus the empty lock
+    // clear — see the doc comment) ------------------------------------
+    macro_rules! stop_z {
+        ($sel:expr, $gi:expr) => {{
+            running[base($sel, nt) + $gi] = false;
+            out.push(ACT_GOAL_STOP, (base($sel, nt) + $gi) as i32, 0, 0, 0);
+        }};
+    }
+    // ---------- the Sensing scan (scan_players_into, verbatim) ----------
+    macro_rules! scan_z {
+        ($combat:expr, $not_riding:expr, $range:expr, $cbuf:expr) => {{
+            let (mx, my, mz, _eyey) = src.mob_pos();
+            let peaceful = mf & MF_PEACEFUL != 0;
+            let mut n = 0usize;
+            for i in 0..src.pcount() {
+                let fl = src.pflags(i);
+                if !pf_can_be_seen_by_anyone(fl) {
+                    continue;
+                }
+                if $not_riding && fl & PF_RIDING != 0 {
+                    continue;
+                }
+                if $combat && (peaceful || !pf_can_be_seen_as_enemy(fl)) {
+                    continue;
+                }
+                let modifier = src.pvis(i);
+                let vd = ($range * modifier).max(2.0);
+                let (px, py, pz) = src.pcoords(i);
+                let dx = mx - px;
+                let dy = my - py;
+                let dz = mz - pz;
+                if dx * dx + dy * dy + dz * dz > vd * vd {
+                    continue;
+                }
+                $cbuf[n] = i;
+                n += 1;
+            }
+            n
+        }};
+    }
+    // ---------- the best-selection (best_from_mask, verbatim) -----------
+    macro_rules! best_z {
+        ($mask:expr, $combat:expr, $not_riding:expr, $range:expr) => {{
+            let mut best: Option<usize> = None;
+            let mut best_d2 = f64::INFINITY;
+            if $mask != 0 {
+                let (mx, _my, mz, eyey) = src.mob_pos();
+                let peaceful = mf & MF_PEACEFUL != 0;
+                for i in 0..src.pcount() {
+                    if $mask & (1i32 << i) == 0 {
+                        continue;
+                    }
+                    let fl = src.pflags(i);
+                    if !pf_can_be_seen_by_anyone(fl) {
+                        continue;
+                    }
+                    if $not_riding && fl & PF_RIDING != 0 {
+                        continue;
+                    }
+                    if $combat && (peaceful || !pf_can_be_seen_as_enemy(fl)) {
+                        continue;
+                    }
+                    let modifier = src.pvis(i);
+                    let vd = ($range * modifier).max(2.0);
+                    let (px, py, pz) = src.pcoords(i);
+                    let dx = mx - px;
+                    let dy = _my - py;
+                    let dz = mz - pz;
+                    if dx * dx + dy * dy + dz * dz > vd * vd {
+                        continue;
+                    }
+                    let ddx = px - mx;
+                    let ddy = py - eyey;
+                    let ddz = pz - mz;
+                    let d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = Some(i);
+                    }
+                }
+            }
+            best
+        }};
+    }
+    // ---------- the los fold resolution (los_apply, verbatim) -----------
+    macro_rules! los_apply_z {
+        ($sel:expr, $gi:expr, $mask:expr, $combat:expr, $not_riding:expr, $range:expr, $lock:expr) => {{
+            let mut ok = true;
+            if $mask != 0 {
+                if let Some(winner) =
+                    best_z!($mask, $combat, $not_riding, $range)
+                {
+                    out.push(ACT_REF_SET_PLAYER, (base($sel, nt) + $gi) as i32, winner as i32, 0, 0);
+                    ok = lock_only!($lock, $sel, $gi);
+                } else if $combat {
+                    out.push(ACT_REF_SET_PLAYER, (base($sel, nt) + $gi) as i32, -1, 0, 0);
+                }
+            }
+            ok
+        }};
+    }
+    // ---------- the park word writer (park(), verbatim) ------------------
+    macro_rules! park_z {
+        ($sel:expr, $gi:expr, $req:expr) => {{
+            out.buf[0] = ST_REQUEST;
+            out.buf[1] = $req;
+            out.buf[2] = $gi as i32;
+            out.buf[3] = (lcg.value & 0xFFFF_FFFF) as i32;
+            out.buf[4] = (lcg.value >> 32) as i32;
+            out.buf[5] = out.n_act as i32;
+            out.buf[6] = cursor($sel, PH_UPDATE, $gi);
+            return ST_REQUEST;
+        }};
+    }
+
+    // ================= SEL_TARGET — PH_CLEANUP (records 0..nt) ========
+    // the classified target kinds (HURT_BY + NEAREST×3) are all
+    // needs_cc_vanilla — the cc fold decides in place (fold on)
+    for gi in 0..nt {
+        if !running[gi] {
+            continue;
+        }
+        if src.flags(SEL_TARGET, gi) & dis_t != 0 {
+            stop_z!(SEL_TARGET, gi);
+            continue;
+        }
+        let kind = src.kind(SEL_TARGET, gi);
+        if kind == GK_HURT_BY {
+            continue; // the HURT_BY fold cc: `_ => true`
+        }
+        // NEAREST_TARGET: the fold cc — target live && the follow gate
+        let cc = f_target >= 0 && {
+            let (mx, _my, mz, _eyey) = src.mob_pos();
+            let (dx, dz) = (f_appx - mx, f_appz - mz);
+            dx * dx + dz * dz <= f_follow2
+        };
+        if !cc {
+            out.push(ACT_TARGET_CLEAR, (base(SEL_TARGET, nt) + gi) as i32, 0, 0, 0);
+            // the in-memory MF word: the same-round gates read it (the
+            // parked flow's resume round re-packs from the cleared state)
+            mf = MF_NO_PASSENGERS | MF_MAINHAND_EMPTY;
+            stop_z!(SEL_TARGET, gi);
+        }
+    }
+    // ================= SEL_TARGET — PH_LOCK_REBUILD ==================
+    for bit in 0..MAX_LOCK_FLAGS {
+        lock_t[bit] = -1;
+    }
+    for gi in 0..nt {
+        if running[gi] {
+            let mut fl = src.flags(SEL_TARGET, gi);
+            while fl != 0 {
+                let bit = fl.trailing_zeros() as usize;
+                if bit >= MAX_LOCK_FLAGS || lock_t[bit] != -1 {
+                    out.buf[0] = ST_FALLBACK;
+                    out.buf[7] = FB_LOCK_COLLIDE;
+                    return ST_FALLBACK;
+                }
+                lock_t[bit] = gi as i32;
+                fl &= fl - 1;
+            }
+        }
+    }
+    // ================= SEL_TARGET — PH_UPDATE (records 0..nt) =========
+    // rec0: HURT_BY — mobTs == state || !LAST_HURT_BY -> No (no draw)
+    if !running[0]
+        && src.flags(SEL_TARGET, 0) & dis_t == 0
+        && can_replace!(lock_t, SEL_TARGET, 0)
+        && !(src.mob_ts() == src.state(SEL_TARGET, 0) || mf & MF_LAST_HURT_BY == 0)
+    {
+        // the anger tail stages (REQ_CANUSE_VANILLA) — no draws consumed
+        park_z!(SEL_TARGET, 0, REQ_CANUSE_VANILLA);
+    }
+    // rec1..3: NEAREST_TARGET — the lock gate, then the interval draw ->
+    // the scan/fold tails. (After rec1's in-stream start the FL_TARGET
+    // lock skips recs 2/3 — can_replace BEFORE the draw, exact.)
+    for gi in 1..nt {
+        if running[gi] {
+            continue;
+        }
+        if src.flags(SEL_TARGET, gi) & dis_t != 0 {
+            continue;
+        }
+        if !can_replace!(lock_t, SEL_TARGET, gi) {
+            continue;
+        }
+        let ri = src.cfg(SEL_TARGET, gi) & 0xFFFF;
+        if ri > 0 && lcg.next_int_bound(ri) != 0 {
+            continue; // the interval gate: No
+        }
+        if pcount == 0 {
+            out.push(ACT_REF_SET_PLAYER, (base(SEL_TARGET, nt) + gi) as i32, -1, 0, 0);
+            continue; // getNearestPlayer -> null, observable
+        }
+        if src.cfg3(SEL_TARGET, gi) & 1 != 0
+            && mf & MF_TEAMS_PRESENT == 0
+            && mf & MF_MANY_PLAYERS == 0
+        {
+            // the Player-typed goal: the native scan + the LOS fold
+            let range = f64::from(f32::from_bits(src.follow_bits() as u32));
+            let mut cbuf = [0usize; 32];
+            let n = scan_z!(true, false, range, cbuf);
+            if n == 0 {
+                out.push(ACT_REF_SET_PLAYER, (base(SEL_TARGET, nt) + gi) as i32, -1, 0, 0);
+                continue;
+            }
+            if fm_los {
+                let mask: i32 = if n >= 32 { -1 } else { (1i32 << n) - 1 };
+                if !los_apply_z!(SEL_TARGET, gi, mask, true, false, range, lock_t) {
+                    out.buf[0] = ST_FALLBACK;
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return ST_FALLBACK;
+                }
+                continue;
+            }
+            // the parked LOS exchange (the cands ride the ext tail)
+            out.buf[0] = ST_REQUEST;
+            out.buf[1] = REQ_LOS_SCAN;
+            out.buf[2] = gi as i32;
+            out.buf[3] = (lcg.value & 0xFFFF_FFFF) as i32;
+            out.buf[4] = (lcg.value >> 32) as i32;
+            out.buf[5] = out.n_act as i32;
+            out.buf[6] = cursor(SEL_TARGET, PH_UPDATE, gi);
+            if out_buf.len() >= OUT_EXT_LEN {
+                out_buf[OUT_EXT_LO + 2] = n as i32;
+                for (k, c) in cbuf[..n].iter().enumerate() {
+                    out_buf[OUT_EXT_LO + 3 + k] = *c as i32;
+                }
+            }
+            return ST_REQUEST;
+        }
+        // non-player-typed: the find_target fold (or the staged park)
+        if fm_fnd {
+            // any_targetable: alive && !spectator, any player
+            let mut res = false;
+            for i in 0..pcount {
+                let fl = src.pflags(i);
+                if fl & PF_ALIVE != 0 && fl & PF_SPECTATOR == 0 {
+                    res = true;
+                    break;
+                }
+            }
+            if res && !lock_only!(lock_t, SEL_TARGET, gi) {
+                out.buf[0] = ST_FALLBACK;
+                out.buf[7] = FB_STATE_MISMATCH;
+                return ST_FALLBACK;
+            }
+            continue; // res ? Continue : No
+        }
+        park_z!(SEL_TARGET, gi, REQ_FIND_TARGET);
+    }
+
+    // ================= SEL_GOAL — PH_CLEANUP (records nt..nt+ng) =====
+    for lgi in 0..ng {
+        let gi = lgi;
+        let flat = nt + lgi;
+        if !running[flat] {
+            continue;
+        }
+        if src.flags(SEL_GOAL, gi) & dis_g != 0 {
+            stop_z!(SEL_GOAL, gi);
+            continue;
+        }
+        let kind = src.kind(SEL_GOAL, gi);
+        // needs_cc_vanilla kinds: the cc fold (in place)
+        if matches!(
+            kind,
+            GK_SPEAR_USE | GK_ZOMBIE_ATTACK | GK_MOVE_THROUGH_VILLAGE
+        ) {
+            if kind == GK_ZOMBIE_ATTACK && f_target < 0 {
+                out.push(ACT_TARGET_CLEAR, flat as i32, 0, 0, 0);
+                mf = MF_NO_PASSENGERS | MF_MAINHAND_EMPTY;
+                stop_z!(SEL_GOAL, gi);
+            }
+            // SPEAR / MTV: `_ => true`; ZA with a live target: true
+            continue;
+        }
+        // the ported cc bodies (stroll / lookat / lookaround)
+        let cc = match kind {
+            GK_STROLL => src.nav_state() == NAV_PATH_ACTIVE && mf & MF_NO_PASSENGERS != 0,
+            GK_LOOKAROUND => src.state(SEL_GOAL, gi) >= 0,
+            GK_LOOKAT_PLAYER => {
+                let st = src.state(SEL_GOAL, gi);
+                (st & (1 << 31)) != 0 && (st & (1 << 30)) != 0 && (st & 0x3FFF_FFFF) > 0
+            }
+            _ => {
+                // an unclassified kind under the fp gate: unreachable —
+                // hand the tick to the generic engine (the mirror covers)
+                out.buf[0] = ST_FALLBACK;
+                out.buf[7] = FB_UNKNOWN_KIND;
+                return ST_FALLBACK;
+            }
+        };
+        if !cc {
+            stop_z!(SEL_GOAL, gi);
+        }
+    }
+    // ================= SEL_GOAL — PH_LOCK_REBUILD ====================
+    for bit in 0..MAX_LOCK_FLAGS {
+        lock_g[bit] = -1;
+    }
+    for lgi in 0..ng {
+        if running[nt + lgi] {
+            let mut fl = src.flags(SEL_GOAL, lgi);
+            while fl != 0 {
+                let bit = fl.trailing_zeros() as usize;
+                if bit >= MAX_LOCK_FLAGS || lock_g[bit] != -1 {
+                    out.buf[0] = ST_FALLBACK;
+                    out.buf[7] = FB_LOCK_COLLIDE;
+                    return ST_FALLBACK;
+                }
+                lock_g[bit] = lgi as i32;
+                fl &= fl - 1;
+            }
+        }
+    }
+    // ================= SEL_GOAL — PH_UPDATE ==========================
+    for lgi in 0..ng {
+        let gi = lgi; // the local index within the selector
+        let flat = nt + lgi; // the global (concatenated) index
+        if running[flat] {
+            continue;
+        }
+        if src.flags(SEL_GOAL, gi) & dis_g != 0 {
+            continue;
+        }
+        let kind = src.kind(SEL_GOAL, gi);
+        match kind {
+            GK_SPEAR_USE => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                if mf & MF_MAINHAND_EMPTY != 0 {
+                    continue; // No
+                }
+                park_z!(SEL_GOAL, gi, REQ_CANUSE_VANILLA);
+            }
+            GK_ZOMBIE_ATTACK => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                // the 20-tick throttle + the target gate (no draws)
+                let time = game_time as u32;
+                let last = src.state(SEL_GOAL, gi) as u32;
+                if time.wrapping_sub(last) < 20 {
+                    continue;
+                }
+                if mf & MF_HAS_TARGET == 0 {
+                    continue;
+                }
+                if fm_canuse {
+                    out.push(ACT_CANUSE_OK, flat as i32, game_time, 0, 0);
+                    if !lock_only!(lock_g, SEL_GOAL, gi) {
+                        out.buf[0] = ST_FALLBACK;
+                        out.buf[7] = FB_STATE_MISMATCH;
+                        return ST_FALLBACK;
+                    }
+                    continue;
+                }
+                park_z!(SEL_GOAL, gi, REQ_CANUSE_VANILLA);
+            }
+            GK_MOVE_THROUGH_VILLAGE => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                if src.state(SEL_GOAL, gi) > 15 {
+                    park_z!(SEL_GOAL, gi, REQ_CANUSE_VANILLA);
+                }
+                if src.cfg(SEL_GOAL, gi) & 1 != 0 && mf & MF_BRIGHT_OUTSIDE != 0 {
+                    continue;
+                }
+                if mf & MF_NEAR_VILLAGE == 0 {
+                    continue;
+                }
+                park_z!(SEL_GOAL, gi, REQ_CANUSE_VANILLA);
+            }
+            GK_STROLL => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                if mf & MF_NO_PASSENGERS == 0 {
+                    continue;
+                }
+                if src.no_action() >= 100 {
+                    continue;
+                }
+                let ri = src.cfg(SEL_GOAL, gi) & 0xFFFF;
+                if ri > 0 && lcg.next_int_bound(ri) != 0 {
+                    continue;
+                }
+                if fm_strl {
+                    let (mx, _my, mz, _eyey) = src.mob_pos();
+                    let rad = fold.stroll_radius;
+                    let v1 = stroll_draw16(&mut fold.stroll_seed, fold.stroll_lcg16);
+                    let v2 = stroll_draw16(&mut fold.stroll_seed, fold.stroll_lcg16);
+                    fold.stroll_drew = true;
+                    let dx = ((v1 as f64) / 65535.0) * 2.0 * rad - rad;
+                    let dz = ((v2 as f64) / 65535.0) * 2.0 * rad - rad;
+                    let (x, z) = (mx + dx, mz + dz);
+                    let xb = x.to_bits();
+                    let zb = z.to_bits();
+                    out.push7(
+                        ACT_STROLL_SET,
+                        flat as i32,
+                        xb as i32,
+                        (xb >> 32) as i32,
+                        zb as i32,
+                        (zb >> 32) as i32,
+                        0,
+                    );
+                    if !lock_only!(lock_g, SEL_GOAL, gi) {
+                        out.buf[0] = ST_FALLBACK;
+                        out.buf[7] = FB_STATE_MISMATCH;
+                        return ST_FALLBACK;
+                    }
+                    continue;
+                }
+                park_z!(SEL_GOAL, gi, REQ_STROLL_POS);
+            }
+            GK_LOOKAT_PLAYER => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                let prob = f32::from_bits(src.cfg(SEL_GOAL, gi) as u32);
+                if lcg.next_f32() >= prob {
+                    continue;
+                }
+                if src.cfg3(SEL_GOAL, gi) & 1 != 0
+                    && mf & MF_MANY_PLAYERS == 0
+                    && pcount > 0
+                {
+                    let range = f64::from(f32::from_bits(src.cfg2(SEL_GOAL, gi) as u32));
+                    let mut cbuf = [0usize; 32];
+                    let n = scan_z!(false, true, range, cbuf);
+                    if n == 0 {
+                        continue; // getNearestPlayer -> null
+                    }
+                    if fm_los {
+                        let mask: i32 = if n >= 32 { -1 } else { (1i32 << n) - 1 };
+                        if !los_apply_z!(SEL_GOAL, gi, mask, false, true, range, lock_g) {
+                            out.buf[0] = ST_FALLBACK;
+                            out.buf[7] = FB_STATE_MISMATCH;
+                            return ST_FALLBACK;
+                        }
+                        continue;
+                    }
+                    out.buf[0] = ST_REQUEST;
+                    out.buf[1] = REQ_LOS_SCAN;
+                    out.buf[2] = gi as i32;
+                    out.buf[3] = (lcg.value & 0xFFFF_FFFF) as i32;
+                    out.buf[4] = (lcg.value >> 32) as i32;
+                    out.buf[5] = out.n_act as i32;
+                    out.buf[6] = cursor(SEL_GOAL, PH_UPDATE, gi);
+                    if out_buf.len() >= OUT_EXT_LEN {
+                        out_buf[OUT_EXT_LO + 2] = n as i32;
+                        for (k, c) in cbuf[..n].iter().enumerate() {
+                            out_buf[OUT_EXT_LO + 3 + k] = *c as i32;
+                        }
+                    }
+                    return ST_REQUEST;
+                }
+                park_z!(SEL_GOAL, gi, REQ_LOOKAT_QUERY);
+            }
+            GK_LOOKAROUND => {
+                if !can_replace!(lock_g, SEL_GOAL, gi) {
+                    continue;
+                }
+                if lcg.next_f32() < 0.02f32 {
+                    // the lock transition rides the same round (map-only —
+                    // the REAL start body runs below on the floor's LCG).
+                    // No displaced stop is reachable here: can_replace
+                    // blocked every FL_ML holder (all table prios < 8), so
+                    // the lock slot is empty — the exact z0 shape.
+                    let mut fl = src.flags(SEL_GOAL, gi);
+                    let mut ok = true;
+                    while fl != 0 {
+                        let bit = fl.trailing_zeros() as usize;
+                        if bit >= MAX_LOCK_FLAGS {
+                            ok = false;
+                            break;
+                        }
+                        lock_g[bit] = gi as i32;
+                        fl &= fl - 1;
+                    }
+                    if !ok {
+                        out.buf[0] = ST_FALLBACK;
+                        out.buf[7] = FB_STATE_MISMATCH;
+                        return ST_FALLBACK;
+                    }
+                    running[flat] = true;
+                    out.push(ACT_GOAL_LOCK_MAP, flat as i32, 0, 0, 0);
+                    if fm_rla {
+                        let d0 = std::f64::consts::PI * 2.0 * lcg.next_f64();
+                        let rx = d0.cos();
+                        let rz = d0.sin();
+                        let look_time = 20 + lcg.next_int_bound(20);
+                        let xb = rx.to_bits();
+                        let zb = rz.to_bits();
+                        out.push7(
+                            ACT_RLA_START,
+                            flat as i32,
+                            xb as i32,
+                            (xb >> 32) as i32,
+                            zb as i32,
+                            (zb >> 32) as i32,
+                            look_time,
+                        );
+                        continue;
+                    }
+                    park_z!(SEL_GOAL, gi, REQ_START_VANILLA);
+                }
+                // else: No
+            }
+            _ => {
+                // an unclassified kind: hand the whole tick to the generic
+                // engine — the fp gate makes this unreachable; the safe
+                // shape is the fallback (the mirror covers the tick).
+                out.buf[0] = ST_FALLBACK;
+                out.buf[7] = FB_UNKNOWN_KIND;
+                return ST_FALLBACK;
+            }
+        }
+    }
+
+    // the walk completed in place — the done words (done(), verbatim,
+    // minus the wire-side draw ledger) + the stroll ext tail
+    if fold.stroll_drew && out.buf.len() >= OUT_EXT_LO + 2 {
+        out.buf[OUT_EXT_LO] = fold.stroll_seed as i32;
+        out.buf[OUT_EXT_LO + 1] = (fold.stroll_seed >> 32) as i32;
+    }
+    out.buf[0] = ST_DONE;
+    out.buf[1] = 0;
+    out.buf[2] = 0;
+    out.buf[3] = (lcg.value & 0xFFFF_FFFF) as i32;
+    out.buf[4] = (lcg.value >> 32) as i32;
+    out.buf[5] = out.n_act as i32;
+    out.buf[6] = 0;
+    ST_DONE
+}
+
+/// WAVE11 slice three: THE ODD RUNNING BODY — tickRunningGoals(false)
+/// straight-line for the classified zombie table. The 26.3 odd branch
+/// touches ONLY the running requiresUpdateEveryTick records (LOOKAROUND's
+/// ported tick + the melee virtual), in record order per selector, then
+/// the done words — NO RNG draws, no cleanup, no locks. Gate (the
+/// caller): resident, the zombie fp, ODD branch, et_running (the caller's
+/// skip already ate the empty shape), cursor 0 — the odd body never
+/// parks, so the walk is one round.
+pub fn ai_floor_z2<W: Src>(src: &W, out_buf: &mut [i32], _fold: &mut FoldCtx) -> i32 {
+    if out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
+        out_buf[0] = ST_FALLBACK;
+        out_buf[7] = FB_BUF_TOO_SMALL;
+        return ST_FALLBACK;
+    }
+    let mut out = Out {
+        buf: out_buf,
+        n_act: 0,
+    };
+    let nt = src.count(SEL_TARGET);
+    let ng = src.count(SEL_GOAL);
+    // PH_TICK_RUNNING, SEL_TARGET: the classified target kinds
+    // (HURT_BY/NEAREST) are never every-tick — the scan is observably
+    // empty; a running et-kind here means a non-zombie table walked in
+    // (the fp gate made that unreachable): fall back closed.
+    for gi in 0..nt {
+        if src.g_running(SEL_TARGET, gi) && every_tick(src.kind(SEL_TARGET, gi)) {
+            out.buf[0] = ST_FALLBACK;
+            out.buf[7] = FB_UNKNOWN_KIND;
+            return ST_FALLBACK;
+        }
+    }
+    // PH_TICK_RUNNING, SEL_GOAL
+    for gi in 0..ng {
+        if !src.g_running(SEL_GOAL, gi) {
+            continue;
+        }
+        let kind = src.kind(SEL_GOAL, gi);
+        if !every_tick(kind) {
+            continue;
+        }
+        match kind {
+            GK_LOOKAROUND => {
+                // lookTime--; lookControl.setLookAt(x+relX, eyeY, z+relZ)
+                let st = src.state(SEL_GOAL, gi);
+                out.push(ACT_LOOK_TICK_AROUND, (nt + gi) as i32, st - 1, 0, 0);
+            }
+            GK_ZOMBIE_ATTACK => {
+                // tick_ported does not port the melee body — the exact
+                // virtual call the parked flow emits
+                out.push(ACT_GOAL_TICK_V, (nt + gi) as i32, 0, 0, 0);
+            }
+            _ => {
+                out.buf[0] = ST_FALLBACK;
+                out.buf[7] = FB_UNKNOWN_KIND;
+                return ST_FALLBACK;
+            }
+        }
+    }
+    // the done words: the LCG is untouched (the odd body never draws) —
+    // the seed round-trips verbatim
+    let seed = src.seed();
+    out.buf[0] = ST_DONE;
+    out.buf[1] = 0;
+    out.buf[2] = 0;
+    out.buf[3] = (seed & 0xFFFF_FFFF) as i32;
+    out.buf[4] = (seed >> 32) as i32;
+    out.buf[5] = out.n_act as i32;
+    out.buf[6] = 0;
+    ST_DONE
+}
+
 /// the concatenated (global) index of (selector, local index)
 #[inline]
 fn base(sel: usize, nt: usize) -> usize {
@@ -1963,7 +2697,6 @@ fn base(sel: usize, nt: usize) -> usize {
         nt
     }
 }
-
 /// The shared exit tail: the stroll-fold ext handoff + the (wire-only)
 /// mob ledger record.
 fn finish_ext(st: i32, out_buf: &mut [i32], fold: &mut FoldCtx, in_buf: Option<&[i32]>) -> i32 {

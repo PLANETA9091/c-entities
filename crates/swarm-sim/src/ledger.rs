@@ -35,6 +35,72 @@ pub fn odd_skip_on() -> bool {
 pub fn set_odd_skip(on: bool) {
     ODD_SKIP.store(on, Relaxed);
 }
+
+/// TEMP WAVE11 probe: CE_NO_ACTS=1 skips the apply_actions body (the
+/// action-apply cost row). Measurement only — parity knobs never set it.
+static NO_ACTS: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn no_acts_on() -> bool {
+    NO_ACTS.load(Relaxed)
+}
+
+pub fn set_no_acts(on: bool) {
+    NO_ACTS.store(on, Relaxed);
+}
+
+// TEMP WAVE11 section fences: the ai_tick internal wall split. CE_SECT=1
+// arms the fences (the measurement inflates every section by the clock
+// overhead — read the RELATIVE split only). Sections: A entry->post skip,
+// B pre-floor (fold build + gates + fills), C the floor call, D
+// seed/ext/apply, E the return tail.
+static SEC_ON: AtomicBool = AtomicBool::new(false);
+static SEC_LAST: AtomicU64 = AtomicU64::new(0);
+pub static SEC_A: AtomicU64 = AtomicU64::new(0);
+pub static SEC_B: AtomicU64 = AtomicU64::new(0);
+pub static SEC_C: AtomicU64 = AtomicU64::new(0);
+pub static SEC_D: AtomicU64 = AtomicU64::new(0);
+pub static SEC_N: AtomicU64 = AtomicU64::new(0);
+static SEC_BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn set_sections(on: bool) {
+    SEC_ON.store(on, Relaxed);
+    SEC_LAST.store(0, Relaxed);
+    SEC_A.store(0, Relaxed);
+    SEC_B.store(0, Relaxed);
+    SEC_C.store(0, Relaxed);
+    SEC_D.store(0, Relaxed);
+    SEC_N.store(0, Relaxed);
+}
+
+#[inline]
+pub fn sect_fence(acc: &AtomicU64) {
+    if SEC_ON.load(Relaxed) {
+        // rdtsc: ~20 cycles — 5x cheaper than the vDSO clock (whose ~100ns
+        // call cost WAS the profile). Cycles are a valid RELATIVE split.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::_rdtsc;
+            let n = unsafe { _rdtsc() };
+            let last = SEC_LAST.load(Relaxed);
+            if last != 0 {
+                acc.fetch_add(n.saturating_sub(last), Relaxed);
+            }
+            SEC_LAST.store(n, Relaxed);
+        }
+    }
+}
+
+/// TEMP: drain the section counters (a, b, c, d ns sums + fence count).
+pub fn sections_take() -> (u64, u64, u64, u64, u64) {
+    (
+        SEC_A.swap(0, Relaxed),
+        SEC_B.swap(0, Relaxed),
+        SEC_C.swap(0, Relaxed),
+        SEC_D.swap(0, Relaxed),
+        SEC_N.swap(0, Relaxed),
+    )
+}
 /// sub-phase sampling stride (per mob, within sampled ticks only)
 pub const SUB_EVERY: u32 = 17;
 

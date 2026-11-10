@@ -597,6 +597,35 @@ pub fn set_z0(on: bool) {
     Z0_ON.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+// TEMP WAVE11 shape counters: the exact mob-tick class fractions in the
+// bench. thread_local Cells — ZERO cost (no atomics; the tick loop is
+// single-threaded). Order: [even_z0, even_z1, even_generic, odd_skip,
+// odd_z2, odd_et_generic].
+thread_local! {
+    static SH: [std::cell::Cell<u64>; 6] = [
+        const { std::cell::Cell::new(0u64) },
+        const { std::cell::Cell::new(0u64) },
+        const { std::cell::Cell::new(0u64) },
+        const { std::cell::Cell::new(0u64) },
+        const { std::cell::Cell::new(0u64) },
+        const { std::cell::Cell::new(0u64) },
+    ];
+}
+
+/// TEMP WAVE11: drain the shape counters (even_z0, even_z1, even_generic,
+/// odd_skip, odd_z2, odd_et_generic) — the bench prints the class fractions.
+#[allow(clippy::type_complexity)]
+pub fn shape_counts_take() -> (u64, u64, u64, u64, u64, u64) {
+    SH.with(|c| (
+        c[0].replace(0),
+        c[1].replace(0),
+        c[2].replace(0),
+        c[3].replace(0),
+        c[4].replace(0),
+        c[5].replace(0),
+    ))
+}
+
 impl EngineSrc for ResSrc<'_> {
     #[inline]
     fn cursor(&self) -> i32 {
@@ -1295,11 +1324,13 @@ impl MobAI {
         // the odd_skip_matches_full_floor_executor twin drives the skip
         // arm against the full-floor arm over 400-tick whole-store dumps,
         // and CE_NO_ODD_SKIP=1 restores the full floor (the A/B arm).
+        let odd_branch = (self.tick_count.wrapping_add(self.id as i32) & 1 != 0)
+            && self.tick_count > 1;
         if crate::ledger::odd_skip_on()
-            && (self.tick_count.wrapping_add(self.id as i32) & 1 != 0)
-            && self.tick_count > 1
+            && odd_branch
             && !self.et_running
         {
+            SH.with(|c| c[3].set(c[3].get() + 1));
             return AiStat::default();
         }
         // WAVE6: the fold contract — None keeps every request parked (the
@@ -1315,13 +1346,36 @@ impl MobAI {
         // (mid-stream, the exact park words), odd ticks with running
         // every-tick goals, non-zombie tables, the parked flow — rides
         // the generic engine bit-for-bit.
-        let z0_shape = resident
+        // WAVE11: the STRAIGHT-LINE gates — the shapes ai_floor_z0/z1/z2
+        // own: the zombie table (fp), the fold contract on; z0 = the even
+        // branch with NO running goals (the cleanup/lock rebuild are
+        // provably empty, the lock table starts cleared); z1 = the even
+        // branch with ANY running subset (the cleanup stops + the lock
+        // rebuild + the update under locks, displaced stops live); z2 =
+        // the odd branch's tickRunningGoals body (et_running only — the
+        // empty shape rides the skip above). Everything else — parks
+        // (mid-stream, the exact park words), non-zombie tables, the
+        // parked flow — rides the generic engine bit-for-bit.
+        let any_running = self.goals.iter().any(|rec| rec.running);
+        let z_strait = resident
             && z0_on()
             && fold.on
-            && self.pack_fp == ZOMBIE_FP
-            && !((self.tick_count.wrapping_add(self.id as i32) & 1 != 0)
-                && self.tick_count > 1)
-            && !self.goals.iter().any(|rec| rec.running);
+            && self.pack_fp == ZOMBIE_FP;
+        // TEMP WAVE11 shape counters (the bench prints the class fractions)
+        if odd_branch {
+            if self.et_running && z_strait {
+                SH.with(|c| c[4].set(c[4].get() + 1));
+            } else if self.et_running {
+                SH.with(|c| c[5].set(c[5].get() + 1));
+            }
+        } else if z_strait && any_running {
+            SH.with(|c| c[1].set(c[1].get() + 1));
+        } else if z_strait {
+            SH.with(|c| c[0].set(c[0].get() + 1));
+        } else {
+            SH.with(|c| c[2].set(c[2].get() + 1));
+        }
+        crate::ledger::sect_fence(&crate::ledger::SEC_A);
         // WAVE6 FIX: the native executor exchanges LOS candidates through the
         // EXT tail in BOTH modes (folded AND the parked twin) — the legacy
         // wire slot out[8] IS action slot 0 and let a same-round action be
@@ -1339,6 +1393,7 @@ impl MobAI {
         // tick/half stamps and pack_head are GONE from this path (the
         // functions stay for the wire tooling; the FULL twin arm packs via
         // pack_into every round below).
+        crate::ledger::sect_fence(&crate::ledger::SEC_B);
         for _round in 0..32 {
             let st = {
                 let _f = crate::ledger::sg_floor();
@@ -1356,12 +1411,24 @@ impl MobAI {
                         res_op: req_op,
                         counts: [TARGET_SEL_COUNT, N_GOALS - TARGET_SEL_COUNT],
                     };
-                    // WAVE11: round 0 of the straight-line shape rides
-                    // ai_floor_z0 (the walk completes in place or parks —
-                    // the park words resume through the generic arm,
-                    // cursor != 0, from round 1 on)
-                    if z0_shape && cursor == 0 {
-                        g::ai_floor_z0(&src, out, &mut fold)
+                    // WAVE11: round 0 of the straight-line shapes rides
+                    // ai_floor_z0/z1/z2 (the walk completes in place or
+                    // parks — the park words resume through the generic
+                    // arm, cursor != 0, from round 1 on). The odd+et shape
+                    // rides z2 (it never parks — one round); the even
+                    // no-running shape rides z0; the even running shape
+                    // rides z1. The odd+!et shape (CE_NO_ODD_SKIP only)
+                    // and every non-straight shape ride the generic arm.
+                    if z_strait && cursor == 0 {
+                        if odd_branch && self.et_running {
+                            g::ai_floor_z2(&src, out, &mut fold)
+                        } else if !odd_branch && any_running {
+                            g::ai_floor_z1(&src, out, &mut fold)
+                        } else if !odd_branch {
+                            g::ai_floor_z0(&src, out, &mut fold)
+                        } else {
+                            g::ai_floor_res(&src, out, &mut fold)
+                        }
                     } else {
                         g::ai_floor_res(&src, out, &mut fold)
                     }
@@ -1402,6 +1469,7 @@ impl MobAI {
                     g::ai_floor_ext(scratch, out, &mut fold)
                 }
             };
+            crate::ledger::sect_fence(&crate::ledger::SEC_C);
             stat.rounds += 1;
             // seed handoff (aiRun: out -> SHARED_RANDOM after EVERY round)
             self.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
@@ -1424,12 +1492,17 @@ impl MobAI {
             }
             {
                 let _a = crate::ledger::sg_acts();
-                if resident {
+                if crate::ledger::no_acts_on() {
+                    // TEMP WAVE11 probe (CE_NO_ACTS=1): skip the apply —
+                    // measures the action-apply + seed-handoff cost row.
+                    // NOT a semantics arm; parity knobs never set it.
+                } else if resident {
                     self.apply_actions::<false>(out, players, scratch);
                 } else {
                     self.apply_actions::<true>(out, players, scratch);
                 }
             }
+            crate::ledger::sect_fence(&crate::ledger::SEC_D);
             if st == g::ST_FALLBACK {
                 stat.status = st;
                 stat.fallback = out[7];
@@ -1608,6 +1681,235 @@ impl MobAI {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[inline]
+    fn black_box<T>(x: T) -> T {
+        std::hint::black_box(x)
+    }
+
+    /// TEMP WAVE11 tail probe: the per-item costs of the ai_tick FIXED
+    /// TAIL on a real stabilized population (the bench scenario frozen
+    /// after 400 ticks). cargo test -p swarm-sim tail_probe -- --nocapture
+    /// Measurement only — no parity semantics.
+    #[test]
+    fn tail_probe() {
+        let mth = TravelMth::new();
+        // the bench scenario, stabilized
+        let players: Vec<PlayerSnap> = vec![PlayerSnap {
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            id: 1,
+            flags: 1,
+        }];
+        let mut mobs: Vec<MobAI> = Vec::with_capacity(25000);
+        for i in 0..25000usize {
+            let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;
+            let z = (i / 250) as f64 * 0.6 - 75.0;
+            let mut m = MobAI::new(
+                1000 + i as i64,
+                0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                x,
+                64.0,
+                z,
+            );
+            m.goals = zombie_table();
+            mobs.push(m);
+        }
+        // stabilize: run the AI heads-only is not the bench shape — tick
+        // the real thing via the executor is unavailable here (native
+        // crate); approximate with 200 ai_ticks against a FlatWorld fold
+        // (the class mix lands: chasers/strollers/RLA). Positions freeze
+        // (no travel in this loop) — the probe measures per-call costs,
+        // not the bench's cache pattern.
+        let mut fw = FlatWorld::new(0xC0FFEE);
+        fw.stroll_radius = 5.0;
+        let mut out = vec![0i32; g::OUT_EXT_LEN];
+        let mut scratch = vec![0i32; 4096];
+        let mut pack = PackState::default();
+        for t in 0..200i32 {
+            for m in mobs.iter_mut() {
+                let _ = m.ai_tick(
+                    &players,
+                    t,
+                    &mut fw,
+                    &mut scratch,
+                    &mut out,
+                    &mut pack,
+                    0,
+                );
+            }
+        }
+        // the class census
+        let chasers = mobs.iter().filter(|m| m.target_player >= 0).count();
+        let nav_active = mobs
+            .iter()
+            .filter(|m| m.nav_state == g::NAV_PATH_ACTIVE)
+            .count();
+        let et_running = mobs.iter().filter(|m| m.et_running).count();
+        println!(
+            "census: n {} chasers {} nav {} et_running {}",
+            mobs.len(),
+            chasers,
+            nav_active,
+            et_running
+        );
+
+        let iters = 30usize;
+        let per = |d: std::time::Duration, n: usize| {
+            (d.as_secs_f64() * 1e9 / (n as f64)).round() as i64
+        };
+
+        // row 1: apply_actions n==0 (the per-call overhead)
+        out[5] = 0;
+        let mut t0 = std::time::Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..iters {
+            for m in mobs.iter_mut() {
+                m.apply_actions::<false>(&out, &players, &mut scratch);
+                sink = sink.wrapping_add(m.tick_count as usize);
+            }
+        }
+        println!(
+            "row1 apply n==0: {} ns/call",
+            per(t0.elapsed(), iters * mobs.len())
+        );
+
+        // row 2: apply_actions with ONE ACT_LOOK_TICK_AROUND (the z2 hot
+        // action: p0 = the LOOKAROUND global index 10, p1 = state-1)
+        out[g::OUT_HEADER] = g::ACT_LOOK_TICK_AROUND;
+        out[g::OUT_HEADER + 1] = 10;
+        out[g::OUT_HEADER + 2] = 20;
+        out[g::OUT_HEADER + 3] = 0;
+        out[g::OUT_HEADER + 4] = 0;
+        out[5] = 1;
+        t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for m in mobs.iter_mut() {
+                m.apply_actions::<false>(&out, &players, &mut scratch);
+                sink = sink.wrapping_add(m.tick_count as usize);
+            }
+        }
+        println!(
+            "row2 apply 1 act: {} ns/call",
+            per(t0.elapsed(), iters * mobs.len())
+        );
+
+        // row 3: the fixed tail mimic — the fold_ctx build + the seed
+        // handoff + the out reset (the per-mob-tick constant work the
+        // ai_tick preamble does around the floor call)
+        out[5] = 0;
+        t0 = std::time::Instant::now();
+        let mut rng = fw.target_rng;
+        for _ in 0..iters {
+            for m in mobs.iter_mut() {
+                let fold = fw.fold_ctx(m).unwrap_or_else(g::FoldCtx::off);
+                out[..9].fill(0); // OUT_RESET (const 9, goals.rs)
+                let _f = black_box(&fold);
+                let s = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+                m.seed = s;
+                rng = rng.wrapping_add(1);
+            }
+        }
+        fw.set_target_rng(rng);
+        println!(
+            "row3 fixed tail: {} ns/call",
+            per(t0.elapsed(), iters * mobs.len())
+        );
+
+        // row 6: the FULL ai_tick mimic per class — tail + ResSrc + the
+        // z-walk (the mob's real branch) + seed handoff + apply. This is
+        // the whole ai_tick minus the exec-loop/guards/skip-gates. The
+        // game_time advances per iteration (the throttles live).
+        out[5] = 0;
+        let nt_count = 4usize; // TARGET_SEL_COUNT (the zombie table)
+        t0 = std::time::Instant::now();
+        let mut floor_calls = 0usize;
+        for it in 0..iters {
+            let gt = 1000 + it as i32;
+            for m in mobs.iter_mut() {
+                m.tick_count = m.tick_count.wrapping_add(1);
+                m.no_action = m.no_action.saturating_add(1);
+                let odd = (m.tick_count.wrapping_add(m.id as i32) & 1 != 0) && m.tick_count > 1;
+                if odd && !m.et_running {
+                    continue; // the skip shape (free)
+                }
+                let any_running = m.goals.iter().any(|rec| rec.running);
+                let fold = fw.fold_ctx(m).unwrap_or_else(g::FoldCtx::off);
+                let mut fold = fold;
+                fold.ext_cands = true;
+                out[..9].fill(0); // OUT_RESET
+                let mut src = ResSrc {
+                    mob: m,
+                    players: &players,
+                    game_time: gt,
+                    cursor: 0,
+                    res: 0,
+                    res_op: 0,
+                    counts: [nt_count, m.goals.len() - nt_count],
+                };
+                let st = if odd && m.et_running {
+                    floor_calls += 1;
+                    g::ai_floor_z2(&src, &mut out, &mut fold)
+                } else if !odd && any_running {
+                    floor_calls += 1;
+                    g::ai_floor_z1(&src, &mut out, &mut fold)
+                } else if !odd {
+                    floor_calls += 1;
+                    g::ai_floor_z0(&src, &mut out, &mut fold)
+                } else {
+                    g::ST_FALLBACK
+                };
+                m.seed = ((out[4] as u64) << 32) | (out[3] as u64 & 0xFFFF_FFFF);
+                if fold.stroll_drew {
+                    let s = ((out[g::OUT_EXT_LO + 1] as u64) << 32)
+                        | (out[g::OUT_EXT_LO] as u64 & 0xFFFF_FFFF);
+                    fw.set_target_rng(s);
+                    fold.stroll_drew = false;
+                }
+                if st != g::ST_REQUEST && st != g::ST_FALLBACK {
+                    m.apply_actions::<false>(&out, &players, &mut scratch);
+                }
+            }
+        }
+        let denom = iters * mobs.len();
+        println!(
+            "row6 ai-mimic: {} ns/mob-tick (floor calls {floor_calls}, skip {})",
+            per(t0.elapsed(), denom),
+            denom - floor_calls
+        );
+
+        // row 4: move_tick over the frozen classes (positions drift — the
+        // class mix is stable within 30 iters; NOT the bench cache pattern)
+        t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for m in mobs.iter_mut() {
+                m.move_tick(&mth);
+            }
+        }
+        println!(
+            "row4 move_tick: {} ns/call (all classes)",
+            per(t0.elapsed(), iters * mobs.len())
+        );
+
+        // row 5: the raw atan2 share — the exact face() expression on the
+        // movers' shape (a unit-ish vector a few blocks long)
+        let (ddx, ddz) = (3.7f64, -2.9f64);
+        let d2 = ddx * ddx + ddz * ddz;
+        t0 = std::time::Instant::now();
+        let mut acc = 0f32;
+        for _ in 0..(iters * 4) {
+            for _ in 0..mobs.len() {
+                let len = black_box(d2).sqrt();
+                let (nx, nz) = (ddx / len, ddz / len);
+                acc += (-(nx).atan2(nz) * (180.0f64 / std::f64::consts::PI)) as f32;
+            }
+        }
+        println!(
+            "row5 face atan2: {} ns/call (sink {acc:.3} {sink})",
+            per(t0.elapsed(), iters * 4 * mobs.len())
+        );
+    }
 
     /// WAVE10: the every-tick bit pin — the maintenance helpers and the
     /// fp sensitivity (the odd-skip executor twin

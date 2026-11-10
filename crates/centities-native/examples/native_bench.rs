@@ -48,6 +48,16 @@ fn main() {
     if std::env::var_os("CE_NO_Z0").is_some() {
         swarm_sim::mob::set_z0(false);
     }
+    // TEMP WAVE11 probes (measurement rows, never parity arms)
+    if std::env::var_os("CE_NO_AI").is_some() {
+        centities_native::exec::set_no_ai(true);
+    }
+    if std::env::var_os("CE_NO_ACTS").is_some() {
+        swarm_sim::ledger::set_no_acts(true);
+    }
+    if std::env::var_os("CE_SECT").is_some() {
+        swarm_sim::ledger::set_sections(true);
+    }
     // the WAVE10 A/B knob: CE_NO_ODD_SKIP=1 restores the full odd-tick
     // floor (the maintained-bit skip's A/B arm — the twin's B side)
     if std::env::var_os("CE_NO_ODD_SKIP").is_some() {
@@ -111,6 +121,37 @@ fn main() {
         chasing
     );
     println!("{}", centities_native::drain());
+    // the TEMP WAVE11 shape counters: the mob-tick class fractions
+    let (ez0, ez1, egen, oskip, oz2, oet) = swarm_sim::mob::shape_counts_take();
+    let tot = (ez0 + ez1 + egen + oskip + oz2 + oet).max(1);
+    println!(
+        "shapes | even_z0 {} ({:.1}%) | even_z1 {} ({:.1}%) | even_gen {} ({:.1}%) | odd_skip {} ({:.1}%) | odd_z2 {} ({:.1}%) | odd_gen {} ({:.1}%)",
+        ez0,
+        ez0 as f64 / tot as f64 * 100.0,
+        ez1,
+        ez1 as f64 / tot as f64 * 100.0,
+        egen,
+        egen as f64 / tot as f64 * 100.0,
+        oskip,
+        oskip as f64 / tot as f64 * 100.0,
+        oz2,
+        oz2 as f64 / tot as f64 * 100.0,
+        oet,
+        oet as f64 / tot as f64 * 100.0
+    );
+    // the TEMP WAVE11 section fences (CE_SECT=1): the ai_tick wall split
+    if std::env::var_os("CE_SECT").is_some() {
+        let (a, b, c, d, n) = swarm_sim::ledger::sections_take();
+        let per = |v: u64| v as f64 / n.max(1) as f64;
+        println!(
+            "sections | A entry {} | B pre-floor {} | C floor {} | D seed+apply {} ns/fence (fences {})",
+            per(a),
+            per(b),
+            per(c),
+            per(d),
+            n
+        );
+    }
     // the TEMP WAVE10 fine probe (CE_FINE=1): the floor's phase split
     if std::env::var_os("CE_FINE").is_some() {
         centities_core::goals::fine_init();

@@ -15,6 +15,19 @@ use crate::profile::{ai_guard, apply_guard, grid_guard, travel_guard};
 use crate::store::{MobStore, SeenGrid};
 use crate::world::{PlayerTick, WorldRes};
 
+// TEMP WAVE11 probe: CE_NO_AI=1 skips every ai_tick body (the executor's
+// per-mob fixed overhead row). Measurement only — parity knobs never set it.
+static NO_AI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn no_ai_on() -> bool {
+    NO_AI.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_no_ai(on: bool) {
+    NO_AI.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The executor state: the persistent store + the grid + the shared travel
 /// context (`Mth` — the sine/cosine table, one instance for the world).
 pub struct NativeTick {
@@ -220,7 +233,13 @@ impl NativeTick {
                 continue;
             }
             res.target_rng = self.target_rng;
-            let stat = {
+            let stat = if no_ai_on() {
+                // TEMP WAVE11 probe (CE_NO_AI=1): skip ai_tick entirely —
+                // measures the executor's per-mob fixed overhead. NOT a
+                // semantics arm (the store stops ticking); parity knobs
+                // never set this.
+                AiStat::default()
+            } else {
                 let _g = ai_guard();
                 slot.mob
                     .ai_tick(players, game_time, &mut res, &mut self.pack_scratch, &mut self.out_buf, &mut self.pack, tfp)
@@ -281,6 +300,65 @@ mod tests {
     use super::*;
     use swarm_sim::mob::zombie_table;
     use swarm_sim::mob::MobAI;
+
+    /// TEMP WAVE11 slice probe: the EXACT wall decomposition with minimal
+    /// population drift (the bench scenario stabilized 400 ticks, then ≤16
+    /// timed iterations per variant). cargo test -p centities-native
+    /// slice_probe -- --nocapture
+    #[test]
+    fn slice_probe() {
+        let build = || -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            for i in 0..25000usize {
+                let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;
+                let z = (i / 250) as f64 * 0.6 - 75.0;
+                let mut m = MobAI::new(
+                    1000 + i as i64,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    x,
+                    64.0,
+                    z,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 0.0,
+                y: 64.0,
+                z: 0.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let iters = 16usize;
+        // the variant runner: ONE instance, the knob flipped between
+        // rounds (the drift over 16 iterations is small vs 400 stabilize)
+        let run = |name: &str, skip_travel: bool, no_ai: bool, no_acts: bool| {
+            let mut nt = build();
+            for t in 0..400 {
+                nt.tick(t);
+            }
+            nt.set_skip_travel(skip_travel);
+            crate::exec::set_no_ai(no_ai);
+            swarm_sim::ledger::set_no_acts(no_acts);
+            let t0 = std::time::Instant::now();
+            for t in 400..400 + iters as i32 {
+                nt.tick(t);
+            }
+            let d = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            println!("slice {name}: {d:.3} ms/tick");
+            crate::exec::set_no_ai(false);
+            swarm_sim::ledger::set_no_acts(false);
+        };
+        run("full", false, false, false);
+        run("no-travel", true, false, false);
+        run("no-ai", false, true, false);
+        run("no-travel+no-ai", true, true, false);
+        run("no-travel+no-acts", true, false, true);
+        crate::exec::set_no_ai(false);
+        swarm_sim::ledger::set_no_acts(false);
+    }
 
     fn mk(id: i64, x: f64, z: f64) -> MobAI {
         let mut m = MobAI::new(id, 0x1234_5678_9abc_def0 + id as u64, x, 64.0, z);
