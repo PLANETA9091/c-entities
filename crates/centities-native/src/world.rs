@@ -226,10 +226,15 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
                 mob.goals[gi].state = 20 + lcg_next_int(&mut mob.seed, 20);
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                // WAVE10: the every-tick bit (the odd-tick no-op skip reads
+                // it) — the production resolver owns this start body, so the
+                // maintenance lives here too
+                mob.et_note_start(g::GK_LOOKAROUND);
             }
             g::GK_ZOMBIE_ATTACK => {
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                mob.et_note_start(g::GK_ZOMBIE_ATTACK);
             }
             _ => {}
         }

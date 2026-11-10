@@ -56,6 +56,9 @@ pub struct NativeTick {
     /// WAVE9 twin hook: true = the pre-wave9 two-pass walk (the A/B arm).
     /// False = the fused vanilla-order walk (one DRAM stream per tick).
     split_travel: bool,
+    /// WAVE10 measurement probe (NOT a semantics arm): skip the travel
+    /// slice entirely — the AI-only decomposition row in the bench ledger.
+    skip_travel: bool,
 }
 
 impl NativeTick {
@@ -73,7 +76,13 @@ impl NativeTick {
             players_buf: Vec::new(),
             fold_off: false,
             split_travel: false,
+            skip_travel: false,
         }
+    }
+
+    /// WAVE10 measurement probe: skip the travel slice (the AI-only row).
+    pub fn set_skip_travel(&mut self, on: bool) {
+        self.skip_travel = on;
     }
 
     /// WAVE6 twin hook: force the parked (pre-fold) semantics.
@@ -228,7 +237,7 @@ impl NativeTick {
             // (25k × ~568 B) streams ONCE per tick instead of twice: the
             // second pass re-fetched every mob from DRAM/L3 after the AI
             // pass evicted it.
-            if !self.split_travel {
+            if !self.split_travel && !self.skip_travel {
                 let _g = travel_guard();
                 slot.mob.move_tick(&self.mth);
             }
@@ -542,6 +551,111 @@ mod tests {
             .filter(|m| m.mob.x != m.mob.x.trunc() || m.mob.goals.iter().any(|g| g.running))
             .count();
         assert!(moved > 0, "the fused twin must walk/stroll: {moved}");
+    }
+
+    /// THE WAVE10 executor gate: the odd-tick no-op SKIP (the maintained
+    /// every-tick bit) must be BIT-IDENTICAL to the full-floor walk over the
+    /// same chased/strolling/looking population — the whole-store dump per
+    /// tick, 400 ticks. The skip arm returns from ai_tick before the floor
+    /// on every odd tick where no requiresUpdateEveryTick goal runs; any
+    /// et_running bit drift diverges the dump streams and fails this gate.
+    #[test]
+    fn odd_skip_matches_full_floor_executor() {
+        let build = || -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.rel_x.to_bits(),
+                    m.rel_z.to_bits(),
+                    m.pend_x.to_bits(),
+                    m.pend_z.to_bits(),
+                    m.approach_x.to_bits(),
+                    m.approach_z.to_bits(),
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            [h, nt.target_rng, pop].to_vec()
+        };
+        // the arms run SEQUENTIALLY (the skip switch is a process-global):
+        // the executor is deterministic per seed (the determinism gate), so
+        // the per-tick dump streams must match arm-for-arm.
+        let mut runs: Vec<Vec<Vec<u64>>> = Vec::new();
+        for skip in [true, false] {
+            swarm_sim::ledger::set_odd_skip(skip);
+            let mut nt = build();
+            let mut dumps = Vec::with_capacity(400);
+            for t in 0..400 {
+                nt.tick(t);
+                dumps.push(dump(&nt));
+            }
+            runs.push(dumps);
+        }
+        swarm_sim::ledger::set_odd_skip(true);
+        assert_eq!(
+            runs[0], runs[1],
+            "the odd-skip walk diverged from the full-floor twin"
+        );
+        // the scenario must actually chase (the melee every-tick path is
+        // exercised: chasing mobs keep their odd-tick floor)
+        let mut nt = build();
+        for t in 0..120 {
+            nt.tick(t);
+        }
+        let chasing = nt
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        assert!(chasing > 0, "the odd-skip twin must acquire targets");
     }
 
     /// THE WAVE6 executor gate: the FOLDED executor (find_target/LOS/stroll/

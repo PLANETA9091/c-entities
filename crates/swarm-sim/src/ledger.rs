@@ -22,6 +22,19 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// SUB flag is the per-mob gate the four guards check.
 static SUB: AtomicBool = AtomicBool::new(false);
 static MOB_N: AtomicU32 = AtomicU32::new(0);
+/// WAVE10: the odd-tick no-op skip (the maintained every-tick bit). ON by
+/// default; CE_NO_ODD_SKIP=1 / set_odd_skip(false) restores the full floor
+/// (the A/B arm + the twin's B side).
+static ODD_SKIP: AtomicBool = AtomicBool::new(true);
+
+#[inline]
+pub fn odd_skip_on() -> bool {
+    ODD_SKIP.load(Relaxed)
+}
+
+pub fn set_odd_skip(on: bool) {
+    ODD_SKIP.store(on, Relaxed);
+}
 /// sub-phase sampling stride (per mob, within sampled ticks only)
 pub const SUB_EVERY: u32 = 17;
 

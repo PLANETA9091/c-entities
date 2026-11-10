@@ -75,7 +75,7 @@ pub const GK_NEAREST_TARGET: i32 = 8;
 // split. Zero cost when GL_ON is false (the window gate); Java reads+resets
 // once per dump tick via nativeGlTake.
 // ---------------------------------------------------------------------------
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub static GL_ON: AtomicBool = AtomicBool::new(false);
 pub static GL_EVALS: [AtomicU32; 9] = [
@@ -1362,6 +1362,40 @@ pub fn ai_floor(in_buf: &[i32], out_buf: &mut [i32]) -> i32 {
     ai_floor_ext(in_buf, out_buf, &mut fold)
 }
 
+/// TEMP WAVE10 fine probe (CE_FINE): the floor phase counters.
+static FINE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FINE_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FINE_CLEANUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINE_LOCKREB_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINE_UPDATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FINE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TEMP WAVE10: arm the fine probe (CE_FINE=1 reads this once).
+pub fn fine_init() {
+    if !FINE_INIT.load(std::sync::atomic::Ordering::Relaxed) {
+        FINE_ON.store(
+            std::env::var_os("CE_FINE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        FINE_INIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// TEMP WAVE10: drain the fine probe (cleanup, lockrebuild, update, calls).
+pub fn fine_take() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FINE_CLEANUP_NS.swap(0, Relaxed),
+        FINE_LOCKREB_NS.swap(0, Relaxed),
+        FINE_UPDATE_NS.swap(0, Relaxed),
+        FINE_CALLS.fetch_add(0, Relaxed),
+    )
+}
+
+pub fn fine_calls_add(n: u64) {
+    FINE_CALLS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// WAVE6: the NATIVE entry — the resolver's FoldCtx enables the no-park
 /// resolutions. The advanced external stream (stroll fold) rides the ext
 /// tail words [OUT_EXT_LO, OUT_EXT_LO+1] when stroll_drew is set.
@@ -1421,6 +1455,38 @@ fn finish_ext(st: i32, out_buf: &mut [i32], fold: &mut FoldCtx, in_buf: Option<&
 }
 
 fn ai_floor_run<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 {
+    // TEMP WAVE10 fine probe (CE_FINE): cleanup/lockreb/update phase split.
+    // Gated by one relaxed load per call; Instant only when armed.
+    let fine = FINE_ON.load(Ordering::Relaxed);
+    if fine {
+        FINE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    struct FG {
+        cell: &'static AtomicU64,
+        t0: Option<std::time::Instant>,
+    }
+    impl Drop for FG {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(t0) = self.t0.take() {
+                let ns = t0.elapsed().as_secs() * 1_000_000_000
+                    + t0.elapsed().subsec_nanos() as u64;
+                self.cell.fetch_add(ns, Ordering::Relaxed);
+            }
+        }
+    }
+    #[inline]
+    fn fg(on: bool, cell: &'static AtomicU64) -> FG {
+        FG {
+            cell,
+            t0: if on { Some(std::time::Instant::now()) } else { None },
+        }
+    }
+    let (c_clean, c_lock, c_upd) = (
+        &FINE_CLEANUP_NS,
+        &FINE_LOCKREB_NS,
+        &FINE_UPDATE_NS,
+    );
     if out_buf.len() < OUT_HEADER + MAX_ACTS * OUT_ACT {
         out_buf[0] = ST_FALLBACK;
         out_buf[7] = FB_BUF_TOO_SMALL;
@@ -1547,6 +1613,7 @@ fn ai_floor_run<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32
         let count = ctx.counts[sel];
         match phase {
             PH_CLEANUP => {
+                let _ph = fg(fine, c_clean);
                 while gi < count {
                     if ctx.running[sel][gi] {
                         if ctx.flags(sel, gi) & ctx.disabled[sel] != 0 {
@@ -1595,6 +1662,7 @@ fn ai_floor_run<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32
                 gi = 0;
             }
             PH_LOCK_REBUILD => {
+                let _ph = fg(fine, c_lock);
                 for bit in 0..MAX_LOCK_FLAGS {
                     ctx.lock[sel][bit] = -1;
                 }
@@ -1617,6 +1685,7 @@ fn ai_floor_run<W: Src>(src: &W, out_buf: &mut [i32], fold: &mut FoldCtx) -> i32
                 gi = 0;
             }
             PH_UPDATE => {
+                let _ph = fg(fine, c_upd);
                 while gi < count {
                     if !ctx.running[sel][gi] {
                         let fl = ctx.flags(sel, gi);

@@ -17,6 +17,8 @@ use swarm_sim::mob::{MobAI, zombie_table};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // the TEMP WAVE10 fine probe must arm BEFORE the first tick
+    centities_core::goals::fine_init();
     let n_mobs: usize = args.get(1).map_or(25000, |s| s.parse().unwrap_or(25000));
     let ticks: i32 = args.get(2).map_or(400, |s| s.parse().unwrap_or(400));
     let seed: u64 = args.get(3).map_or(0xC0FFEE, |s| s.parse().unwrap_or(0xC0FFEE));
@@ -35,6 +37,16 @@ fn main() {
     // walk (all AI, then all travel) — the fused-vs-split twin arm
     if std::env::var_os("CE_SPLIT_TRAVEL").is_some() {
         nt.set_split_travel(true);
+    }
+    // the WAVE10 measurement probe: CE_NO_TRAVEL=1 skips the travel slice
+    // (the AI-only decomposition row)
+    if std::env::var_os("CE_NO_TRAVEL").is_some() {
+        nt.set_skip_travel(true);
+    }
+    // the WAVE10 A/B knob: CE_NO_ODD_SKIP=1 restores the full odd-tick
+    // floor (the maintained-bit skip's A/B arm — the twin's B side)
+    if std::env::var_os("CE_NO_ODD_SKIP").is_some() {
+        swarm_sim::ledger::set_odd_skip(false);
     }
     // the mobs-25k stand: a pile around the spawn column, flat ground
     for i in 0..n_mobs {
@@ -94,6 +106,19 @@ fn main() {
         chasing
     );
     println!("{}", centities_native::drain());
+    // the TEMP WAVE10 fine probe (CE_FINE=1): the floor's phase split
+    if std::env::var_os("CE_FINE").is_some() {
+        centities_core::goals::fine_init();
+        let (cl, lk, up, calls) = centities_core::goals::fine_take();
+        let tot = (cl + lk + up).max(1) as f64;
+        println!(
+            "floor fine | cleanup {:.1}% | lockreb {:.1}% | update {:.1}% | calls {}",
+            cl as f64 / tot * 100.0,
+            lk as f64 / tot * 100.0,
+            up as f64 / tot * 100.0,
+            calls
+        );
+    }
     // the perf hint: this process just ran a deterministic, allocation-free
     // (steady-state) single-thread tick loop — profile IT, not the server.
     eprintln!(

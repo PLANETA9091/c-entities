@@ -104,7 +104,7 @@ pub struct GoalRec {
 
 impl GoalRec {
     #[inline]
-    fn rec(kind: i32, prio: i32, flags: i64, cfg: i32) -> Self {
+    const fn rec(kind: i32, prio: i32, flags: i64, cfg: i32) -> Self {
         GoalRec {
             kind,
             prio,
@@ -122,7 +122,7 @@ impl GoalRec {
 /// (goals.rs::build_in — the table PARITY #369 proved bit-identical).
 /// `player_scan` marks the two Player-typed goals (cfg3 bit0): the
 /// NearestAttackable(Player) and the LookAtPlayer(Player).
-pub fn zombie_table() -> [GoalRec; N_GOALS] {
+pub const fn zombie_table() -> [GoalRec; N_GOALS] {
     let mut t = [
         GoalRec::rec(g::GK_HURT_BY, 1, FL_TARGET, 0),
         GoalRec::rec(g::GK_NEAREST_TARGET, 2, FL_TARGET, 10), // Player (cfg3)
@@ -219,6 +219,12 @@ pub struct MobAI {
     /// per round from the snapshot)
     pub approach_x: f64,
     pub approach_z: f64,
+    /// WAVE10: the every-tick bit — true iff a requiresUpdateEveryTick
+    /// goal (LOOKAROUND or MELEE in the classified set) is RUNNING. The
+    /// odd-tick floor is a provable no-op when this is false (see
+    /// ai_tick); the bit is maintained at every start/stop and policed
+    /// by the odd_skip_matches_full_floor_executor twin.
+    pub et_running: bool,
     /// WAVE4: the static-pack fingerprint (fnv1a over the goal cfg words
     /// + counts/follow/lastHurt header trio). Computed ONCE at
     /// construction — the goal table is fixed at add_mob (the executor
@@ -229,19 +235,52 @@ pub struct MobAI {
 }
 
 impl MobAI {
+    /// WAVE10: the every-tick bit maintenance (see et_running). pub: the
+    /// production resolver (centities-native::world::WorldRes) owns its own
+    /// start bodies and must maintain the bit at every start.
+    #[inline]
+    pub fn et_note_start(&mut self, kind: i32) {
+        if kind == g::GK_LOOKAROUND || kind == g::GK_ZOMBIE_ATTACK {
+            self.et_running = true;
+        }
+    }
+    #[inline]
+    pub fn et_note_stop(&mut self, kind: i32) {
+        if kind == g::GK_LOOKAROUND || kind == g::GK_ZOMBIE_ATTACK {
+            self.et_running = false;
+        }
+    }
+
     /// WAVE4: fnv1a over the words the resident path leaves to the static
     /// writer (goal cfg {0,1,2,3,6,7} per record + counts + follow bits +
     /// the static-zero lastHurtByMobTimestamp). Two mobs share the static
     /// scratch iff this matches.
-    fn static_fp(goals: &[GoalRec; N_GOALS]) -> u64 {
+    /// WAVE10: const fn — the zombie gate is a compile-time constant.
+    pub const fn static_fp(goals: &[GoalRec; N_GOALS]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for grec in goals.iter() {
-            for w in [grec.kind as u64, grec.prio as u64, grec.flags as u64, grec.cfg as u64, grec.cfg2 as u64, grec.cfg3 as u64] {
+        let mut i = 0;
+        while i < N_GOALS {
+            let grec = &goals[i];
+            let mut k = 0;
+            while k < 6 {
+                let w = match k {
+                    0 => grec.kind as u64,
+                    1 => grec.prio as u64,
+                    2 => grec.flags as u64,
+                    3 => grec.cfg as u64,
+                    4 => grec.cfg2 as u64,
+                    _ => grec.cfg3 as u64,
+                };
                 h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                k += 1;
             }
+            i += 1;
         }
-        for w in [4u64, 7, FOLLOW_RANGE.to_bits() as u64, 0] {
-            h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+        let tail = [4u64, 7, FOLLOW_RANGE.to_bits() as u64, 0];
+        let mut k = 0;
+        while k < tail.len() {
+            h = (h ^ tail[k]).wrapping_mul(0x1000_0000_01b3);
+            k += 1;
         }
         h
     }
@@ -271,6 +310,7 @@ impl MobAI {
             pend_z: 0.0,
             approach_x: 0.0,
             approach_z: 0.0,
+            et_running: false,
             pack_fp: Self::static_fp(&zombie_table()),
         }
     }
@@ -445,10 +485,12 @@ impl Resolver for FlatWorld {
                 mob.goals[gi].state = 20 + lcg_next_int(&mut mob.seed, 20);
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                mob.et_note_start(g::GK_LOOKAROUND);
             }
             g::GK_ZOMBIE_ATTACK => {
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                mob.et_note_start(g::GK_ZOMBIE_ATTACK);
             }
             _ => {}
         }
@@ -1014,6 +1056,7 @@ impl MobAI {
                     if p0 < N_GOALS {
                         self.goals[p0].running = true;
                         self.no_action = 0;
+                        self.et_note_start(self.goals[p0].kind);
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 1;
                             packed[4] = self.no_action;
@@ -1095,6 +1138,7 @@ impl MobAI {
                         self.goals[p0].state = out[b + 6];
                         self.goals[p0].running = true;
                         self.no_action = 0;
+                        self.et_note_start(self.goals[p0].kind);
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 1;
                             packed[g::IN_HEADER + gw + 5] = out[b + 6];
@@ -1105,6 +1149,7 @@ impl MobAI {
                 g::ACT_GOAL_STOP | g::ACT_GOAL_STOP_D => {
                     if p0 < N_GOALS {
                         self.goals[p0].running = false;
+                        self.et_note_stop(self.goals[p0].kind);
                         if MIRROR {
                             packed[g::IN_HEADER + gw + 4] = 0;
                         }
@@ -1215,6 +1260,27 @@ impl MobAI {
         // the sub-phase ledger gate (1-in-SUB_EVERY mobs on sampled
         // ticks; the guard drops at scope end)
         let _sub = crate::ledger::begin_mob();
+        self.tick_count = self.tick_count.wrapping_add(1);
+        self.no_action = self.no_action.saturating_add(1);
+        // WAVE10: the odd-tick no-op skip. The 26.3 odd branch is
+        // tickRunningGoals(false) — it touches ONLY the
+        // requiresUpdateEveryTick goals (LOOKAROUND + MELEE in the
+        // classified set): zero RNG draws, zero state writes of any other
+        // record, and done() writes the LCG value back verbatim. When
+        // NEITHER every-tick goal is running, the whole odd floor is a
+        // provable no-op — the exact shortcut the Java fast path has run
+        // since L22c (aiMeleeRunning). The et_running bit is maintained at
+        // every start/stop (apply_actions + the resolver start bodies);
+        // the odd_skip_matches_full_floor_executor twin drives the skip
+        // arm against the full-floor arm over 400-tick whole-store dumps,
+        // and CE_NO_ODD_SKIP=1 restores the full floor (the A/B arm).
+        if crate::ledger::odd_skip_on()
+            && (self.tick_count.wrapping_add(self.id as i32) & 1 != 0)
+            && self.tick_count > 1
+            && !self.et_running
+        {
+            return AiStat::default();
+        }
         // WAVE6: the fold contract — None keeps every request parked (the
         // Java-mirror twin); Some lets ai_floor_ext resolve the pure-v0
         // requests in place. Built ONCE per mob-tick from the resolver +
@@ -1225,8 +1291,6 @@ impl MobAI {
         // wire slot out[8] IS action slot 0 and let a same-round action be
         // replaced by the candidate list (the phantom ACT_GOAL_START p0=0).
         fold.ext_cands = true;
-        self.tick_count = self.tick_count.wrapping_add(1);
-        self.no_action = self.no_action.saturating_add(1);
         let mut stat = AiStat::default();
         let (mut cursor, mut res, mut req_op) = (0i32, 0i32, 0i32);
         let (mut rx, mut ry, mut rz) = (0f64, 0f64, 0f64);
@@ -1246,8 +1310,8 @@ impl MobAI {
                 if resident {
                     // WAVE9b THE MERGE: no scratch writes at all — the
                     // engine's Ctx reads the MobAI fields through ResSrc
-                    // (monomorphized, no vtable). The round words ride the
-                    // struct.
+                    // (monomorphized, no vtable). The round words ride
+                    // the struct.
                     let src = ResSrc {
                         mob: self,
                         players,
@@ -1501,6 +1565,36 @@ impl MobAI {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WAVE10: the every-tick bit pin — the maintenance helpers and the
+    /// fp sensitivity (the odd-skip executor twin
+    /// (centities-native::exec::odd_skip_matches_full_floor_executor)
+    /// proves the skip over the LIVE engine; this pin fails fast).
+    #[test]
+    fn et_bit_and_fp_pins() {
+        let mut m = MobAI::new(1, 7, 0.0, 64.0, 0.0);
+        assert!(!m.et_running, "a fresh mob runs no every-tick goal");
+        m.et_note_start(g::GK_LOOKAROUND);
+        assert!(m.et_running);
+        m.et_note_stop(g::GK_LOOKAROUND);
+        assert!(!m.et_running);
+        m.et_note_start(g::GK_ZOMBIE_ATTACK);
+        assert!(m.et_running, "melee is an every-tick kind");
+        m.et_note_start(g::GK_STROLL);
+        assert!(m.et_running, "a non-every-tick start keeps the bit");
+        m.et_note_stop(g::GK_STROLL);
+        assert!(m.et_running, "a non-every-tick stop keeps the bit");
+        m.et_note_stop(g::GK_ZOMBIE_ATTACK);
+        assert!(!m.et_running);
+        // the fp is table-sensitive: one mutated cfg word flips it
+        let mut t2 = zombie_table();
+        t2[8].cfg = 61; // the stroll interval, mutated
+        assert_ne!(
+            MobAI::static_fp(&t2),
+            m.pack_fp,
+            "a mutated table must not pass the fp"
+        );
+    }
 
     /// the goals.rs parity fixture's idle build (build_in) — the table
     /// PARITY #369 proved bit-identical, with the executor's follow/cfg2
