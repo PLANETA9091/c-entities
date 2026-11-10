@@ -108,7 +108,9 @@ impl NativeTick {
         // stale slot entry would double-list the id after recycling
         if let Some(slot) = self.store.remove(id) {
             let cell = self.store.mobs[slot as usize].grid_cell;
-            self.grid.detach(slot, cell);
+            // WAVE8b: the mobs slice rides along for the O(1) grid_pos
+            // re-stamp (the two field borrows are disjoint)
+            self.grid.detach(slot, cell, &mut self.store.mobs);
         }
     }
 

@@ -9,6 +9,7 @@
 //! list ONLY at the tail; interior removals tombstone to keep iteration
 //! order stable within the tick — the host removes between ticks).
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use swarm_sim::mob::MobAI;
 
@@ -24,9 +25,62 @@ pub struct MobSlot {
     pub mob: MobAI,
     /// alive=false entries are tombstones awaiting the between-tick compact.
     pub alive: bool,
-    /// grid bucket index (usize::MAX = unbuilt), refreshed per tick.
+    /// grid bucket index ((i64::MAX, i64::MAX) = unbuilt), refreshed per tick.
     pub grid_cell: (i64, i64),
+    /// WAVE8b: the slot's index WITHIN its cell's bucket vec — the O(1)
+    /// detach handle (swap_remove + the swapped element's re-stamp). Stale
+    /// whenever grid_cell is the unbuilt sentinel; guarded at every use.
+    pub grid_pos: u32,
 }
+
+/// WAVE8b: the cells-map hasher — FxHash-style multiply-xor over the key
+/// words. The default RandomState (SipHash-1-3) cost ~25ns per map op;
+/// every mover pays TWO per tick (the old-cell detach + the new-cell
+/// insert) ≈ 0.9ms/tick at the 25k pile. The keys are internal (never
+/// exposed across the wire), so a fixed-seed cheap hash is safe — Horizon's
+/// own grid uses FxHashMap for the same reason.
+#[derive(Default)]
+pub struct CellHasher {
+    h: u64,
+}
+
+impl Hasher for CellHasher {
+    #[inline]
+    fn write_u64(&mut self, w: u64) {
+        self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_i64(&mut self, w: i64) {
+        self.write_u64(w as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, w: u32) {
+        self.write_u64(w as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, w: u8) {
+        self.write_u64(w as u64);
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.write_u64(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            self.write_u64(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.h
+    }
+}
+
+type CellMap = HashMap<(i64, i64), Vec<u32>, BuildHasherDefault<CellHasher>>;
 
 /// The uniform 2-D XZ grid over mob slots. Cells are `HashMap<(i64,i64),
 /// Vec<u32>)` — at 25k mobs in a pile the hot cells hold thousands of slots;
@@ -35,7 +89,7 @@ pub struct MobSlot {
 /// exact boxes themselves).
 #[derive(Default)]
 pub struct SeenGrid {
-    cells: HashMap<(i64, i64), Vec<u32>>,
+    cells: CellMap,
     pub population: u64,
 }
 
@@ -69,26 +123,44 @@ impl SeenGrid {
     /// slots detach + insert, stationary slots are already right.
     pub fn rebuild(&mut self, mobs: &mut [MobSlot]) {
         let mut population = 0u64;
-        for (slot_i, m) in mobs.iter_mut().enumerate() {
-            if !m.alive {
+        for slot_i in 0..mobs.len() {
+            if !mobs[slot_i].alive {
                 continue;
             }
             population += 1;
-            let c = Self::cell_of(m.mob.x, m.mob.z);
-            if m.grid_cell == c {
+            let c = Self::cell_of(mobs[slot_i].mob.x, mobs[slot_i].mob.z);
+            if mobs[slot_i].grid_cell == c {
                 continue; // stationary: already listed under this cell
             }
+            let old_cell = mobs[slot_i].grid_cell;
             // detach from the stale cell (order-insensitive: the
-            // candidates() contract is an unordered superset)
-            if m.grid_cell.0 != i64::MAX {
-                if let Some(old) = self.cells.get_mut(&m.grid_cell) {
-                    if let Some(pos) = old.iter().position(|&s| s as usize == slot_i) {
+            // candidates() contract is an unordered superset).
+            // WAVE8b: the slot's position rides grid_pos — the O(len)
+            // position() scan is gone (the 25k pile's hot cells held ~35
+            // slots: ~17 linear comparisons per mover per tick).
+            if old_cell.0 != i64::MAX {
+                if let Some(old) = self.cells.get_mut(&old_cell) {
+                    let pos = mobs[slot_i].grid_pos as usize;
+                    if pos < old.len() && old[pos] == slot_i as u32 {
                         old.swap_remove(pos);
+                        if pos < old.len() {
+                            // the element swapped into `pos` re-stamps
+                            let moved = old[pos] as usize;
+                            mobs[moved].grid_pos = pos as u32;
+                        }
+                    } else {
+                        // invariant broke (a detached-but-not-rebuilt slot
+                        // would land here): the honest linear fallback
+                        if let Some(pos) = old.iter().position(|&s| s as usize == slot_i) {
+                            old.swap_remove(pos);
+                        }
                     }
                 }
             }
-            self.cells.entry(c).or_default().push(slot_i as u32);
-            m.grid_cell = c;
+            let v = self.cells.entry(c).or_default();
+            v.push(slot_i as u32);
+            mobs[slot_i].grid_pos = (v.len() - 1) as u32;
+            mobs[slot_i].grid_cell = c;
         }
         self.population = population;
     }
@@ -96,15 +168,25 @@ impl SeenGrid {
     /// Detach a slot from its listed cell (remove()-time; the tombstone
     /// must not linger as a stale candidate and slot recycling must not
     /// double-list). No-op for unbuilt slots.
-    pub fn detach(&mut self, slot: u32, cell: (i64, i64)) {
+    /// WAVE8b: the mobs slice rides along for the swapped element's
+    /// grid_pos re-stamp (the O(1) handle must stay exact).
+    pub fn detach(&mut self, slot: u32, cell: (i64, i64), mobs: &mut [MobSlot]) {
         if cell.0 == i64::MAX {
             return;
         }
         if let Some(old) = self.cells.get_mut(&cell) {
-            if let Some(pos) = old.iter().position(|&s| s == slot) {
+            let pos = mobs[slot as usize].grid_pos as usize;
+            if pos < old.len() && old[pos] == slot {
+                old.swap_remove(pos);
+                if pos < old.len() {
+                    let moved = old[pos] as usize;
+                    mobs[moved].grid_pos = pos as u32;
+                }
+            } else if let Some(pos) = old.iter().position(|&s| s == slot) {
                 old.swap_remove(pos);
             }
         }
+        mobs[slot as usize].grid_pos = u32::MAX;
     }
 
     /// Full invalidation (the compact renumbering): every stored cell
@@ -202,6 +284,7 @@ impl MobStore {
                     mob,
                     alive: true,
                     grid_cell: (i64::MAX, i64::MAX),
+            grid_pos: u32::MAX,
                 };
                 s
             }
@@ -210,6 +293,7 @@ impl MobStore {
                     mob,
                     alive: true,
                     grid_cell: (i64::MAX, i64::MAX),
+            grid_pos: u32::MAX,
                 });
                 (self.mobs.len() - 1) as u32
             }
@@ -342,7 +426,7 @@ mod tests {
         // remove detaches; recycling the slot must not double-list it
         let slot = s.remove(2).expect("removed");
         let cell = s.mobs[slot as usize].grid_cell;
-        g.detach(slot, cell);
+        g.detach(slot, cell, &mut s.mobs);
         g.candidates(19.5, 7.5, 20.5, 8.5, &mut out);
         assert!(out.is_empty(), "removed mob must leave the grid");
         // slot 1 recycles as a NEW mob near (21,8): rebuild re-lists it,
@@ -352,6 +436,7 @@ mod tests {
             mob: m4,
             alive: true,
             grid_cell: (i64::MAX, i64::MAX),
+            grid_pos: u32::MAX,
         };
         s.index.insert(4, 1);
         s.free.pop();
