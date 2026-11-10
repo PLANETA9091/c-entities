@@ -126,6 +126,7 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
             stroll_drew: false,
             ext_cands: false,
             find_target_fold: true, // WorldRes.find_target = any alive && !spectator
+            canuse_fold: true, // WorldRes.canuse_vanilla = target lives (open ground)
         })
     }
 

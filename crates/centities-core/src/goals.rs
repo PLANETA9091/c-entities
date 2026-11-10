@@ -316,6 +316,22 @@ pub const ACT_STROLL_SET: i32 = 12;
 /// the floor on its own LCG (no park): rel = (p1..p4 f64 pair),
 /// lookTime/state = p5. running/no_action flip here too.
 pub const ACT_RLA_START: i32 = 13;
+pub const ACT_CANUSE_OK: i32 = 14;
+/// WAVE7 fix of the WAVE6 cc-fold latent drift: the parked flow's cc
+/// resolution clears the carried target + the MF word AT THE RESOLVER
+/// (`target_player = -1; scratch[1] = MF_BASE`) for the
+/// ZOMBIE_ATTACK/NEAREST_TARGET kinds — the floor cannot touch mob state,
+/// so the FOLD emits the same clear as an action (p0 = the goal idx),
+/// applied BEFORE the paired ACT_GOAL_STOP. The floor ALSO refreshes its
+/// in-memory MF word at the fold site (the same-round gates must see the
+/// cleared target exactly as the parked flow's re-packed resume round
+/// does).
+pub const ACT_TARGET_CLEAR: i32 = 15;
+/// WAVE7 canuse fold: the MeleeAttackGoal.canUse tail resolved IN PLACE —
+/// the lastCanUseCheck write (p1 = level game time) the parked flow's
+/// resume arm makes at the resolution. No lock transition here — the
+/// paired lock_only actions follow in the same list (the parked flow's
+/// order: state write at resolution, then the resume round's apply).
 
 // phases within one selector tick
 const PH_CLEANUP: i32 = 0;
@@ -363,6 +379,10 @@ pub struct FoldMask {
     pub rla: bool,
     /// the cleanup cc fold
     pub cc: bool,
+    /// WAVE7: the MeleeAttackGoal.canUse tail fold (the v0 answer is a
+    /// pure function of the round state — target alive check provable
+    /// from the round's HAS_TARGET gate)
+    pub canuse: bool,
 }
 
 /// The per-mob fold context the RESOLVER builds (trait Resolver::fold_ctx).
@@ -401,6 +421,12 @@ pub struct FoldCtx {
     /// a resolver whose find_target differs (FlatWorld: no targets, always
     /// false) must leave this OFF and keep the park.
     pub find_target_fold: bool,
+    /// WAVE7: the RESOLVER-declared canuse fold enable — the fold answers
+    /// the GK_ZOMBIE_ATTACK canUse tail as `target_player >= 0` (the
+    /// WorldRes.open_ground_v0 contract: the path always yields, the
+    /// target lives). A resolver whose canuse_vanilla differs (FlatWorld:
+    /// always false) must leave this OFF and keep the park.
+    pub canuse_fold: bool,
 }
 
 impl FoldCtx {
@@ -419,6 +445,7 @@ impl FoldCtx {
             stroll_drew: false,
             ext_cands: false,
             find_target_fold: false,
+            canuse_fold: false,
         }
     }
 }
@@ -672,6 +699,12 @@ struct Ctx<'a> {
     fold: &'a mut FoldCtx,
     /// WAVE6: the SNAPSHOT enables — by value, one load per site.
     fm: FoldMask,
+    /// WAVE7: the in-memory MF word override — the cc fold's target clear
+    /// must be visible to the SAME-round gates (the parked flow's resume
+    /// round re-packs the word from the cleared live state; the fold has
+    /// no resume round). None = read the packed word (the common case:
+    /// one branch per flag() call, never taken without a fold-stop).
+    mf_ov: Option<i32>,
 }
 
 impl<'a> Ctx<'a> {
@@ -727,7 +760,13 @@ impl<'a> Ctx<'a> {
     }
     #[inline]
     fn flag(&self, bit: i32) -> bool {
-        self.inb[1] & bit != 0
+        // WAVE7: the cc-fold target clear overrides the packed MF word for
+        // the rest of the round (never set without a fold — the None arm
+        // is the packed load)
+        match self.mf_ov {
+            Some(w) => w & bit != 0,
+            None => self.inb[1] & bit != 0,
+        }
     }
     // ---- player snapshot accessors (v3 native scans) ----
     #[inline]
@@ -1155,7 +1194,9 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
             strl: fold.on,
             rla: fold.on,
             cc: fold.on,
+            canuse: fold.on && fold.canuse_fold,
         },
+        mf_ov: None,
         fold,
     };
     for sel in 0..2usize {
@@ -1268,10 +1309,26 @@ fn ai_floor_run(in_buf: &[i32], out_buf: &mut [i32], fold: &mut FoldCtx) -> i32 
                                 // function of the pack + the carried
                                 // target/approach — continue or stop in
                                 // place, no park/resume round-trip.
-                                if !ctx.fold_cc(sel, gi)
-                                    && stop_goal(&mut ctx, &mut out, sel, gi).is_err()
-                                {
-                                    return fallback(&mut out, FB_STATE_MISMATCH);
+                                // WAVE7: the STOP half must ALSO carry the
+                                // parked flow's resolver-side target clear
+                                // (ZOMBIE_ATTACK/NEAREST_TARGET kinds) —
+                                // the latent drift the canuse fold's round
+                                // schedule exposed (the stress twin, tick 9,
+                                // mob 18136: folded kept a target the parked
+                                // flow had dropped).
+                                if !ctx.fold_cc(sel, gi) {
+                                    let k = ctx.kind(sel, gi);
+                                    if k == GK_ZOMBIE_ATTACK || k == GK_NEAREST_TARGET {
+                                        out.push(ACT_TARGET_CLEAR, ctx.global(sel, gi), 0, 0, 0);
+                                        // the in-memory MF word: the same-round
+                                        // gates read it — the parked flow's
+                                        // resume round re-packs it from the
+                                        // cleared live state
+                                        ctx.mf_ov = Some(MF_NO_PASSENGERS | MF_MAINHAND_EMPTY);
+                                    }
+                                    if stop_goal(&mut ctx, &mut out, sel, gi).is_err() {
+                                        return fallback(&mut out, FB_STATE_MISMATCH);
+                                    }
                                 }
                             } else {
                                 return park(&ctx, &mut out, sel, PH_CLEANUP, gi, REQ_CC_VANILLA);
@@ -1570,6 +1627,22 @@ fn can_use_inner(
             }
             if !ctx.flag(MF_HAS_TARGET) {
                 return Ok(Cu::No);
+            }
+            // WAVE7 CANUSE fold: the parked flow's resume answer (the
+            // WorldRes contract: `matches!(ZOMBIE_ATTACK) &&
+            // target_player >= 0` — the HAS_TARGET gate above proved the
+            // target lives THIS round) resolves IN PLACE. The parked
+            // continuation, in order: the lastCanUseCheck write (the
+            // resume arm's `state = game_time` — rides ACT_CANUSE_OK) then
+            // the lock transition (lock_only). Same apply order, zero
+            // park/resume round-trips.
+            if ctx.fm.canuse {
+                out.push(ACT_CANUSE_OK, ctx.global(sel, gi), ctx.inb[23], 0, 0);
+                if lock_only(ctx, out, sel, gi).is_err() {
+                    out.buf[7] = FB_STATE_MISMATCH;
+                    return Err(());
+                }
+                return Ok(Cu::Continue);
             }
             park(ctx, out, sel, phase, gi, REQ_CANUSE_VANILLA);
             Ok(Cu::Staged)

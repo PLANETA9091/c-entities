@@ -375,6 +375,7 @@ impl Resolver for FlatWorld {
             stroll_drew: false,
             ext_cands: false,
             find_target_fold: false, // FlatWorld's find_target contract = false (no targets)
+            canuse_fold: false, // FlatWorld's canuse_vanilla = always false — keep the park
         })
     }
 
@@ -858,6 +859,24 @@ impl MobAI {
                     }
                 }
                 g::ACT_GOAL_LOCK_MAP => { /* map-only; running flips at start */ }
+                // WAVE7 canuse fold: the MeleeAttackGoal.canUse tail passed
+                // IN PLACE — the lastCanUseCheck write the parked flow's
+                // resume arm makes at the resolution (state = game_time,
+                // p1). The paired lock_only actions follow in the same list.
+                g::ACT_CANUSE_OK => {
+                    if p0 < N_GOALS {
+                        self.goals[p0].state = p1;
+                        packed[g::IN_HEADER + gw + 5] = p1;
+                    }
+                }
+                // WAVE7 cc-fold target clear: the parked flow's resolver
+                // clears the carried target + the MF word at the cc
+                // resolution (the attack/target chain drops) — the fold
+                // emits the same clear as an action.
+                g::ACT_TARGET_CLEAR => {
+                    self.target_player = -1;
+                    packed[1] = g::MF_NO_PASSENGERS | g::MF_MAINHAND_EMPTY;
+                }
                 // WAVE6 stroll fold: the floor drew the v0 target from the
                 // external stream — stash it (pend); the paired GOAL_START
                 // (later in this action list, lock_only's push) sets nav from
