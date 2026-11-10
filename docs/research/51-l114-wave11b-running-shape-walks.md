@@ -107,3 +107,26 @@ holds.
   re-downloaded (26.3 build 248, sha256 pinned in the fetch). The module
   suite needs Java 25 (paper 26.3 refuses 21) — the Temurin 25 tarball is
   the recipe; natives_parity pending the mapped-jar boot.
+
+## wave11c addendum (same session): the 20-byte goal record + the ar bit
+
+The two levers from the list above, shipped and verified:
+
+- **ar_running** — the maintained any-running bit (the et_running
+  pattern): starts set it, stops RECOMPUTE (the stop paths are rare),
+  debug_assert-pinned at the z0/z1 gate. The 11-record scan per even
+  mob-tick left the B-tail. 25k: 2.31 → 2.11.
+- **GoalRec 40B → 20B** — kind/prio/flags u8 + running bool pack the
+  4-byte header; cfg/state/cfg2/cfg3 stay i32. The wire words are
+  DERIVED by pack_into (byte-identical, the fixture pins it); the
+  small-const domains (kinds 0..9, prios 1..9, flags bits 0..4) make
+  the narrowing lossless. The goals[11] array: 440B → 220B per mob of
+  the fused pass's L3/DRAM traffic. The consumers read through the Src
+  accessors (casts centralized) + ~15 mechanical as-i32 sites.
+  25k: 2.11 → **1.95**; 100k: 8.26 → **7.82** (the DRAM-bound lever
+  compounds: 12.65 at wave8c → 7.82 = −38% for the 100k chain).
+
+Session: **8.41 → 1.95 p50 (−76.8%)**, chasing 3745 == 3745 /
+14008 == 14008. 77 Rust suites green; the module suite (the JNI hooks vs
+the real mapped 26.3 jar) green locally; the server-side parity legs run
+in CI on push (parity.yml — the honest A/B gate).
