@@ -101,16 +101,17 @@ impl NativeTick {
     /// packs the goal table, RNG mirror and physics fields verbatim).
     pub fn add_mob(&mut self, mob: MobAI) {
         self.store.add(mob);
+        // WAVE8c lazy grid: a fresh slot's position lands at the next query
+        self.grid.dirty = true;
     }
 
     pub fn remove_mob(&mut self, id: i64) {
-        // the tombstone detaches from the grid immediately: a lingering
-        // stale slot entry would double-list the id after recycling
-        if let Some(slot) = self.store.remove(id) {
-            let cell = self.store.mobs[slot as usize].grid_cell;
-            // WAVE8b: the mobs slice rides along for the O(1) grid_pos
-            // re-stamp (the two field borrows are disjoint)
-            self.grid.detach(slot, cell, &mut self.store.mobs);
+        // WAVE8c lazy grid: the tombstone skips the immediate detach — the
+        // next query rebuilds from live positions (the stale-listed id
+        // would only be observable through candidates(), which rebuilds
+        // first). One dirty store per remove instead of a map op + scan.
+        if self.store.remove(id).is_some() {
+            self.grid.dirty = true;
         }
     }
 
@@ -119,12 +120,13 @@ impl NativeTick {
     /// allocated a fresh 25k-slot Vec — ~1.2 MB — every tick; the buffer
     /// now persists, the borrow ends at the next tick call).
     pub fn tick(&mut self, game_time: i32) -> &[AiStat] {
-        // grid refresh (WAVE2: the Horizon N1 incremental re-bucket —
-        // movers only; the profile shows the real share)
-        {
-            let _g = grid_guard();
-            self.grid.rebuild(&mut self.store.mobs);
-        }
+        // WAVE8c: the grid maintenance is LAZY — the native v0 path never
+        // queries candidates() (the folds answer LOS/target scans natively
+        // over the packed players), so the per-tick re-bucket walk was pure
+        // overhead (~0.7ms/tick at 25k). The grid dirty-flag fires on the
+        // first actual query (the JNI production scans route through
+        // candidates()); see SeenGrid::candidates.
+        let _ = grid_guard; // the phase bracket stays for the query-time cost
         // players -> the pack snapshot (the floor borrows it per mob;
         // WAVE4: built into a REUSED buffer, not a fresh Vec per tick)
         let players: &[PlayerSnap] = {
@@ -214,6 +216,7 @@ impl NativeTick {
         if self.store.free.len() > self.compact_at {
             self.store.compact();
             self.grid.invalidate_all();
+            self.grid.dirty = true;
             for m in &mut self.store.mobs {
                 m.grid_cell = (i64::MAX, i64::MAX);
             }

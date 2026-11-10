@@ -91,6 +91,13 @@ type CellMap = HashMap<(i64, i64), Vec<u32>, BuildHasherDefault<CellHasher>>;
 pub struct SeenGrid {
     cells: CellMap,
     pub population: u64,
+    /// WAVE8c: lazy maintenance — the grid rebuilds (full, from live
+    /// positions) on the first query after any population/position change.
+    /// The native v0 tick never queries (the folds answer scans natively),
+    /// so the per-tick re-bucket walk was pure overhead. The content is
+    /// only observable through candidates()/cell_len — both fire the
+    /// rebuild first, so the superset contract is unchanged bit-for-bit.
+    pub dirty: bool,
 }
 
 impl SeenGrid {
@@ -163,6 +170,7 @@ impl SeenGrid {
             mobs[slot_i].grid_cell = c;
         }
         self.population = population;
+        self.dirty = false;
     }
 
     /// Detach a slot from its listed cell (remove()-time; the tombstone
@@ -194,19 +202,19 @@ impl SeenGrid {
     pub fn invalidate_all(&mut self) {
         self.cells.clear();
         self.population = 0;
+        self.dirty = true;
     }
 
     /// A superset of the mobs whose position could touch the XZ area.
     /// Returned slot indices are unordered (Horizon contract: the caller
     /// re-tests exact boxes; order-sensitive callers sort by slot).
-    pub fn candidates(
-        &self,
-        min_x: f64,
-        min_z: f64,
-        max_x: f64,
-        max_z: f64,
-        out: &mut Vec<u32>,
-    ) {
+    /// WAVE8c: LAZY — a dirty grid rebuilds (full walk, live positions)
+    /// before answering; clean grids answer from the maintained buckets.
+    pub fn candidates(&mut self, mobs: &mut [MobSlot], min_x: f64, min_z: f64, max_x: f64, max_z: f64, out: &mut Vec<u32>) {
+        if self.dirty {
+            self.rebuild(mobs);
+            self.dirty = false;
+        }
         out.clear();
         let cx0 = (min_x * 0.25).floor() as i64;
         let cx1 = (max_x * 0.25).floor() as i64;
@@ -232,13 +240,18 @@ impl SeenGrid {
     }
 
     #[inline]
-    pub fn cell_len(&self, cx: i64, cz: i64) -> usize {
+    pub fn cell_len(&mut self, mobs: &mut [MobSlot], cx: i64, cz: i64) -> usize {
+        if self.dirty {
+            self.rebuild(mobs);
+            self.dirty = false;
+        }
         self.cells.get(&(cx, cz)).map_or(0, |c| c.len())
     }
 
     pub fn clear(&mut self) {
         self.cells.clear();
         self.population = 0;
+        self.dirty = true;
     }
 }
 
@@ -384,15 +397,15 @@ mod tests {
         let mut g = SeenGrid::default();
         g.rebuild(&mut s.mobs);
         let mut out = Vec::new();
-        g.candidates(-1.0, -1.0, 3.5, 1.0, &mut out);
+        g.candidates(&mut s.mobs, -1.0, -1.0, 3.5, 1.0, &mut out);
         out.sort_unstable();
         assert_eq!(out, vec![0, 1]); // 4.1 is in the next cell — must NOT be missed by [0,3.5]
         // degenerate far-apart area: overflow fallback walks all cells
-        g.candidates(-1.0e6, -1.0e6, 1.0e6, 1.0e6, &mut out);
+        g.candidates(&mut s.mobs, -1.0e6, -1.0e6, 1.0e6, 1.0e6, &mut out);
         assert_eq!(out.len(), 3);
         // double-check the boundary: an area touching the boundary of a cell
         // must include the neighbour mob at 4.1 (superset, not exact)
-        g.candidates(0.0, 0.0, 4.0, 0.0, &mut out);
+        g.candidates(&mut s.mobs, 0.0, 0.0, 4.0, 0.0, &mut out);
         out.sort_unstable();
         assert!(out.contains(&2));
     }
@@ -411,23 +424,23 @@ mod tests {
         g.rebuild(&mut s.mobs);
         let mut out = Vec::new();
         // both far cells list their own mob
-        g.candidates(7.9, 7.9, 8.1, 8.1, &mut out);
+        g.candidates(&mut s.mobs, 7.9, 7.9, 8.1, 8.1, &mut out);
         assert_eq!(out, vec![1]);
         // mob 2 walks three cells over (8,8 -> 20,8): cross-cell move
         s.mobs[1].mob.x = 20.0;
         g.rebuild(&mut s.mobs);
-        g.candidates(7.5, 7.5, 8.5, 8.5, &mut out);
+        g.candidates(&mut s.mobs, 7.5, 7.5, 8.5, 8.5, &mut out);
         assert!(out.is_empty(), "the old cell must not list a mover");
-        g.candidates(19.9, 7.9, 20.1, 8.1, &mut out);
+        g.candidates(&mut s.mobs, 19.9, 7.9, 20.1, 8.1, &mut out);
         assert_eq!(out, vec![1], "the new cell must list the mover");
         // stationary mob: untouched by the second rebuild
-        g.candidates(-0.1, -0.1, 0.1, 0.1, &mut out);
+        g.candidates(&mut s.mobs, -0.1, -0.1, 0.1, 0.1, &mut out);
         assert_eq!(out, vec![0]);
         // remove detaches; recycling the slot must not double-list it
         let slot = s.remove(2).expect("removed");
         let cell = s.mobs[slot as usize].grid_cell;
         g.detach(slot, cell, &mut s.mobs);
-        g.candidates(19.5, 7.5, 20.5, 8.5, &mut out);
+        g.candidates(&mut s.mobs, 19.5, 7.5, 20.5, 8.5, &mut out);
         assert!(out.is_empty(), "removed mob must leave the grid");
         // slot 1 recycles as a NEW mob near (21,8): rebuild re-lists it,
         // exactly once
@@ -441,7 +454,7 @@ mod tests {
         s.index.insert(4, 1);
         s.free.pop();
         g.rebuild(&mut s.mobs);
-        g.candidates(20.5, 7.5, 21.5, 8.5, &mut out);
+        g.candidates(&mut s.mobs, 20.5, 7.5, 21.5, 8.5, &mut out);
         assert_eq!(out, vec![1], "recycled slot listed once at its new cell");
         // compact renumbering invalidates; the rebuild rebuilds all
         s.compact();
@@ -450,7 +463,7 @@ mod tests {
             m.grid_cell = (i64::MAX, i64::MAX);
         }
         g.rebuild(&mut s.mobs);
-        g.candidates(-1.0, -1.0, 200.0, 200.0, &mut out);
+        g.candidates(&mut s.mobs, -1.0, -1.0, 200.0, 200.0, &mut out);
         out.sort_unstable();
         assert_eq!(out.len(), 3, "all alive mobs after compact+rebuild");
     }
