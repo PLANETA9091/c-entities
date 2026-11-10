@@ -553,6 +553,109 @@ mod tests {
         assert!(moved > 0, "the fused twin must walk/stroll: {moved}");
     }
 
+    /// THE WAVE11 executor gate: the STRAIGHT-LINE zombie walk (ai_floor_z0
+    /// behind the fp/running/even/fold gate) must be BIT-IDENTICAL to the
+    /// generic engine over the same chased/strolling/looking population —
+    /// the whole-store dump per tick, 400 ticks. The straight arm engages
+    /// on round 0 of every eligible tick; parks resume through the generic
+    /// arm — both arms must land the same words every tick.
+    #[test]
+    fn zstrait_matches_generic_executor() {
+        let build = || -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.rel_x.to_bits(),
+                    m.rel_z.to_bits(),
+                    m.pend_x.to_bits(),
+                    m.pend_z.to_bits(),
+                    m.approach_x.to_bits(),
+                    m.approach_z.to_bits(),
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            [h, nt.target_rng, pop].to_vec()
+        };
+        // the arms run SEQUENTIALLY (the z0 switch is a process-global);
+        // the executor is deterministic per seed (the determinism gate)
+        let mut runs: Vec<Vec<Vec<u64>>> = Vec::new();
+        for z0 in [true, false] {
+            swarm_sim::mob::set_z0(z0);
+            let mut nt = build();
+            let mut dumps = Vec::with_capacity(400);
+            for t in 0..400 {
+                nt.tick(t);
+                dumps.push(dump(&nt));
+            }
+            runs.push(dumps);
+        }
+        swarm_sim::mob::set_z0(true);
+        assert_eq!(
+            runs[0], runs[1],
+            "the straight-line walk diverged from the generic twin"
+        );
+        // the scenario must actually chase (the z0 target path is exercised)
+        let mut nt = build();
+        for t in 0..120 {
+            nt.tick(t);
+        }
+        let chasing = nt
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        assert!(chasing > 0, "the zstrait twin must acquire targets");
+    }
+
     /// THE WAVE10 executor gate: the odd-tick no-op SKIP (the maintained
     /// every-tick bit) must be BIT-IDENTICAL to the full-floor walk over the
     /// same chased/strolling/looking population — the whole-store dump per

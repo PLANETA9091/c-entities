@@ -576,6 +576,27 @@ impl ResSrc<'_> {
     }
 }
 
+/// WAVE11: the zombie static-table fingerprint — a compile-time constant
+/// built from the same const fn the constructor uses. `pack_fp == ZOMBIE_FP`
+/// proves the mob's live goal table is the classified zombie shape
+/// (kind/prio/flags/cfg/cfg2/cfg3 per record + counts + follow + lastHurt)
+/// — the gate for the straight-line walk (`ai_floor_z0`), which reads the
+/// LIVE table through ResSrc and only ASSUMES the shape.
+pub const ZOMBIE_FP: u64 = MobAI::static_fp(&zombie_table());
+
+/// WAVE11: the straight-line A/B escape (the twin's B side).
+/// CE_NO_Z0=1 / set_z0(false) forces the generic engine.
+static Z0_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[inline]
+pub fn z0_on() -> bool {
+    Z0_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_z0(on: bool) {
+    Z0_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl EngineSrc for ResSrc<'_> {
     #[inline]
     fn cursor(&self) -> i32 {
@@ -1285,7 +1306,22 @@ impl MobAI {
         // Java-mirror twin); Some lets ai_floor_ext resolve the pure-v0
         // requests in place. Built ONCE per mob-tick from the resolver +
         // the mob's carried target/approach; None degrades to FoldCtx::off.
+        let resident = !pack.full;
         let mut fold = r.fold_ctx(self).unwrap_or_else(g::FoldCtx::off);
+        // WAVE11: the STRAIGHT-LINE gate — the shape ai_floor_z0 owns:
+        // the zombie table (fp), the fold contract on, the EVEN branch,
+        // NO running goals (the cleanup/lock rebuild are provably empty
+        // and the lock table starts cleared). Everything else — parks
+        // (mid-stream, the exact park words), odd ticks with running
+        // every-tick goals, non-zombie tables, the parked flow — rides
+        // the generic engine bit-for-bit.
+        let z0_shape = resident
+            && z0_on()
+            && fold.on
+            && self.pack_fp == ZOMBIE_FP
+            && !((self.tick_count.wrapping_add(self.id as i32) & 1 != 0)
+                && self.tick_count > 1)
+            && !self.goals.iter().any(|rec| rec.running);
         // WAVE6 FIX: the native executor exchanges LOS candidates through the
         // EXT tail in BOTH modes (folded AND the parked twin) — the legacy
         // wire slot out[8] IS action slot 0 and let a same-round action be
@@ -1295,7 +1331,6 @@ impl MobAI {
         let (mut cursor, mut res, mut req_op) = (0i32, 0i32, 0i32);
         let (mut rx, mut ry, mut rz) = (0f64, 0f64, 0f64);
         out[..OUT_RESET].fill(0);
-        let resident = !pack.full;
         let need = g::IN_HEADER + N_GOALS * g::GOAL_STRIDE + players.len() * g::PSTRIDE;
         if scratch.len() < need {
             scratch.resize(need, 0);
@@ -1321,7 +1356,15 @@ impl MobAI {
                         res_op: req_op,
                         counts: [TARGET_SEL_COUNT, N_GOALS - TARGET_SEL_COUNT],
                     };
-                    g::ai_floor_res(&src, out, &mut fold)
+                    // WAVE11: round 0 of the straight-line shape rides
+                    // ai_floor_z0 (the walk completes in place or parks —
+                    // the park words resume through the generic arm,
+                    // cursor != 0, from round 1 on)
+                    if z0_shape && cursor == 0 {
+                        g::ai_floor_z0(&src, out, &mut fold)
+                    } else {
+                        g::ai_floor_res(&src, out, &mut fold)
+                    }
                 } else {
                     // the WIRE arm (the FULL twin): the full pack every
                     // round — the pre-wave8 semantics, bit-for-bit

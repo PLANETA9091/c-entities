@@ -43,6 +43,11 @@ fn main() {
     if std::env::var_os("CE_NO_TRAVEL").is_some() {
         nt.set_skip_travel(true);
     }
+    // the WAVE11 A/B knob: CE_NO_Z0=1 forces the generic engine (the
+    // straight-line walk's A/B arm — the twin's B side)
+    if std::env::var_os("CE_NO_Z0").is_some() {
+        swarm_sim::mob::set_z0(false);
+    }
     // the WAVE10 A/B knob: CE_NO_ODD_SKIP=1 restores the full odd-tick
     // floor (the maintained-bit skip's A/B arm — the twin's B side)
     if std::env::var_os("CE_NO_ODD_SKIP").is_some() {
