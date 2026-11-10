@@ -72,6 +72,12 @@ pub struct NativeTick {
     /// WAVE10 measurement probe (NOT a semantics arm): skip the travel
     /// slice entirely — the AI-only decomposition row in the bench ledger.
     skip_travel: bool,
+    /// WAVE12 twin hook: true = the pre-wave12 PRE-PASS shape (the whole
+    /// approach-refresh walk runs before the main loop — one extra full
+    /// population stream per tick). False (the production default) = the
+    /// refresh FUSES into the main loop, immediately before each mob's own
+    /// ai_tick — the only reader of the fields is the mob itself.
+    prepass: bool,
 }
 
 impl NativeTick {
@@ -90,7 +96,19 @@ impl NativeTick {
             fold_off: false,
             split_travel: false,
             skip_travel: false,
+            prepass: false,
         }
+    }
+
+    /// WAVE12 twin hook: restore the pre-wave12 approach-refresh PRE-PASS
+    /// (the extra full population stream per tick). The production default
+    /// is the fused refresh: no mob reads another mob (the folds answer
+    /// every scan over the packed players; the snapshot is immutable during
+    /// the tick), so refreshing mob i's approach fields right before ITS
+    /// ai_tick lands the same two writes at the same point of ITS own
+    /// timeline — the executor twin walks both arms bit-for-bit.
+    pub fn set_prepass(&mut self, on: bool) {
+        self.prepass = on;
     }
 
     /// WAVE10 measurement probe: skip the travel slice (the AI-only row).
@@ -192,20 +210,27 @@ impl NativeTick {
         // WAVE4: the tick-level player fingerprint (computed ONCE per tick;
         // the stamp check in ai_tick is free per mob)
         let tfp = MobAI::tick_fp(players);
-        // the melee approach refresh: the floor reads approach_x/z live —
-        // they must track the target's CURRENT position (vanilla reads
-        // getTarget().position() per round through the pack). One pass
-        // over target-holding mobs (no aliasing: mobs and snapshot are
-        // separate fields).
-        {
+        // WAVE12a: the melee approach refresh FUSED into the main loop —
+        // the floor reads approach_x/z live (they must track the target's
+        // CURRENT position; vanilla reads getTarget().position() per round
+        // through the pack). The old shape ran it as a PRE-PASS: a second
+        // full population stream per tick (25k × ~360 B of L3/DRAM
+        // traffic) for a per-mob two-field write. The write is independent
+        // of every other mob — no mob-mob reads exist (the folds answer
+        // every scan over the packed players) and the snapshot is immutable
+        // during the tick — so landing it immediately before the mob's OWN
+        // ai_tick is bit-identical (the prepass_matches_fused_refresh twin
+        // drives both arms 400 ticks). CE_PREPASS=1 / set_prepass(true)
+        // restores the pre-pass shape (the A/B arm).
+        if self.prepass {
             let _g = apply_guard();
             for slot in self.store.mobs.iter_mut() {
-                let m = &slot.mob;
-                if m.target_player >= 0 {
-                    let tp = m.target_player as usize;
-                    if let Some(p) = self.store.snapshot.players.get(tp) {
-                        slot.mob.approach_x = p.x;
-                        slot.mob.approach_z = p.z;
+                let tp = slot.mob.target_player;
+                if tp >= 0 {
+                    if let Some(p) = self.store.snapshot.players.get(tp as usize) {
+                        let (px, pz) = (p.x, p.z);
+                        slot.mob.approach_x = px;
+                        slot.mob.approach_z = pz;
                     } else {
                         slot.mob.target_player = -1;
                     }
@@ -231,6 +256,21 @@ impl NativeTick {
         for slot in self.store.mobs.iter_mut() {
             if !slot.alive {
                 continue;
+            }
+            // WAVE12a: the fused approach refresh — the two-field write
+            // rides the SAME population stream the AI is about to pay for
+            // (the fields are L3-hot the moment the floor reads them).
+            if !self.prepass {
+                let tp = slot.mob.target_player;
+                if tp >= 0 {
+                    if let Some(p) = self.store.snapshot.players.get(tp as usize) {
+                        let (px, pz) = (p.x, p.z);
+                        slot.mob.approach_x = px;
+                        slot.mob.approach_z = pz;
+                    } else {
+                        slot.mob.target_player = -1;
+                    }
+                }
             }
             res.target_rng = self.target_rng;
             let stat = if no_ai_on() {
@@ -629,6 +669,97 @@ mod tests {
             .filter(|m| m.mob.x != m.mob.x.trunc() || m.mob.goals.iter().any(|g| g.running))
             .count();
         assert!(moved > 0, "the fused twin must walk/stroll: {moved}");
+    }
+
+    /// THE WAVE12 gate: the fused approach refresh (the two-field write
+    /// inside the main loop, right before each mob's own ai_tick) must be
+    /// BIT-IDENTICAL to the pre-wave12 pre-pass (the separate whole-store
+    /// walk before the loop) over the same chased/strolling/looking
+    /// population — the whole-store dump per tick, 400 ticks. The write is
+    /// independent of every other mob (no mob-mob reads: the folds answer
+    /// every scan over the packed players; the snapshot is immutable during
+    /// the tick), so both arms must land the same words every tick.
+    #[test]
+    fn prepass_matches_fused_refresh() {
+        let build = |prepass: bool| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_prepass(prepass);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = zombie_table();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: 12.0,
+                y: 64.0,
+                z: 4.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let mut pre = build(true);
+        let mut fus = build(false);
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.approach_x.to_bits(),
+                    m.approach_z.to_bits(),
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            [h, nt.target_rng, pop].to_vec()
+        };
+        for t in 0..400 {
+            pre.tick(t);
+            fus.tick(t);
+            assert_eq!(
+                dump(&pre),
+                dump(&fus),
+                "tick {t}: the fused refresh diverged from the pre-pass twin"
+            );
+        }
+        // the scenario must acquire targets (the refresh actually fires)
+        let chasing = fus
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        assert!(chasing > 0, "the refresh twin must chase: {chasing}");
     }
 
     /// THE WAVE11 executor gate: the STRAIGHT-LINE zombie walk (ai_floor_z0

@@ -48,6 +48,11 @@ fn main() {
     if std::env::var_os("CE_NO_Z0").is_some() {
         swarm_sim::mob::set_z0(false);
     }
+    // the WAVE12 A/B knob: CE_PREPASS=1 restores the pre-wave12 approach
+    // refresh pre-pass (the extra full population stream — the twin's B side)
+    if std::env::var_os("CE_PREPASS").is_some() {
+        nt.set_prepass(true);
+    }
     // TEMP WAVE11 probes (measurement rows, never parity arms)
     if std::env::var_os("CE_NO_AI").is_some() {
         centities_native::exec::set_no_ai(true);

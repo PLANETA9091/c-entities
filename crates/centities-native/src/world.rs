@@ -217,6 +217,15 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
                 mob.nav_z = mob.pend_z;
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
+                // WAVE12 FIX: the wave11b any-running bit maintenance — the
+                // sim resolver's start_vanilla (swarm-sim mob.rs) had it, the
+                // PRODUCTION resolver didn't: every fold-resolved start
+                // drifted ar_running false while the record ran, and the
+                // window mob-ticks (start → first stop) routed to the wrong
+                // floor shape (the folded-vs-parked twin's debug_assert
+                // caught it on the first suite run of the wave). Starts set
+                // the bit unconditionally — see MobAI::ar_note_start.
+                mob.ar_note_start();
             }
             g::GK_LOOKAROUND => {
                 // the DRAW-EXACT RandomLookAround start (javap 26.3)
@@ -230,11 +239,15 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
                 // it) — the production resolver owns this start body, so the
                 // maintenance lives here too
                 mob.et_note_start(g::GK_LOOKAROUND);
+                // WAVE12 FIX: the wave11b any-running bit (see STROLL above)
+                mob.ar_note_start();
             }
             g::GK_ZOMBIE_ATTACK => {
                 mob.goals[gi].running = true;
                 mob.no_action = 0;
                 mob.et_note_start(g::GK_ZOMBIE_ATTACK);
+                // WAVE12 FIX: the wave11b any-running bit (see STROLL above)
+                mob.ar_note_start();
             }
             _ => {}
         }
