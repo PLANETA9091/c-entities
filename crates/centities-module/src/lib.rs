@@ -2881,7 +2881,7 @@ fn precompute_mob(loader: jni::jobject) {
         check_name: "mobAiFloor",
         check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
     };
-    // N2-M1/M1.5: the wholesale wire chains THREE guards on the same stashed
+    // N2-M1/M1.5: the wholesale wire chains FOUR guards on the same stashed
     // Mob bytes, outermost first:
     //   1. `tick` ← nativeMobTick — the M1.5 FULL-JAVA-TICK skip: Mob.tick's
     //      super call (LivingEntity.tick → Entity.tick: baseTick fire/air/
@@ -2893,7 +2893,18 @@ fn precompute_mob(loader: jni::jobject) {
     //      sensors/burnUndead/looting): the route for a config where the
     //      tick weave is absent, dead code for a fully-armed wire.
     //   3. `serverAiStep` ← mobAiFloor — the L22a route + the fallback.
-    // All three check methods are no-arg-instance op-4 shapes (receiver =
+    //   4. `checkDespawn` ← nativeMobTracked (M2c) — the per-mob per-tick
+    //      paper-config walk (despawnRanges Map.get + paperConfig() chain +
+    //      findNearbyPlayer) is dead weight for a RESIDENT native: the
+    //      10k profile priced it at ~3% of the thread (the HashMap.get
+    //      leaf alone 1.9%). PURE residency probe — no classification, the
+    //      route stays pinned to the tick guard. DELTA (the honesty
+    //      ledger): a resident native no longer hard-despawns — the paper
+    //      despawn ranges return with the N3 event outbox; the wire's
+    //      removal driver still covers death/discard (isRemoved), and the
+    //      bench population is persistenceRequired anyway (despawn never
+    //      fired for it).
+    // All check methods are no-arg-instance op-4 shapes (receiver =
     // local 0, exact descriptor == link safety — the Paper-26.3 entity-
     // discard lesson). With CE_NATIVE_MOB unset only the serverAiStep guard
     // is woven (the L22a path) — CI parity/e2e are byte-path-identical.
@@ -2923,7 +2934,22 @@ fn precompute_mob(loader: jni::jobject) {
             else {
                 return None;
             };
-            cplug_sdk::asm::insert_early_return_guard(env, loader, &b2, &spec)
+            // M2c: checkDespawn's paper-config walk dies for residents (the
+            // receiver Mob is assignable to the check's Entity parameter —
+            // the same link-safety shape as the Zombie.tick weave).
+            let desp = cplug_sdk::asm::EarlyReturnGuard {
+                method_name: "checkDespawn",
+                method_desc: "()V",
+                check_class: HOOKS_CLASS,
+                check_name: "nativeMobTracked",
+                check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+            };
+            let Some(b3) = cplug_sdk::asm::insert_early_return_guard(env, loader, &b2, &desp)
+                .filter(|b| !b.is_empty())
+            else {
+                return None;
+            };
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &b3, &spec)
         } else {
             cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
         }
