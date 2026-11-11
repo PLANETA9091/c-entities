@@ -36,6 +36,14 @@ const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
 const ENTITY_TICK_LIST_CLASS: &str = "net/minecraft/world/level/entity/EntityTickList";
 const GOAL_SELECTOR_CLASS: &str = "net/minecraft/world/entity/ai/goal/GoalSelector";
 const MOB_CLASS: &str = "net/minecraft/world/entity/Mob";
+/// N2-M1.5: the zombie family — Zombie OVERRIDES tick() (the conversion
+/// tracker tick runs AFTER the super call, so a guard in Mob's bytes only
+/// skips the super half). The wire's classified population is
+/// `instanceof Zombie`, so the tick guard must ALSO ride the override(s):
+/// Zombie.tick covers Drowned/Husk (they inherit it); ZombieVillager has
+/// its own tick() override and needs its own weave.
+const ZOMBIE_CLASS: &str = "net/minecraft/world/entity/monster/zombie/Zombie";
+const ZOMBIE_VILLAGER_CLASS: &str = "net/minecraft/world/entity/monster/zombie/ZombieVillager";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
 const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
@@ -437,6 +445,10 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
     cplug_sdk::hooks::register_bytes(GOAL_SELECTOR_CLASS, |_n, b| patch_goalselector(b));
     cplug_sdk::hooks::register_bytes(MOB_CLASS, |_n, b| patch_mob(b));
+    cplug_sdk::hooks::register_bytes(ZOMBIE_CLASS, |_n, b| patch_zombie_family(b, ZOMBIE_CLASS));
+    cplug_sdk::hooks::register_bytes(ZOMBIE_VILLAGER_CLASS, |_n, b| {
+        patch_zombie_family(b, ZOMBIE_VILLAGER_CLASS)
+    });
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
     cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
@@ -655,6 +667,8 @@ fn arm_module() {
     precompute_entity(loader);
     precompute_goalselector(loader);
     precompute_mob(loader);
+    precompute_zombie_family(loader, ZOMBIE_CLASS);
+    precompute_zombie_family(loader, ZOMBIE_VILLAGER_CLASS);
     precompute_conversion(loader);
     precompute_sensing(loader);
     precompute_idle_controls(loader);
@@ -802,6 +816,33 @@ fn arm_module() {
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred Mob AI floor applied, rc={rc}"
                         ));
+                    }
+                }
+                // N2-M1.5 deferred weaves: the zombie classes load with the
+                // first zombie (post-arm on every bench boot).
+                for zcls in [ZOMBIE_CLASS, ZOMBIE_VILLAGER_CLASS] {
+                    let woven = PRECOMPUTED
+                        .lock()
+                        .map(|p| p.contains_key(zcls))
+                        .unwrap_or(false);
+                    if !ZOMBIE_DECLINED.load(Ordering::Acquire)
+                        && !woven
+                        && STASH
+                            .lock()
+                            .map(|s| s.contains_key(zcls))
+                            .unwrap_or(false)
+                    {
+                        precompute_zombie_family(loader as jni::jobject, zcls);
+                        let woven = PRECOMPUTED
+                            .lock()
+                            .map(|p| p.contains_key(zcls))
+                            .unwrap_or(false);
+                        if woven {
+                            let rc = cplug_sdk::retransform_class(zcls);
+                            cplug_sdk::log::info(&format!(
+                                "[c-entities] verifier: deferred zombie-family tick weave applied ({zcls}), rc={rc}"
+                            ));
+                        }
                     }
                 }
                 // L62a deferred weave: EnchantmentHelper loads with the first
@@ -1267,6 +1308,12 @@ static DELTA_ARMED: AtomicBool = AtomicBool::new(false);
 static MOB_WOVEN: AtomicBool = AtomicBool::new(false);
 static MOB_DECLINED: AtomicBool = AtomicBool::new(false);
 static MOB_ARMED: AtomicBool = AtomicBool::new(false);
+/// N2-M1.5: the zombie-family tick weaves (Zombie + ZombieVillager) — the
+/// tick guard must ride the OVERRIDES or the subclass pre/post-super body
+/// (the drowning-conversion tracker) keeps running for natives. The
+/// per-class woven state lives in PRECOMPUTED (contains_key); this atomic
+/// is only the global native-mode refusal.
+static ZOMBIE_DECLINED: AtomicBool = AtomicBool::new(false);
 /// L26: the Sensing.tick O(1)-clear floor weave state.
 static SENSING_WOVEN: AtomicBool = AtomicBool::new(false);
 static SENSING_DECLINED: AtomicBool = AtomicBool::new(false);
@@ -2005,6 +2052,86 @@ fn patch_mob(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_mob_inner(bytes))
         .ok()
         .flatten()
+}
+
+/// N2-M1.5: the zombie-family byte hook — same stash-or-serve contract as
+/// the Mob hook, keyed per class. The woven bytes (the nativeMobTick guard
+/// at the head of the class's tick()V) come from precompute_zombie_family;
+/// a native-mode-off boot serves vanilla (the guard is never precomputed,
+/// the bytes are stashed once and never re-woven).
+fn patch_zombie_family(bytes: &[u8], cls: &'static str) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_zombie_family_inner(bytes, cls))
+        .ok()
+        .flatten()
+}
+
+fn patch_zombie_family_inner(bytes: &[u8], cls: &'static str) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(cls).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(cls).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched zombie-family tick guard");
+            Some(b)
+        }
+        _ if !ZOMBIE_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(cls).or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info("[c-entities] zombie bytes stashed post-arm — verifier will weave");
+            None
+        }
+        _ => None, // native mode off: vanilla serves
+    }
+}
+
+/// N2-M1.5: the zombie-family tick weave. Only armed in native mode
+/// (CE_NATIVE_MOB=1 without centities.mobAi): one op-4 guard at the head of
+/// the class's tick()V — check `nativeMobTick(Mob)Z` (the receiver widens
+/// Zombie→Mob, verifier-clean). The check does the first-sight
+/// classification AND the in-store skip, so the whole override body (the
+/// drowning-conversion tracker + the super chain) dies in one early return.
+fn precompute_zombie_family(loader: jni::jobject, cls: &'static str) {
+    let native_mob = read_java_flag("NATIVE_MOB_ON_INIT") == Some(true);
+    let mob_ai = read_java_flag("MOB_AI_ON_INIT") == Some(true);
+    if !native_mob || mob_ai {
+        ZOMBIE_DECLINED.store(true, Ordering::Release);
+        return;
+    }
+    let Some(bytes) = STASH.lock().ok().and_then(|mut s| s.remove(cls)) else {
+        cplug_sdk::log::info(&format!(
+            "[c-entities] {cls} not stashed yet — zombie-family tick weave deferred to the verifier"
+        ));
+        return;
+    };
+    let spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "tick",
+        method_desc: "()V",
+        check_class: HOOKS_CLASS,
+        check_name: "nativeMobTick",
+        check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(cls, weave_burn_probe(b));
+            }
+            cplug_sdk::log::info(&format!(
+                "[c-entities] precomputed zombie-family tick guard ({cls})"
+            ));
+        }
+        _ => {
+            cplug_sdk::log::info(&format!(
+                "[c-entities] FAILED to precompute the zombie-family tick guard ({cls}) — vanilla kept"
+            ));
+        }
+    }
 }
 
 fn patch_mob_inner(bytes: &[u8]) -> Option<Vec<u8>> {

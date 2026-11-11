@@ -213,3 +213,27 @@ sandbox (the whole leg must run inside one call); a double `PATH=` in one
 silently got Java 21 and Paper's gate refused it; separate export lines.
 ViaVersion/ViaBackwards resolved from Hangar (the GitHub release asset
 names 404 on `latest/download`).
+
+## Addendum 3 — the zombie-family tick weave (the override hole)
+
+The 10k-native JFR profile caught it: `ConversionTracker.tick` ran
+6.0% of the server thread **under `Zombie.tick`** — `Zombie` OVERRIDES
+`tick()` (super call + the drowning-conversion tracker), so the M1.5
+guard in Mob's bytes only skipped the super half; the override's own body
+kept running for every native zombie, every tick.
+
+Fix: the tick guard weaves the OVERRIDES too — `Zombie.tick` (covers
+Drowned/Husk by inheritance; they do not override) and
+`ZombieVillager.tick` (its own override). Same `nativeMobTick` check
+(receiver widens Zombie→Mob, verifier-clean), per-class woven state in
+PRECOMPUTED, stash-or-serve byte hooks, deferred verifier weaves (the
+zombie classes load with the first zombie). Native-mode-off boots serve
+vanilla bytes untouched.
+
+Live: both classes precompute at boot, `n=10000 ads=10000 rem=0` across
+the soak. Caveat: the sandbox's run-to-run mspt noise is ±40% (2 shared
+vCPU) — the p50 cross-run comparison is meaningless here; the
+`mobs-25k-native` CI leg (dedicated 4-vCPU runners, back-to-back A/B)
+is the arbiter for the −90% line. The profile's next rocks after the
+family guard: the tracker's SynchedEntityData dirty scan (~15.7% at 10k —
+needed for real players) and the applier's setPos path.
