@@ -494,3 +494,22 @@ Stage Summary:
 - Six commits on main: 2a5e60b, 6c89799, 2a1727a, 7caf5ef, c593617, 0ea9d1e — all pushed. Module suite 5/5 green throughout; CI parity/e2e paths byte-identical (every new weave is gated on CE_NATIVE_MOB).
 - The executor line stands: par(4) 0.53-0.80 ms (-90.5...-93.7%) in-bench; production 10k with a player: -71.6% p50 local (noisy box, directional).
 - Next: the mobs-25k-native CI leg (the -90% arbiter), M3 (the N3 event outbox: damage/sounds/drops — returns environmental death), the tracker's remaining dirty scan + the applier setPos path if the 25k numbers demand more.
+
+---
+Task ID: 9
+Agent: main (Z.ai)
+Task: N2-M1.8b/M2 — the activation gate, the dispatcher floor, the three live-boot wire fixes; the e2e CI repair
+
+Work Log:
+- The e2e CI had been red since aad3509: the N2-M0 commit widened the L22a declined marker with the CE_NATIVE_MOB leg and the closing-paren grep never matched again. Fixed the pattern (prefix-anchored), verified ALL 25 static e2e markers against the current sources with a checker script (scripts/check_e2e_markers.py). e2e green again on 62ad1fe.
+- The local 10k leg after M1.7 booted ARMED with the wire DEAD (mob=0/0/0): THREE silent boot bugs killed on forensics (doc 58): (1) M1.7 looked up Entity.dead — the field is LivingEntity.dead in 26.3, the probe declined and the whole wire stayed vanilla; (2) the M1.5b zombie-family weave chained the burnUndead probe onto Zombie bytes (the method is Mob-private) and PATCHES_FAIL++ed the arm gate to death on every CE_NATIVE_MOB=1 boot; (3) the boot-dir mapped jar without a sibling libraries/ starved javac (CE_MAPPED_JAR override).
+- M1.8b was shipped DEAD: the op-4 receiver heuristic emitted ALOAD 1 into the STATIC checkIfActive frame — VerifyError, silent retransform rejection, no counter. CRUSSTY cplug-sdk fixed (statics pass local 0); after the rebuild the activation gate arms and the getHealth data-watcher walk (~2.6% @10k) dies.
+- M2a: the L7 itemDispatch guard now suppresses the WHOLE dispatcher floor for in-store natives (profiler lambda alloc, commonTick, checkIfActive, the dead tick() virtual, inactiveTick). Passengers route vanilla; checkDespawn stays in the walk lambda (despawn exact). Live: dmob=5.86M @10k.
+- M2b: the applier read-back compare reads Entity.position -> Vec3.x/y/z directly (one ref + three plain doubles vs the getX/getY/getZ virtual trio, ~1.9% @10k), handle-gated.
+- Infra: the sandbox pty gave jline a live terminal — the console redisplay loop ate ~6% of the JFR; the bench server's stdin now rides /dev/null (both legs).
+- The paired local A/B @10k+bot: vanilla 199.9 p50 -> native 51.9 = -74.0% p50 (the box is ±40% noisy; the CI 4-vCPU mobs-25k-native legs are the -90% arbiter). All 116 tests green on the module line; the wire steady (n=10000 ads=10000 rem=0, jpos bit-exact).
+
+Stage Summary:
+- Three commits: 62ad1fe (the e2e marker repair), c8e9162 (the M1.8b/M2 wave), 38fa93e (the bench stdin). CRUSSTY: ce-m2-static-fix (the op-4 static fix + the wave's working state).
+- The wire's live-boot path is now forensics-hardened: every silent catch logs, the probe failures name the throwable, the counters (dmob) prove the weaves engage.
+- Next: the CI arbiter verdicts (mobs-25k-native), M3 (the N3 event outbox — environmental death), the GC leg only if the CI numbers demand it.
