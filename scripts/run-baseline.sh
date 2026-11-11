@@ -118,6 +118,9 @@ EOF
 AGENT_ARGS=()
 if [ "${MODULE:-off}" = "on" ]; then
   echo "MODULE=on: building CRUSSTY runtime (from source) + c-entities module"
+  # cargo can be missing from an inherited PATH (fresh shell) — the rustup
+  # env hook is the canonical location.
+  command -v cargo >/dev/null 2>&1 || [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env" || true
   # 1. mojang-mapped server jar for javac (one-shot paperclip boot, no world)
   # Idempotent: reuse the previously produced mapped jar when present.
   PB="$ROOT/build/paperboot"
@@ -129,6 +132,12 @@ if [ "${MODULE:-off}" = "on" ]; then
     (cd "$PB" && timeout 300 java -Xmx2G -jar paper.jar nogui > boot.log 2>&1 || true)
     MAPPED=$(find "$PB/versions" -name "paper-26.3.jar" | head -1)
   fi
+  # CE_MAPPED_JAR override: a boot-dir mapped jar without a sibling
+  # libraries/ tree starves javac of fastutil/DFU annotations (the build.rs
+  # classpath walk finds libraries/ NEXT to the jar's ancestor dirs) — the
+  # leg died with 871 "package net.minecraft does not exist" errors. A
+  # caller-provided mapped jar (with its own libraries sibling) wins.
+  MAPPED="${CE_MAPPED_JAR:-$MAPPED}"
   [ -n "$MAPPED" ] && [ -f "$MAPPED" ] || { echo "FATAL: paperclip boot produced no mapped jar"; tail -20 "$PB/boot.log" || true; exit 1; }
   # 2. module cdylib (CRUSSTY path deps live at repo-parent/CRUSSTY)
   (cd "$ROOT" && PAPER_JAR="$MAPPED" cargo build -p centities-module --release) \

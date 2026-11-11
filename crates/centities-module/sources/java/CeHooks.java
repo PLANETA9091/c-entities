@@ -4496,7 +4496,8 @@ public final class CeHooks {
     // ==================================================================
     // L15b: PLAIN (per non-player tick) — see the mergeChecks note.
     public static long dispChecks = 0, dispNative = 0,
-            dispInactive = 0, dispPass = 0, dispGate = 0;
+            dispInactive = 0, dispPass = 0, dispGate = 0,
+            dispMobNative = 0;
 
     /** World revision: bumped by the flush whenever any section changed
      *  since the previous flush. MODE_REV[slot] stamps the revision that
@@ -4516,7 +4517,37 @@ public final class CeHooks {
      */
     public static boolean itemDispatch(Entity ent) {
         dispChecks++;
-        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady) return false;
+        if (!ACTIVE || !cplugReady) return false;
+        // N2-M2a: the native mob's DISPATCHER floor dies with its tick body
+        // (M1.5). The vanilla dispatcher per entity per tick pays: the
+        // currentlyTicking bookkeeping, TWO profiler pushes (one invokedynamic
+        // lambda ALLOC per entity per tick), commonTick (setOldPosAndRot +
+        // walkDist), ActivationRange.checkIfActive (its isAlive() walks the
+        // FULL SynchedEntityData chain — the 10k JFR: ~2.6% of the server
+        // thread at 10k; the M1.8b activation weave was meant to kill exactly
+        // this but its first build shipped a DEAD weave — the op-4 helper
+        // emitted ALOAD 1 into the STATIC checkIfActive frame and the
+        // retransform was rejected, silently, with no counter to see it),
+        // the dead Entity.tick() virtual and the inactiveTick path. All of
+        // it is behavior-free for a native mob: the Java body is already
+        // dead, the tickCount mirror stays with the applier (the M1.5
+        // contract) and checkDespawn lives in the WALK lambda (outside this
+        // dispatcher) — despawn semantics stay exact.
+        // Passengers route vanilla: tickPassenger rides THIS dispatcher and
+        // a suppressed vehicle would starve its riders (the item guard uses
+        // the same gate). The nativeMobTick probe is PURE residency for an
+        // already-classified mob; the classification stays pinned to the
+        // tick route (the t=157 byte-exactness lesson) — an unclassified mob
+        // returns false here and takes the vanilla dispatch, whose tick()
+        // fires the sight.
+        if (NATIVE_MOB_ON && ent instanceof net.minecraft.world.entity.Mob m) {
+            if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                dispMobNative++;
+                return true;
+            }
+            return false; // a non-native mob NEVER takes the item path
+        }
+        if (!ITEM_TICK_ON) return false;
         if (!(ent instanceof ItemEntity e)) return false;
         if (ibN >= IB_CAP) return false;
         try {
@@ -8659,6 +8690,12 @@ public final class CeHooks {
             return used[i] ? vals[i] : null;
         }
 
+        /** N2-M1.8b: the activation gate's pure probe — no boxing, no
+         *  Mob deref (the caller only needs residency). */
+        boolean containsKey(int eid) {
+            return used[probe(eid)];
+        }
+
         void put(int eid, net.minecraft.world.entity.Mob m) {
             if ((size + 1) * 2 > keys.length) {
                 grow();
@@ -9554,6 +9591,18 @@ public final class CeHooks {
             if (O_ENT_DELTA < 0) {
                 O_ENT_DELTA = offOf(net.minecraft.world.entity.Entity.class, "deltaMovement");
             }
+            // N2-M2b: the direct position triple (javap 26.3: Entity.position
+            // is a private Vec3 field; Vec3.x/y/z are public final doubles —
+            // one object ref + three plain loads replace the getX/getY/getZ
+            // virtual trio in the read-back compare).
+            if (O_ENT_POS < 0) {
+                O_ENT_POS = offOf(net.minecraft.world.entity.Entity.class, "position");
+            }
+            if (O_VEC_X < 0) {
+                O_VEC_X = offOf(net.minecraft.world.phys.Vec3.class, "x");
+                O_VEC_Y = offOf(net.minecraft.world.phys.Vec3.class, "y");
+                O_VEC_Z = offOf(net.minecraft.world.phys.Vec3.class, "z");
+            }
             if (O_MOB_NOACTION < 0) {
                 O_MOB_NOACTION = offOf(net.minecraft.world.entity.Mob.class, "noActionTime");
             }
@@ -9568,11 +9617,15 @@ public final class CeHooks {
                 // M1.7: the liveness check read !m.isAlive() — getHealth()
                 // walks the FULL SynchedEntityData chain (health lives in the
                 // data watcher) — 10k mobs x per boundary showed as 15.7% of
-                // the server thread in the 10k JFR profile. Entity.dead is
-                // set by die() the instant health hits 0 — a plain field
+                // the server thread in the 10k JFR profile. LivingEntity.dead
+                // is set by die() the instant health hits 0 — a plain field
                 // read covers every health-death; isRemoved covers
                 // discard/unload. Same predicate, two cheap loads.
-                O_ENT_DEAD = offOf(net.minecraft.world.entity.Entity.class, "dead");
+                // FIX (m10k-native5 forensics): the field lives on
+                // LivingEntity, NOT Entity — the Entity lookup resolved -1
+                // and the whole wholesale wire declined to vanilla (the
+                // 26.3 Entity has no 'dead' boolean; javap-verified).
+                O_ENT_DEAD = offOf(net.minecraft.world.entity.LivingEntity.class, "dead");
             }
             // SHARED_RANDOM resolution is SELF-CONTAINED here (the leaner
             // probe must not assume the L22a init ran): the static field +
@@ -9602,8 +9655,12 @@ public final class CeHooks {
                 return;
             }
             NATIVE_MOB_HANDLES_OK = O_ENT_YROT >= 0 && O_MOB_NOACTION >= 0
-                    && O_ENT_TICKCOUNT >= 0 && O_ENT_DEAD >= 0;
+                    && O_ENT_TICKCOUNT >= 0 && O_ENT_DEAD >= 0
+                    && O_ENT_POS >= 0 && O_VEC_X >= 0 && O_VEC_Y >= 0 && O_VEC_Z >= 0;
         } catch (Throwable t) {
+            // forensics: a silent catch made the declined wire undebuggable
+            // (the m10k-native5 'handle probe failed' had no reason on file)
+            System.out.println("[c-entities] native mob handle probe threw: " + t);
             NATIVE_MOB_HANDLES_OK = false;
         }
     }
@@ -9733,6 +9790,26 @@ public final class CeHooks {
         return nativeMobSight(mob);
     }
 
+    /**
+     *  N2-M1.8b: the ACTIVATION gate's check (woven at the head of
+     *  ActivationRange.checkIfActive, descriptor (Entity)Z — the receiver is
+     *  an arbitrary Entity, so the instanceof lives here). PURE residency
+     *  probe: NO classification (the sight stays pinned to the tick route —
+     *  the t=157 byte-exactness lesson), NO counters, NO handle dependency
+     *  beyond the always-present NM_BYID. True -> checkIfActive returns
+     *  true (active) -> vanilla calls entity.tick() -> the Mob.tick guard
+     *  already kills that body; the point of the fast path is skipping the
+     *  vanilla isAlive() -> getHealth() -> SynchedEntityData walk this
+     *  method performed for every mob past tickCount 200 every tick
+     *  (the m10k profiles: 3-5% of the server thread at 10k).
+     */
+    public static boolean nativeMobTracked(net.minecraft.world.entity.Entity e) {
+        if (!(e instanceof net.minecraft.world.entity.Mob m)) {
+            return false;
+        }
+        return NM_BYID.containsKey(m.getId());
+    }
+
     /** The boundary driver (itemTickFlush, after the entity loop): the
      *  player snapshot push + ONE nativeMobBatch + the read-back applier
      *  (positions/yaw/noActionTime) + the removal diff. Any throwable
@@ -9841,8 +9918,18 @@ public final class CeHooks {
                     m.fallDistance = 0.0;
                 }
                 double px = NM_POS[4 * i], py = NM_POS[4 * i + 1], pz = NM_POS[4 * i + 2];
+                // N2-M2b: the Java-side read is ONE position ref + three plain
+                // double loads (Entity.position -> Vec3.x/y/z) instead of the
+                // getX/getY/getZ virtual trio — the 10k JFR put 60% of the
+                // Entity.get[XYZ] slice (≈1.9% of the server thread) on this
+                // exact compare. The offsets are handle-gated (a miss keeps
+                // the whole wire off), so the direct read is total here.
+                Object po = U.getObject(m, O_ENT_POS);
+                final double jx = U.getDouble(po, O_VEC_X);
+                final double jy = U.getDouble(po, O_VEC_Y);
+                final double jz = U.getDouble(po, O_VEC_Z);
                 if (Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
-                        && (px != m.getX() || py != m.getY() || pz != m.getZ())) {
+                        && (px != jx || py != jy || pz != jz)) {
                     m.setPos(px, py, pz);
                 }
                 nmApplies++;
@@ -9859,6 +9946,7 @@ public final class CeHooks {
                         + " ads=" + nmAds + " rem=" + nmRemoves
                         + " skip=" + nmSkipped
                         + " appl=" + nmApplies
+                        + " dmob=" + dispMobNative
                         + " id0=" + NM_IDS[0]
                         + " p=" + NM_POS[0] + "," + NM_POS[1] + "," + NM_POS[2]
                         + " jpos=" + (NM_BYID.get((int) NM_IDS[0]) == null ? "gone"
@@ -11013,6 +11101,13 @@ public final class CeHooks {
     // direct delta write (javap 26.3: setDeltaMovement's whole body is the
     // isFinite gate + the posLock-guarded field store; no flag writes).
     private static volatile long O_ENT_DELTA = -1;
+    // N2-M2b: O_ENT_POS already exists (line ~8903, the L-era position read)
+    // — the Vec3 field offsets are the only new handles: one ref load +
+    // three plain double loads replace the getX/getY/getZ virtual trio in
+    // the applier's read-back compare (the 10k JFR: 60% of the
+    // Entity.get[XYZ] slice, ~1.9% of the server thread). A missed offset
+    // keeps the WIRE off (the arm discipline).
+    private static volatile long O_VEC_X = -1, O_VEC_Y = -1, O_VEC_Z = -1;
     // L66: Entity.level (private Level) + Level.isClientSide (private final
     // boolean) — itemDispatch's per-item client check (the 3.2% Entity.level
     // frame on items: 98.9% of it is the dispatch walk's own

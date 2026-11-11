@@ -44,6 +44,14 @@ const MOB_CLASS: &str = "net/minecraft/world/entity/Mob";
 /// its own tick() override and needs its own weave.
 const ZOMBIE_CLASS: &str = "net/minecraft/world/entity/monster/zombie/Zombie";
 const ZOMBIE_VILLAGER_CLASS: &str = "net/minecraft/world/entity/monster/zombie/ZombieVillager";
+/// N2-M1.8b: Paper's activation gate — `checkIfActive(Entity)` runs per
+/// entity per tick and walks `isAlive() -> getHealth() -> the FULL
+/// SynchedEntityData chain` for every mob past tickCount 200 (the m10k
+/// profiles: getItem+getValue+getHealth ≈ 3-5% of the server thread at 10k,
+/// exactly this call chain). For in-store natives the result is irrelevant
+/// (both tick() and inactiveTick() routes die in the Mob.tick guard), so
+/// the check short-circuits to `true` through a pure NmMap probe.
+const ACTIVATION_CLASS: &str = "io/papermc/paper/entity/activation/ActivationRange";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
 const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
@@ -445,6 +453,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(ENTITY_TICK_LIST_CLASS, |_n, b| patch_entityticklist(b));
     cplug_sdk::hooks::register_bytes(GOAL_SELECTOR_CLASS, |_n, b| patch_goalselector(b));
     cplug_sdk::hooks::register_bytes(MOB_CLASS, |_n, b| patch_mob(b));
+    cplug_sdk::hooks::register_bytes(ACTIVATION_CLASS, |_n, b| patch_activation(b));
     cplug_sdk::hooks::register_bytes(ZOMBIE_CLASS, |_n, b| patch_zombie_family(b, ZOMBIE_CLASS));
     cplug_sdk::hooks::register_bytes(ZOMBIE_VILLAGER_CLASS, |_n, b| {
         patch_zombie_family(b, ZOMBIE_VILLAGER_CLASS)
@@ -492,6 +501,8 @@ static MOVE_WOVEN: AtomicBool = AtomicBool::new(false);
 static MOVE_DECLINED: AtomicBool = AtomicBool::new(false);
 static LOOK_WOVEN: AtomicBool = AtomicBool::new(false);
 static LOOK_DECLINED: AtomicBool = AtomicBool::new(false);
+static ACT_WOVEN: AtomicBool = AtomicBool::new(false);
+static ACT_DECLINED: AtomicBool = AtomicBool::new(false);
 
 fn patch_navigation(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_idle_inner(bytes, NAVIGATION_CLASS, &NAV_WOVEN))
@@ -507,6 +518,13 @@ fn patch_movecontrol(bytes: &[u8]) -> Option<Vec<u8>> {
 
 fn patch_lookcontrol(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_idle_inner(bytes, LOOK_CONTROL_CLASS, &LOOK_WOVEN))
+        .ok()
+        .flatten()
+}
+
+/// N2-M1.8b: the activation gate byte hook — same stash-or-serve contract.
+fn patch_activation(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_idle_inner(bytes, ACTIVATION_CLASS, &ACT_WOVEN))
         .ok()
         .flatten()
 }
@@ -638,6 +656,58 @@ fn precompute_idle_controls(loader: jni::jobject) {
     }
 }
 
+/// N2-M1.8b: the activation-gate weave — natives-only (the same gate as the
+/// zombie family: CE_NATIVE_MOB=1 without centities.mobAi). One op-4 guard
+/// at the head of `checkIfActive(Entity)Z`: `nativeMobTracked(Entity)Z` is a
+/// PURE NmMap probe (no classification, no counters — the sight semantics
+/// stay pinned to the tick route). `true` -> the method returns `true`
+/// (active) -> vanilla proceeds to entity.tick() -> the Mob.tick guard
+/// already kills that body; `false` -> the vanilla body runs unchanged for
+/// every non-native entity.
+fn precompute_activation(loader: jni::jobject) {
+    if ACT_WOVEN.load(Ordering::Acquire) || ACT_DECLINED.load(Ordering::Acquire) {
+        return;
+    }
+    let native_mob = read_java_flag("NATIVE_MOB_ON_INIT") == Some(true);
+    let mob_ai = read_java_flag("MOB_AI_ON_INIT") == Some(true);
+    if !native_mob || mob_ai {
+        ACT_DECLINED.store(true, Ordering::Release);
+        return;
+    }
+    let Some(bytes) = STASH.lock().ok().and_then(|mut s| s.remove(ACTIVATION_CLASS)) else {
+        // not loaded yet — UNDECIDED (the verifier retries on the class load)
+        cplug_sdk::log::info(
+            "[c-entities] ActivationRange not stashed yet — activation gate deferred to the verifier",
+        );
+        return;
+    };
+    let spec = cplug_sdk::asm::EarlyReturnGuard {
+        method_name: "checkIfActive",
+        method_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+        check_class: HOOKS_CLASS,
+        check_name: "nativeMobTracked",
+        check_desc: "(Lnet/minecraft/world/entity/Entity;)Z",
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(ACTIVATION_CLASS, b);
+            }
+            ACT_WOVEN.store(true, Ordering::Release);
+            cplug_sdk::log::info("[c-entities] precomputed activation gate (native fast-active)");
+        }
+        _ => {
+            ACT_DECLINED.store(true, Ordering::Release);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute the activation gate — vanilla kept",
+            );
+        }
+    }
+}
+
 fn arm_module() {
     // define_bridge returns (GLOBAL ref of the Level class loader, GLOBAL ref
     // of the defined CeHooks class). Arming MUST go through the exact class
@@ -672,6 +742,7 @@ fn arm_module() {
     precompute_conversion(loader);
     precompute_sensing(loader);
     precompute_idle_controls(loader);
+    precompute_activation(loader);
     precompute_trackedentity(loader);
     precompute_chunkmap(loader);
 
@@ -696,6 +767,21 @@ fn arm_module() {
         NAVIGATION_CLASS,
         MOVE_CONTROL_CLASS,
         LOOK_CONTROL_CLASS,
+        ACTIVATION_CLASS,
+        // N2-M1.8 fix: the zombie family MUST ride the arm-time retransform
+        // too. When the classes load PRE-arm (bootstrap entity-type
+        // registration — the common bench boot), the deferred verifier path
+        // can never fire: the class-load hook already ran AND
+        // precompute_zombie_family REMOVED the bytes from the stash, so the
+        // deferred STASH.contains_key gate is dead — the guard never reached
+        // the JVM and Zombie.tick kept running its whole vanilla body
+        // (ConversionTracker.tick + the drowning probe) for every native
+        // zombie every tick (the m10k-native6 JFR: setConverting$ 1.5% +
+        // the tracker's data reads under Zombie.tick at 10k). The retransform
+        // fires the ClassFileLoadHook -> patch_zombie_family serves the
+        // PRECOMPUTED bytes (BRIDGE_READY is already stored above).
+        ZOMBIE_CLASS,
+        ZOMBIE_VILLAGER_CLASS,
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
@@ -956,6 +1042,15 @@ fn arm_module() {
                             "[c-entities] verifier: deferred idle guard applied to {cls}, rc={rc}"
                         ));
                     }
+                }
+                // N2-M1.8b deferred weave: ActivationRange loads with the
+                // first level entity tick on most boots (post-arm).
+                precompute_activation(loader as jni::jobject);
+                if ACT_WOVEN.load(Ordering::Acquire) {
+                    let rc = cplug_sdk::retransform_class(ACTIVATION_CLASS);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] verifier: deferred activation gate applied, rc={rc}"
+                    ));
                 }
             }
             let snap = read_hook_counters();
@@ -2119,8 +2214,15 @@ fn precompute_zombie_family(loader: jni::jobject, cls: &'static str) {
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
+            // NO burnUndead probe here (the m10k-native5 forensics): the
+            // probe's insert_static_call_at_start looks up burnUndead()V in
+            // the TARGET class's method table — the zombie family does not
+            // declare it (javap 26.3: burnUndead is Mob-private, Zombie
+            // inherits), so the chain PATCHES_FAIL++ed on every
+            // CE_NATIVE_MOB=1 boot and the arm gate (fail==0) killed the
+            // whole wholesale wire. The burn hunt rides the Mob weave only.
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(cls, weave_burn_probe(b));
+                pc.insert(cls, b);
             }
             cplug_sdk::log::info(&format!(
                 "[c-entities] precomputed zombie-family tick guard ({cls})"
