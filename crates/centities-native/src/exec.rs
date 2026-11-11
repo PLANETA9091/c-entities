@@ -599,20 +599,30 @@ impl NativeTick {
         let skip_travel = *skip_travel;
         let pass2_serial_max = self.pass2_serial_max;
 
-        // ---- WAVE15 THE RANK PREFIX: ONE serial pass counts each
-        // chunk's alive slots and assigns its base_k in the same breath
-        // (the count IS the prefix — no second loop). 25 KB of bools at
-        // 25k ≈ 20 µs serial — the rayon dispatch of a parallel count
-        // pass measured MORE than the scan itself, so this stage stays
-        // serial by measurement. NO per-tick memsets: every stats word is
-        // written exactly once by pass 1 through its own region. ----
+        // ---- WAVE15 THE RANK PREFIX: the alive counts per chunk fused
+        // with the base_k assignment. FAST PATH (no tombstones — the
+        // steady state between the lazy compactions): every slot is
+        // alive, the counts ARE the chunk widths — O(chunks) arithmetic,
+        // ZERO memory reads (the full-store flag scan measured ~0.05 ms
+        // for 25 KB of useful bits). TOMBSTONE PATH: the 1-in-a-while
+        // scan (bounded by the compact threshold). NO per-tick memsets:
+        // every stats word is written exactly once by pass 1 through its
+        // own region. ----
         let mut run_k: u32 = 0;
         let mut regions: Vec<(usize, usize)> = Vec::with_capacity(nchunks);
-        for (ci, c) in store.mobs.chunks(chunk).enumerate() {
-            let cnt = c.iter().filter(|s| s.alive).count() as u32;
-            bufs[ci].base_k = run_k;
-            regions.push((run_k as usize, cnt as usize));
-            run_k = run_k.wrapping_add(cnt);
+        if store.free.is_empty() {
+            for (ci, c) in store.mobs.chunks(chunk).enumerate() {
+                bufs[ci].base_k = run_k;
+                regions.push((run_k as usize, c.len()));
+                run_k = run_k.wrapping_add(c.len() as u32);
+            }
+        } else {
+            for (ci, c) in store.mobs.chunks(chunk).enumerate() {
+                let cnt = c.iter().filter(|s| s.alive).count() as u32;
+                bufs[ci].base_k = run_k;
+                regions.push((run_k as usize, cnt as usize));
+                run_k = run_k.wrapping_add(cnt);
+            }
         }
         let alive_len = run_k as usize;
         if stats_buf.len() > alive_len {

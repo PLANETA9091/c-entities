@@ -6,10 +6,11 @@ Branch `main` @ wave15. The arm: `CE_SER=1` restores the serial fused walk
 Session arc: wave14 shipped the double-buffer shadow eval at **1.49 ms/tick
 p50 @ 25k** (2 vCPUs, −82.3% vs the vanilla 8.41) with the scaling fit
 `par(T) = F + W/T`, **F = 0.44 ms** (the serial fragments), W = 2.12 ms.
-Wave15 kills the fragments: **F ≈ 0.17–0.25 ms** (−2.2×), same-window A/B
-**−25…−29% vs the serial arm** (wave14 measured −17%), 100k × 400:
-7.0–7.3 → **5.1–5.2 ms**. The −90% line now crosses at **FOUR real cores**
-(par(4) ≈ 0.76–0.83 ms = −90…−91%); eight cores ≈ 0.46–0.50 ms = −94%.
+Wave15 kills the fragments: **F ≈ 0.14–0.26 ms** (−2…−3×), same-window A/B
+**−26…−32% vs the serial arm** (wave14 measured −17%), 100k × 400:
+7.27 → **4.87 ms** (−33%). The −90% line now crosses at **FOUR real cores**
+(par(4) ≈ 0.71–0.79 ms = −90.6…−91.6%); eight cores ≈ 0.42–0.50 ms = −94…−95%.
+The 2-core box lands at **1.26–1.41 ms = −83…−85%**.
 
 ## The instrument: the phase probe
 
@@ -33,11 +34,16 @@ and the serial stats-contract walk.
 Five whole buffers and two serial passes DIED:
 
 - `alive_idx` (the serial O(n) push-scan) — replaced by the **rank
-  prefix**: ONE serial pass counts each chunk's alive slots and assigns
-  its `base_k` in the same breath (the count IS the prefix — no second
-  loop). A parallel count pass was BUILT first and measured SLOWER: the
-  rayon dispatch of a 25 KB flag scan costs more than the scan itself
-  (~20 µs serial) — the stage stays serial by measurement.
+  prefix**: the alive counts per chunk fused with the `base_k`
+  assignment. FAST PATH (no tombstones — the steady state between the
+  lazy compactions, `store.free.is_empty()` is the EXACT condition):
+  every slot is alive, the counts ARE the chunk widths — O(chunks)
+  arithmetic, ZERO memory reads (the full-store flag walk measured
+  ~0.05 ms for 25 KB of useful bits). TOMBSTONE PATH: the 1-in-a-while
+  scan (bounded by the compact threshold). A parallel count pass was
+  BUILT first and measured SLOWER: the rayon dispatch of a 25 KB flag
+  scan costs more than the scan itself — the stage stays serial by
+  measurement.
 - `results_buf` (the per-slot (stat, drew) staging) — pass 1 writes the
   contract stat DIRECTLY through the chunk's own **stats region**: the
   k-range `[base_k, base_k + alive_count)` is contiguous per chunk, so
@@ -83,16 +89,18 @@ the invariant.
   - W2 (box drift +0.2 ms — even the untouched serial arm moved):
     PAR 1.51/1.52/1.51 vs SER 2.02/2.00/1.98 → −24.5%
   - W3: PAR 1.41/1.41 vs SER 1.87/1.99 → −25…−29%
+  - W4 (the fast-path rank prefix): PAR 1.27/1.38 vs SER 1.87/1.85 →
+    −26…−32%
   - CE_JOBS sweep (W2 window): 1.74 / **1.40** / 1.35 / 1.37 / 1.40 for
     jobs = 1/2/4/8/16 — the default 2 stays; the dial is for real hosts.
-- 100k × 400: PAR 5.12/5.23 vs SER 7.01/7.31 → −27…−28%.
-- vs the vanilla 8.41: the 2-core box lands at −83…−84% (windows drift);
+- 100k × 400: PAR 5.12/5.23/4.87 vs SER 7.01/7.31/7.27 → −27…−33%.
+- vs the vanilla 8.41: the 2-core box lands at −83…−85% (windows drift);
   the FIT is the deliverable:
-  - T1 = 2.52–2.77, T2 = 1.34–1.52 across windows → **F ≈ 0.17–0.25**,
-    W ≈ 2.35–2.52.
-  - par(4) = F + W/4 ≈ **0.76–0.83 ms = −90…−91%** ← the −90% goal at
+  - T1 = 2.39–2.77, T2 = 1.26–1.52 across windows → **F ≈ 0.14–0.26**,
+    W ≈ 2.13–2.52.
+  - par(4) = F + W/4 ≈ **0.71–0.79 ms = −90.6…−91.6%** ← the −90% goal at
     FOUR real cores
-  - par(8) ≈ 0.46–0.50 = **−94%**, par(16) ≈ 0.32–0.33 = **−96%**
+  - par(8) ≈ 0.42–0.50 = **−94…−95%**, par(16) ≈ 0.28–0.33 = **−96%**
 
 ## Proof
 
