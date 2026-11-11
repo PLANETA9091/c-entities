@@ -9945,9 +9945,14 @@ public final class CeHooks {
                 // the re-snapped landings dealt 5 dmg/s). The Motion zero +
                 // the fallDistance zero cap the vanilla residual at one
                 // 0.08-step wobble per tick (never a landing, never damage).
-                Object d = U.getObject(m, O_ENT_DELTA);
-                if (!(d instanceof net.minecraft.world.phys.Vec3 v3)
-                        || v3.x != 0.0 || v3.y != 0.0 || v3.z != 0.0) {
+                // N2-M2f: ONE reference compare replaces the getObject +
+                // three Vec3 double loads — after the first zeroing the
+                // field HOLDS the shared NM_ZERO_DELTA instance and nothing
+                // but a plugin setDeltaMovement can change it (any new
+                // instance differs by identity; a fresh Vec3(0,0,0) is
+                // value-identical AND instance-different, so the re-store
+                // fires — Vec3 is immutable, the swap is invisible).
+                if (U.getObject(m, O_ENT_DELTA) != NM_ZERO_DELTA) {
                     U.putObjectVolatile(m, O_ENT_DELTA, NM_ZERO_DELTA);
                 }
                 if (m.fallDistance != 0.0) {
@@ -9960,12 +9965,16 @@ public final class CeHooks {
                 // Entity.get[XYZ] slice (≈1.9% of the server thread) on this
                 // exact compare. The offsets are handle-gated (a miss keeps
                 // the whole wire off), so the direct read is total here.
-                Object po = U.getObject(m, O_ENT_POS);
-                final double jx = U.getDouble(po, O_VEC_X);
-                final double jy = U.getDouble(po, O_VEC_Y);
-                final double jz = U.getDouble(po, O_VEC_Z);
-                if (Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
-                        && (px != jx || py != jy || pz != jz)) {
+                // N2-M2f: the loads are LAZY inside the predicate — the
+                // NaN guard short-circuits first (no reads on garbage), a
+                // mover whose x already differs never pays the y/z loads,
+                // a parked mob pays all three and skips the setPos. The
+                // predicate is unchanged (same compares, same order).
+                Object po = O_ENT_POS >= 0 ? U.getObject(m, O_ENT_POS) : null;
+                if (po != null && Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
+                        && (px != U.getDouble(po, O_VEC_X)
+                            || py != U.getDouble(po, O_VEC_Y)
+                            || pz != U.getDouble(po, O_VEC_Z))) {
                     m.setPos(px, py, pz);
                 }
                 nmApplies++;
