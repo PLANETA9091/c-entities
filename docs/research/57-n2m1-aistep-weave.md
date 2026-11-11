@@ -237,3 +237,25 @@ vCPU) — the p50 cross-run comparison is meaningless here; the
 is the arbiter for the −90% line. The profile's next rocks after the
 family guard: the tracker's SynchedEntityData dirty scan (~15.7% at 10k —
 needed for real players) and the applier's setPos path.
+
+## Addendum 4 — M1.7 (the liveness fast read) + the data-read truth
+
+The 10k profile drill-down: `SynchedEntityData.getItem` (8.5%) +
+`DataItem.getValue` (7.2%) — 160 of 177 samples — call chain
+`SynchedEntityData.get <- LivingEntity.getHealth <- **the boundary's
+liveness check**`. Health lives in the DATA WATCHER in 26.3 — every
+`!m.isAlive()` walked the full get() chain, 10k mobs per boundary per
+tick = 15.7% of the server thread for a boolean.
+
+Fix: `U.getBoolean(m, O_ENT_DEAD) || m.isRemoved()` — die() sets
+`Entity.dead` the instant health hits 0 (the predicate is exact for
+health deaths; isRemoved covers discard/unload) — two plain loads, the
+data-watcher walk gone. Handle-gated (a missed offset keeps the wire
+off entirely — the arm discipline).
+
+Sandbox caveat for the ledger: the 2-vCPU box's run-to-run mspt noise is
+±40% at this hour (native p50s 49.6/116.3/85.4 across identical builds)
+— the local A/B numbers are directional only; the `mobs-25k-native` CI
+leg (dedicated runners, back-to-back A/B, the mineflayer bot) is the
+arbiter. The next profile rocks: the tracker's remaining dirty scan
+(needed for real players) and the applier's setPos path.

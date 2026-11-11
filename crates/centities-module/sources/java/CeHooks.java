@@ -8632,6 +8632,7 @@ public final class CeHooks {
     private static int[] NM_PF = new int[2 * 8];
     private static long O_ENT_YROT = -1;
     private static long O_ENT_TICKCOUNT = -1;
+    private static long O_ENT_DEAD = -1;
     /** The primitive int->Mob open-addressing map for the native-mob wire.
      *  Linear probing, power-of-two capacity, `used` bit per slot (entity
      *  id 0 is legal in theory), growth at 50% load, deletion by the
@@ -9563,6 +9564,16 @@ public final class CeHooks {
                 // per boundary.
                 O_ENT_TICKCOUNT = offOf(net.minecraft.world.entity.Entity.class, "tickCount");
             }
+            if (O_ENT_DEAD < 0) {
+                // M1.7: the liveness check read !m.isAlive() — getHealth()
+                // walks the FULL SynchedEntityData chain (health lives in the
+                // data watcher) — 10k mobs x per boundary showed as 15.7% of
+                // the server thread in the 10k JFR profile. Entity.dead is
+                // set by die() the instant health hits 0 — a plain field
+                // read covers every health-death; isRemoved covers
+                // discard/unload. Same predicate, two cheap loads.
+                O_ENT_DEAD = offOf(net.minecraft.world.entity.Entity.class, "dead");
+            }
             // SHARED_RANDOM resolution is SELF-CONTAINED here (the leaner
             // probe must not assume the L22a init ran): the static field +
             // the ceSrOriginal duck-type unwrap (the L85b parity-proxy
@@ -9591,7 +9602,7 @@ public final class CeHooks {
                 return;
             }
             NATIVE_MOB_HANDLES_OK = O_ENT_YROT >= 0 && O_MOB_NOACTION >= 0
-                    && O_ENT_TICKCOUNT >= 0;
+                    && O_ENT_TICKCOUNT >= 0 && O_ENT_DEAD >= 0;
         } catch (Throwable t) {
             NATIVE_MOB_HANDLES_OK = false;
         }
@@ -9790,7 +9801,13 @@ public final class CeHooks {
                 if (m == null) {
                     continue; // removed Java-side mid-tick; the store diff cleans
                 }
-                if (m.isRemoved() || !m.isAlive()) {
+                // M1.7 liveness: dead + isRemoved — two plain loads. The old
+                // !m.isAlive() walked getHealth() -> the full SynchedEntityData
+                // chain per mob per boundary (the 10k JFR profile's 15.7%).
+                // die() sets Entity.dead the instant health hits 0, so the
+                // predicate is exact for health deaths; isRemoved covers
+                // discard/chunk-unload.
+                if (U.getBoolean(m, O_ENT_DEAD) || m.isRemoved()) {
                     nmCollectDead(eid);
                     continue;
                 }
