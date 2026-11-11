@@ -8,6 +8,7 @@ description = "L110 native pivot: the zero-Java entity executor — persistent A
 [dependencies]
 centities-core = { path = "../centities-core" }
 swarm-sim = { path = "../swarm-sim" }
+rayon = "1"
 
 [[example]]
 name = "native_bench"

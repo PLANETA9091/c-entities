@@ -53,6 +53,13 @@ fn main() {
     if std::env::var_os("CE_PREPASS").is_some() {
         nt.set_prepass(true);
     }
+    // the WAVE14 A/B knob: CE_PAR=1 drives the PARALLEL executor (the
+    // double-buffer shadow eval + the serial stroll-stream pre-assignment
+    // + the drawer repair + the parallel travel). The parallel-vs-serial
+    // twin gate proves the arm bit-identical; this knob is the A/B meter.
+    if std::env::var_os("CE_PAR").is_some() {
+        nt.set_parallel(true);
+    }
     // TEMP WAVE11 probes (measurement rows, never parity arms)
     if std::env::var_os("CE_NO_AI").is_some() {
         centities_native::exec::set_no_ai(true);

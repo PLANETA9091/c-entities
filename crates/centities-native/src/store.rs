@@ -21,6 +21,10 @@ pub const GRID_CELL: f64 = 4.0;
 /// One registry entry: the parity-proven per-mob state (`MobAI` — goal
 /// records, RNG mirror, nav, physics f64 fields) plus the registry plumbing
 /// Horizon carries on the struct (join order, alive flag, grid slot).
+/// WAVE14: Clone — the parallel double-buffer swaps `mobs` with a
+/// shadow Vec of slots each tick (the store's post-tick buffer becomes
+/// the working one for the next tick; no per-tick deep copy pass).
+#[derive(Clone)]
 pub struct MobSlot {
     pub mob: MobAI,
     /// alive=false entries are tombstones awaiting the between-tick compact.

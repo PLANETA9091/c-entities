@@ -51,6 +51,12 @@ pub struct WorldRes<'a, F: BlockFacts> {
     /// WAVE6 twin hook: true = fold_ctx returns None — every request parks
     /// (the exact pre-fold semantics; the A/B gate drives both modes).
     pub fold_off: bool,
+    /// WAVE14: the stroll-draw counter for THIS mob's ai_tick — the
+    /// executor's parallel pre-assignment walks it. Every draw path lands
+    /// here exactly once: the park arm (stroll_pos) and the fold handoff
+    /// (set_target_rng — the ONLY set_target_rng caller is the stroll
+    /// handoff in mob.rs). Reset by the executor before each mob.
+    pub draw_count: u32,
 }
 
 impl WorldRes<'_, OpenGround> {
@@ -64,6 +70,7 @@ impl WorldRes<'_, OpenGround> {
             stroll_radius: 10.0,
             follow_range: 35.0,
             fold_off: false,
+            draw_count: 0,
         }
     }
 }
@@ -79,6 +86,7 @@ impl<'a, F: BlockFacts> WorldRes<'a, F> {
             stroll_radius: 10.0,
             follow_range: 35.0,
             fold_off: false,
+            draw_count: 0,
         }
     }
 
@@ -132,6 +140,10 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
 
     fn set_target_rng(&mut self, s: u64) {
         self.target_rng = s;
+        // WAVE14: the fold handoff IS a stroll draw — count it (the park
+        // arm counts in stroll_pos below; the two are the only stream
+        // consumers, and at most one fires per ai_tick)
+        self.draw_count += 1;
     }
 
     fn stroll_pos(&mut self, mob: &mut swarm_sim::mob::MobAI) -> Option<(f64, f64, f64)> {
@@ -141,6 +153,8 @@ impl<'a, F: BlockFacts> Resolver for WorldRes<'a, F> {
         // the seam rejects, the goal fails its canUse honestly (res 0) —
         // the floor continues with the next goal.
         let r = self.stroll_radius;
+        // WAVE14: the park-arm draw — count it (see set_target_rng)
+        self.draw_count += 1;
         let dx = ((lcg_next(&mut self.target_rng, 16) as f64) / 65535.0) * 2.0 * r - r;
         let dz = ((lcg_next(&mut self.target_rng, 16) as f64) / 65535.0) * 2.0 * r - r;
         let (x, z) = (mob.x + dx, mob.z + dz);

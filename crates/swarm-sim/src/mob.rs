@@ -265,6 +265,10 @@ pub struct PackState {
 
 /// Persistent per-mob state — everything the Java executor holds on the
 /// live Mob object, in the same shape aiPack reads.
+/// WAVE14: Clone — the parallel executor evals a per-mob SHADOW (the
+/// pristine pre-tick state stays in slot A; the result lands in slot B;
+/// the drawers re-eval from the same pristine A). Plain data — derive.
+#[derive(Clone)]
 pub struct MobAI {
     pub id: i64,
     /// the shared-random mirror (SHARED_RANDOM.value)
@@ -867,7 +871,8 @@ fn put_f64(b: &mut [i32], idx: usize, v: f64) {
 }
 
 /// Per-tick accounting for the hot loop.
-#[derive(Debug, Default, Clone, Copy)]
+/// WAVE14: PartialEq — the parallel twin diffs the whole stats stream.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct AiStat {
     pub rounds: u32,
     pub requests: u32,

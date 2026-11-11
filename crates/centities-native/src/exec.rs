@@ -12,8 +12,10 @@ use swarm_sim::mob::{AiStat, MobAI, PackState, PlayerSnap};
 use swarm_sim::mob::TravelMth as Mth;
 
 use crate::profile::{ai_guard, apply_guard, grid_guard, travel_guard};
-use crate::store::{MobStore, SeenGrid};
-use crate::world::{PlayerTick, WorldRes};
+use crate::store::{MobSlot, MobStore, SeenGrid};
+use crate::world::{OpenGround, PlayerTick, Snapshot, WorldRes};
+
+use rayon::prelude::*;
 
 // TEMP WAVE11 probe: CE_NO_AI=1 skips every ai_tick body (the executor's
 // per-mob fixed overhead row). Measurement only — parity knobs never set it.
@@ -26,6 +28,27 @@ pub fn no_ai_on() -> bool {
 
 pub fn set_no_ai(on: bool) {
     NO_AI.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// WAVE14: the per-thread eval workspace (the scratch/out/pack triple the
+/// serial executor owns once — the parallel arm needs one set per WORKING
+/// thread; every field is pure workspace, written before read per mob, so
+/// the per-thread copies are content-identical to the shared one).
+struct WorkerBufs {
+    scratch: Vec<i32>,
+    out: Vec<i32>,
+    pack: PackState,
+}
+
+impl WorkerBufs {
+    #[inline]
+    fn fresh() -> Self {
+        WorkerBufs {
+            scratch: Vec::new(),
+            out: vec![0i32; swarm_sim::mob::out_len()],
+            pack: PackState::default(),
+        }
+    }
 }
 
 /// The executor state: the persistent store + the grid + the shared travel
@@ -78,6 +101,29 @@ pub struct NativeTick {
     /// refresh FUSES into the main loop, immediately before each mob's own
     /// ai_tick — the only reader of the fields is the mob itself.
     prepass: bool,
+    /// WAVE14: the parallel double-buffer (the shadow store). tick_parallel
+    /// evals every mob from THIS buffer pair: slot A stays PRISTINE (the
+    /// eval runs on a per-mob clone), the result lands in slot B; the
+    /// drawers (stroll-draw mobs) re-eval from the pristine A with their
+    /// serially pre-assigned stream value; the buffers SWAP at tick end.
+    /// Sized to the store between ticks.
+    pre_buf: Vec<MobSlot>,
+    /// WAVE14: the alive slot list (slot order) — the stats stream
+    /// contract is ONE entry per alive mob in slot order; the walk writes
+    /// by POSITION through this map.
+    alive_idx: Vec<u32>,
+    /// WAVE14: the per-mob stroll-draw counts + stats staging (slot-indexed
+    /// reuse — zero per-tick allocation) + the repair set (slot flags,
+    /// assigned stream values, the (slot, stat-pos) drawer list) + the
+    /// persistent per-worker eval workspaces.
+    results_buf: Vec<(AiStat, u32)>,
+    repair_buf: Vec<bool>,
+    assign_buf: Vec<u64>,
+    drawer_list: Vec<(u32, u32)>,
+    bufs: Vec<WorkerBufs>,
+    /// WAVE14: the parallel-arm switch (default OFF until the twin gate
+    /// proves the arm; the bench/CI flips it through set_parallel).
+    parallel: bool,
 }
 
 impl NativeTick {
@@ -97,7 +143,25 @@ impl NativeTick {
             split_travel: false,
             skip_travel: false,
             prepass: false,
+            pre_buf: Vec::new(),
+            alive_idx: Vec::new(),
+            results_buf: Vec::new(),
+            repair_buf: Vec::new(),
+            assign_buf: Vec::new(),
+            drawer_list: Vec::new(),
+            bufs: Vec::new(),
+            parallel: false,
         }
+    }
+
+    /// WAVE14 twin hook: drive the PARALLEL executor (the double-buffer
+    /// shadow-eval with the serial stream pre-assignment). The serial
+    /// fused walk stays the default until the twin gate proves the arm;
+    /// the dispatch falls back to serial for the twin-only shapes (the
+    /// full-pack wire arm, the pre-pass arm, the split-travel arm, the
+    /// no-AI probe) — those exist to arm the A/B gates, not to run fast.
+    pub fn set_parallel(&mut self, on: bool) {
+        self.parallel = on;
     }
 
     /// WAVE12 twin hook: restore the pre-wave12 approach-refresh PRE-PASS
@@ -173,6 +237,20 @@ impl NativeTick {
     /// allocated a fresh 25k-slot Vec — ~1.2 MB — every tick; the buffer
     /// now persists, the borrow ends at the next tick call).
     pub fn tick(&mut self, game_time: i32) -> &[AiStat] {
+        // WAVE14: the parallel arm owns the production shape (the fused
+        // refresh + the resident pack); the twin-only shapes stay serial.
+        if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
+        {
+            self.tick_parallel(game_time)
+        } else {
+            self.tick_serial(game_time)
+        }
+    }
+
+    /// The pre-wave14 SERIAL fused walk (the wave12b shape) — the A/B
+    /// twin arm for the parallel gate and the fallback for the twin-only
+    /// knobs. Bit-identical to the wave12b release by construction.
+    fn tick_serial(&mut self, game_time: i32) -> &[AiStat] {
         // WAVE8c: the grid maintenance is LAZY — the native v0 path never
         // queries candidates() (the folds answer LOS/target scans natively
         // over the packed players), so the per-tick re-bucket walk was pure
@@ -327,6 +405,348 @@ impl NativeTick {
         self.store.game_time = game_time;
         &stats[..]
     }
+
+    /// WAVE14 — THE PARALLEL TICK, v2 (the lean shape). The per-mob
+    /// independence theorem made hardware: no mob reads another mob (the
+    /// folds answer every scan over the packed players; move_tick touches
+    /// self fields only — the fused-vs-split executor twin), the snapshot
+    /// is immutable during the tick, and the ONE cross-mob channel — the
+    /// shared stroll stream (`target_rng`) — is a PURE DRAW COUNTER:
+    /// whether a mob draws is a function of its own state + its own seed
+    /// LCG (the stroll gate runs BEFORE the draw and never reads the
+    /// stream), at most one draw per ai_tick, and the stream advance is
+    /// TWO 48-bit LCG steps per draw regardless of the values (the park
+    /// arm draws 2x16 via lcg_next, the fold arm 2x16 via
+    /// stroll_draw_lcg16 — the same LCG).
+    ///
+    /// So the serial mob order fixes WHICH mobs draw and HOW MANY; the
+    /// VALUES chain as advance-per-draw. The tick decomposes:
+    ///
+    ///   pass 1 (parallel): each worker chunk CLONES its slots A→B
+    ///     (clone_from — the pre-tick state stays pristine in A), evals
+    ///     B in place with a placeholder stream value, and FUSES the
+    ///     travel right after (the wave9 vanilla order, per mob).
+    ///     Non-drawers are already CORRECT (they never touch the stream).
+    ///     Drawers record their draw count; their B state is garbage and
+    ///     gets replaced below.
+    ///   walk (serial, one fused pass over the alive slots): copy the
+    ///     stats into the contract buffer, assign each drawer its stream
+    ///     value = the chain advanced by the draws before it; the
+    ///     executor's post-tick stream = the chain end (exactly what the
+    ///     serial arm leaves in self.target_rng).
+    ///   pass 2 (the drawer repair): re-clone ONLY the drawers A→B and
+    ///     re-eval with the assigned value + the fused travel (serial
+    ///     below 1024 drawers — the thread spin dominates there — chunked
+    ///     parallel above). ZERO allocations: the per-chunk results ride
+    ///     pre-sliced regions of reused buffers, the worker bufs persist.
+    ///   swap: the shadow buffer becomes the store; no copy pass.
+    ///
+    /// Every mob's result is a pure function of (its pre-state, the
+    /// immutable snapshot, game_time, its assigned stream value) and the
+    /// assignment is a deterministic serial scan — the parallel result is
+    /// bit-identical to tick_serial for ANY thread interleaving. The twin
+    /// test drives both arms 400 ticks and diffs the whole-store dumps.
+    ///
+    /// The v1→v2 lesson (measured): the v1 shape paid ~1.9 ms/tick at ONE
+    /// thread — the stack shadow clones (A→stack→B double copy), the
+    /// per-chunk result Vec allocations (mmap page faults every tick),
+    /// the regrown scratch per map_init share, and the split-travel second
+    /// stream. v2 clones A→B once (the eval mutates B in place), rides
+    /// pre-sliced result regions, keeps persistent worker bufs, and fuses
+    /// the travel — the parallel arm's overhead is now the clone stream
+    /// itself (~0.25 ms at 25k), which the extra cores buy back many times.
+    fn tick_parallel(&mut self, game_time: i32) -> &[AiStat] {
+        drop(grid_guard());
+        // players -> the pack snapshot (the same shape as the serial arm)
+        let players: &[PlayerSnap] = {
+            let _g = apply_guard();
+            let pb = &mut self.players_buf;
+            pb.clear();
+            pb.extend(
+                self.store
+                    .snapshot
+                    .players
+                    .iter()
+                    .map(|p: &PlayerTick| PlayerSnap {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z,
+                        id: p.id,
+                        flags: p.flags,
+                    }),
+            );
+            &*pb
+        };
+        let tfp = MobAI::tick_fp(players);
+
+        let n = self.store.mobs.len();
+        // the shadow buffer mirrors the store shape (the resizes are rare:
+        // the population changes between ticks, the compact shrinks it)
+        if self.pre_buf.len() > n {
+            self.pre_buf.truncate(n);
+        }
+        if self.pre_buf.len() < n {
+            self.pre_buf.resize_with(n, || MobSlot {
+                mob: MobAI::new(0, 0, 0.0, 0.0, 0.0),
+                alive: false,
+                grid_cell: (i64::MAX, i64::MAX),
+                grid_pos: 0,
+            });
+        }
+        // the alive map (slot order) + the reused per-tick work buffers
+        self.alive_idx.clear();
+        for (i, s) in self.store.mobs.iter().enumerate() {
+            if s.alive {
+                self.alive_idx.push(i as u32);
+            }
+        }
+        let alive_len = self.alive_idx.len();
+        if self.results_buf.len() != n {
+            self.results_buf.resize(n, (AiStat::default(), 0u32));
+        }
+        self.repair_buf.clear();
+        self.repair_buf.resize(n, false);
+        self.assign_buf.clear();
+        self.assign_buf.resize(n, 0);
+        self.drawer_list.clear();
+        self.stats_buf.clear();
+        self.stats_buf.resize(alive_len, AiStat::default());
+
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunk = (n / (nthreads * 2)).clamp(256, 8192).max(1);
+        let nchunks = n.div_ceil(chunk);
+        if self.bufs.len() != nchunks {
+            // the resize keeps the GROWN buffers (scratch/out/pack) alive
+            // across ticks — zero per-tick allocation after the first
+            self.bufs.resize_with(nchunks, WorkerBufs::fresh);
+        }
+
+        let Self {
+            store,
+            pre_buf,
+            stats_buf,
+            alive_idx,
+            results_buf,
+            repair_buf,
+            assign_buf,
+            drawer_list,
+            bufs,
+            target_rng,
+            mth,
+            fold_off,
+            skip_travel,
+            compact_at,
+            grid,
+            ..
+        } = self;
+
+        let snapshot: &Snapshot = &store.snapshot;
+        let players_raw: &[PlayerTick] = &store.snapshot.players;
+        let s0 = *target_rng;
+        let fold_off = *fold_off;
+        let skip_travel = *skip_travel;
+
+        // ---- PASS 1: clone A→B (A stays pristine — pass 2's re-eval
+        // source), eval B in place with the placeholder stream value, fuse
+        // the travel. The per-chunk (stat, draws) land in the pre-sliced
+        // results region — zero allocation. The tombstones ride along
+        // (metadata mirror + mob copy) — the buffers stay index-aligned
+        // for the swap and the free list. ----
+        results_buf
+            .par_chunks_mut(chunk)
+            .zip(store.mobs.par_chunks_mut(chunk))
+            .zip(pre_buf.par_chunks_mut(chunk))
+            .zip(bufs.par_chunks_mut(1))
+            .for_each(|(((res_chunk, a_chunk), b_chunk), b1)| {
+                let bufs = &mut b1[0];
+                let _g = ai_guard();
+                for ((res, a), b) in res_chunk.iter_mut().zip(a_chunk).zip(b_chunk) {
+                    b.alive = a.alive;
+                    b.grid_cell = a.grid_cell;
+                    b.grid_pos = a.grid_pos;
+                    if !a.alive {
+                        b.mob.clone_from(&a.mob);
+                        *res = (AiStat::default(), 0);
+                        continue;
+                    }
+                    let (stat, drew) = re_eval_mob(
+                        &a.mob,
+                        &mut b.mob,
+                        players, players_raw, game_time, snapshot, fold_off, s0, tfp, bufs,
+                    );
+                    if !skip_travel {
+                        let _t = travel_guard();
+                        b.mob.move_tick(mth);
+                    }
+                    *res = (stat, drew);
+                }
+            });
+
+        // ---- THE WALK (serial, ONE fused pass): the stats contract copy +
+        // the drawer stream pre-assignment. TWO LCG-48 steps per draw. ----
+        let mut stream = s0;
+        let mut drawers = 0usize;
+        for k in 0..alive_len {
+            let slot = alive_idx[k] as usize;
+            let (stat, drew) = results_buf[slot];
+            stats_buf[k] = stat;
+            if drew == 0 {
+                continue;
+            }
+            assign_buf[slot] = stream;
+            repair_buf[slot] = true;
+            drawer_list.push((slot as u32, k as u32));
+            drawers += 1;
+            for _ in 0..(2 * drew) {
+                stream = stream
+                    .wrapping_mul(2521_4903_917)
+                    .wrapping_add(11)
+                    & 0xFFFF_FFFF_FFFF;
+            }
+        }
+        // the executor's post-tick stream — exactly what the serial arm
+        // accumulates across its per-mob handoffs
+        *target_rng = stream;
+
+        // ---- PASS 2: the drawer repair — re-clone A→B, re-eval with the
+        // assigned value, re-travel. Small sets run serial (the thread
+        // spin dominates there); big sets chunk parallel. ----
+        if drawers > 0 {
+            if drawers < 1024 {
+                let mut bufs = WorkerBufs::fresh();
+                for &(slot, k) in &*drawer_list {
+                    let expect = results_buf[slot as usize].1;
+                    let (stat, drew) = re_eval_mob(
+                        &store.mobs[slot as usize].mob,
+                        &mut pre_buf[slot as usize].mob,
+                        players,
+                        players_raw,
+                        game_time,
+                        snapshot,
+                        fold_off,
+                        assign_buf[slot as usize],
+                        tfp,
+                        &mut bufs,
+                    );
+                    debug_assert_eq!(
+                        drew, expect,
+                        "the stroll draw count must be stream-value-independent"
+                    );
+                    if !skip_travel {
+                        let _t = travel_guard();
+                        pre_buf[slot as usize].mob.move_tick(mth);
+                    }
+                    stats_buf[k as usize] = stat;
+                }
+            } else {
+                let a_all: &[MobSlot] = &store.mobs;
+                let base = results_buf.as_ptr() as usize;
+                let unit = std::mem::size_of::<(AiStat, u32)>();
+                results_buf
+                    .par_chunks_mut(chunk)
+                    .zip(a_all.par_chunks(chunk))
+                    .zip(pre_buf.par_chunks_mut(chunk))
+                    .zip(bufs.par_chunks_mut(1))
+                    .for_each(move |(((res_chunk, a_chunk), b_chunk), b1)| {
+                        let bufs = &mut b1[0];
+                        let _g = ai_guard();
+                        let cbase = (res_chunk.as_ptr() as usize - base) / unit;
+                        for (j, ((res, a), b)) in
+                            res_chunk.iter_mut().zip(a_chunk).zip(b_chunk).enumerate()
+                        {
+                            let slot = cbase + j;
+                            if !repair_buf[slot] {
+                                continue;
+                            }
+                            let (stat, _drew) = re_eval_mob(
+                                &a.mob,
+                                &mut b.mob,
+                                players,
+                                players_raw,
+                                game_time,
+                                snapshot,
+                                fold_off,
+                                assign_buf[slot],
+                                tfp,
+                                bufs,
+                            );
+                            if !skip_travel {
+                                let _t = travel_guard();
+                                b.mob.move_tick(mth);
+                            }
+                            *res = (stat, 0);
+                        }
+                    });
+                // the repair stats scatter — the drawer list is slot order
+                for &(slot, k) in &*drawer_list {
+                    stats_buf[k as usize] = results_buf[slot as usize].0;
+                }
+            }
+        }
+
+        // ---- the swap: the shadow becomes the store (the post-tick
+        // state), the old store buffer becomes the next tick's shadow ----
+        std::mem::swap(&mut store.mobs, pre_buf);
+        // tombstone compaction (between ticks, the Horizon lazy compact;
+        // the same shape as the serial arm)
+        if store.free.len() > *compact_at {
+            store.compact();
+            grid.invalidate_all();
+            grid.dirty = true;
+            for m in store.mobs.iter_mut() {
+                m.grid_cell = (i64::MAX, i64::MAX);
+            }
+        }
+        store.game_time = game_time;
+        stats_buf
+    }
+}
+
+/// WAVE14: ONE mob's eval from its pristine pre-tick state. The clone
+/// lands DIRECTLY in `target` (the shadow slot's mob — the eval mutates
+/// it in place; the v1 stack shadow's extra copy is gone). Pass 1 (the
+/// placeholder stream) and pass 2 (the assigned value) run the SAME body
+/// — the only input that differs is `assign`, and the non-drawers never
+/// read it (their results are assign-independent).
+#[inline]
+fn re_eval_mob(
+    a: &MobAI,
+    target: &mut MobAI,
+    players: &[PlayerSnap],
+    players_raw: &[PlayerTick],
+    game_time: i32,
+    snapshot: &Snapshot,
+    fold_off: bool,
+    assign: u64,
+    tfp: u64,
+    bufs: &mut WorkerBufs,
+) -> (AiStat, u32) {
+    target.clone_from(a);
+    // the WAVE12a fused approach refresh — rides the eval input (the
+    // only reader of the fields is the mob itself; the write lands on
+    // the SHADOW — the pristine slot A is pass-2's re-eval source)
+    if target.target_player >= 0 {
+        if let Some(p) = players_raw.get(target.target_player as usize) {
+            let (px, pz) = (p.x, p.z);
+            target.approach_x = px;
+            target.approach_z = pz;
+        } else {
+            target.target_player = -1;
+        }
+    }
+    let mut res: WorldRes<OpenGround> = WorldRes::open_ground_v0(snapshot, assign);
+    res.fold_off = fold_off;
+    res.draw_count = 0;
+    let stat = target.ai_tick(
+        players,
+        game_time,
+        &mut res,
+        &mut bufs.scratch,
+        &mut bufs.out,
+        &mut bufs.pack,
+        tfp,
+    );
+    (stat, res.draw_count)
 }
 
 impl Default for NativeTick {
@@ -341,12 +761,26 @@ mod tests {
     use swarm_sim::mob::zombie_table;
     use swarm_sim::mob::MobAI;
 
+    /// WAVE14: the executor twins + the global-knob probes SERIALIZE here.
+    /// The suite runs tests concurrently; every twin compares two executor
+    /// arms tick-by-tick, and a concurrent knob flip (odd-skip / z0 / the
+    /// probes) landing BETWEEN the two arm ticks would diverge them — a
+    /// pure test-harness race, not an executor bug. Lock + the knob tests
+    /// below make the whole twin family deterministic.
+    static EXEC_TWIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    macro_rules! twin_guard {
+        () => {
+            let _twin_guard = EXEC_TWIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        };
+    }
+
     /// TEMP WAVE11 slice probe: the EXACT wall decomposition with minimal
     /// population drift (the bench scenario stabilized 400 ticks, then ≤16
     /// timed iterations per variant). cargo test -p centities-native
     /// slice_probe -- --nocapture
     #[test]
     fn slice_probe() {
+        twin_guard!();
         let build = || -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             for i in 0..25000usize {
@@ -518,6 +952,7 @@ mod tests {
     /// goal states, nav, the whole store, word for word.
     #[test]
     fn resident_executor_matches_full_pack_executor() {
+        twin_guard!();
         let build = |full: bool| -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             nt.set_full_pack(full);
@@ -584,6 +1019,7 @@ mod tests {
     /// twin PROVES that claim every CI run.
     #[test]
     fn fused_executor_matches_split_executor() {
+        twin_guard!();
         let build = |split: bool| -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             nt.set_split_travel(split);
@@ -681,6 +1117,7 @@ mod tests {
     /// the tick), so both arms must land the same words every tick.
     #[test]
     fn prepass_matches_fused_refresh() {
+        twin_guard!();
         let build = |prepass: bool| -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             nt.set_prepass(prepass);
@@ -762,6 +1199,137 @@ mod tests {
         assert!(chasing > 0, "the refresh twin must chase: {chasing}");
     }
 
+    /// THE WAVE14 GATE: the PARALLEL executor (the double-buffer shadow
+    /// eval + the serial stroll-stream pre-assignment + the drawer repair
+    /// + the split travel + the buffer swap) must be BIT-IDENTICAL to the
+    /// serial fused walk over the same chased/strolling/looking
+    /// population — the whole-store dump per tick, 400 ticks, PLUS the
+    /// per-tick stats stream and the executor's post-tick stroll stream.
+    /// The independence theorem: every mob's result is a pure function of
+    /// (its pre-state, the immutable snapshot, game_time, its assigned
+    /// stream value); the assignment is a deterministic serial scan — so
+    /// ANY thread interleaving lands the same words.
+    #[test]
+    fn parallel_executor_matches_serial_executor() {
+        twin_guard!();
+        let build = |parallel: bool, px: f64, pz: f64| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_parallel(parallel);
+            for i in 0..96 {
+                let mut m = MobAI::new(
+                    1000 + i,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 12) as f64 * 3.0,
+                    64.0,
+                    (i / 12) as f64 * 3.0,
+                );
+                m.goals = swarm_sim::mob::zombie_table_res();
+                nt.add_mob(m);
+            }
+            nt.push_players(vec![PlayerTick {
+                x: px,
+                y: 64.0,
+                z: pz,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let dump = |nt: &NativeTick| -> Vec<u64> {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            let mut pop = 0u64;
+            for s in &nt.store.mobs {
+                if !s.alive {
+                    continue;
+                }
+                pop += 1;
+                let m = &s.mob;
+                for w in [
+                    m.id as u64,
+                    m.x.to_bits(),
+                    m.y.to_bits(),
+                    m.z.to_bits(),
+                    m.seed,
+                    m.yaw.to_bits() as u64,
+                    m.dx.to_bits(),
+                    m.dy.to_bits(),
+                    m.dz.to_bits(),
+                    m.nav_state as u64,
+                    m.nav_x.to_bits(),
+                    m.nav_z.to_bits(),
+                    m.target_player as u64,
+                    m.no_action as u64,
+                    m.tick_count as u64,
+                    m.approach_x.to_bits(),
+                    m.approach_z.to_bits(),
+                    m.et_running as u64,
+                    m.ar_running as u64,
+                    m.pend_x.to_bits(),
+                    m.pend_z.to_bits(),
+                    m.lookat_player as u64,
+                ] {
+                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                }
+                for g in &m.goals {
+                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.kind as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.prio as u64)).wrapping_mul(0x1000_0000_01b3);
+                    h = (h ^ (g.flags as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            [h, nt.target_rng, pop].to_vec()
+        };
+        // arm A — the CHASED shape: the player inside the follow range (the
+        // refresh/target/attack paths ride the parallel eval)
+        let mut ser = build(false, 12.0, 4.0);
+        let mut par = build(true, 12.0, 4.0);
+        for t in 0..400 {
+            let ss = ser.tick(t).to_vec();
+            let ps = par.tick(t).to_vec();
+            assert_eq!(ss, ps, "tick {t}: the stats stream diverged (chase)");
+            assert_eq!(
+                dump(&ser),
+                dump(&par),
+                "tick {t}: the parallel executor diverged from the serial twin (chase)"
+            );
+        }
+        let chasing = par
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.target_player >= 0)
+            .count();
+        assert!(chasing > 0, "the chase twin must chase: {chasing}");
+
+        // arm B — the STROLL shape: the player far outside the follow range
+        // (nobody targets -> the stroll gates fire -> the DRAWER path — the
+        // stream pre-assignment + the repair pass — is exercised HARD)
+        let mut ser = build(false, 100000.0, 100000.0);
+        let mut par = build(true, 100000.0, 100000.0);
+        for t in 0..400 {
+            let ss = ser.tick(t).to_vec();
+            let ps = par.tick(t).to_vec();
+            assert_eq!(ss, ps, "tick {t}: the stats stream diverged (stroll)");
+            assert_eq!(
+                dump(&ser),
+                dump(&par),
+                "tick {t}: the parallel executor diverged from the serial twin (stroll)"
+            );
+        }
+        assert_ne!(
+            par.target_rng, 0xC0FFEE,
+            "the stroll twin must draw (the pre-assignment path must be live)"
+        );
+        let strolling = par
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.nav_state != 0)
+            .count();
+        assert!(strolling > 0, "the stroll twin must stroll: {strolling}");
+    }
+
     /// THE WAVE11 executor gate: the STRAIGHT-LINE zombie walk (ai_floor_z0
     /// behind the fp/running/even/fold gate) must be BIT-IDENTICAL to the
     /// generic engine over the same chased/strolling/looking population —
@@ -770,6 +1338,7 @@ mod tests {
     /// arm — both arms must land the same words every tick.
     #[test]
     fn zstrait_matches_generic_executor() {
+        twin_guard!();
         let build = || -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             for i in 0..96 {
@@ -873,6 +1442,7 @@ mod tests {
     /// et_running bit drift diverges the dump streams and fails this gate.
     #[test]
     fn odd_skip_matches_full_floor_executor() {
+        twin_guard!();
         let build = || -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             for i in 0..96 {
@@ -978,6 +1548,7 @@ mod tests {
     /// store, word for word, 400 ticks.
     #[test]
     fn folded_executor_matches_parked_executor() {
+        twin_guard!();
         let build = |fold_off: bool| -> NativeTick {
             let mut nt = NativeTick::new(0xC0FFEE);
             nt.set_fold_off(fold_off);
