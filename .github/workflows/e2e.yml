@@ -145,7 +145,11 @@ jobs:
           # must see the DECLINED marker ("mob AI floor disabled") and an
           # explicitly-requested soak (-Dcentities.mobAi=1) the ARMED marker.
           # Neither = the arming probe itself broke (handles/classification).
-          grep -qE "precomputed \+ armed the Mob AI floor|mob AI floor disabled \(centities\.mobAi\)" e2e.log || fail "L22a mob AI floor neither armed nor correctly declined (handles/classification probe failed)"
+          # N2-M0 (aad3509) widened the declined marker with the
+          # CE_NATIVE_MOB leg ("(centities.mobAi / CE_NATIVE_MOB)") — the
+          # pattern is prefix-anchored so both the old and the new suffix
+          # match; the closing-paren form kept failing e2e since M0.
+          grep -qE "precomputed \+ armed the Mob AI floor|mob AI floor disabled \(centities\.mobAi" e2e.log || fail "L22a mob AI floor neither armed nor correctly declined (handles/classification probe failed)"
           grep -q  "\[c-entities\] ARMED"                     e2e.log || fail "module not armed"
           grep -q  "Done ("                                   e2e.log || fail "server did not finish boot"
           ! grep -q "NOT armed"                               e2e.log || fail "module reported NOT armed"
