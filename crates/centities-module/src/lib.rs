@@ -2652,8 +2652,36 @@ fn precompute_mob(loader: jni::jobject) {
         check_name: "mobAiFloor",
         check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
     };
+    // N2-M1: the wholesale wire chains a SECOND guard at the head of
+    // Mob.aiStep — the FULL-body skip. One early return now kills the
+    // entire per-mob Java tick body for a native-classified mob:
+    // LivingEntity.aiStep (movement scale, lerp/sensors, the serverAiStep
+    // call, jump, travel+gravity), then burnUndead and the looting scan in
+    // Mob.aiStep's own body. The applier (the boundary read-back) stays the
+    // sole mover; the executor already owns the stroll stream and the
+    // kinematics (doc 56's tug-of-war fix). The serverAiStep guard remains
+    // underneath: the L22a route for centities.mobAi mode and the fallback
+    // if the aiStep weave ever failed to link. The no-arg-instance-method
+    // shape is the tickEffects/pushEntities op-4 pattern (receiver = local
+    // 0, exact descriptor == link safety — the Paper-26.3 discard lesson).
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+        if native_mob && !mob_ai {
+            let step = cplug_sdk::asm::EarlyReturnGuard {
+                method_name: "aiStep",
+                method_desc: "()V",
+                check_class: HOOKS_CLASS,
+                check_name: "nativeMobStep",
+                check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
+            };
+            match cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &step) {
+                Some(b) if !b.is_empty() => {
+                    cplug_sdk::asm::insert_early_return_guard(env, loader, &b, &spec)
+                }
+                _ => None,
+            }
+        } else {
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
+        }
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {

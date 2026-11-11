@@ -8613,6 +8613,7 @@ public final class CeHooks {
     public static long nmAds = 0, nmRemoves = 0, nmApplies = 0, nmGrows = 0,
             nmTicks = 0, nmSkipped = 0;
     private static long nmEntryProbe = 0;
+    private static long nmStepProbe = 0;
     private static final java.util.HashMap<Integer, net.minecraft.world.entity.Mob> NM_BYID =
             new java.util.HashMap<>();
     private static java.util.HashSet<Integer> NM_SEEN = new java.util.HashSet<>();
@@ -9543,6 +9544,43 @@ public final class CeHooks {
         return true;
     }
 
+    /** N2-M1: the aiStep-entry route — the WHOLESALE skip. The guard rides
+     *  the head of Mob.aiStep (chained BEFORE the serverAiStep guard): for a
+     *  native-classified mob one early return kills the whole per-mob Java
+     *  body — LivingEntity.aiStep (movement scale, lerp/sensors, the
+     *  serverAiStep call, jump, travel+gravity) plus Mob.aiStep's own
+     *  burnUndead and the looting scan. The applier is the sole mover; the
+     *  executor owns the stroll stream and the kinematics (doc 56's
+     *  tug-of-war fix).
+     *  In-store mobs skip REGARDLESS of awareness: an unaware in-store mob
+     *  used to fall through to the zero-input vanilla residual AND to lose
+     *  its saw-set feed (the M0 removal diff then evicted it every
+     *  inactive tick — re-added on wake with a fresh stroll seed). Feeding
+     *  the saw-set here keeps the whole population resident: the removal
+     *  driver now fires only on real Java-side deaths (dead mobs never
+     *  reach aiStep at all). The first-sight classification keeps the
+     *  nativeMobSight aware-gate EXACTLY (the t=157 byte-exactness lesson:
+     *  the unaware branch draws no randomness and is never preempted). */
+    public static boolean nativeMobStep(net.minecraft.world.entity.Mob mob) {
+        if (nmStepProbe++ == 0) {
+            // M1 route marker: distinguishes the aiStep-entry route from the
+            // serverAiStep fallback (mobAiFloor keeps its nmEntryProbe line)
+            System.out.println("[c-entities] N2-M1: aiStep route live, native="
+                    + NATIVE_MOB_ON + " ok=" + NATIVE_MOB_HANDLES_OK
+                    + " cls=" + mob.getClass().getName());
+        }
+        if (!NATIVE_MOB_ON || !NATIVE_MOB_HANDLES_OK) {
+            return false;
+        }
+        int eid = entId(mob);
+        if (NM_BYID.containsKey(eid)) {
+            NM_SAW.computeIfAbsent(mob.level(), k -> new java.util.HashSet<>()).add(eid);
+            nmSkipped++;
+            return true;
+        }
+        return nativeMobSight(mob);
+    }
+
     /** The boundary driver (itemTickFlush, after the entity loop): the
      *  player snapshot push + ONE nativeMobBatch + the read-back applier
      *  (positions/yaw/noActionTime) + the removal diff. Any throwable
@@ -9656,6 +9694,7 @@ public final class CeHooks {
                 // periodic diagnostic: the wire's state every ~10s
                 System.out.println("[c-entities] N2 poll: n=" + n
                         + " ads=" + nmAds + " rem=" + nmRemoves
+                        + " skip=" + nmSkipped
                         + " appl=" + nmApplies
                         + " id0=" + NM_IDS[0]
                         + " p=" + NM_POS[0] + "," + NM_POS[1] + "," + NM_POS[2]
