@@ -100,10 +100,19 @@ the invariant.
   400 ticks × (chase + stroll-far) shapes, the whole-store FNV dumps +
   the stats stream + the handoff words + the post-tick stream
   bit-identical against the serial arm, on the NEW shape.
-- Suites: **105 Rust tests green** (37 core lib + the core integration
-  suites incl. exactness 10 + 20 native incl. the twin + 22 sim + aux;
-  the `#[ignore]d` phase_probe rides along as the instrument). The module
-  suite stays CI-side (mapped 26.3 jar + Java 25).
+- The pass-2 branch gap CLOSED: the production threshold (1024 drawers)
+  meant the bench-sized twins never executed the chunked-parallel repair.
+  `parallel_pass2_chunked_matches_serial_executor` drives THREE arms over
+  the same 4096-mob stroll world (≈68 drawers/tick spread over 4 chunks)
+  — the serial executor, the parallel executor with the serial repair,
+  and the parallel executor with `pass2_serial_max = 0` (EVERY drawer
+  rides the chunked branch, the per-chunk `base_stream` walk + the region
+  stats overwrite): all three dumps + stats streams agree bit-for-bit
+  every tick of 400.
+- Suites: **106 Rust tests green** (37 core lib + the core integration
+  suites incl. exactness 10 + 21 native incl. the twin pair + 22 sim +
+  aux; the `#[ignore]d` phase_probe rides along as the instrument). The
+  module suite stays CI-side (mapped 26.3 jar + Java 25).
 - Zero per-tick allocation on the steady state: the stats regions are
   re-split per tick from the persistent buffer (the split Vec is
   pointer-sized per chunk), the ledgers keep their capacity, the worker

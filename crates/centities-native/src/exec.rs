@@ -173,11 +173,16 @@ pub struct NativeTick {
     /// each carrying the chunk-local drawer ledger + the rank/stream
     /// prefix outputs (see WorkerBufs).
     bufs: Vec<WorkerBufs>,
-    /// WAVE14: the parallel-arm switch — the PRODUCTION DEFAULT (the twin
+    /// WAVE15: the parallel-arm switch — the PRODUCTION DEFAULT (the twin
     /// gate proved the arm bit-identical; the dispatch falls back to
     /// serial for the twin-only shapes). `set_parallel(false)` / CE_SER=1
     /// restores the serial fused walk (the A/B arm).
     parallel: bool,
+    /// WAVE15: the pass-2 branch threshold — drawer counts below it run
+    /// the serial repair (the thread spin dominates there), above it the
+    /// chunked-parallel shape. 1024 in production; the big-draw twin pins
+    /// it to 0 to drive EVERY drawer through the chunked branch.
+    pass2_serial_max: usize,
 }
 
 impl NativeTick {
@@ -200,6 +205,7 @@ impl NativeTick {
             pre_buf: Vec::new(),
             bufs: Vec::new(),
             parallel: true,
+            pass2_serial_max: 1024,
         }
     }
 
@@ -211,6 +217,13 @@ impl NativeTick {
     /// no-AI probe) — those exist to arm the A/B gates, not to run fast.
     pub fn set_parallel(&mut self, on: bool) {
         self.parallel = on;
+    }
+
+    /// WAVE15 twin hook: the pass-2 branch threshold. 0 = EVERY drawer
+    /// rides the chunked-parallel repair (the big-draw twin drives the
+    /// branch the production threshold never reaches at bench sizes).
+    pub fn set_pass2_serial_max(&mut self, v: usize) {
+        self.pass2_serial_max = v;
     }
 
     /// WAVE12 twin hook: restore the pre-wave12 approach-refresh PRE-PASS
@@ -584,6 +597,7 @@ impl NativeTick {
         let s0 = *target_rng;
         let fold_off = *fold_off;
         let skip_travel = *skip_travel;
+        let pass2_serial_max = self.pass2_serial_max;
 
         // ---- WAVE15 THE RANK PREFIX: ONE serial pass counts each
         // chunk's alive slots and assigns its base_k in the same breath
@@ -695,7 +709,7 @@ impl NativeTick {
         // Small sets run serial (the thread spin dominates there); big
         // sets run the chunked-parallel shape. ----
         if drawers_total > 0 {
-            if drawers_total < 1024 {
+            if drawers_total < pass2_serial_max {
                 let mut local = WorkerBufs::fresh();
                 for bi in 0..bufs.len() {
                     let mut stream = bufs[bi].base_stream;
@@ -1000,6 +1014,55 @@ mod tests {
             nt.tick(t);
         }
         println!("{}", phase_probe_take());
+    }
+
+    /// WAVE15: the whole-store census dump shared by the twin family (the
+    /// FNV over the 22 live MobAI words + every goal record, + the
+    /// executor's post-tick stream + the population).
+    fn twin_dump(nt: &NativeTick) -> Vec<u64> {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut pop = 0u64;
+        for s in &nt.store.mobs {
+            if !s.alive {
+                continue;
+            }
+            pop += 1;
+            let m = &s.mob;
+            for w in [
+                m.id as u64,
+                m.x.to_bits(),
+                m.y.to_bits(),
+                m.z.to_bits(),
+                m.seed,
+                m.yaw.to_bits() as u64,
+                m.dx.to_bits(),
+                m.dy.to_bits(),
+                m.dz.to_bits(),
+                m.nav_state as u64,
+                m.nav_x.to_bits(),
+                m.nav_z.to_bits(),
+                m.target_player as u64,
+                m.no_action as u64,
+                m.tick_count as u64,
+                m.approach_x.to_bits(),
+                m.approach_z.to_bits(),
+                m.et_running as u64,
+                m.ar_running as u64,
+                m.pend_x.to_bits(),
+                m.pend_z.to_bits(),
+                m.lookat_player as u64,
+            ] {
+                h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+            }
+            for g in &m.goals {
+                h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
+                h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
+                h = (h ^ (g.kind as u64)).wrapping_mul(0x1000_0000_01b3);
+                h = (h ^ (g.prio as u64)).wrapping_mul(0x1000_0000_01b3);
+                h = (h ^ (g.flags as u64)).wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        [h, nt.target_rng, pop].to_vec()
     }
 
     fn mk(id: i64, x: f64, z: f64) -> MobAI {
@@ -1403,51 +1466,7 @@ mod tests {
             }]);
             nt
         };
-        let dump = |nt: &NativeTick| -> Vec<u64> {
-            let mut h = 0xcbf2_9ce4_8422_2325u64;
-            let mut pop = 0u64;
-            for s in &nt.store.mobs {
-                if !s.alive {
-                    continue;
-                }
-                pop += 1;
-                let m = &s.mob;
-                for w in [
-                    m.id as u64,
-                    m.x.to_bits(),
-                    m.y.to_bits(),
-                    m.z.to_bits(),
-                    m.seed,
-                    m.yaw.to_bits() as u64,
-                    m.dx.to_bits(),
-                    m.dy.to_bits(),
-                    m.dz.to_bits(),
-                    m.nav_state as u64,
-                    m.nav_x.to_bits(),
-                    m.nav_z.to_bits(),
-                    m.target_player as u64,
-                    m.no_action as u64,
-                    m.tick_count as u64,
-                    m.approach_x.to_bits(),
-                    m.approach_z.to_bits(),
-                    m.et_running as u64,
-                    m.ar_running as u64,
-                    m.pend_x.to_bits(),
-                    m.pend_z.to_bits(),
-                    m.lookat_player as u64,
-                ] {
-                    h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
-                }
-                for g in &m.goals {
-                    h = (h ^ (g.running as u64)).wrapping_mul(0x1000_0000_01b3);
-                    h = (h ^ (g.state as u64)).wrapping_mul(0x1000_0000_01b3);
-                    h = (h ^ (g.kind as u64)).wrapping_mul(0x1000_0000_01b3);
-                    h = (h ^ (g.prio as u64)).wrapping_mul(0x1000_0000_01b3);
-                    h = (h ^ (g.flags as u64)).wrapping_mul(0x1000_0000_01b3);
-                }
-            }
-            [h, nt.target_rng, pop].to_vec()
-        };
+        let dump = |nt: &NativeTick| -> Vec<u64> { twin_dump(nt) };
         // arm A — the CHASED shape: the player inside the follow range (the
         // refresh/target/attack paths ride the parallel eval)
         let mut ser = build(false, 12.0, 4.0);
@@ -1496,6 +1515,79 @@ mod tests {
             .filter(|m| m.mob.nav_state != 0)
             .count();
         assert!(strolling > 0, "the stroll twin must stroll: {strolling}");
+    }
+
+    /// WAVE15: the pass-2 branch gap — the production threshold (1024
+    /// drawers) means the bench-sized twins never execute the
+    /// CHUNKED-PARALLEL repair. Three arms over the same 4096-mob stroll
+    /// world (≈68 drawers/tick spread over 4 chunks): the serial
+    /// executor, the parallel executor with the SERIAL repair, and the
+    /// parallel executor with pass2_serial_max = 0 — EVERY drawer rides
+    /// the chunked branch (per-chunk base_stream walk + region stats
+    /// overwrite). All three dumps + stats streams must agree bit-for-bit
+    /// every tick of 400.
+    #[test]
+    fn parallel_pass2_chunked_matches_serial_executor() {
+        twin_guard!();
+        let build = |parallel: bool, chunked_pass2: bool, n: usize| -> NativeTick {
+            let mut nt = NativeTick::new(0xC0FFEE);
+            nt.set_parallel(parallel);
+            if chunked_pass2 {
+                nt.set_pass2_serial_max(0);
+            }
+            for i in 0..n {
+                let mut m = MobAI::new(
+                    1000 + i as i64,
+                    0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                    (i % 64) as f64 * 3.0,
+                    64.0,
+                    (i / 64) as f64 * 3.0,
+                );
+                m.goals = swarm_sim::mob::zombie_table_res();
+                nt.add_mob(m);
+            }
+            // the player far outside the follow range — the stroll gates
+            // fire across the whole population (the drawer path)
+            nt.push_players(vec![PlayerTick {
+                x: 100000.0,
+                y: 64.0,
+                z: 100000.0,
+                id: 1,
+                flags: 1,
+            }]);
+            nt
+        };
+        let mut ser = build(false, false, 4096);
+        let mut par_ser = build(true, false, 4096);
+        let mut par_chunked = build(true, true, 4096);
+        for t in 0..400 {
+            let ss = ser.tick(t).to_vec();
+            let ps = par_ser.tick(t).to_vec();
+            let pc = par_chunked.tick(t).to_vec();
+            assert_eq!(ss, ps, "tick {t}: par/serial-pass2 diverged from serial");
+            assert_eq!(ss, pc, "tick {t}: par/chunked-pass2 diverged from serial");
+            assert_eq!(
+                twin_dump(&ser),
+                twin_dump(&par_ser),
+                "tick {t}: the serial-pass2 arm diverged (store)"
+            );
+            assert_eq!(
+                twin_dump(&ser),
+                twin_dump(&par_chunked),
+                "tick {t}: the chunked-pass2 arm diverged (store)"
+            );
+        }
+        assert_ne!(
+            par_chunked.target_rng, 0xC0FFEE,
+            "the chunked-pass2 twin must draw"
+        );
+        let strolling = par_chunked
+            .store
+            .mobs
+            .iter()
+            .filter(|m| m.mob.nav_state != 0)
+            .count();
+        assert!(strolling > 0, "the chunked-pass2 twin must stroll: {strolling}");
     }
 
     /// THE WAVE11 executor gate: the STRAIGHT-LINE zombie walk (ai_floor_z0
