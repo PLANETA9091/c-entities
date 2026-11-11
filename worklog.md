@@ -546,3 +546,27 @@ Work Log:
 
 Next: the tracker gate residual (ttlCachedPath ~1.3%), the applier's setPos
 for the walking population, the mobs-25k-native CI leg (the -90% arbiter).
+
+---
+Task ID: 11
+Agent: main (Z.ai)
+Task: N2-M2c verification + the paired 10k production A/B at the M2c build
+
+Work Log:
+- Paired 10k legs (same window fill300/warm60/measure300, same box hour):
+  vanilla 283.4 p50 / 313.5 mean vs native M2c 47.9 p50 / 60.9 mean =
+  -83.1% p50 (the first production A/B was -71.6%). Wire n=10000
+  ads=10000 rem=0, dmob=4.97M, jpos bit-exact; module suite 14 green.
+- Post-M2c profile: the mob-attributable server-thread leaves sum to ~7%
+  of all samples (the walk 1.52, the applier's primitive reads ~3, the
+  tracker gate 0.92, setPosRaw 0.49, the tracker dirty scan 0.48) — the
+  Java-side mob floor is CLOSED; the rest is harness + shared server
+  floor. doc 59 (59-n2m2c-checkdespawn-skip.md).
+- Dead-end ledger: the M1.8b activation weave shipped dead (the op-4
+  static ALOAD bug — fixed in the sdk d7ae117 and made redundant by the
+  M2a dispatcher floor); the M1.8a zombie-family arm-time retransform fix
+  (the deferred path is dead for pre-arm classes — the stash is removed by
+  the precompute); the local 25k vanilla leg exceeds the sandbox call
+  ceiling (the CI 25k leg stays the arbiter).
+- Next: M3 (the N3 event outbox), the 25k CI pair, the tracker gate
+  residual.
