@@ -142,3 +142,46 @@ per-mob cost") is closed on the wire level. Next: **M2 — the e2e perf
 stand under the gates** (the parity-less legs with `CE_NATIVE_MOB=1` on
 mobs-25k: production mspt vs module-off vanilla, JFR + the phase ledger;
 the JNI crossing must stay ~2/level-tick), then M3 (the N3 event outbox).
+
+## Addendum — M1.6 (the wire fastpath) + M1.5 (the tick weave)
+
+The 2000-mob JFR profile (server-thread self-time) drove two more waves:
+
+**M1.6 — the wire fastpath.** `nativeMobStep` self 6.4% → 0.0%,
+`nativeMobBoundary` self 6.7% → 1.9%:
+- `NM_BYID` became `NmMap` — a primitive int→Mob open-addressing map
+  (linear probing, Knuth 6.4 R cluster-pull deletion, grow at 50%): the
+  old `HashMap<Integer,Mob>` boxed twice per mob per tick.
+- The saw-set machinery died outright (the liveness driver made it dead
+  code): no `NM_SAW` map, no per-mob `HashSet.add`, no `NM_SEEN`/
+  `NM_SEEN_TMP` swap, no boxed adds per boundary.
+- The liveness check folded INTO the apply loop: a dead mob is collected
+  into an int scratch and drained after — the steady state (nobody died)
+  costs one extra field check per mob and ZERO map walks (the two full
+  `NM_BYID` walks per boundary are gone).
+
+**M1.5 — the tick weave.** A THIRD guard chained at the head of `Mob.tick`
+(op-4, `nativeMobTick`): the native mob's whole Java tick dies —
+`Entity.tick` (baseTick: fire/air/lava/tickCount, pushEntities) and every
+layer above (the M1-skipped aiStep, updateControlFlags, the swing/item-use
+machinery). The classification moved here (aiStep is skipped for natives —
+the sight could never fire there); the applier keeps `tickCount`/
+`ticksLived` advancing with one Unsafe increment per mob per boundary
+(one boundary per server tick — pinned empirically: appl grows exactly n
+per tick). The death path is re-verified: the sight refuses `!isAlive()`
+mobs (with the classification at tick ENTRY a dying mob would otherwise be
+re-classified and resurrected — a corpse the vanilla dead-branch could
+never remove); after the liveness diff drops a dead native, the next
+tick's guard declines and LivingEntity.tick's dead branch animates and
+removes the corpse. Live: `/kill` → `rem=1` on the same boundary, the
+survivors untouched (jpos bit-exact, zero churn).
+
+**M1.5 disclosures**: native mobs no longer burn in daylight, take lava/
+fire damage, drown, or freeze (baseTick skipped) — environmental death
+returns with the N3 event outbox; `updateControlFlags` freezes (the
+vanilla goalSelector is not used by natives); hurt-by-command still kills
+(hurt runs outside the skipped body, health drops, the liveness diff
+fires). JFR after both waves: server-thread samples 999 → 790 → 504 over
+equal windows; the remaining mob-attributable server time is the applier
+(boundary 13.5%) and the tracker's data reads (~8%, needed for real
+players).

@@ -8614,26 +8614,117 @@ public final class CeHooks {
             nmTicks = 0, nmSkipped = 0;
     private static long nmEntryProbe = 0;
     private static long nmStepProbe = 0;
-    private static final java.util.HashMap<Integer, net.minecraft.world.entity.Mob> NM_BYID =
-            new java.util.HashMap<>();
-    private static java.util.HashSet<Integer> NM_SEEN = new java.util.HashSet<>();
-    private static java.util.HashSet<Integer> NM_SEEN_TMP = new java.util.HashSet<>();
+    private static long nmTickProbe = 0;
+    /** The primitive int->Mob map (linear probing, NO boxing): the old
+     *  HashMap<Integer,Mob> boxed twice per mob per tick on the guard path
+     *  (containsKey + the saw feed) and showed up as nativeMobStep self-time
+     *  in the 2000-mob JFR profile. Removes use the classic cluster pull
+     *  (Knuth 6.4 R) — rare (Java-side deaths). */
+    private static final NmMap NM_BYID = new NmMap();
+    /** The dead-mob scratch of one boundary pass (ids collected while
+     *  applying, drained right after — zero map walks in the steady
+     *  state where nobody died). */
+    private static int[] NM_DEAD = new int[64];
+    private static int NM_DEAD_N = 0;
     private static long[] NM_IDS = new long[2 * 4096];
     private static double[] NM_POS = new double[4 * 4096];
     private static double[] NM_PXYZ = new double[3 * 8];
     private static int[] NM_PF = new int[2 * 8];
     private static long O_ENT_YROT = -1;
+    private static long O_ENT_TICKCOUNT = -1;
+    /** The primitive int->Mob open-addressing map for the native-mob wire.
+     *  Linear probing, power-of-two capacity, `used` bit per slot (entity
+     *  id 0 is legal in theory), growth at 50% load, deletion by the
+     *  classic cluster pull so the probe chains stay intact. Server-thread
+     *  confined like everything else on the wire. */
+    static final class NmMap {
+        private int[] keys = new int[1024];
+        private net.minecraft.world.entity.Mob[] vals =
+                new net.minecraft.world.entity.Mob[1024];
+        private boolean[] used = new boolean[1024];
+        private int mask = 1023;
+        private int size = 0;
+
+        private int probe(int eid) {
+            int i = (eid ^ (eid >>> 16)) & mask;
+            while (used[i] && keys[i] != eid) {
+                i = (i + 1) & mask;
+            }
+            return i;
+        }
+
+        net.minecraft.world.entity.Mob get(int eid) {
+            int i = probe(eid);
+            return used[i] ? vals[i] : null;
+        }
+
+        void put(int eid, net.minecraft.world.entity.Mob m) {
+            if ((size + 1) * 2 > keys.length) {
+                grow();
+            }
+            int i = probe(eid);
+            if (!used[i]) {
+                used[i] = true;
+                keys[i] = eid;
+                size++;
+            }
+            vals[i] = m;
+        }
+
+        void remove(int eid) {
+            int i = probe(eid);
+            if (!used[i] || keys[i] != eid) {
+                return;
+            }
+            // Knuth 6.4 algorithm R: pull the cluster forward so every
+            // following entry keeps its home-slot invariant.
+            int j = i;
+            while (true) {
+                j = (j + 1) & mask;
+                if (!used[j]) {
+                    break;
+                }
+                int h = (keys[j] ^ (keys[j] >>> 16)) & mask;
+                boolean between = (h <= j) ? (i >= h && i <= j) : (i >= h || i <= j);
+                if (between) {
+                    keys[i] = keys[j];
+                    vals[i] = vals[j];
+                    i = j;
+                }
+            }
+            used[i] = false;
+            vals[i] = null;
+            size--;
+        }
+
+        private void grow() {
+            int[] ok = keys;
+            net.minecraft.world.entity.Mob[] ov = vals;
+            boolean[] ou = used;
+            int cap = ok.length * 2;
+            keys = new int[cap];
+            vals = new net.minecraft.world.entity.Mob[cap];
+            used = new boolean[cap];
+            mask = cap - 1;
+            size = 0;
+            for (int i = 0; i < ok.length; i++) {
+                if (ou[i]) {
+                    put(ok[i], ov[i]);
+                }
+            }
+        }
+    }
+
+    private static void nmCollectDead(int eid) {
+        if (NM_DEAD_N == NM_DEAD.length) {
+            NM_DEAD = java.util.Arrays.copyOf(NM_DEAD, NM_DEAD_N * 2);
+        }
+        NM_DEAD[NM_DEAD_N++] = eid;
+    }
     /** The shared zero-delta — Vec3 is immutable in vanilla, one instance
      *  serves every write (the item applier instantiates Vec3 directly). */
     private static final net.minecraft.world.phys.Vec3 NM_ZERO_DELTA =
             new net.minecraft.world.phys.Vec3(0.0, 0.0, 0.0);
-    /** The per-level saw-set: the boundary is woven per LEVEL (three calls
-     *  per server tick — one per dimension), so the removal diff must be
-     *  scoped to the mobs of THIS level or another level's boundary kills
-     *  them (the observed add/remove churn: every dimension's boundary
-     *  removed every mob it did not own). */
-    private static final java.util.HashMap<net.minecraft.world.level.Level, java.util.HashSet<Integer>> NM_SAW =
-            new java.util.HashMap<>();
     private static final int NM_SEED_FALLBACK = 0xC0FFEE;
     // L90b: the per-tick branch counters of the AI floor — the GL line
     // prints `br=<even-ai>/<odd-java>/<odd-rust>`; the vanilla cadence
@@ -9465,6 +9556,13 @@ public final class CeHooks {
             if (O_MOB_NOACTION < 0) {
                 O_MOB_NOACTION = offOf(net.minecraft.world.entity.Mob.class, "noActionTime");
             }
+            if (O_ENT_TICKCOUNT < 0) {
+                // M1.5: the tick weave owns the native mob's whole Java tick
+                // (Entity.tick's tickCount++ included) — the applier keeps
+                // ticksLived advancing with one Unsafe increment per mob
+                // per boundary.
+                O_ENT_TICKCOUNT = offOf(net.minecraft.world.entity.Entity.class, "tickCount");
+            }
             // SHARED_RANDOM resolution is SELF-CONTAINED here (the leaner
             // probe must not assume the L22a init ran): the static field +
             // the ceSrOriginal duck-type unwrap (the L85b parity-proxy
@@ -9492,7 +9590,8 @@ public final class CeHooks {
                 NATIVE_MOB_HANDLES_OK = false;
                 return;
             }
-            NATIVE_MOB_HANDLES_OK = O_ENT_YROT >= 0 && O_MOB_NOACTION >= 0;
+            NATIVE_MOB_HANDLES_OK = O_ENT_YROT >= 0 && O_MOB_NOACTION >= 0
+                    && O_ENT_TICKCOUNT >= 0;
         } catch (Throwable t) {
             NATIVE_MOB_HANDLES_OK = false;
         }
@@ -9520,11 +9619,22 @@ public final class CeHooks {
      *  Non-zombies keep vanilla (M0: the store's goal table is the zombie
      *  table). */
     private static boolean nativeMobSight(net.minecraft.world.entity.Mob mob) {
-        if (!(mob instanceof net.minecraft.world.entity.monster.zombie.Zombie) || !mob.aware) {
+        // M1.5 death gate: with the classification riding Mob.tick ENTRY, a
+        // DYING mob (health 0, death animation, still in the world) would be
+        // re-classified here and resurrected natively — a corpse the vanilla
+        // dead-branch can never remove (its tick is skipped). Refusing dead
+        // mobs sends the corpse back to vanilla: the liveness diff drops it
+        // from the store at the boundary, the next tick's guard declines,
+        // and LivingEntity.tick's dead branch animates + removes it. (The
+        // old aiStep-route sight could never see a dying mob — the vanilla
+        // dead-branch does not call aiStep.)
+        if (!mob.isAlive()
+                || !(mob instanceof net.minecraft.world.entity.monster.zombie.Zombie)
+                || !mob.aware) {
             return false;
         }
         int eid = entId(mob);
-        if (!NM_BYID.containsKey(eid)) {
+        if (NM_BYID.get(eid) == null) {
             long seed;
             try {
                 seed = U.getLong(SHARED_RANDOM, O_RNG_VALUE);
@@ -9539,7 +9649,6 @@ public final class CeHooks {
                 System.out.println("[c-entities] N2 sight: first native zombie id=" + eid);
             }
         }
-        NM_SAW.computeIfAbsent(mob.level(), k -> new java.util.HashSet<>()).add(eid);
         nmSkipped++;
         return true;
     }
@@ -9573,8 +9682,40 @@ public final class CeHooks {
             return false;
         }
         int eid = entId(mob);
-        if (NM_BYID.containsKey(eid)) {
-            NM_SAW.computeIfAbsent(mob.level(), k -> new java.util.HashSet<>()).add(eid);
+        if (NM_BYID.get(eid) != null) {
+            nmSkipped++;
+            return true;
+        }
+        return nativeMobSight(mob);
+    }
+
+    /** N2-M1.5: the tick-entry route — the mob's WHOLE Java tick dies. The
+     *  guard rides the head of Mob.tick (chained BEFORE the aiStep guard):
+     *  for a native-classified mob one early return now kills
+     *  LivingEntity.tick's ENTIRE body — Entity.tick (baseTick: fire/air/
+     *  lava/tickCount, pushEntities) and everything LivingEntity/Mob layer
+     *  on top (the M1-skipped aiStep included, updateControlFlags, the
+     *  swing/item-use machinery). The applier owns the kinematics and
+     *  increments tickCount per mob per boundary (ticksLived keeps
+     *  advancing; the executor owns everything behavioral).
+     *  The FIRST-SIGHT classification moved HERE — with aiStep skipped the
+     *  sight could never fire; nativeMobTick is the classification's new
+     *  home (same nativeMobSight aware-gate, byte-exact M0 semantics). The
+     *  aiStep/serverAiStep guards remain underneath as the L22a route and
+     *  the fallback for a config where the tick weave is absent. */
+    public static boolean nativeMobTick(net.minecraft.world.entity.Mob mob) {
+        if (nmTickProbe++ == 0) {
+            // M1.5 route marker: distinguishes the tick-entry route from the
+            // deeper fallbacks (each has its own one-shot probe line)
+            System.out.println("[c-entities] N2-M1.5: tick route live, native="
+                    + NATIVE_MOB_ON + " ok=" + NATIVE_MOB_HANDLES_OK
+                    + " cls=" + mob.getClass().getName());
+        }
+        if (!NATIVE_MOB_ON || !NATIVE_MOB_HANDLES_OK) {
+            return false;
+        }
+        int eid = entId(mob);
+        if (NM_BYID.get(eid) != null) {
             nmSkipped++;
             return true;
         }
@@ -9623,24 +9764,46 @@ public final class CeHooks {
                 return; // the read-back lags one tick (population jump)
             }
             // the applier: positions are the native truth; the same-value
-            // skips keep the parked population free of setPos cascades
+            // skips keep the parked population free of setPos cascades.
+            // The liveness check rides HERE (M1.6): the Java object itself is
+            // the truth — isRemoved covers death/discard/chunk-unload, isAlive
+            // covers the death animation (deathTime). A dead mob is collected
+            // into the scratch and drained right after the loop; in the
+            // steady state (nobody died) this costs ONE extra field check per
+            // mob and ZERO map walks — the old forms were (a) the guard-saw
+            // proxy (an inactive mob never ran aiStep, never fed the set, and
+            // the activation flip then evicted the whole population — the
+            // live 2000-mob smoke's ads+2000/rem+2000 swap) and (b) the
+            // two full NM_BYID walks per boundary. The read-back diff alone
+            // can never see a Java-side death — the store keeps ticking the
+            // dead id forever. Other levels' mobs are THEIR boundary's
+            // business (m.level() != level never reaches the drain — a mob
+            // belongs to exactly one level).
             if (n > 0 && nmApplies == 0) {
                 // cold-path diagnostic: the first live read-back
                 System.out.println("[c-entities] N2 boundary: first read-back n=" + n);
             }
-            NM_SEEN_TMP.clear();
+            NM_DEAD_N = 0;
             for (int i = 0; i < n; i++) {
                 int eid = (int) NM_IDS[2 * i];
-                int noAct = (int) NM_IDS[2 * i + 1];
-                Integer key = eid;
-                NM_SEEN_TMP.add(key);
-                net.minecraft.world.entity.Mob m = NM_BYID.get(key);
+                net.minecraft.world.entity.Mob m = NM_BYID.get(eid);
                 if (m == null) {
                     continue; // removed Java-side mid-tick; the store diff cleans
                 }
+                if (m.isRemoved() || !m.isAlive()) {
+                    nmCollectDead(eid);
+                    continue;
+                }
+                int noAct = (int) NM_IDS[2 * i + 1];
                 if (U.getInt(m, O_MOB_NOACTION) != noAct) {
                     U.putInt(m, O_MOB_NOACTION, noAct);
                 }
+                // M1.5: the tick weave owns the native mob's Java tick
+                // (Entity.tick's tickCount++ included) — the applier keeps
+                // ticksLived advancing with one increment per mob per
+                // boundary (one boundary per server tick — the appl counter
+                // grows exactly n per tick at 25k, empirically pinned).
+                U.putInt(m, O_ENT_TICKCOUNT, U.getInt(m, O_ENT_TICKCOUNT) + 1);
                 float yw = (float) NM_POS[4 * i + 3];
                 if (U.getFloat(m, O_ENT_YROT) != yw) {
                     U.putFloat(m, O_ENT_YROT, yw);
@@ -9667,35 +9830,12 @@ public final class CeHooks {
                 }
                 nmApplies++;
             }
-            // the removal driver, M1 liveness form: the Java object itself is
-            // the truth — isRemoved covers death/discard/chunk-unload, isAlive
-            // covers the death animation (deathTime). The old guard-saw proxy
-            // ("not seen this tick") depended on the mob's ACTIVATION duty:
-            // an inactive mob never runs aiStep, never feeds the saw set, and
-            // the diff then evicted the whole population at the activation
-            // flip (the live 2000-mob smoke: one ads+2000/rem+2000 swap; the
-            // re-adds reset every stroll seed). The read-back diff alone can
-            // never see a Java-side death — the store keeps ticking the dead
-            // id forever — hence the object-state check HERE, per boundary.
-            // Other levels' mobs are THEIR boundary's business.
-            for (java.util.Map.Entry<Integer, net.minecraft.world.entity.Mob> en : NM_BYID.entrySet()) {
-                net.minecraft.world.entity.Mob sm = en.getValue();
-                if (sm == null || sm.level() != level) {
-                    continue;
-                }
-                if (sm.isRemoved() || !sm.isAlive()) {
-                    nativeMobRemove((long) en.getKey());
-                    nmRemoves++;
-                }
+            for (int i = 0; i < NM_DEAD_N; i++) {
+                nativeMobRemove((long) NM_DEAD[i]);
+                NM_BYID.remove(NM_DEAD[i]);
+                nmRemoves++;
             }
-            NM_BYID.entrySet().removeIf(en -> {
-                net.minecraft.world.entity.Mob sm = en.getValue();
-                return sm != null && sm.level() == level
-                        && (sm.isRemoved() || !sm.isAlive());
-            });
-            java.util.HashSet<Integer> t = NM_SEEN;
-            NM_SEEN = NM_SEEN_TMP;
-            NM_SEEN_TMP = t;
+            NM_DEAD_N = 0;
             if (n > 0 && (nmTicks % 200) == 0) {
                 // periodic diagnostic: the wire's state every ~10s
                 System.out.println("[c-entities] N2 poll: n=" + n

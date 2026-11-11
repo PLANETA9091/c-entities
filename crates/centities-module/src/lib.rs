@@ -2652,20 +2652,36 @@ fn precompute_mob(loader: jni::jobject) {
         check_name: "mobAiFloor",
         check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
     };
-    // N2-M1: the wholesale wire chains a SECOND guard at the head of
-    // Mob.aiStep — the FULL-body skip. One early return now kills the
-    // entire per-mob Java tick body for a native-classified mob:
-    // LivingEntity.aiStep (movement scale, lerp/sensors, the serverAiStep
-    // call, jump, travel+gravity), then burnUndead and the looting scan in
-    // Mob.aiStep's own body. The applier (the boundary read-back) stays the
-    // sole mover; the executor already owns the stroll stream and the
-    // kinematics (doc 56's tug-of-war fix). The serverAiStep guard remains
-    // underneath: the L22a route for centities.mobAi mode and the fallback
-    // if the aiStep weave ever failed to link. The no-arg-instance-method
-    // shape is the tickEffects/pushEntities op-4 pattern (receiver = local
-    // 0, exact descriptor == link safety — the Paper-26.3 discard lesson).
+    // N2-M1/M1.5: the wholesale wire chains THREE guards on the same stashed
+    // Mob bytes, outermost first:
+    //   1. `tick` ← nativeMobTick — the M1.5 FULL-JAVA-TICK skip: Mob.tick's
+    //      super call (LivingEntity.tick → Entity.tick: baseTick fire/air/
+    //      tickCount, pushEntities) plus every layer above dies in one early
+    //      return; the first-sight classification moved here (aiStep is
+    //      skipped for natives, it could never fire there). The applier
+    //      keeps tickCount/ticksLived advancing.
+    //   2. `aiStep` ← nativeMobStep — the M1 body skip (travel/gravity/
+    //      sensors/burnUndead/looting): the route for a config where the
+    //      tick weave is absent, dead code for a fully-armed wire.
+    //   3. `serverAiStep` ← mobAiFloor — the L22a route + the fallback.
+    // All three check methods are no-arg-instance op-4 shapes (receiver =
+    // local 0, exact descriptor == link safety — the Paper-26.3 entity-
+    // discard lesson). With CE_NATIVE_MOB unset only the serverAiStep guard
+    // is woven (the L22a path) — CI parity/e2e are byte-path-identical.
     let patched = cplug_sdk::jni_util::with_attached(|env| {
         if native_mob && !mob_ai {
+            let tick_g = cplug_sdk::asm::EarlyReturnGuard {
+                method_name: "tick",
+                method_desc: "()V",
+                check_class: HOOKS_CLASS,
+                check_name: "nativeMobTick",
+                check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
+            };
+            let Some(b1) = cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &tick_g)
+                .filter(|b| !b.is_empty())
+            else {
+                return None;
+            };
             let step = cplug_sdk::asm::EarlyReturnGuard {
                 method_name: "aiStep",
                 method_desc: "()V",
@@ -2673,12 +2689,12 @@ fn precompute_mob(loader: jni::jobject) {
                 check_name: "nativeMobStep",
                 check_desc: "(Lnet/minecraft/world/entity/Mob;)Z",
             };
-            match cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &step) {
-                Some(b) if !b.is_empty() => {
-                    cplug_sdk::asm::insert_early_return_guard(env, loader, &b, &spec)
-                }
-                _ => None,
-            }
+            let Some(b2) = cplug_sdk::asm::insert_early_return_guard(env, loader, &b1, &step)
+                .filter(|b| !b.is_empty())
+            else {
+                return None;
+            };
+            cplug_sdk::asm::insert_early_return_guard(env, loader, &b2, &spec)
         } else {
             cplug_sdk::asm::insert_early_return_guard(env, loader, &bytes, &spec)
         }
