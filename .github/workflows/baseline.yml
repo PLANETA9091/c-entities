@@ -64,8 +64,17 @@ jobs:
           # were runner noise, not module regressions. Paired on one runner,
           # the only variable left is the module.
           - { name: items-100k,  SCALE: 100000, PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AB: '1' }
-          - { name: spread-100k, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600, AB: '1' }
-          - { name: mixed-150k,  SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AB: '1' }
+          # N2-M2e: the spread/mixed rows carry a zombie fraction (20% /
+          # 10% of scale) — the old rows ticked them VANILLA in the mod leg
+          # and the committed L-era report read spread -2% / mixed +46%
+          # (the weave overhead on vanilla mobs drowned the item wins).
+          # The native wire (CE_NATIVE_MOB=1) is the production mob story:
+          # the zombies ride the wholesale wire + the M2e walk route in the
+          # mod leg, exactly like the mobs-25k-native row. The populations
+          # are persistenceRequired (the fill spawns helmeted persistent
+          # zombies) — the M2c despawn ledger is invisible by construction.
+          - { name: spread-100k, SCALE: 100000, PCT_ITEMS: 0.6, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AREA: 600, AB: '1', EXTRA: 'CE_NATIVE_MOB=1' }
+          - { name: mixed-150k,  SCALE: 150000, PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0, TILE_F: 0, MEASURE: 1200, AB: '1', EXTRA: 'CE_NATIVE_MOB=1' }
     env:
       RUN_NAME: ${{ matrix.name }}
       SCALE: ${{ matrix.SCALE }}
