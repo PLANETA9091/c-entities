@@ -435,3 +435,21 @@ CI-пара на l107-rowboxes (20e6f6f): parity 42430389700 = SUCCESS (четв
 - Wave7-кандидаты: REQ_CANUSE_VANILLA-фолд (нужен target-index в контексте),
   переразметка resident pack после падения раунд-рейта (~40%), cc-фолд с
   обновлением approach в раунде.
+
+---
+Task ID: 24
+Agent: main (Z.ai)
+Task: WAVE15 — F-kill: параллельный executor без серийных фрагментов (док 55)
+
+Work Log:
+- Фазовая проба tick_parallel (PHASE_PROBE + #[ignore] phase_probe, 25k × 200): players 0.000 | pre 0.252 | pass1 1.763 | walk 0.082 | pass2 0.060 | tail 0.000, drawers/tick 157 (0.6% популяции) — серийные фрагменты ≈ 0.39ms = фит F=0.44.
+- УМЕРЛИ: alive_idx (серийный O(n) скан), results_buf, repair_buf, assign_buf, drawer_list, серийный walk (статс-контракт + pre-assignment), пар-dispatch счётчика живых (диспатч дороже скана — измерено).
+- ВЗЯЛИ: ранговый префикс (fast path free.is_empty() = ширины chunk'ов, tombstone-ветка — скан), пер-chunk статс-регионы через safe split_at_mut (каждое статс-слово пишется РОВНО ОДИН раз — мемсеты умерли), chunk-локальный drawer-леджер в WorkerBufs, O(chunks) stream-префикс (base_stream по префиксу ничьих draws — бит-точная цепочка: alive-порядок = возрастание слотов), pass 2 serial <1024 / chunk-параллель ≥1024.
+- Дыра покрытия ЗАКРЫТА: pass2_serial_max крюк + трёхрукий твин parallel_pass2_chunked_matches_serial_executor (4096 мобов, ~68 drawers/тик на 4 chunk'ах): serial / par(serial-repair) / par(chunked-repair) — бит-в-бит 400 тиков.
+- W14c-вердикт: gate-пролог (убить pass 2 целиком) = реплей всего floor-движка (гейт внутри goal-update конвейера) — дрейф-риск ради 40µs. Клон подтверждён 4-й раз (undo-log / журнал / prefetch / gate-prologue — все мертвы).
+- ЧИСЛА (same-window A/B, 25k × 400, 2 vCPU): PAR 1.26–1.41 vs SER 1.79–2.02 → −26…−32% (4 окна; wave14 был −17%); 100k: 7.27 → 4.87 (−33%); фит T1 2.39–2.42 / T2 1.26–1.29 → F ≈ 0.14, W ≈ 2.27; par(4) ≈ 0.71ms = −91.6% (линия −90% берётся на 4 реальных ядрах), par(8) ≈ 0.42 = −95%; 2 ядра = −85% от ванилы 8.41.
+- 106 Rust-тестов зелёных (модульный suite — CI-side). Коммиты c4d11ff (wave15), 700737f (15b), b098e0a (15c) — запушены.
+
+Stage Summary:
+- Параллельный executor: серийные фрагменты 0.44 → 0.14ms; −85% на 2 vCPU, −91.6% на 4 ядрах (проекция), −95% на 8.
+- Док 55 (docs/research/55-wave15-f-kill.md). Следующие рычаги: travel бит-заперт (atan2/sqrt — vanilla-модель), AI floor выжат волнами 5–13; остаток W — eval+клон+travel ≈ 2.3ms.
