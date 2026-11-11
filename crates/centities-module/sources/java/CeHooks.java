@@ -9880,6 +9880,7 @@ public final class CeHooks {
                 NM_PF[i * 2 + 1] = (pl.isAlive() && !pl.isSpectator()) ? 1 : 0;
             }
             nativeMobPlayers(NM_PXYZ, NM_PF);
+            pushDespawnCfgOnce(level);
             int n = nativeMobBatch(CUR_TICK, NM_IDS, NM_POS);
             if (n < 0) {
                 int need = -n;
@@ -10739,6 +10740,92 @@ public final class CeHooks {
     public static native int nativeMobRemove(long eid);
     public static native void nativeMobPlayers(double[] xyz, int[] pf);
     public static native int nativeMobBatch(int gameTick, long[] ids, double[] pos);
+
+    /** N3-N1 (doc 61) phase-2a: the RESOLVED despawn config crosses to
+     *  native ONCE per level at the first boundary (the paper config is
+     *  per-world; the init has no level yet). One attempt per level — a
+     *  Throwable leaves DESPAWN_CFG_LIVE false and the M2c skip stays
+     *  (the vanilla despawn decision never returns for natives in this
+     *  boot: the SAFE default). The decision itself stays UNWIRED (doc
+     *  61's phase-2b: the executor slot + the RNG order + the outbox) —
+     *  this push only lands the table. */
+    public static boolean DESPAWN_CFG_LIVE = false;
+    private static final java.util.WeakHashMap<Object, Boolean> DESPAWN_PUSHED =
+            new java.util.WeakHashMap<>();
+    private static long O_DR_H2 = -1, O_DR_RATIO = -1, O_DR_VDEF = -1, O_DR_VLIM = -1;
+
+    private static void pushDespawnCfgOnce(net.minecraft.world.level.Level level) {
+        if (DESPAWN_PUSHED.get(level) != null) {
+            return;
+        }
+        DESPAWN_PUSHED.put(level, Boolean.TRUE);
+        try {
+            if (!(level instanceof net.minecraft.server.level.ServerLevel sl)) {
+                return;
+            }
+            // the private DespawnRange precomputations (javap 26.3) — one
+            // cold resolution per boot; a miss leaves the push dead
+            if (O_DR_H2 < 0) {
+                O_DR_H2 = offOf(io.papermc.paper.configuration.type.DespawnRange.class,
+                        "preComputedHorizontalLimitSquared");
+                O_DR_RATIO = offOf(io.papermc.paper.configuration.type.DespawnRange.class,
+                        "preComputedHorizontalLimitSquaredOverVerticalLimitSquared");
+                O_DR_VDEF = offOf(io.papermc.paper.configuration.type.DespawnRange.class,
+                        "preComputedVanillaDefaultLimit");
+                O_DR_VLIM = offOf(io.papermc.paper.configuration.type.DespawnRange.class,
+                        "verticalLimit");
+                if (O_DR_H2 < 0 || O_DR_RATIO < 0 || O_DR_VDEF < 0 || O_DR_VLIM < 0) {
+                    System.out.println("[c-entities] N3-N1: despawn range offsets unresolved, push dead");
+                    return;
+                }
+            }
+            var spawning = sl.paperConfig().entities.spawning;
+            int ellipsoid = spawning.despawnRangeShape
+                    == io.papermc.paper.configuration.type.DespawnRange.Shape.ELLIPSOID ? 1 : 0;
+            net.minecraft.world.entity.MobCategory[] cats =
+                    net.minecraft.world.entity.MobCategory.values();
+            // (h2, ratio) per (category, hard/soft) + the resolved v
+            double[] geom = new double[cats.length * 2 * 2];
+            int[] meta = new int[cats.length * 2];
+            int present = 0;
+            for (int i = 0; i < cats.length && i < 8; i++) {
+                var pair = spawning.despawnRanges.get(cats[i]);
+                if (pair == null) {
+                    continue; // the vanilla map.get would NPE downstream — the
+                              // Rust side treats an absent pair as decline
+                }
+                present |= (1 << i);
+                fillDespawnRange(pair.hard(), i * 2, geom, meta);
+                fillDespawnRange(pair.soft(), i * 2 + 1, geom, meta);
+            }
+            DESPAWN_CFG_LIVE = nativeDespawnCfg(ellipsoid, present, geom, meta);
+            if (DESPAWN_CFG_LIVE) {
+                System.out.println("[c-entities] N3-N1: despawn cfg live (shape="
+                        + (ellipsoid == 1 ? "ellipsoid" : "cylinder") + " present=" + present + ")");
+            }
+        } catch (Throwable t) {
+            DESPAWN_CFG_LIVE = false;
+            System.out.println("[c-entities] N3-N1: despawn cfg push failed: " + t);
+        }
+    }
+
+    private static void fillDespawnRange(io.papermc.paper.configuration.type.DespawnRange r,
+                                         int slot, double[] geom, int[] meta) {
+        geom[slot * 2] = U.getDouble(r, O_DR_H2);
+        geom[slot * 2 + 1] = U.getDouble(r, O_DR_RATIO);
+        int v = U.getInt(r, O_DR_VDEF);
+        Object vlim = U.getObject(r, O_DR_VLIM);
+        if (vlim instanceof io.papermc.paper.configuration.type.number.IntOr.Default d) {
+            java.util.OptionalInt oi = d.value(); // the record accessor
+            if (oi.isPresent()) {
+                v = oi.getAsInt();
+            }
+        }
+        meta[slot] = v;
+    }
+
+    public static native boolean nativeDespawnCfg(int ellipsoid, int present,
+                                                  double[] geom, int[] meta);
 
     /** L89: the gate ledger — per-class canUse census (evals/no/staged/rolls
      *  for the GK_* classes 0..8, 36 ints) collected by the engine while

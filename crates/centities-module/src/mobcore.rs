@@ -189,3 +189,94 @@ pub extern "system" fn n_mob_batch(
         }
     }
 }
+
+// ----------------------------------------------------------------------
+// N3-N1 (doc 61) phase-2a: the resolved despawn config table. The push
+// rides the boundary ONCE per level (CeHooks.pushDespawnCfgOnce); the
+// decision itself stays UNWIRED until phase-2b (the executor slot + the
+// RNG order + the outbox). Thread-local like EXEC: the boundary and the
+// future decision read it on the same server thread.
+// ----------------------------------------------------------------------
+
+thread_local! {
+    static DESPAWN_CFG: RefCell<Option<(bool, centities_native::despawn::DespawnCfg)>> =
+        const { RefCell::new(None) };
+}
+
+/// `(II[D[I)Z` — (ellipsoid, present-bitmask, (h2, ratio)*8*2, v*8*2) ->
+/// true when the table landed. A refuse (cats > 8, bad strides) leaves
+/// the previous state; the Java side logs DESPAWN_CFG_LIVE=false and the
+/// M2c skip stays (the SAFE default).
+pub extern "system" fn n_despawn_cfg(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    ellipsoid: i32,
+    present: i32,
+    geom: jni::jdoubleArray,
+    meta: jni::jintArray,
+) -> u8 {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let n_geom = ((*vt).GetArrayLength)(raw, geom) as usize;
+        let n_meta = ((*vt).GetArrayLength)(raw, meta) as usize;
+        let cats = n_meta / 2;
+        let ok = cats <= 8
+            && n_meta == cats * 2
+            && n_geom == cats * 2 * 2
+            && (cats == 0 || (cats * 2 * 2 == n_geom));
+        if !ok {
+            return 0;
+        }
+        let mut g = vec![0.0f64; n_geom];
+        let mut m = vec![0i32; n_meta];
+        if n_geom > 0 {
+            ((*vt).GetDoubleArrayRegion)(raw, geom, 0, n_geom as i32, g.as_mut_ptr());
+        }
+        if n_meta > 0 {
+            ((*vt).GetIntArrayRegion)(raw, meta, 0, n_meta as i32, m.as_mut_ptr());
+        }
+        let mut pairs = [None, None, None, None, None, None, None, None];
+        for c in 0..cats {
+            if present & (1 << c) == 0 {
+                continue;
+            }
+            let mk = |slot: usize| centities_native::despawn::DespawnRange {
+                h2: g[slot * 2],
+                ratio: g[slot * 2 + 1],
+                // the Java push resolves verticalLimit.or(default) into ONE
+                // number — both fields carry it (should_despawn reads v)
+                v_default: m[slot],
+                v: m[slot],
+            };
+            pairs[c] = Some(centities_native::despawn::DespawnRangePair {
+                hard: mk(c * 2),
+                soft: mk(c * 2 + 1),
+            });
+        }
+        let cfg = centities_native::despawn::DespawnCfg {
+            ellipsoid: ellipsoid == 1,
+            pairs,
+        };
+        // sanity: a present category must have FINITE geometry (a NaN
+        // would poison the phase-2 decision — refuse the whole table)
+        for c in 0..cats {
+            if present & (1 << c) == 0 {
+                continue;
+            }
+            for slot in [c * 2, c * 2 + 1] {
+                if !g[slot * 2].is_finite() || !g[slot * 2 + 1].is_finite() {
+                    return 0;
+                }
+            }
+        }
+        DESPAWN_CFG.with(|d| *d.borrow_mut() = Some((ellipsoid == 1, cfg)));
+        1
+    }
+}
+
+/// Phase-2b read: the live config on the calling (server) thread.
+pub fn despawn_cfg() -> Option<(bool, centities_native::despawn::DespawnCfg)> {
+    DESPAWN_CFG.with(|d| d.borrow().as_ref().map(|(e, c)| (*e, c.clone())))
+}

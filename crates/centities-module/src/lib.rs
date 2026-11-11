@@ -3973,6 +3973,20 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             jni::jdoubleArray,
         ) -> i32
     );
+    // N3-N1 phase-2a: the resolved despawn config table (doc 61) — the
+    // decision stays UNWIRED; the push only lands the numbers
+    push!(
+        "nativeDespawnCfg",
+        "(II[D[I)Z",
+        crate::mobcore::n_despawn_cfg as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+            i32,
+            jni::jdoubleArray,
+            jni::jintArray,
+        ) -> u8
+    );
     match env.register_natives(cls, &methods) {
         Ok(()) => {
             cplug_sdk::log::info("[c-entities] natives registered");
