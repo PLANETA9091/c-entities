@@ -98,12 +98,59 @@ fn main() {
     }
     centities_native::drain(); // reset the ledger
 
+    // N2-M0 wire mode: CE_WIRE=1 drives the SAME world through MobBatch
+    // (the wholesale JNI protocol — the read-back fill included) instead of
+    // the raw executor. The p50 delta IS the wire's Rust-side cost (the JNI
+    // Set*ArrayRegion copy is Java-side and not on this meter).
+    let wire = std::env::var_os("CE_WIRE").is_some();
+    let mut batch = if wire {
+        Some(centities_native::MobBatch::new(seed))
+    } else {
+        None
+    };
+    if let Some(b) = batch.as_mut() {
+        for (i, s) in nt.store.mobs.iter().enumerate() {
+            b.add(
+                s.mob.id,
+                s.mob.seed,
+                s.mob.x,
+                s.mob.y,
+                s.mob.z,
+            );
+            // mirror the executor's state so the arms start identical
+            let slot = &mut b.exec_mut().store.mobs[i];
+            slot.mob = s.mob.clone();
+        }
+        let pl: Vec<(f64, f64, f64, i32, i32)> = nt
+            .store
+            .snapshot
+            .players
+            .iter()
+            .map(|p| (p.x, p.y, p.z, p.id, p.flags))
+            .collect();
+        let mut xyz = Vec::with_capacity(pl.len() * 3);
+        let mut pf = Vec::with_capacity(pl.len() * 2);
+        for (x, y, z, id, f) in &pl {
+            xyz.extend_from_slice(&[*x, *y, *z]);
+            pf.extend_from_slice(&[*id, *f]);
+        }
+        b.set_players(&xyz, &pf);
+    }
+    let mut ids_buf = vec![0i64; 2 * n_mobs];
+    let mut pos_buf = vec![0f64; 4 * n_mobs];
+
     // measure
     let mut samples: Vec<f64> = Vec::with_capacity(ticks as usize);
     let t_all = std::time::Instant::now();
     for t in 50..50 + ticks {
         let t0 = std::time::Instant::now();
-        nt.tick(t);
+        if let Some(b) = batch.as_mut() {
+            // the buffers are REUSED (the JNI shim passes Java-pinned arrays;
+            // the clone would meter the bench, not the wire)
+            b.tick(t, &mut ids_buf, &mut pos_buf).unwrap();
+        } else {
+            nt.tick(t);
+        }
         samples.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     let wall = t_all.elapsed().as_secs_f64() * 1000.0;

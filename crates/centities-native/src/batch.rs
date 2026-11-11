@@ -93,10 +93,17 @@ impl MobBatch {
     /// Err(needed) when either buffer is too small — NOTHING is filled,
     /// the host grows the arrays and the NEXT tick proceeds (the current
     /// tick's native state is already advanced; the read-back is pure).
+    ///
+    /// The parallel arm fills the buffers FUSED (inside pass 1/pass 2 —
+    /// the same alive-rank the stats use); the serial/knob shapes fall
+    /// back to this method's own fill loop.
     pub fn tick(&mut self, game_time: i32, ids: &mut [i64], pos: &mut [f64]) -> Result<usize, usize> {
         let pop = self.population();
         if ids.len() < pop * 2 || pos.len() < pop * 4 {
             return Err(pop);
+        }
+        if self.exec.tick_wire_fused(game_time, ids, pos) {
+            return Ok(pop);
         }
         self.exec.tick(game_time);
         let mut w = 0usize;
@@ -122,6 +129,12 @@ impl MobBatch {
     /// ledger/diagnostics; the twin tests assert on them directly).
     pub fn last_stats(&self) -> &[swarm_sim::mob::AiStat] {
         self.exec.last_stats()
+    }
+
+    /// The host's read access to the underlying executor (the bench wire
+    /// mode mirrors the warm state; the twins inspect the store directly).
+    pub fn exec_mut(&mut self) -> &mut NativeTick {
+        &mut self.exec
     }
 }
 

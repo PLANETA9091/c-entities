@@ -50,6 +50,13 @@ over the proven `NativeTick` (the parallel executor included):
   `ids[2i] = eid; ids[2i+1] = nav_state << 32 | no_action;
   pos[4i..] = x, y, z, yaw`. Truncation fills NOTHING and returns
   `Err(pop)` (the host grows, the next tick reads).
+  **The FUSED FILL**: the parallel arm writes the read-back INSIDE pass 1
+  and pass 2 (`NativeTick::tick_wire_fused` — the same alive-rank k the
+  stats regions use; the drawers' words are re-written by the repair).
+  A separate post-tick fill loop re-streams the whole 6.8 MB store —
+  measured **+0.39 ms @25k**; the fused fill costs **+0.06–0.07 ms**
+  (5.7× cheaper, ~5% of the wall). The serial/knob shapes fall back to
+  the batch's own fill loop (bit-identical semantics).
 - `population()` = `mobs.len() − free.len()` (exact per MobStore)
 - `last_stats()` — the executor's stats borrow (NativeTick got the
   accessor; the buffer reuse contract is unchanged)

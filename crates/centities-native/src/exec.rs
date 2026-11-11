@@ -310,9 +310,30 @@ impl NativeTick {
         // refresh + the resident pack); the twin-only shapes stay serial.
         if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
         {
-            self.tick_parallel(game_time)
+            self.tick_parallel(game_time, None)
         } else {
             self.tick_serial(game_time)
+        }
+    }
+
+    /// N2-M0 the FUSED WIRE TICK: the parallel arm writes the read-back
+    /// (ids/pos) DURING pass 1 / pass 2 (the same alive-rank k the stats
+    /// use) — the batch's own post-tick fill loop would re-stream the whole
+    /// store. Returns false when the arm did NOT fill (the serial/knob
+    /// shapes) — the caller falls back to its own fill.
+    pub fn tick_wire_fused(
+        &mut self,
+        game_time: i32,
+        ids: &mut [i64],
+        pos: &mut [f64],
+    ) -> bool {
+        if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
+        {
+            self.tick_parallel(game_time, Some((ids, pos)));
+            true
+        } else {
+            self.tick_serial(game_time);
+            false
         }
     }
 
@@ -524,7 +545,11 @@ impl NativeTick {
     /// pre-sliced result regions, keeps persistent worker bufs, and fuses
     /// the travel — the parallel arm's overhead is now the clone stream
     /// itself (~0.25 ms at 25k), which the extra cores buy back many times.
-    fn tick_parallel(&mut self, game_time: i32) -> &[AiStat] {
+    fn tick_parallel(
+        &mut self,
+        game_time: i32,
+        mut wire: Option<(&mut [i64], &mut [f64])>,
+    ) -> &[AiStat] {
         drop(grid_guard());
         let mut probe_t = if PHASE_PROBE.load(std::sync::atomic::Ordering::Relaxed) {
             Some(std::time::Instant::now())
@@ -656,48 +681,83 @@ impl NativeTick {
             }
             v
         };
+        // N2-M0 the FUSED WIRE FILL: the read-back rides pass 1 (the same
+        // alive-rank k the stats use) — a separate post-tick fill loop would
+        // re-stream the whole 6.8 MB store (measured +0.39 ms @25k); here it
+        // is 6 words into L2-hot lines the pass already owns. The drawers'
+        // words are overwritten by pass 2 (the repair re-travels them).
+        // The regions ride the zip as OWNED per-chunk Options (Send) — a
+        // shared &mut capture would not be Sync across the par closures.
+        let mut wire_chunks: Vec<Option<(&mut [i64], &mut [f64])>> = Vec::with_capacity(nchunks);
+        if let Some((ids, pos)) = wire.as_mut() {
+            let mut id_rest: &mut [i64] = ids;
+            let mut pos_rest: &mut [f64] = pos;
+            for &(_, len) in &regions {
+                let (l, r) = id_rest.split_at_mut(len * 2);
+                id_rest = r;
+                let (pl, pr) = pos_rest.split_at_mut(len * 4);
+                pos_rest = pr;
+                wire_chunks.push(Some((l, pl)));
+            }
+        } else {
+            wire_chunks.resize_with(nchunks, || None);
+        }
         stat_slices
             .into_par_iter()
             .zip(bufs.par_chunks_mut(1))
             .zip(pre_buf.par_chunks_mut(chunk))
             .zip(store.mobs.par_chunks(chunk))
+            .zip(wire_chunks)
             .enumerate()
-            .for_each(|(ci, (((stats_region, b1), b_chunk), a_chunk))| {
-                let bufs = &mut b1[0];
-                let _g = ai_guard();
-                let mut rank: usize = 0;
-                bufs.drawers.clear();
-                bufs.draws = 0;
-                let cbase = (ci * chunk) as u32;
-                for (j, (a, b)) in a_chunk.iter().zip(b_chunk).enumerate() {
-                    b.alive = a.alive;
-                    b.grid_cell = a.grid_cell;
-                    b.grid_pos = a.grid_pos;
-                    if !a.alive {
-                        b.mob.clone_from(&a.mob);
-                        continue;
+            .for_each(
+                |(ci, (((((stats_region, b1), b_chunk), a_chunk), mut wire_r)))| {
+                    let bufs = &mut b1[0];
+                    let _g = ai_guard();
+                    let mut rank: usize = 0;
+                    bufs.drawers.clear();
+                    bufs.draws = 0;
+                    let cbase = (ci * chunk) as u32;
+                    for (j, (a, b)) in a_chunk.iter().zip(b_chunk).enumerate() {
+                        b.alive = a.alive;
+                        b.grid_cell = a.grid_cell;
+                        b.grid_pos = a.grid_pos;
+                        if !a.alive {
+                            b.mob.clone_from(&a.mob);
+                            continue;
+                        }
+                        let (stat, drew) = re_eval_mob(
+                            &a.mob,
+                            &mut b.mob,
+                            players, players_raw, game_time, snapshot, fold_off, s0, tfp, bufs,
+                        );
+                        if !skip_travel {
+                            let _t = travel_guard();
+                            b.mob.move_tick(mth);
+                        }
+                        stats_region[rank] = stat;
+                        if let Some((ids_r, pos_r)) = &mut wire_r {
+                            let m = &b.mob;
+                            ids_r[rank * 2] = m.id;
+                            ids_r[rank * 2 + 1] = ((((m.nav_state as i64) as u64) << 32)
+                                | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
+                                as i64;
+                            pos_r[rank * 4] = m.x;
+                            pos_r[rank * 4 + 1] = m.y;
+                            pos_r[rank * 4 + 2] = m.z;
+                            pos_r[rank * 4 + 3] = m.yaw as f64;
+                        }
+                        if drew > 0 {
+                            bufs.drawers.push((
+                                cbase + j as u32,
+                                bufs.base_k + rank as u32,
+                                drew,
+                            ));
+                            bufs.draws += drew;
+                        }
+                        rank += 1;
                     }
-                    let (stat, drew) = re_eval_mob(
-                        &a.mob,
-                        &mut b.mob,
-                        players, players_raw, game_time, snapshot, fold_off, s0, tfp, bufs,
-                    );
-                    if !skip_travel {
-                        let _t = travel_guard();
-                        b.mob.move_tick(mth);
-                    }
-                    stats_region[rank] = stat;
-                    if drew > 0 {
-                        bufs.drawers.push((
-                            cbase + j as u32,
-                            bufs.base_k + rank as u32,
-                            drew,
-                        ));
-                        bufs.draws += drew;
-                    }
-                    rank += 1;
-                }
-            });
+                },
+            );
         probe_lap(&mut probe_t, &T_PASS1_NS);
 
         // ---- WAVE15 THE STREAM PREFIX (serial, O(chunks)): chunk i's
@@ -728,6 +788,23 @@ impl NativeTick {
         if drawers_total > 0 {
             if drawers_total < pass2_serial_max {
                 let mut local = WorkerBufs::fresh();
+                // the wire regions, rebuilt from the global slices (pass 1
+                // consumed its own per-chunk vec; the global &muts remain)
+                let mut wire_chunks: Vec<Option<(&mut [i64], &mut [f64])>> =
+                    Vec::with_capacity(bufs.len());
+                if let Some((ids, pos)) = wire.as_mut() {
+                    let mut id_rest: &mut [i64] = ids;
+                    let mut pos_rest: &mut [f64] = pos;
+                    for &(_, len) in &regions {
+                        let (l, r) = id_rest.split_at_mut(len * 2);
+                        id_rest = r;
+                        let (pl, pr) = pos_rest.split_at_mut(len * 4);
+                        pos_rest = pr;
+                        wire_chunks.push(Some((l, pl)));
+                    }
+                } else {
+                    wire_chunks.resize_with(bufs.len(), || None);
+                }
                 for bi in 0..bufs.len() {
                     let mut stream = bufs[bi].base_stream;
                     for i in 0..bufs[bi].drawers.len() {
@@ -754,6 +831,18 @@ impl NativeTick {
                             pre_buf[slot as usize].mob.move_tick(mth);
                         }
                         stats_buf[k as usize] = stat;
+                        if let Some((ids_r, pos_r)) = wire_chunks[bi].as_mut() {
+                            let m = &pre_buf[slot as usize].mob;
+                            let local_rank = (k - bufs[bi].base_k) as usize;
+                            ids_r[local_rank * 2] = m.id;
+                            ids_r[local_rank * 2 + 1] = ((((m.nav_state as i64) as u64) << 32)
+                                | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
+                                as i64;
+                            pos_r[local_rank * 4] = m.x;
+                            pos_r[local_rank * 4 + 1] = m.y;
+                            pos_r[local_rank * 4 + 2] = m.z;
+                            pos_r[local_rank * 4 + 3] = m.yaw as f64;
+                        }
                         if drew > 0 {
                             stream = advance_stream(stream, 2 * drew);
                         }
@@ -771,48 +860,79 @@ impl NativeTick {
                     v
                 };
                 let a_all: &[MobSlot] = &store.mobs;
+                let mut wire_chunks: Vec<Option<(&mut [i64], &mut [f64])>> =
+                    Vec::with_capacity(nchunks);
+                if let Some((ids, pos)) = wire.as_mut() {
+                    let mut id_rest: &mut [i64] = ids;
+                    let mut pos_rest: &mut [f64] = pos;
+                    for &(_, len) in &regions {
+                        let (l, r) = id_rest.split_at_mut(len * 2);
+                        id_rest = r;
+                        let (pl, pr) = pos_rest.split_at_mut(len * 4);
+                        pos_rest = pr;
+                        wire_chunks.push(Some((l, pl)));
+                    }
+                } else {
+                    wire_chunks.resize_with(nchunks, || None);
+                }
                 stat_slices
                     .into_par_iter()
                     .zip(bufs.par_chunks_mut(1))
                     .zip(pre_buf.par_chunks_mut(chunk))
+                    .zip(wire_chunks)
                     .enumerate()
-                    .for_each(move |(ci, ((stats_region, b1), b_chunk))| {
-                        let bufs = &mut b1[0];
-                        if bufs.drawers.is_empty() {
-                            return;
-                        }
-                        let _g = ai_guard();
-                        let lo = ci * chunk;
-                        let mut stream = bufs.base_stream;
-                        for i in 0..bufs.drawers.len() {
-                            let (slot, k, drew) = bufs.drawers[i];
-                            let assign = stream;
-                            let (stat, redrew) = re_eval_mob(
-                                &a_all[slot as usize].mob,
-                                &mut b_chunk[slot as usize - lo].mob,
-                                players,
-                                players_raw,
-                                game_time,
-                                snapshot,
-                                fold_off,
-                                assign,
-                                tfp,
-                                bufs,
-                            );
-                            debug_assert_eq!(
-                                redrew, drew,
-                                "the stroll draw count must be stream-value-independent"
-                            );
-                            if !skip_travel {
-                                let _t = travel_guard();
-                                b_chunk[slot as usize - lo].mob.move_tick(mth);
+                    .for_each(
+                        move |(ci, (((stats_region, b1), b_chunk), mut wire_r))| {
+                            let bufs = &mut b1[0];
+                            if bufs.drawers.is_empty() {
+                                return;
                             }
-                            stats_region[(k - bufs.base_k) as usize] = stat;
-                            if drew > 0 {
-                                stream = advance_stream(stream, 2 * drew);
+                            let _g = ai_guard();
+                            let lo = ci * chunk;
+                            let mut stream = bufs.base_stream;
+                            for i in 0..bufs.drawers.len() {
+                                let (slot, k, drew) = bufs.drawers[i];
+                                let assign = stream;
+                                let (stat, redrew) = re_eval_mob(
+                                    &a_all[slot as usize].mob,
+                                    &mut b_chunk[slot as usize - lo].mob,
+                                    players,
+                                    players_raw,
+                                    game_time,
+                                    snapshot,
+                                    fold_off,
+                                    assign,
+                                    tfp,
+                                    bufs,
+                                );
+                                debug_assert_eq!(
+                                    redrew, drew,
+                                    "the stroll draw count must be stream-value-independent"
+                                );
+                                if !skip_travel {
+                                    let _t = travel_guard();
+                                    b_chunk[slot as usize - lo].mob.move_tick(mth);
+                                }
+                                stats_region[(k - bufs.base_k) as usize] = stat;
+                                if let Some((ids_r, pos_r)) = &mut wire_r {
+                                    let m = &b_chunk[slot as usize - lo].mob;
+                                    let local_rank = (k - bufs.base_k) as usize;
+                                    ids_r[local_rank * 2] = m.id;
+                                    ids_r[local_rank * 2 + 1] = ((((m.nav_state as i64) as u64)
+                                        << 32)
+                                        | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
+                                        as i64;
+                                    pos_r[local_rank * 4] = m.x;
+                                    pos_r[local_rank * 4 + 1] = m.y;
+                                    pos_r[local_rank * 4 + 2] = m.z;
+                                    pos_r[local_rank * 4 + 3] = m.yaw as f64;
+                                }
+                                if drew > 0 {
+                                    stream = advance_stream(stream, 2 * drew);
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
             }
         }
         probe_lap(&mut probe_t, &T_PASS2_NS);
