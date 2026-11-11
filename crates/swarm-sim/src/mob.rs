@@ -309,13 +309,11 @@ pub struct MobAI {
     /// every running=true write; RECOMPUTED at every stop (the stops are
     /// rare — the stroll/RLA lifetimes). debug_assert-pinned at the gate.
     pub ar_running: bool,
-    /// WAVE4: the static-pack fingerprint (fnv1a over the goal cfg words
-    /// + counts/follow/lastHurt header trio). Computed ONCE at
-    /// construction — the goal table is fixed at add_mob (the executor
-    /// contract; the wave3 delta-pack already assumes the cfg words never
-    /// mutate). A stale fp after a post-construction goals swap is caught
-    /// by the debug probe (full-pack word compare every round).
-    pub pack_fp: u64,
+    // WAVE13c: the pack_fp FIELD is GONE — the fp was immutable per mob
+    // and identical across mobs (one table in the system, built only by
+    // zombie_table_res()); the gate term folds to the compile-time
+    // ZOMBIE_FP == ZOMBIE_FP. The fp FUNCTION stays public for the
+    // sensitivity test and the fixture.
 }
 
 impl MobAI {
@@ -406,7 +404,6 @@ impl MobAI {
             approach_z: 0.0,
             et_running: false,
             ar_running: false,
-            pack_fp: Self::static_fp(&zombie_table()),
         }
     }
 
@@ -1465,10 +1462,12 @@ impl MobAI {
             self.goals.iter().any(|rec| rec.running),
             "the maintained ar_running bit drifted from the live records"
         );
-        let z_strait = resident
-            && z0_on()
-            && fold.on
-            && self.pack_fp == ZOMBIE_FP;
+        let z_strait = resident && z0_on() && fold.on;
+        // WAVE13c: the pack_fp term is compile-time true — the resident
+        // table is the zombie shape BY CONSTRUCTION (goals: [GoalRecR;
+        // N_GOALS] built only via zombie_table_res(); the cfg words are
+        // the shared ZOMBIE_CFG). The old `pack_fp == ZOMBIE_FP` load is
+        // gone from the per-mob gate.
         // TEMP WAVE11 shape counters (the bench prints the class fractions)
         if odd_branch {
             if self.et_running && z_strait {
@@ -1605,7 +1604,13 @@ impl MobAI {
                     // measures the action-apply + seed-handoff cost row.
                     // NOT a semantics arm; parity knobs never set it.
                 } else if resident {
-                    self.apply_actions::<false>(out, players, scratch);
+                    // WAVE13b: the n==0 early-out rides the CALLER — the
+                    // empty action list is the majority case, and the old
+                    // shape paid a full non-inlined call (~10 ns) for one
+                    // out[5] load. Same word, same order, zero semantics.
+                    if out[5] > 0 {
+                        self.apply_actions::<false>(out, players, scratch);
+                    }
                 } else {
                     self.apply_actions::<true>(out, players, scratch);
                 }
@@ -2065,12 +2070,16 @@ mod tests {
         assert!(m.et_running, "a non-every-tick stop keeps the bit");
         m.et_note_stop(g::GK_ZOMBIE_ATTACK);
         assert!(!m.et_running);
-        // the fp is table-sensitive: one mutated cfg word flips it
+        // the fp is table-sensitive: one mutated cfg word flips it.
+        // WAVE13c: the fp FIELD is gone from the mob (the gate term is
+        // compile-time true by construction), but the fp FUNCTION stays
+        // the classification oracle — the sensitivity proof compares it
+        // against the ZOMBIE_FP constant.
         let mut t2 = zombie_table();
         t2[8].cfg = 61; // the stroll interval, mutated
         assert_ne!(
             MobAI::static_fp(&t2),
-            m.pack_fp,
+            ZOMBIE_FP,
             "a mutated table must not pass the fp"
         );
     }
