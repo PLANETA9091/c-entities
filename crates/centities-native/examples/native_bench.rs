@@ -73,7 +73,7 @@ fn main() {
         let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;
         let z = (i / 250) as f64 * 0.6 - 75.0;
         let mut m = MobAI::new(1000 + i as i64, seed ^ (i as u64).wrapping_mul(0x9E37), x, 64.0, z);
-        m.goals = zombie_table();
+        m.goals = swarm_sim::mob::zombie_table_res();
         nt.add_mob(m);
     }
     // the player (the bot) — 20 blocks from the pile edge, the mobs-25k

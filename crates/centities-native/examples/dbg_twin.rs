@@ -15,7 +15,7 @@ fn build(fold_off: bool) -> NativeTick {
             64.0,
             (i / 12) as f64 * 3.0,
         );
-        m.goals = zombie_table();
+        m.goals = swarm_sim::mob::zombie_table_res();
         nt.add_mob(m);
     }
     nt.push_players(vec![PlayerTick {

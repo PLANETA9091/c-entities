@@ -366,7 +366,7 @@ mod tests {
 
     fn mk(id: i64, x: f64, z: f64) -> MobAI {
         let mut m = MobAI::new(id, 0x1234_5678_9abc_def0, x, 64.0, z);
-        m.goals = zombie_table();
+        m.goals = swarm_sim::mob::zombie_table_res();
         m
     }
 

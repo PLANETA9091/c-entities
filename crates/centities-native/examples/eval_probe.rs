@@ -63,7 +63,7 @@ fn eval_stream_a(mob: &MobAI, game_time: i32) -> (bool, u64) {
     let _ = (0i32 == goals[0].state) && (mf & g::MF_LAST_HURT_BY == 0);
     // rec1..3 NEAREST: interval 10 draw; pass -> scan (stops the stream)
     for rec in 1..4 {
-        let ri = goals[rec].cfg & 0xFFFF;
+        let ri = swarm_sim::mob::ZOMBIE_CFG[rec][0] & 0xFFFF;
         if ri > 0 && lcg_next_int_bound(&mut s, ri) != 0 {
             continue;
         }
@@ -86,7 +86,7 @@ fn eval_stream_a(mob: &MobAI, game_time: i32) -> (bool, u64) {
     if goals[7].state > 15 {
         return (true, s);
     }
-    if goals[7].cfg & 1 != 0 && mf & g::MF_BRIGHT_OUTSIDE != 0 {
+    if swarm_sim::mob::ZOMBIE_CFG[7][0] & 1 != 0 && mf & g::MF_BRIGHT_OUTSIDE != 0 {
         continue_eval();
     }
     if mf & g::MF_NEAR_VILLAGE == 0 {
@@ -101,7 +101,7 @@ fn eval_stream_a(mob: &MobAI, game_time: i32) -> (bool, u64) {
     if mob.no_action >= 100 {
         continue_eval();
     }
-    let ri = goals[8].cfg & 0xFFFF;
+    let ri = swarm_sim::mob::ZOMBIE_CFG[8][0] & 0xFFFF;
     if ri > 0 && lcg_next_int_bound(&mut s, ri) != 0 {
         // No
     } else if ri > 0 {
@@ -146,9 +146,9 @@ fn eval_stream_b(mobs: [&MobAI; 8], game_time: i32, out: &mut [(bool, u64); 8]) 
         st5[l] = m.goals[5].state;
         st6[l] = m.goals[6].state;
         st7[l] = m.goals[7].state;
-        cfg1[l] = m.goals[1].cfg & 0xFFFF;
-        cfg7[l] = m.goals[7].cfg & 0xFFFF;
-        cfg8[l] = m.goals[8].cfg & 0xFFFF;
+        cfg1[l] = swarm_sim::mob::ZOMBIE_CFG[1][0] & 0xFFFF;
+        cfg7[l] = m.goals[7].state & 0xFFFF;
+        cfg8[l] = m.goals[8].state & 0xFFFF;
         na[l] = m.no_action;
     }
     // SEL_TARGET

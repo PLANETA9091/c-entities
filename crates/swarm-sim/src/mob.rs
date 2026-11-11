@@ -129,6 +129,72 @@ impl GoalRec {
     }
 }
 
+/// WAVE13: the COMPACT resident record — 8 B (the 4-byte header + the
+/// state word). cfg/cfg2/cfg3 are IMMUTABLE per the executor contract
+/// (the goal table is fixed at add_mob — the same contract pack_fp
+/// polices) and IDENTICAL for every mob of the table, so the per-mob
+/// copy is pure stream waste: they live in ZOMBIE_CFG (one L1-resident
+/// static, derived from the same zombie_table() the parity fixture
+/// pins) and are read through the Src accessors + the static pack
+/// writer. The wire words are unchanged — byte-identical parity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalRecR {
+    pub kind: u8,
+    pub prio: u8,
+    pub flags: u8,
+    pub running: bool,
+    pub state: i32,
+}
+
+impl GoalRecR {
+    #[inline]
+    pub const fn kind32(&self) -> i32 {
+        self.kind as i32
+    }
+}
+
+/// WAVE13: the shared cfg words — [[cfg, cfg2, cfg3]; N_GOALS], derived
+/// from the SAME zombie_table() (const-evaluated; one source of truth,
+/// zero drift from the parity fixture).
+pub const ZOMBIE_CFG: [[i32; 3]; N_GOALS] = zombie_cfg_words();
+
+pub const fn zombie_cfg_words() -> [[i32; 3]; N_GOALS] {
+    let t = zombie_table();
+    let mut out = [[0i32; 3]; N_GOALS];
+    let mut i = 0;
+    while i < N_GOALS {
+        out[i] = [t[i].cfg, t[i].cfg2, t[i].cfg3];
+        i += 1;
+    }
+    out
+}
+
+/// WAVE13: the resident (compact) form of the table — what MobAI.goals
+/// actually stores. The header + state copy losslessly; the cfg words
+/// ride ZOMBIE_CFG.
+pub const fn zombie_table_res() -> [GoalRecR; N_GOALS] {
+    let t = zombie_table();
+    let mut out = [GoalRecR {
+        kind: 0,
+        prio: 0,
+        flags: 0,
+        running: false,
+        state: 0,
+    }; N_GOALS];
+    let mut i = 0;
+    while i < N_GOALS {
+        out[i] = GoalRecR {
+            kind: t[i].kind,
+            prio: t[i].prio,
+            flags: t[i].flags,
+            running: t[i].running,
+            state: t[i].state,
+        };
+        i += 1;
+    }
+    out
+}
+
 /// The vanilla zombie goal table, byte-equal to the parity fixture
 /// (goals.rs::build_in — the table PARITY #369 proved bit-identical).
 /// `player_scan` marks the two Player-typed goals (cfg3 bit0): the
@@ -208,7 +274,9 @@ pub struct MobAI {
     pub nav_state: i32,
     pub nav_x: f64,
     pub nav_z: f64,
-    pub goals: [GoalRec; N_GOALS],
+    /// WAVE13: the COMPACT records (GoalRecR, 8 B) — the cfg words live
+    /// in the shared ZOMBIE_CFG static (immutable + identical per table).
+    pub goals: [GoalRecR; N_GOALS],
     /// the lookAt/target player INDEX into this tick's snapshot (-1 none)
     pub lookat_player: i32,
     pub target_player: i32,
@@ -320,7 +388,7 @@ impl MobAI {
             nav_state: g::NAV_NONE,
             nav_x: 0.0,
             nav_z: 0.0,
-            goals: zombie_table(),
+            goals: zombie_table_res(),
             lookat_player: -1,
             target_player: -1,
             rel_x: 0.0,
@@ -726,15 +794,17 @@ impl EngineSrc for ResSrc<'_> {
     }
     #[inline]
     fn cfg(&self, sel: usize, i: usize) -> i32 {
-        self.mob.goals[self.offset_of(sel) + i].cfg
+        // WAVE13: the cfg words ride the shared ZOMBIE_CFG static (the
+        // per-mob copy is gone — the values are table-immutable)
+        ZOMBIE_CFG[self.offset_of(sel) + i][0]
     }
     #[inline]
     fn cfg2(&self, sel: usize, i: usize) -> i32 {
-        self.mob.goals[self.offset_of(sel) + i].cfg2
+        ZOMBIE_CFG[self.offset_of(sel) + i][1]
     }
     #[inline]
     fn cfg3(&self, sel: usize, i: usize) -> i32 {
-        self.mob.goals[self.offset_of(sel) + i].cfg3
+        ZOMBIE_CFG[self.offset_of(sel) + i][2]
     }
     #[inline]
     fn g_running(&self, sel: usize, i: usize) -> bool {
@@ -939,7 +1009,7 @@ impl MobAI {
             b[o] = rec.kind as i32;
             b[o + 1] = rec.prio as i32;
             b[o + 2] = rec.flags as i32;
-            b[o + 3] = rec.cfg;
+            b[o + 3] = ZOMBIE_CFG[i][0];
             b[o + 4] = rec.running as i32;
             b[o + 5] = match rec.kind as i32 {
                 g::GK_LOOKAROUND
@@ -949,8 +1019,8 @@ impl MobAI {
                 g::GK_LOOKAT_PLAYER => self.packed_lookat_state(i, players),
                 _ => 0,
             };
-            b[o + 6] = rec.cfg2;
-            b[o + 7] = rec.cfg3;
+            b[o + 6] = ZOMBIE_CFG[i][1];
+            b[o + 7] = ZOMBIE_CFG[i][2];
         }
         // player snapshot records (level.players() order)
         let pb = base + N_GOALS * g::GOAL_STRIDE;
@@ -985,9 +1055,9 @@ impl MobAI {
             b[o] = rec.kind as i32;
             b[o + 1] = rec.prio as i32;
             b[o + 2] = rec.flags as i32;
-            b[o + 3] = rec.cfg;
-            b[o + 6] = rec.cfg2;
-            b[o + 7] = rec.cfg3;
+            b[o + 3] = ZOMBIE_CFG[i][0];
+            b[o + 6] = ZOMBIE_CFG[i][1];
+            b[o + 7] = ZOMBIE_CFG[i][2];
         }
     }
 
@@ -1777,7 +1847,7 @@ mod tests {
                 64.0,
                 z,
             );
-            m.goals = zombie_table();
+            m.goals = zombie_table_res();
             mobs.push(m);
         }
         // stabilize: run the AI heads-only is not the bench shape — tick
@@ -2337,7 +2407,7 @@ mod tests {
         let mth = Mth::new();
         let mk = |seed: u64| -> MobAI {
             let mut m = MobAI::new(9, seed, 5.0, 64.0, -3.0);
-            m.goals = zombie_table();
+            m.goals = zombie_table_res();
             m
         };
         let players = [PlayerSnap {
@@ -2392,9 +2462,9 @@ mod tests {
             flags: g::PF_ALIVE,
         }];
         let mut a = MobAI::new(9, 0xABCD_1234, 5.0, 64.0, -3.0);
-        a.goals = zombie_table();
+        a.goals = zombie_table_res();
         let mut b = MobAI::new(9, 0xABCD_1234, 5.0, 64.0, -3.0);
-        b.goals = zombie_table();
+        b.goals = zombie_table_res();
         let mut scratch_a = Vec::new();
         let mut scratch_b = Vec::new();
         let mut out_a = vec![0i32; out_len()];
@@ -2463,7 +2533,7 @@ mod tests {
         }];
         let mk = |id: i64| -> MobAI {
             let mut m = MobAI::new(id, 0x5EED_0000 + id as u64, id as f64 * 4.0, 64.0, id as f64);
-            m.goals = zombie_table();
+            m.goals = zombie_table_res();
             m
         };
         // shared-scratch pair
@@ -2550,7 +2620,7 @@ mod tests {
             let mut w = FlatWorld::new(0x9E37_79B9_7F4A);
             w.no_fold = no_fold;
             let mut m = MobAI::new(1, 0x1234_5678_9abc_def0, 0.0, 64.0, 0.0);
-            m.goals = zombie_table();
+            m.goals = zombie_table_res();
             let mut scratch: Vec<i32> = Vec::new();
             let mut out = vec![0i32; out_len()];
             let mut pk = PackState::default();

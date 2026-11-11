@@ -359,7 +359,7 @@ mod tests {
                     64.0,
                     z,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -402,7 +402,7 @@ mod tests {
 
     fn mk(id: i64, x: f64, z: f64) -> MobAI {
         let mut m = MobAI::new(id, 0x1234_5678_9abc_def0 + id as u64, x, 64.0, z);
-        m.goals = zombie_table();
+        m.goals = swarm_sim::mob::zombie_table_res();
         m
     }
 
@@ -529,7 +529,7 @@ mod tests {
                     64.0,
                     (i / 8) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -595,7 +595,7 @@ mod tests {
                     64.0,
                     (i / 12) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -692,7 +692,7 @@ mod tests {
                     64.0,
                     (i / 12) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -780,7 +780,7 @@ mod tests {
                     64.0,
                     (i / 12) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -883,7 +883,7 @@ mod tests {
                     64.0,
                     (i / 12) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
@@ -989,7 +989,7 @@ mod tests {
                     64.0,
                     (i / 12) as f64 * 3.0,
                 );
-                m.goals = zombie_table();
+                m.goals = swarm_sim::mob::zombie_table_res();
                 nt.add_mob(m);
             }
             nt.push_players(vec![PlayerTick {
