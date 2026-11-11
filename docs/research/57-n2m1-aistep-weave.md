@@ -99,6 +99,41 @@ branch) — CI parity/e2e are byte-path-identical.
 - Clean `stop` shutdown; module suite green (4 lib + natives_parity +
   patch_entity_repro + patch_real).
 
+## The population-scale proof (2000-mob live A/B, same box, same plugin)
+
+Same protocol both legs (fresh flat world, ce-baseline measure window, a
+console storm of 2000 persistent zombies at the spawn area, 2 vCPU, no
+bot — the activation duty cycle ~11%):
+
+| leg | mspt p50 | mspt mean | travel (last hooks@) | gs (last hooks@) |
+|---|---:|---:|---:|---:|
+| A — vanilla AI | 69.0 | 62.9 | 817 318 | 806 756 |
+| B — native M1 wire | 50.0 | 49.8 | 26 860 | 66 050 |
+
+**−21% p50 / −26% mean at the WORST-case duty** — the vanilla mobs sit in
+`inactiveTick` 89% of ticks (no player), while the native executor ticks
+its population fully every tick and still wins the window. The movement
+pipeline counters collapse 30× (travel) and 12× (GoalSelector) — the skip
+is visible at population scale, not just in the polls. The M2 bot legs
+(100% duty, 25k mobs) are where the full −90% executor line shows.
+
+### The liveness removal driver (the saw-set proxy dies)
+
+The 2000-mob smoke caught a real M0-era edge the single-mob smoke could
+never see: at the activation flip the WHOLE population swapped —
+`ads+2000 rem+2000` in one window. Root cause: the removal driver
+diffed "mobs the guard did not see this tick", but an INACTIVE mob never
+runs aiStep, never feeds the saw set — the diff then evicted it; the
+re-add on its next active tick reset every stroll seed.
+
+Fix: the diff now reads the Java object state directly at the boundary —
+`sm.isRemoved() || !sm.isAlive()` (isRemoved covers death/discard/
+chunk-unload; isAlive covers the death animation via deathTime/health).
+Activation-independent, and it catches a Java-side death on the SAME
+boundary tick. Post-fix soak: `ads=2008 rem=0` for the whole run (8
+natural spawns joined, zero churn), positions bit-exact, 0 boundary
+failures.
+
 ## Verdict
 
 The per-mob Java tick body for a native mob is now ONE static call +

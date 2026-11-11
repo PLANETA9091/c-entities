@@ -9667,26 +9667,32 @@ public final class CeHooks {
                 }
                 nmApplies++;
             }
-            // the removal driver: a mob of THIS level the guard did not see
-            // this tick is gone Java-side (death, discard, chunk unload) —
-            // the store must follow. (The read-back diff alone can never see
-            // a Java-side death: the store keeps ticking the dead id
-            // forever.) Other levels' mobs are THEIR boundary's business.
-            java.util.HashSet<Integer> saw = NM_SAW.get(level);
-            if (saw != null) {
-                for (java.util.Map.Entry<Integer, net.minecraft.world.entity.Mob> en : NM_BYID.entrySet()) {
-                    net.minecraft.world.entity.Mob sm = en.getValue();
-                    if (sm != null && sm.level() == level && !saw.contains(en.getKey())) {
-                        nativeMobRemove((long) en.getKey());
-                        nmRemoves++;
-                    }
+            // the removal driver, M1 liveness form: the Java object itself is
+            // the truth — isRemoved covers death/discard/chunk-unload, isAlive
+            // covers the death animation (deathTime). The old guard-saw proxy
+            // ("not seen this tick") depended on the mob's ACTIVATION duty:
+            // an inactive mob never runs aiStep, never feeds the saw set, and
+            // the diff then evicted the whole population at the activation
+            // flip (the live 2000-mob smoke: one ads+2000/rem+2000 swap; the
+            // re-adds reset every stroll seed). The read-back diff alone can
+            // never see a Java-side death — the store keeps ticking the dead
+            // id forever — hence the object-state check HERE, per boundary.
+            // Other levels' mobs are THEIR boundary's business.
+            for (java.util.Map.Entry<Integer, net.minecraft.world.entity.Mob> en : NM_BYID.entrySet()) {
+                net.minecraft.world.entity.Mob sm = en.getValue();
+                if (sm == null || sm.level() != level) {
+                    continue;
                 }
-                NM_BYID.entrySet().removeIf(en -> {
-                    net.minecraft.world.entity.Mob sm = en.getValue();
-                    return sm != null && sm.level() == level && !saw.contains(en.getKey());
-                });
-                saw.clear();
+                if (sm.isRemoved() || !sm.isAlive()) {
+                    nativeMobRemove((long) en.getKey());
+                    nmRemoves++;
+                }
             }
+            NM_BYID.entrySet().removeIf(en -> {
+                net.minecraft.world.entity.Mob sm = en.getValue();
+                return sm != null && sm.level() == level
+                        && (sm.isRemoved() || !sm.isAlive());
+            });
             java.util.HashSet<Integer> t = NM_SEEN;
             NM_SEEN = NM_SEEN_TMP;
             NM_SEEN_TMP = t;
