@@ -118,3 +118,17 @@ the remaining tick wall is chunk/world/packet work shared with vanilla.
   dead by design).
 - The GC pauses (~3.7% of the leg wall, young collections 40ms avg on the
   noisy box) — paired-valid; revisit only if the CI legs demand it.
+
+## Addendum — the fresh scaling curve (post-M2, the same binary as the wave legs)
+
+| N | threads | p50 ms/tick | vs vanilla* |
+|---|---:|---:|---:|
+| 25k | 1 | 2.23 | −73.5% |
+| 25k | 2 | 1.21 | −85.6% |
+| 100k | 2 | 4.55 | −86.5% |
+
+*vanilla 8.41 ms/tick @25k / 33.6 @100k (the doc-38 measure). The law
+par(T) = F + W/T fits exactly: F ≈ 0.35 ms (the clone+protocol floor),
+W ≈ 2.1 ms @25k (×4 at 100k). The 4-vCPU CI leg projects ~0.71 ms @25k =
+−91.6%. The 100k number is the first post-W15 100k datapoint on the
+current shape.
