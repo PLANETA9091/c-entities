@@ -649,3 +649,36 @@ needs a player-present non-persistent scenario to be honest: the parity
 harness has no player, checkDespawn declines early, so the harness CANNOT
 see despawn), the tracker gate residual (ttlCachedPath ~1.7% — mature
 L59-L72 territory, byte-exactness-sensitive, LOW priority).
+
+---
+Task ID: 14
+Agent: main (Z.ai)
+Task: the despawn pure port (N3-N1 phase 1) + the CI matrix rides the wire
+
+Work Log:
+- doc 61 (d1103b3): the exact 26.3 checkDespawn semantics javap'd from
+  the pinned jar — the ellipsoid/cylinder shapes, the persistent gates,
+  the noActionTime>600 + 1/800 soft roll, the in-soft-range RESET (the
+  ELSE branch, NOT persistence-gated), the config table push design,
+  the virtual class-cache, the SHARED_RANDOM draw slot (the draw COUNT
+  per mob is computable pre-draw -> the wave13/14 prefix assignment
+  survives), and the honest blocker: NO existing scenario can see a
+  native despawn (parity has no player; the bench is persistent) —
+  a new player-present non-persistent scenario is the gate.
+- The pure port (c04cd63): crates/centities-native/src/despawn.rs —
+  DespawnRange::should_despawn byte-exact both shapes, DespawnCfg::
+  decide() the full tail, the draw stays with the caller. 6 geometry
+  tests (every == vs > edge, the ratio stretch, the else-reset for
+  persistent mobs too). 29/29 native tests green. Phase 2 = the config
+  push + the executor slot + the outbox (doc 61 §"The native pieces").
+- CI matrix: the spread-100k / mixed-150k rows carried a zombie
+  fraction (20% / 10%) that ticked VANILLA in every previous mod leg —
+  the committed L-era report read spread -2% / mixed +46% (the weave
+  overhead on vanilla mobs drowned the item wins). Both rows now pass
+  CE_NATIVE_MOB=1 (19b8d7f) — the production configuration; the
+  populations are persistenceRequired so the M2c ledger is invisible
+  by construction.
+- CI verdicts so far: e2e SUCCESS on e61307f (M2e+M2f — the walk route
+  + the applier trim under the natives soak), module SUCCESS; parity
+  in flight; the mobs-25k-native arbiter queued/in-flight on two
+  baselines (the dispatch + the full matrix).
