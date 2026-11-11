@@ -682,3 +682,34 @@ Work Log:
   + the applier trim under the natives soak), module SUCCESS; parity
   in flight; the mobs-25k-native arbiter queued/in-flight on two
   baselines (the dispatch + the full matrix).
+
+---
+Task ID: 15
+Agent: main (Z.ai)
+Task: N3-N1 phase-2a live (the despawn cfg push) + the verification leg
+
+Work Log:
+- phase-2a (84550f2): pushDespawnCfgOnce rides the FIRST boundary per
+  level (WeakHashMap-guarded, one attempt, handle-gated) — reads the
+  PUBLIC spawning.despawnRanges map + despawnRangeShape, the four
+  PRIVATE DespawnRange precomputations via Unsafe offsets, resolves v
+  through the IntOr.Default record accessor; one nativeDespawnCfg
+  (II[D[I)Z crossing lands the table in the mobcore thread-local. A
+  NaN/stride/refuse leaves DESPAWN_CFG_LIVE=false and the M2c skip
+  stays (the SAFE default). natives_parity pins the descriptor.
+- Live m10k-n3cfg leg: "N3-N1: despawn cfg live (shape=ellipsoid
+  present=255)" — the REAL Paper 26.3 config crossed: ALL 8 categories
+  present, the default shape is ELLIPSOID (ground truth for phase-2b's
+  tests; the cylinder tests stay as the alternative shape's gate). The
+  push ran once per level (3 worlds x the boundary driver) — phase-2b
+  needs the per-level cfg state (noted in doc 61 §"the native pieces").
+  MSPT p50 19.05 (the best on this box), walk=6.3M, dmob=0, jpos
+  bit-exact — the push is free on the hot path (one WeakHashMap probe
+  per boundary).
+- CI: e2e SUCCESS on e61307f (M2e+M2f) and c04cd63 (the despawn port);
+  module SUCCESS both; parity + the mobs-25k-native arbiter in flight.
+
+Next: phase-2b — the executor slot (the decision rides the pack pass),
+the RNG walk-order draw prefix, the discard outbox (nativeMobDiscard ->
+mob.discard(DESPAWN) at the boundary), the per-level cfg state, and the
+player-present non-persistent bench scenario (doc 61's honest gate).
