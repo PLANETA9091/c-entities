@@ -8677,8 +8677,12 @@ public final class CeHooks {
             "true".equals(System.getProperty("centities.mobWalkRaw", "false"));
     /** M2e counter: natives routed straight from the walk mirror (the
      *  lambda + isRemoved + checkDespawn + tickNonPassenger + the M2a
-     *  guard chain all SKIPPED — the frames were dead since M1.5/M2a). */
-    public static volatile long walkMobNative = 0;
+     *  guard chain all SKIPPED — the frames were dead since M1.5/M2a).
+     *  PLAIN long: the increment and the poll read ride the SAME tick
+     *  thread (the walk + the boundary driver) — no cross-thread reader,
+     *  a volatile store per mob per tick would be a fence in the hot
+     *  route for nothing. */
+    public static long walkMobNative = 0;
     private static long nmEntryProbe = 0;
     private static long nmStepProbe = 0;
     private static long nmTickProbe = 0;

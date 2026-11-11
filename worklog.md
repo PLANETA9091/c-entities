@@ -589,3 +589,63 @@ Work Log:
 - doc 59 addendum. The -90% arbiter stays the mobs-25k-native CI leg; the
   executor line (par(4) -90.5...-93.7%, doc 55) and the production 10k
   pair now both sit at the line's doorstep on a 2-shared-vCPU box.
+
+---
+Task ID: 13
+Agent: main (Z.ai)
+Task: the vanilla-order regression gate + M2e (the walk fast route) + M2f (the applier trim)
+
+Work Log:
+- Doc 36b gate: the versioned parity-order re-sort (upsert_ord /
+  ensure_cell_order) shipped in the N2 wave train WITHOUT its own
+  regression tests. tests/order_parity.rs adds 6 tests against an
+  independent vanilla-order model — cell-internal insertion independence
+  (+ the sy-desc/seq-asc adversary), chunkZ-major walk across six chunks
+  (seqs assigned chunkZ-ASCENDING on purpose), re-append/section-move
+  reorder + same-stamp no-churn, oversize global merge, 12k-op removal
+  storm (ghost ids fail loudly), world separation. 6/6 green first run;
+  42 core tests green. Commit db1a432.
+- N2-M2e (doc 60, commit 4294755): the L13/L17 walk mirror fast-routed
+  native ITEMS straight into the flush; a classified MOB still paid
+  consumer.accept -> the vanilla lambda (isRemoved read, the M2c-killed
+  checkDespawn entry, tickNonPassenger) -> the M2a guard chain — every
+  frame inside already-dead code, invoked per mob per tick. The M2e
+  branch routes the mob with the SAME decision chain (nativeMobTick)
+  one level up; a decline takes the exact vanilla path; mobRoute flips
+  whole-hog on disarm (no tick-list membership touched, zero
+  bookkeeping); -Dcentities.mobWalkRaw=true refuses. Live m10k-m2e:
+  walk=6.29M == skip=6.29M, dmob=0 (the M2a dispatcher counter FROZEN —
+  the dispatcher is never entered), n=10000 rem=0, jpos bit-exact.
+- Paired local A/B (same box hour, fill300/warm60/measure300, 2 shared
+  vCPU): vanilla 151.1 p50 / 161.2 mean vs native M2e 19.4 / 30.5 =
+  -87.1% p50 (the M2d build read 21.4 on the same protocol — the route
+  is the ~2ms/tick of dead frames).
+- N2-M2f (commit 9942a43): the boundary applier's per-mob reads were the
+  top server leaf (getDouble 3.4% + getBoolean 1.5%, all inside
+  nativeMobBoundary). The Motion zero check now reads the FIELD
+  REFERENCE (1 read vs getObject + 3 Vec3 loads — any plugin
+  setDeltaMovement allocates a fresh Vec3, identity-differs, re-store
+  fires; Vec3 immutable); the M2b position read-back's loads are LAZY
+  inside the unchanged predicate (NaN guard short-circuits, a mover
+  whose x differs never pays y/z). m10k-m2f: p50 19.6 / mean 27.9 (the
+  mean carries the trim), walk=6.38M, dmob=0, jpos bit-exact, GC pauses
+  0 for the whole leg. The remaining getDouble leaf is the safepoint-
+  biased attribution of the whole applier loop (setPos + the volatile
+  fence inside the same body) — load-bearing.
+- walkMobNative counter demoted to a PLAIN long (the increment and the
+  poll read ride the same tick thread — a volatile store per mob per
+  tick was a fence in the hot route for nothing).
+- Sandbox provisioning rebuilt from scratch (the recycle wiped /tmp):
+  rustup, JDK 25.0.5 (javac v69), paperclip 218 extraction (the pinned
+  build, sha256 verified), maven 3.9.9, ViaVersion 5.12.2 + ViaBackwards,
+  mineflayer. The local leg protocol: XMS=512M (XMS 2G > XMX 1536M died
+  the JVM silently once), RUN_TIMEOUT=300, ~9 min/leg inside the 600s
+  tool ceiling.
+- CI: the mobs-25k-native arbiter dispatched on 9942a43 (M2e+M2f);
+  the full-matrix baselines queued behind it.
+
+Next: the arbiter verdict, M3 (the N3 event outbox — the despawn design
+needs a player-present non-persistent scenario to be honest: the parity
+harness has no player, checkDespawn declines early, so the harness CANNOT
+see despawn), the tracker gate residual (ttlCachedPath ~1.7% — mature
+L59-L72 territory, byte-exactness-sensitive, LOW priority).
