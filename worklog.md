@@ -474,3 +474,23 @@ Work Log:
 Stage Summary:
 - N2-M0 LAND: протокол (JNI-free, twin-гейт) + JNI-клей + Java copy-layer (гейт CE_NATIVE_MOB, default OFF). Один JNI-переход на уровень-тик вместо пермобных раундов. Живой сервер: замкнутая петля без churn, бит-точный синк, выживание.
 - Следующее: M1 (aiStep-weave — полный скип Java-тела), M2 (e2e-стенд под гейтами: перф-ноги с ботом + JFR), M3 (N3 event-outbox: урон/звуки/дропы), N4 (транскрипты на границе executor'а).
+
+---
+Task ID: 8
+Agent: main (Z.ai)
+Task: N2-M1/M1.5/M1.6/M1.7 — the wholesale wire closes the Java body; the first production A/B
+
+Work Log:
+- M1 (2a5e60b, doc 57): the aiStep weave — a chained EarlyReturnGuard at the head of Mob.aiStep; the whole per-mob Java body (LivingEntity.aiStep: travel/gravity/sensors/serverAiStep + Mob.aiStep: burnUndead/looting) = one static call. javap-verified checkDespawn is OUTSIDE aiStep (despawn survives). Live: the route marker, skip lockstep, jpos bit-exact.
+- The 2000-mob live smoke caught the activation-flip churn (the saw-set proxy: an inactive mob never feeds the set, the removal diff evicted the whole population — ads+2000/rem+2000 once). Fix (6c89799): the removal driver reads the Java object state (isRemoved/isAlive) at the boundary — activation-independent, same-tick death detection. Post-fix: ads=2008 rem=0 for the whole soak.
+- M1.6 (2a1727a): the wire fastpath — NM_BYID -> the primitive NmMap (linear probing, Knuth 6.4 R deletion, zero boxing); the saw machinery dies (dead code); the liveness check folds into the apply loop (int scratch + drain, zero map walks in the steady state). JFR: nativeMobStep self 6.4%->0.0%, boundary self 6.7%->1.9%.
+- M1.5 (2a1727a): the tick weave — a THIRD guard at Mob.tick: the native mob's WHOLE Java tick dies (baseTick fire/air/lava/tickCount, pushEntities, updateControlFlags, swing); the applier advances tickCount per mob per boundary; the first-sight classification moved to the tick route. The sight refuses !isAlive() (a dying mob would otherwise be re-classified — a corpse the vanilla dead-branch can never remove). Death path re-verified live (/kill -> rem=1 same boundary, survivors untouched).
+- M1.5b (c593617): the zombie-family weave — Zombie OVERRIDES tick() (the drowning-conversion tracker ran 6.0% of the server thread for natives!); the guard now rides Zombie.tick (+ ZombieVillager.tick; Drowned/Husk inherit). Per-class woven state in PRECOMPUTED, deferred verifier weaves.
+- M1.7 (0ea9d1e): the liveness fast read — !isAlive() walked getHealth() -> the FULL SynchedEntityData chain (health lives in the data watcher in 26.3), 15.7% of the server thread at 10k. Now U.getBoolean(dead) || isRemoved() — two plain loads; a missed handle keeps the wire off.
+- The first PRODUCTION A/B (7caf5ef): scripts/run-baseline.sh end-to-end locally (2 vCPU, mineflayer bot via ViaVersion, 10000 fill zombies, 300-tick measure): vanilla 174.7 ms/tick p50 -> the native wire 49.6 = -71.6% p50, TPS 5.7 -> 20.0; wire state n=10000 ads=10000 rem=0 across the run. CI: the mobs-25k-native matrix row (matrix.EXTRA splices CE_NATIVE_MOB=1 into the paired mod leg) — the dedicated 4-vCPU runners + the back-to-back A/B are the -90% arbiter.
+- The @e[type=zombie] selector flag (doc 56): NOT reproducible with the plugin present (typed + untyped selectors both return the entities) — the earlier repro lacked the plugin's chunk tickets; documented, the CI arbiter note stands.
+
+Stage Summary:
+- Six commits on main: 2a5e60b, 6c89799, 2a1727a, 7caf5ef, c593617, 0ea9d1e — all pushed. Module suite 5/5 green throughout; CI parity/e2e paths byte-identical (every new weave is gated on CE_NATIVE_MOB).
+- The executor line stands: par(4) 0.53-0.80 ms (-90.5...-93.7%) in-bench; production 10k with a player: -71.6% p50 local (noisy box, directional).
+- Next: the mobs-25k-native CI leg (the -90% arbiter), M3 (the N3 event outbox: damage/sounds/drops — returns environmental death), the tracker's remaining dirty scan + the applier setPos path if the 25k numbers demand more.
