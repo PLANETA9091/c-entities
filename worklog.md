@@ -513,3 +513,36 @@ Stage Summary:
 - Three commits: 62ad1fe (the e2e marker repair), c8e9162 (the M1.8b/M2 wave), 38fa93e (the bench stdin). CRUSSTY: ce-m2-static-fix (the op-4 static fix + the wave's working state).
 - The wire's live-boot path is now forensics-hardened: every silent catch logs, the probe failures name the throwable, the counters (dmob) prove the weaves engage.
 - Next: the CI arbiter verdicts (mobs-25k-native), M3 (the N3 event outbox — environmental death), the GC leg only if the CI numbers demand it.
+
+---
+Task ID: 10
+Agent: main (Z.ai)
+Task: N2-M2c — the checkDespawn residency skip (the paper-config walk dies)
+
+Work Log:
+- The 10k JFR priced the checkDespawn chain at ~3% of the server thread:
+  despawnRanges Map.get per mob per tick (the HashMap.get leaf 1.9%),
+  the paperConfig() field walk, findNearbyPlayer, getDifficulty/
+  isPersistenceRequired. For an in-store native every line is dead weight.
+- The 5th op-4 guard on the Mob blob: checkDespawn()V <- nativeMobTracked
+  (Entity)Z — the PURE residency probe (no classification; the sight stays
+  pinned to the tick route; receiver Mob assignable to Entity — the same
+  link-safety shape as the Zombie.tick weave).
+- DELTA (honesty ledger): a resident native no longer hard-despawns — the
+  paper despawn ranges return with the N3 event outbox. The wire's removal
+  driver covers death/discard exactly; the bench population is
+  persistenceRequired anyway.
+- Live 10k leg: checkDespawn/findNearbyPlayer/despawn leaves GONE (1 sample
+  of 5399, was ~3%); wire n=10000 ads=10000 rem=0, jpos bit-exact, dmob
+  live. Commit 01e4b54, pushed.
+- Also this session: the M1.8a zombie-family arm-time retransform fix (the
+  guard never reached the JVM when the zombie classes loaded pre-arm —
+  the deferred verifier path is dead for them because
+  precompute_zombie_family REMOVES the stash; the m10k-native8 profile
+  showed ConversionTracker.tick still riding Zombie.tick — the guard is
+  now visible landing in the arm retransform loop, "patched zombie-family
+  tick guard" x2). The op-4 STATIC receiver fix (local 0 for static
+  methods) went in via the CRUSSTY sdk commit d7ae117.
+
+Next: the tracker gate residual (ttlCachedPath ~1.3%), the applier's setPos
+for the walking population, the mobs-25k-native CI leg (the -90% arbiter).
