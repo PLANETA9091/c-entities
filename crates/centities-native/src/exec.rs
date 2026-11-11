@@ -30,6 +30,51 @@ pub fn set_no_ai(on: bool) {
     NO_AI.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+// WAVE15 phase probe: per-tick wall decomposition of tick_parallel. One
+// relaxed load per tick when off (~ns); the #[ignore]d probe test turns it
+// on and drains the accumulators. Measurement only.
+pub static PHASE_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static T_PLAYERS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_PRE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_PASS1_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_PREFIX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_PASS2_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_TAIL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROBE_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROBE_DRAWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_phase_probe(on: bool) {
+    PHASE_PROBE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drain the probe: ms/tick per phase + the mean drawer count. Resets.
+pub fn phase_probe_take() -> String {
+    let ticks = PROBE_TICKS.swap(0, std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+    let drawers = PROBE_DRAWERS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64;
+    let ns = |c: &std::sync::atomic::AtomicU64| {
+        c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / ticks
+    };
+    format!(
+        "probe ms/tick: players {:.3} | pre {:.3} | pass1 {:.3} | prefix {:.3} | pass2 {:.3} | tail {:.3} | drawers/tick {:.0} | ticks {}",
+        ns(&T_PLAYERS_NS),
+        ns(&T_PRE_NS),
+        ns(&T_PASS1_NS),
+        ns(&T_PREFIX_NS),
+        ns(&T_PASS2_NS),
+        ns(&T_TAIL_NS),
+        drawers / ticks,
+        ticks as u64,
+    )
+}
+
+#[inline]
+fn probe_lap(t: &mut Option<std::time::Instant>, c: &std::sync::atomic::AtomicU64) {
+    if let Some(t0) = t {
+        c.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        *t = Some(std::time::Instant::now());
+    }
+}
+
 /// WAVE14: the per-thread eval workspace (the scratch/out/pack triple the
 /// serial executor owns once — the parallel arm needs one set per WORKING
 /// thread; every field is pure workspace, written before read per mob, so
@@ -38,6 +83,18 @@ struct WorkerBufs {
     scratch: Vec<i32>,
     out: Vec<i32>,
     pack: PackState,
+    /// WAVE15: the chunk-local drawer ledger — (slot, k, drew) in k order.
+    /// The stream pre-assignment became a per-chunk LOCAL walk off
+    /// `base_stream`; the global drawer list, the repair flags, the assign
+    /// buffer and the results staging all died with it.
+    drawers: Vec<(u32, u32, u32)>,
+    /// WAVE15: this chunk's draw total (the stream-prefix input) — written
+    /// before read per tick.
+    draws: u32,
+    /// WAVE15: the prefix outputs — the chunk's first alive position (the
+    /// stats-region rank base) and the stream value its first drawer gets.
+    base_k: u32,
+    base_stream: u64,
 }
 
 impl WorkerBufs {
@@ -47,6 +104,10 @@ impl WorkerBufs {
             scratch: Vec::new(),
             out: vec![0i32; swarm_sim::mob::out_len()],
             pack: PackState::default(),
+            drawers: Vec::new(),
+            draws: 0,
+            base_k: 0,
+            base_stream: 0,
         }
     }
 }
@@ -108,18 +169,9 @@ pub struct NativeTick {
     /// serially pre-assigned stream value; the buffers SWAP at tick end.
     /// Sized to the store between ticks.
     pre_buf: Vec<MobSlot>,
-    /// WAVE14: the alive slot list (slot order) — the stats stream
-    /// contract is ONE entry per alive mob in slot order; the walk writes
-    /// by POSITION through this map.
-    alive_idx: Vec<u32>,
-    /// WAVE14: the per-mob stroll-draw counts + stats staging (slot-indexed
-    /// reuse — zero per-tick allocation) + the repair set (slot flags,
-    /// assigned stream values, the (slot, stat-pos) drawer list) + the
-    /// persistent per-worker eval workspaces.
-    results_buf: Vec<(AiStat, u32)>,
-    repair_buf: Vec<bool>,
-    assign_buf: Vec<u64>,
-    drawer_list: Vec<(u32, u32)>,
+    /// WAVE15: the persistent per-worker eval workspaces — one per CHUNK,
+    /// each carrying the chunk-local drawer ledger + the rank/stream
+    /// prefix outputs (see WorkerBufs).
     bufs: Vec<WorkerBufs>,
     /// WAVE14: the parallel-arm switch — the PRODUCTION DEFAULT (the twin
     /// gate proved the arm bit-identical; the dispatch falls back to
@@ -146,11 +198,6 @@ impl NativeTick {
             skip_travel: false,
             prepass: false,
             pre_buf: Vec::new(),
-            alive_idx: Vec::new(),
-            results_buf: Vec::new(),
-            repair_buf: Vec::new(),
-            assign_buf: Vec::new(),
-            drawer_list: Vec::new(),
             bufs: Vec::new(),
             parallel: true,
         }
@@ -459,6 +506,11 @@ impl NativeTick {
     /// itself (~0.25 ms at 25k), which the extra cores buy back many times.
     fn tick_parallel(&mut self, game_time: i32) -> &[AiStat] {
         drop(grid_guard());
+        let mut probe_t = if PHASE_PROBE.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // players -> the pack snapshot (the same shape as the serial arm)
         let players: &[PlayerSnap] = {
             let _g = apply_guard();
@@ -480,6 +532,7 @@ impl NativeTick {
             &*pb
         };
         let tfp = MobAI::tick_fp(players);
+        probe_lap(&mut probe_t, &T_PLAYERS_NS);
 
         let n = self.store.mobs.len();
         // the shadow buffer mirrors the store shape (the resizes are rare:
@@ -495,25 +548,6 @@ impl NativeTick {
                 grid_pos: 0,
             });
         }
-        // the alive map (slot order) + the reused per-tick work buffers
-        self.alive_idx.clear();
-        for (i, s) in self.store.mobs.iter().enumerate() {
-            if s.alive {
-                self.alive_idx.push(i as u32);
-            }
-        }
-        let alive_len = self.alive_idx.len();
-        if self.results_buf.len() != n {
-            self.results_buf.resize(n, (AiStat::default(), 0u32));
-        }
-        self.repair_buf.clear();
-        self.repair_buf.resize(n, false);
-        self.assign_buf.clear();
-        self.assign_buf.resize(n, 0);
-        self.drawer_list.clear();
-        self.stats_buf.clear();
-        self.stats_buf.resize(alive_len, AiStat::default());
-
         let nthreads = rayon::current_num_threads().max(1);
         // the job-count knob: more, smaller jobs = better load balance (the
         // chaser mobs cost more than the idlers); the rayon overhead per
@@ -529,16 +563,12 @@ impl NativeTick {
             // across ticks — zero per-tick allocation after the first
             self.bufs.resize_with(nchunks, WorkerBufs::fresh);
         }
+        probe_lap(&mut probe_t, &T_PRE_NS);
 
         let Self {
             store,
             pre_buf,
             stats_buf,
-            alive_idx,
-            results_buf,
-            repair_buf,
-            assign_buf,
-            drawer_list,
             bufs,
             target_rng,
             mth,
@@ -555,27 +585,65 @@ impl NativeTick {
         let fold_off = *fold_off;
         let skip_travel = *skip_travel;
 
-        // ---- PASS 1: clone A→B (A stays pristine — pass 2's re-eval
-        // source), eval B in place with the placeholder stream value, fuse
-        // the travel. The per-chunk (stat, draws) land in the pre-sliced
-        // results region — zero allocation. The tombstones ride along
-        // (metadata mirror + mob copy) — the buffers stay index-aligned
-        // for the swap and the free list. ----
-        results_buf
-            .par_chunks_mut(chunk)
-            .zip(store.mobs.par_chunks_mut(chunk))
-            .zip(pre_buf.par_chunks_mut(chunk))
+        // ---- WAVE15 THE RANK PREFIX: ONE serial pass counts each
+        // chunk's alive slots and assigns its base_k in the same breath
+        // (the count IS the prefix — no second loop). 25 KB of bools at
+        // 25k ≈ 20 µs serial — the rayon dispatch of a parallel count
+        // pass measured MORE than the scan itself, so this stage stays
+        // serial by measurement. NO per-tick memsets: every stats word is
+        // written exactly once by pass 1 through its own region. ----
+        let mut run_k: u32 = 0;
+        let mut regions: Vec<(usize, usize)> = Vec::with_capacity(nchunks);
+        for (ci, c) in store.mobs.chunks(chunk).enumerate() {
+            let cnt = c.iter().filter(|s| s.alive).count() as u32;
+            bufs[ci].base_k = run_k;
+            regions.push((run_k as usize, cnt as usize));
+            run_k = run_k.wrapping_add(cnt);
+        }
+        let alive_len = run_k as usize;
+        if stats_buf.len() > alive_len {
+            stats_buf.truncate(alive_len);
+        } else if stats_buf.len() < alive_len {
+            stats_buf.resize(alive_len, AiStat::default());
+        }
+        probe_lap(&mut probe_t, &T_PRE_NS);
+
+        // ---- WAVE15 PASS 1: clone A→B (A stays pristine — pass 2's
+        // re-eval source), eval B in place with the placeholder stream
+        // value, fuse the travel, write the contract stat through the
+        // chunk's OWN stats region (the k-range [base_k, base_k+count) —
+        // safe disjoint splits, O(chunks)), ledger the drawers locally.
+        // The tombstones ride along (metadata mirror + mob copy) — the
+        // buffers stay index-aligned for the swap and the free list. ----
+        let stat_slices: Vec<&mut [AiStat]> = {
+            let mut rest: &mut [AiStat] = &mut stats_buf[..alive_len];
+            let mut v = Vec::with_capacity(nchunks);
+            for &(_, len) in &regions {
+                let (l, r) = rest.split_at_mut(len);
+                v.push(l);
+                rest = r;
+            }
+            v
+        };
+        stat_slices
+            .into_par_iter()
             .zip(bufs.par_chunks_mut(1))
-            .for_each(|(((res_chunk, a_chunk), b_chunk), b1)| {
+            .zip(pre_buf.par_chunks_mut(chunk))
+            .zip(store.mobs.par_chunks(chunk))
+            .enumerate()
+            .for_each(|(ci, (((stats_region, b1), b_chunk), a_chunk))| {
                 let bufs = &mut b1[0];
                 let _g = ai_guard();
-                for ((res, a), b) in res_chunk.iter_mut().zip(a_chunk).zip(b_chunk) {
+                let mut rank: usize = 0;
+                bufs.drawers.clear();
+                bufs.draws = 0;
+                let cbase = (ci * chunk) as u32;
+                for (j, (a, b)) in a_chunk.iter().zip(b_chunk).enumerate() {
                     b.alive = a.alive;
                     b.grid_cell = a.grid_cell;
                     b.grid_pos = a.grid_pos;
                     if !a.alive {
                         b.mob.clone_from(&a.mob);
-                        *res = (AiStat::default(), 0);
                         continue;
                     }
                     let (stat, drew) = re_eval_mob(
@@ -587,110 +655,139 @@ impl NativeTick {
                         let _t = travel_guard();
                         b.mob.move_tick(mth);
                     }
-                    *res = (stat, drew);
+                    stats_region[rank] = stat;
+                    if drew > 0 {
+                        bufs.drawers.push((
+                            cbase + j as u32,
+                            bufs.base_k + rank as u32,
+                            drew,
+                        ));
+                        bufs.draws += drew;
+                    }
+                    rank += 1;
                 }
             });
+        probe_lap(&mut probe_t, &T_PASS1_NS);
 
-        // ---- THE WALK (serial, ONE fused pass): the stats contract copy +
-        // the drawer stream pre-assignment. TWO LCG-48 steps per draw. ----
+        // ---- WAVE15 THE STREAM PREFIX (serial, O(chunks)): chunk i's
+        // drawers draw from the chain advanced by every PRIOR chunk's
+        // draws — the alive-order chain of the old serial walk, cut into
+        // nchunks pieces (alive order is ascending slot order, so a
+        // slot-chunk owns a contiguous k-range and the pieces chain in
+        // chunk order). TWO LCG-48 steps per draw. ----
         let mut stream = s0;
-        let mut drawers = 0usize;
-        for k in 0..alive_len {
-            let slot = alive_idx[k] as usize;
-            let (stat, drew) = results_buf[slot];
-            stats_buf[k] = stat;
-            if drew == 0 {
-                continue;
-            }
-            assign_buf[slot] = stream;
-            repair_buf[slot] = true;
-            drawer_list.push((slot as u32, k as u32));
-            drawers += 1;
-            for _ in 0..(2 * drew) {
-                stream = stream
-                    .wrapping_mul(2521_4903_917)
-                    .wrapping_add(11)
-                    & 0xFFFF_FFFF_FFFF;
+        let mut drawers_total = 0usize;
+        for b in bufs.iter_mut() {
+            b.base_stream = stream;
+            drawers_total += b.drawers.len();
+            if b.draws > 0 {
+                stream = advance_stream(stream, 2 * b.draws);
             }
         }
-        // the executor's post-tick stream — exactly what the serial arm
-        // accumulates across its per-mob handoffs
+        // the executor's post-tick stream — the chain end (exactly what
+        // the serial arm accumulates across its per-mob handoffs)
         *target_rng = stream;
+        probe_lap(&mut probe_t, &T_PREFIX_NS);
 
-        // ---- PASS 2: the drawer repair — re-clone A→B, re-eval with the
-        // assigned value, re-travel. Small sets run serial (the thread
-        // spin dominates there); big sets chunk parallel. ----
-        if drawers > 0 {
-            if drawers < 1024 {
-                let mut bufs = WorkerBufs::fresh();
-                for &(slot, k) in &*drawer_list {
-                    let expect = results_buf[slot as usize].1;
-                    let (stat, drew) = re_eval_mob(
-                        &store.mobs[slot as usize].mob,
-                        &mut pre_buf[slot as usize].mob,
-                        players,
-                        players_raw,
-                        game_time,
-                        snapshot,
-                        fold_off,
-                        assign_buf[slot as usize],
-                        tfp,
-                        &mut bufs,
-                    );
-                    debug_assert_eq!(
-                        drew, expect,
-                        "the stroll draw count must be stream-value-independent"
-                    );
-                    if !skip_travel {
-                        let _t = travel_guard();
-                        pre_buf[slot as usize].mob.move_tick(mth);
+        // ---- WAVE15 PASS 2: the drawer repair — re-clone A→B, re-eval
+        // with the assigned value (the chunk-local walk off base_stream),
+        // re-travel, overwrite the drawer stats in the chunk's region.
+        // Small sets run serial (the thread spin dominates there); big
+        // sets run the chunked-parallel shape. ----
+        if drawers_total > 0 {
+            if drawers_total < 1024 {
+                let mut local = WorkerBufs::fresh();
+                for bi in 0..bufs.len() {
+                    let mut stream = bufs[bi].base_stream;
+                    for i in 0..bufs[bi].drawers.len() {
+                        let (slot, k, drew) = bufs[bi].drawers[i];
+                        let assign = stream;
+                        let (stat, redrew) = re_eval_mob(
+                            &store.mobs[slot as usize].mob,
+                            &mut pre_buf[slot as usize].mob,
+                            players,
+                            players_raw,
+                            game_time,
+                            snapshot,
+                            fold_off,
+                            assign,
+                            tfp,
+                            &mut local,
+                        );
+                        debug_assert_eq!(
+                            redrew, drew,
+                            "the stroll draw count must be stream-value-independent"
+                        );
+                        if !skip_travel {
+                            let _t = travel_guard();
+                            pre_buf[slot as usize].mob.move_tick(mth);
+                        }
+                        stats_buf[k as usize] = stat;
+                        if drew > 0 {
+                            stream = advance_stream(stream, 2 * drew);
+                        }
                     }
-                    stats_buf[k as usize] = stat;
                 }
             } else {
+                let stat_slices: Vec<&mut [AiStat]> = {
+                    let mut rest: &mut [AiStat] = &mut stats_buf[..alive_len];
+                    let mut v = Vec::with_capacity(nchunks);
+                    for &(_, len) in &regions {
+                        let (l, r) = rest.split_at_mut(len);
+                        v.push(l);
+                        rest = r;
+                    }
+                    v
+                };
                 let a_all: &[MobSlot] = &store.mobs;
-                let base = results_buf.as_ptr() as usize;
-                let unit = std::mem::size_of::<(AiStat, u32)>();
-                results_buf
-                    .par_chunks_mut(chunk)
-                    .zip(a_all.par_chunks(chunk))
-                    .zip(pre_buf.par_chunks_mut(chunk))
+                stat_slices
+                    .into_par_iter()
                     .zip(bufs.par_chunks_mut(1))
-                    .for_each(move |(((res_chunk, a_chunk), b_chunk), b1)| {
+                    .zip(pre_buf.par_chunks_mut(chunk))
+                    .enumerate()
+                    .for_each(move |(ci, ((stats_region, b1), b_chunk))| {
                         let bufs = &mut b1[0];
+                        if bufs.drawers.is_empty() {
+                            return;
+                        }
                         let _g = ai_guard();
-                        let cbase = (res_chunk.as_ptr() as usize - base) / unit;
-                        for (j, ((res, a), b)) in
-                            res_chunk.iter_mut().zip(a_chunk).zip(b_chunk).enumerate()
-                        {
-                            let slot = cbase + j;
-                            if !repair_buf[slot] {
-                                continue;
-                            }
-                            let (stat, _drew) = re_eval_mob(
-                                &a.mob,
-                                &mut b.mob,
+                        let lo = ci * chunk;
+                        let mut stream = bufs.base_stream;
+                        for i in 0..bufs.drawers.len() {
+                            let (slot, k, drew) = bufs.drawers[i];
+                            let assign = stream;
+                            let (stat, redrew) = re_eval_mob(
+                                &a_all[slot as usize].mob,
+                                &mut b_chunk[slot as usize - lo].mob,
                                 players,
                                 players_raw,
                                 game_time,
                                 snapshot,
                                 fold_off,
-                                assign_buf[slot],
+                                assign,
                                 tfp,
                                 bufs,
                             );
+                            debug_assert_eq!(
+                                redrew, drew,
+                                "the stroll draw count must be stream-value-independent"
+                            );
                             if !skip_travel {
                                 let _t = travel_guard();
-                                b.mob.move_tick(mth);
+                                b_chunk[slot as usize - lo].mob.move_tick(mth);
                             }
-                            *res = (stat, 0);
+                            stats_region[(k - bufs.base_k) as usize] = stat;
+                            if drew > 0 {
+                                stream = advance_stream(stream, 2 * drew);
+                            }
                         }
                     });
-                // the repair stats scatter — the drawer list is slot order
-                for &(slot, k) in &*drawer_list {
-                    stats_buf[k as usize] = results_buf[slot as usize].0;
-                }
             }
+        }
+        probe_lap(&mut probe_t, &T_PASS2_NS);
+        if let Some(_) = probe_t {
+            PROBE_DRAWERS.fetch_add(drawers_total as u64, std::sync::atomic::Ordering::Relaxed);
+            PROBE_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // ---- the swap: the shadow becomes the store (the post-tick
@@ -707,8 +804,24 @@ impl NativeTick {
             }
         }
         store.game_time = game_time;
+        probe_lap(&mut probe_t, &T_TAIL_NS);
         stats_buf
     }
+}
+
+/// WAVE15: the stroll stream advance — TWO 48-bit LCG steps per draw,
+/// the same chain the serial walk accumulated. The advance is
+/// value-independent, so the chunked prefix produces the exact serial
+/// chain bit-for-bit.
+#[inline]
+fn advance_stream(mut s: u64, steps: u32) -> u64 {
+    for _ in 0..steps {
+        s = s
+            .wrapping_mul(2521_4903_917)
+            .wrapping_add(11)
+            & 0xFFFF_FFFF_FFFF;
+    }
+    s
 }
 
 /// WAVE14: ONE mob's eval from its pristine pre-tick state. The clone
@@ -841,6 +954,52 @@ mod tests {
         run("no-travel+no-acts", true, false, true);
         crate::exec::set_no_ai(false);
         swarm_sim::ledger::set_no_acts(false);
+    }
+
+    /// WAVE15 phase probe: the tick_parallel wall decomposition over the
+    /// bench-shaped 25k world (400 stabilize, 200 timed). NOT part of the
+    /// suite — run it explicitly:
+    ///   cargo test -p centities-native --release phase_probe -- \
+    ///     --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn phase_probe() {
+        let mut nt = NativeTick::new(0xC0FFEE);
+        for i in 0..25000usize {
+            let x = (i % 250) as f64 * 0.6 - 75.0 + 0.05 * ((i / 7) % 3) as f64;
+            let z = (i / 250) as f64 * 0.6 - 75.0;
+            let mut m = MobAI::new(
+                1000 + i as i64,
+                0xC0FFEE ^ (i as u64).wrapping_mul(0x9E37),
+                x,
+                64.0,
+                z,
+            );
+            m.goals = swarm_sim::mob::zombie_table_res();
+            nt.add_mob(m);
+        }
+        nt.push_players(vec![PlayerTick {
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            id: 1,
+            flags: 1,
+        }]);
+        for t in 0..400 {
+            nt.tick(t);
+        }
+        set_phase_probe(true);
+        for t in 400..600 {
+            nt.tick(t);
+        }
+        set_phase_probe(false);
+        println!("{}", phase_probe_take());
+        // a second drain on a fresh window (the numbers repeat — the
+        // accumulators reset on take)
+        for t in 600..800 {
+            nt.tick(t);
+        }
+        println!("{}", phase_probe_take());
     }
 
     fn mk(id: i64, x: f64, z: f64) -> MobAI {
