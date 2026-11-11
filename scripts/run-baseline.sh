@@ -181,6 +181,12 @@ if [ "${MODULE:-off}" = "on" ] && [ "${CE_AI_FLOOR:-1}" != "1" ]; then
   AIFLOOR_PROP="-Dcentities.aiFloor=false"
 fi
 echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_HOPPERS:-0} furnaces=${TILE_FURNACES:-0} module=${MODULE:-off} itemTick=$CE_ITEM_TICK merge=${CE_MERGE:-1} mobAi=${MOBAI_PROP:+on}"
+# stdin from /dev/null: the sandbox/pty bench gives jline a LIVE terminal and
+# the console's redisplay loop (LineReaderImpl.redisplay + AttributedString
+# churn + EnumMap.clear + getKeys/getVariable) then eats ~6% of the JFR
+# samples and steals CPU from the server thread on a 2-vCPU box. A dumb
+# terminal (no pty) — what CI runners already get — costs nothing. BOTH A/B
+# legs share the redirect, so the pairing stays valid.
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
   ${MERGE_PROP} \
@@ -189,7 +195,7 @@ java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitO
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m,stackdepth=64" \
-  -jar paper.jar nogui > "$R/server.log" 2>&1 &
+  -jar paper.jar nogui < /dev/null > "$R/server.log" 2>&1 &
 JPID=$!
 
 # Forensics watchdog: a runner death (exit 143) kills the job — artifacts
