@@ -116,3 +116,34 @@ tracker's sync duty and the vanilla setPos — all load-bearing.
 - A local 25k vanilla leg does not fit the sandbox budget (worldgen +
   fill at 2 shared vCPU exceed the 600s tool-call ceiling) — the 25k
   production pair belongs to the CI runners.
+
+## Addendum — M2d: the console dies; the paired 10k pair reads −87.4% p50
+
+The stdin=/dev/null fix (38fa93e) silenced the jline pty redisplay loop but
+the PumpThread still SPUN on the instant EOF (~1.5% of the samples — the
+reader never parks). The bench launcher now passes `--noconsole`
+(org.bukkit.craftbukkit.Main parses it in 26.3): the console reader thread
+is never created. Both A/B legs share the flag — the pairing stays valid.
+
+The re-run pair (same window fill300/warm60/measure300, same hour, both
+legs --noconsole, the disk also un-saturated — the bench server trees were
+pinned at 250MB per run and the rootfs had hit 100%):
+
+| leg | MSPT p50 | mean |
+|---|---:|---:|
+| vanilla (module off) | 169.7 | 188.4 |
+| **native M2d wire** | **21.4** | 33.4 |
+
+**−87.4% mspt p50 at 10k, player-present, full duty** (the wire: n=10000
+ads=10000 rem=0, dmob live, jpos bit-exact). The console reader had been
+stealing CPU slices from BOTH legs on the 2-vCPU box — the vanilla leg
+more (its tick is CPU-saturated; 283.4 → 169.7 with the flag). The mob-
+attributable native cost is now nearly invisible against the shared server
+floor (chunk system, GC, network); the remaining distance to −90% belongs
+to the CI 4-vCPU runners (the arbiter), where the executor's parallel arm
+also scales (doc 55: par(4) −90.5…−93.7% in-bench).
+
+Ops note for the next wave: the rootfs hit 100% — every bench server dir
+pins ~250MB (the paperclip libraries tree). The cleanup that unblocked
+this pair: `rm -rf bench/*/server` (results kept; the runner recreates the
+tree per leg).

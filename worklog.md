@@ -570,3 +570,22 @@ Work Log:
   ceiling (the CI 25k leg stays the arbiter).
 - Next: M3 (the N3 event outbox), the 25k CI pair, the tracker gate
   residual.
+
+---
+Task ID: 12
+Agent: main (Z.ai)
+Task: M2d — the bench console dies (--noconsole); the paired 10k pair reads -87.4% p50
+
+Work Log:
+- The rootfs hit 100% (each bench server dir pins ~250MB) — that was the
+  source of the tool-call timeouts late in the session. Purged bench/*/server
+  (results kept, the runner recreates them): 5.0GB -> 559MB, the disk 54%.
+- The M2d launcher fix: `--noconsole` for the bench server (the jline
+  PumpThread spun on the /dev/null EOF — ~1.5% of samples). javap-verified
+  the flag in org.bukkit.craftbukkit.Main (26.3). Both legs share it.
+- The re-run pair (same window, same hour): vanilla 169.7 p50 / 188.4 mean
+  vs native 21.4 p50 / 33.4 mean = **-87.4% p50** at 10k player-present
+  (the wire n=10000 ads=10000 rem=0, dmob live, jpos bit-exact).
+- doc 59 addendum. The -90% arbiter stays the mobs-25k-native CI leg; the
+  executor line (par(4) -90.5...-93.7%, doc 55) and the production 10k
+  pair now both sit at the line's doorstep on a 2-shared-vCPU box.

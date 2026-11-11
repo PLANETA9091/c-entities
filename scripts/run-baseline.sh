@@ -186,7 +186,12 @@ echo "starting server (heap $XMX) for run=$RUN scale=${SCALE:-0} hoppers=${TILE_
 # churn + EnumMap.clear + getKeys/getVariable) then eats ~6% of the JFR
 # samples and steals CPU from the server thread on a 2-vCPU box. A dumb
 # terminal (no pty) — what CI runners already get — costs nothing. BOTH A/B
-# legs share the redirect, so the pairing stays valid.
+# legs share the redirect, so the pairing stays valid. --noconsole (M2d):
+# even with the /dev/null stdin the jline PumpThread spun on the instant EOF
+# (~1.5% of the JFR samples — the reader loop never parks); the flag kills
+# the console reader outright (org.bukkit.craftbukkit.Main: ldc "noconsole").
+# The module's System.out diagnostics still land in server.log (stdout is
+# redirected); no bench path reads the console. Both legs share it — paired.
 java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitOnOutOfMemoryError \
   -XX:NativeMemoryTracking=summary \
   ${MERGE_PROP} \
@@ -195,7 +200,7 @@ java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitO
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
   -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m,stackdepth=64" \
-  -jar paper.jar nogui < /dev/null > "$R/server.log" 2>&1 &
+  -jar paper.jar nogui --noconsole < /dev/null > "$R/server.log" 2>&1 &
 JPID=$!
 
 # Forensics watchdog: a runner death (exit 143) kills the job — artifacts
