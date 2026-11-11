@@ -6048,6 +6048,12 @@ public final class CeHooks {
             gateLedgerPrint();
             mobLedgerDump();
         }
+        // N2-M0: the wholesale native-mob boundary — the player snapshot +
+        // ONE nativeMobBatch + the read-back applier; runs before the n==0
+        // return (the mob wire is independent of the item batch size).
+        if (NATIVE_MOB_ON && (level instanceof net.minecraft.server.level.ServerLevel)) {
+            nativeMobBoundary(level);
+        }
         if (n == 0) return;
         ibN = 0;
         int cdN = ibCDN;
@@ -8587,6 +8593,47 @@ public final class CeHooks {
     public static volatile boolean MOB_AI_HANDLES_OK = false;
     public static long mobAiTicks = 0, mobAiFallbacks = 0, mobAiRequests = 0,
             mobAiClassified = 0, mobAiRefused = 0, mobAiOddJava = 0;
+
+    // ===================== N2-M0: the wholesale native-mob wire =====================
+    // doc 42 N2 phase M0: the mob state lives FULLY in the Rust executor
+    // (centities_native::MobBatch — the JNI-free protocol behind mobcore.rs);
+    // Java is a COPY layer: the sight guard registers first-sight zombies and
+    // skips their serverAiStep, the boundary driver (itemTickFlush, the same
+    // per-level entity-loop-end weave the item flush rides) pushes the player
+    // snapshot, runs ONE nativeMobBatch per level tick and applies the
+    // read-back (positions, yaw, noActionTime) + the removal diff.
+    // M0 disclosures: zombie-only (the store's goal table IS the zombie
+    // table); the executor's own stroll stream; melee damage/sounds/drops are
+    // the N3 event outbox (pending); the entity ids box through HashMap
+    // (revisit at the M1 aiStep weave).
+    public static final boolean NATIVE_MOB_ON_INIT =
+            "1".equals(System.getenv("CE_NATIVE_MOB"));
+    public static volatile boolean NATIVE_MOB_ON = false;
+    public static volatile boolean NATIVE_MOB_HANDLES_OK = false;
+    public static long nmAds = 0, nmRemoves = 0, nmApplies = 0, nmGrows = 0,
+            nmTicks = 0, nmSkipped = 0;
+    private static long nmEntryProbe = 0;
+    private static final java.util.HashMap<Integer, net.minecraft.world.entity.Mob> NM_BYID =
+            new java.util.HashMap<>();
+    private static java.util.HashSet<Integer> NM_SEEN = new java.util.HashSet<>();
+    private static java.util.HashSet<Integer> NM_SEEN_TMP = new java.util.HashSet<>();
+    private static long[] NM_IDS = new long[2 * 4096];
+    private static double[] NM_POS = new double[4 * 4096];
+    private static double[] NM_PXYZ = new double[3 * 8];
+    private static int[] NM_PF = new int[2 * 8];
+    private static long O_ENT_YROT = -1;
+    /** The shared zero-delta — Vec3 is immutable in vanilla, one instance
+     *  serves every write (the item applier instantiates Vec3 directly). */
+    private static final net.minecraft.world.phys.Vec3 NM_ZERO_DELTA =
+            new net.minecraft.world.phys.Vec3(0.0, 0.0, 0.0);
+    /** The per-level saw-set: the boundary is woven per LEVEL (three calls
+     *  per server tick — one per dimension), so the removal diff must be
+     *  scoped to the mobs of THIS level or another level's boundary kills
+     *  them (the observed add/remove churn: every dimension's boundary
+     *  removed every mob it did not own). */
+    private static final java.util.HashMap<net.minecraft.world.level.Level, java.util.HashSet<Integer>> NM_SAW =
+            new java.util.HashMap<>();
+    private static final int NM_SEED_FALLBACK = 0xC0FFEE;
     // L90b: the per-tick branch counters of the AI floor — the GL line
     // prints `br=<even-ai>/<odd-java>/<odd-rust>`; the vanilla cadence
     // reference: even+oddJava+oddRust == the AI'd mob count and even ==
@@ -9402,7 +9449,244 @@ public final class CeHooks {
     }
 
     /** The floor body — the EarlyReturnGuard check for Mob.serverAiStep. */
+    /** N2-M0: the wholesale wire's handle probe — deliberately LEANER than
+     *  initMobAiHandles (the per-mob engine's pack classes are dead weight
+     *  here): the zombie gate, the yaw offset, and the re-verified shared
+     *  pieces (noActionTime for the despawn write-back, SHARED_RANDOM for
+     *  the add-time seed mirror). Sets NATIVE_MOB_HANDLES_OK. */
+    public static void initNativeMobHandles() {
+        try {
+            Class.forName("net.minecraft.world.entity.monster.zombie.Zombie");
+            O_ENT_YROT = offOf(net.minecraft.world.entity.Entity.class, "yRot");
+            if (O_ENT_DELTA < 0) {
+                O_ENT_DELTA = offOf(net.minecraft.world.entity.Entity.class, "deltaMovement");
+            }
+            if (O_MOB_NOACTION < 0) {
+                O_MOB_NOACTION = offOf(net.minecraft.world.entity.Mob.class, "noActionTime");
+            }
+            // SHARED_RANDOM resolution is SELF-CONTAINED here (the leaner
+            // probe must not assume the L22a init ran): the static field +
+            // the ceSrOriginal duck-type unwrap (the L85b parity-proxy
+            // lesson — a proxy class has no 'value' field), then the
+            // RNG value offset.
+            if (SHARED_RANDOM == null) {
+                java.lang.reflect.Field sr = net.minecraft.world.entity.Entity.class
+                        .getDeclaredField("SHARED_RANDOM");
+                sr.setAccessible(true);
+                Object s = sr.get(null);
+                try {
+                    java.lang.reflect.Method om = s.getClass().getMethod("ceSrOriginal");
+                    om.setAccessible(true);
+                    Object orig = om.invoke(s);
+                    if (orig != null) {
+                        s = orig;
+                    }
+                } catch (Throwable noWrap) { /* no harness wrap — plain path */ }
+                SHARED_RANDOM = s;
+            }
+            if (O_RNG_VALUE < 0 && SHARED_RANDOM != null) {
+                O_RNG_VALUE = offOf(SHARED_RANDOM.getClass(), "value");
+            }
+            if (SHARED_RANDOM == null || O_RNG_VALUE < 0) {
+                NATIVE_MOB_HANDLES_OK = false;
+                return;
+            }
+            NATIVE_MOB_HANDLES_OK = O_ENT_YROT >= 0 && O_MOB_NOACTION >= 0;
+        } catch (Throwable t) {
+            NATIVE_MOB_HANDLES_OK = false;
+        }
+    }
+
+    public static void setNativeMobOn(boolean on) {
+        if (on && !NATIVE_MOB_ON) {
+            // the executor's stroll-stream seed: the world's shared-random
+            // value at arm time (the bench pins 0xC0FFEE; the live server
+            // hands the real stream position)
+            long seed = 0xC0FFEEL;
+            try {
+                seed = U.getLong(SHARED_RANDOM, O_RNG_VALUE);
+            } catch (Throwable ignore) {
+            }
+            nativeMobInit(seed);
+        }
+        NATIVE_MOB_ON = on;
+    }
+
+    /** The sight guard (the serverAiStep EarlyReturnGuard's native route):
+     *  registers the first-sight zombie and skips the Java AI body. The
+     *  unaware decline keeps the t=157 byte-exactness lesson: the vanilla
+     *  aware branch draws NO randomness — the engine must never preempt it.
+     *  Non-zombies keep vanilla (M0: the store's goal table is the zombie
+     *  table). */
+    private static boolean nativeMobSight(net.minecraft.world.entity.Mob mob) {
+        if (!(mob instanceof net.minecraft.world.entity.monster.zombie.Zombie) || !mob.aware) {
+            return false;
+        }
+        int eid = entId(mob);
+        if (!NM_BYID.containsKey(eid)) {
+            long seed;
+            try {
+                seed = U.getLong(SHARED_RANDOM, O_RNG_VALUE);
+            } catch (Throwable t) {
+                seed = NM_SEED_FALLBACK;
+            }
+            nativeMobAdd(eid, seed, mob.getX(), mob.getY(), mob.getZ(), 0);
+            NM_BYID.put(eid, mob);
+            nmAds++;
+            if (nmAds == 1) {
+                // cold-path diagnostic: the FIRST live mob the wire absorbed
+                System.out.println("[c-entities] N2 sight: first native zombie id=" + eid);
+            }
+        }
+        NM_SAW.computeIfAbsent(mob.level(), k -> new java.util.HashSet<>()).add(eid);
+        nmSkipped++;
+        return true;
+    }
+
+    /** The boundary driver (itemTickFlush, after the entity loop): the
+     *  player snapshot push + ONE nativeMobBatch + the read-back applier
+     *  (positions/yaw/noActionTime) + the removal diff. Any throwable
+     *  disarms the wire globally (the store state is native-only; vanilla
+     *  resumes from the last applied positions). */
+    private static void nativeMobBoundary(net.minecraft.world.level.Level level) {
+        nmTicks++;
+        if (nmTicks == 1) {
+            // cold-path diagnostic: the driver is on the level-tick boundary
+            System.out.println("[c-entities] N2 boundary: driver live (level="
+                    + level.dimension().toString() + ")");
+        }
+        try {
+            java.util.List<? extends net.minecraft.world.entity.player.Player> ps =
+                    level.players();
+            int p = ps.size();
+            if (NM_PXYZ.length < p * 3) {
+                NM_PXYZ = new double[Math.max(p * 3, NM_PXYZ.length * 2)];
+                NM_PF = new int[NM_PXYZ.length / 3 * 2];
+                nmGrows++;
+            }
+            for (int i = 0; i < p; i++) {
+                net.minecraft.world.entity.player.Player pl = ps.get(i);
+                NM_PXYZ[i * 3] = pl.getX();
+                NM_PXYZ[i * 3 + 1] = pl.getY();
+                NM_PXYZ[i * 3 + 2] = pl.getZ();
+                NM_PF[i * 2] = pl.getId();
+                NM_PF[i * 2 + 1] = (pl.isAlive() && !pl.isSpectator()) ? 1 : 0;
+            }
+            nativeMobPlayers(NM_PXYZ, NM_PF);
+            int n = nativeMobBatch(CUR_TICK, NM_IDS, NM_POS);
+            if (n < 0) {
+                int need = -n;
+                if (NM_IDS.length < need * 2) {
+                    int cap = 2 * need * 2;
+                    NM_IDS = new long[cap];
+                    NM_POS = new double[cap * 2];
+                    nmGrows++;
+                }
+                return; // the read-back lags one tick (population jump)
+            }
+            // the applier: positions are the native truth; the same-value
+            // skips keep the parked population free of setPos cascades
+            if (n > 0 && nmApplies == 0) {
+                // cold-path diagnostic: the first live read-back
+                System.out.println("[c-entities] N2 boundary: first read-back n=" + n);
+            }
+            NM_SEEN_TMP.clear();
+            for (int i = 0; i < n; i++) {
+                int eid = (int) NM_IDS[2 * i];
+                int noAct = (int) NM_IDS[2 * i + 1];
+                Integer key = eid;
+                NM_SEEN_TMP.add(key);
+                net.minecraft.world.entity.Mob m = NM_BYID.get(key);
+                if (m == null) {
+                    continue; // removed Java-side mid-tick; the store diff cleans
+                }
+                if (U.getInt(m, O_MOB_NOACTION) != noAct) {
+                    U.putInt(m, O_MOB_NOACTION, noAct);
+                }
+                float yw = (float) NM_POS[4 * i + 3];
+                if (U.getFloat(m, O_ENT_YROT) != yw) {
+                    U.putFloat(m, O_ENT_YROT, yw);
+                }
+                // M0 kinematics: the native truth owns the state — the
+                // vanilla residual physics (gravity on a stale delta) must
+                // never integrate against the applier's positions (the
+                // tug-of-war accumulates fall distance and KILLS the mob:
+                // the re-snapped landings dealt 5 dmg/s). The Motion zero +
+                // the fallDistance zero cap the vanilla residual at one
+                // 0.08-step wobble per tick (never a landing, never damage).
+                Object d = U.getObject(m, O_ENT_DELTA);
+                if (!(d instanceof net.minecraft.world.phys.Vec3 v3)
+                        || v3.x != 0.0 || v3.y != 0.0 || v3.z != 0.0) {
+                    U.putObjectVolatile(m, O_ENT_DELTA, NM_ZERO_DELTA);
+                }
+                if (m.fallDistance != 0.0) {
+                    m.fallDistance = 0.0;
+                }
+                double px = NM_POS[4 * i], py = NM_POS[4 * i + 1], pz = NM_POS[4 * i + 2];
+                if (Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
+                        && (px != m.getX() || py != m.getY() || pz != m.getZ())) {
+                    m.setPos(px, py, pz);
+                }
+                nmApplies++;
+            }
+            // the removal driver: a mob of THIS level the guard did not see
+            // this tick is gone Java-side (death, discard, chunk unload) —
+            // the store must follow. (The read-back diff alone can never see
+            // a Java-side death: the store keeps ticking the dead id
+            // forever.) Other levels' mobs are THEIR boundary's business.
+            java.util.HashSet<Integer> saw = NM_SAW.get(level);
+            if (saw != null) {
+                for (java.util.Map.Entry<Integer, net.minecraft.world.entity.Mob> en : NM_BYID.entrySet()) {
+                    net.minecraft.world.entity.Mob sm = en.getValue();
+                    if (sm != null && sm.level() == level && !saw.contains(en.getKey())) {
+                        nativeMobRemove((long) en.getKey());
+                        nmRemoves++;
+                    }
+                }
+                NM_BYID.entrySet().removeIf(en -> {
+                    net.minecraft.world.entity.Mob sm = en.getValue();
+                    return sm != null && sm.level() == level && !saw.contains(en.getKey());
+                });
+                saw.clear();
+            }
+            java.util.HashSet<Integer> t = NM_SEEN;
+            NM_SEEN = NM_SEEN_TMP;
+            NM_SEEN_TMP = t;
+            if (n > 0 && (nmTicks % 200) == 0) {
+                // periodic diagnostic: the wire's state every ~10s
+                System.out.println("[c-entities] N2 poll: n=" + n
+                        + " ads=" + nmAds + " rem=" + nmRemoves
+                        + " appl=" + nmApplies
+                        + " id0=" + NM_IDS[0]
+                        + " p=" + NM_POS[0] + "," + NM_POS[1] + "," + NM_POS[2]
+                        + " jpos=" + (NM_BYID.get((int) NM_IDS[0]) == null ? "gone"
+                            : (NM_BYID.get((int) NM_IDS[0]).getX() + ","
+                                + NM_BYID.get((int) NM_IDS[0]).getY() + ","
+                                + NM_BYID.get((int) NM_IDS[0]).getZ())));
+            }
+        } catch (Throwable t) {
+            NATIVE_MOB_ON = false;
+            lastError = System.nanoTime();
+            lastErrorText = "nativeMobBoundary: " + t;
+            System.out.println("[c-entities] N2 boundary FAILED: " + t);
+        }
+    }
+
     public static boolean mobAiFloor(net.minecraft.world.entity.Mob mob) {
+        if (nmEntryProbe++ == 0) {
+            // cold-path probe: the FIRST guard entry tells whether the weave
+            // is live at all and what the unaware/flags reality is
+            System.out.println("[c-entities] N2 probe: guard entered, native="
+                    + NATIVE_MOB_ON + " ok=" + NATIVE_MOB_HANDLES_OK
+                    + " aware=" + mob.aware + " cls=" + mob.getClass().getName());
+        }
+        // N2-M0: the wholesale wire routes FIRST — before the L22a gates
+        // (the native path needs only NATIVE_MOB_HANDLES_OK; the per-mob
+        // engine's MOB_AI_HANDLES_OK / VH_GS_DISABLED requirements are its
+        // own). A decline falls through to the L22a/vanilla gates unchanged.
+        if (NATIVE_MOB_ON && NATIVE_MOB_HANDLES_OK) {
+            return nativeMobSight(mob);
+        }
         // VH_GS_DISABLED (GoalSelector.goalTypes) is resolved by the L15
         // initAIHandles — a DIFFERENT init than initMobAiHandles. With the
         // L15 GoalSelector floor shipped off (aiFloor=0) it stays null while
@@ -10106,6 +10390,15 @@ public final class CeHooks {
     /** The native goal engine (centities-core/src/goals.rs) — returns
      *  ST_DONE / ST_REQUEST / ST_FALLBACK and fills out. */
     public static native int nativeMobAiFloor(int[] in, int[] out);
+
+    // N2-M0: the wholesale native-mob wire (mobcore.rs — the shim over the
+    // tested MobBatch protocol; the whole batch crosses JNI once per tick).
+    public static native void nativeMobInit(long seed);
+    public static native void nativeMobReset();
+    public static native int nativeMobAdd(int eid, long seed, double x, double y, double z, int kind);
+    public static native int nativeMobRemove(long eid);
+    public static native void nativeMobPlayers(double[] xyz, int[] pf);
+    public static native int nativeMobBatch(int gameTick, long[] ids, double[] pos);
 
     /** L89: the gate ledger — per-class canUse census (evals/no/staged/rolls
      *  for the GK_* classes 0..8, 36 ints) collected by the engine while

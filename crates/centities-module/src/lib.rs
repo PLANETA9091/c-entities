@@ -13,6 +13,8 @@
 
 pub mod itemcore;
 #[doc(hidden)]
+pub mod mobcore;
+#[doc(hidden)]
 pub mod patch;
 pub use centities_core::pushcore;
 
@@ -2612,14 +2614,25 @@ fn delta_spec() -> cplug_sdk::asm::EarlyReturnGuard2<'static> {
 /// L15 GoalSelector floor do not overlap: a floored mob never reaches the
 /// GoalSelector bodies.
 fn precompute_mob(loader: jni::jobject) {
-    if read_java_flag("MOB_AI_ON_INIT") != Some(true) {
+    // N2-M0: CE_NATIVE_MOB=1 arms the wholesale wire on the SAME weave (the
+    // serverAiStep EarlyReturnGuard) — with its own leaner handle probe; the
+    // L22a per-mob engine stays the path when centities.mobAi is set (the
+    // native route wins inside mobAiFloor when both are armed).
+    let mob_ai = read_java_flag("MOB_AI_ON_INIT") == Some(true);
+    let native_mob = read_java_flag("NATIVE_MOB_ON_INIT") == Some(true);
+    if !mob_ai && !native_mob {
         MOB_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
-            "[c-entities] mob AI floor disabled (centities.mobAi) — vanilla serverAiStep kept",
+            "[c-entities] mob AI floor disabled (centities.mobAi / CE_NATIVE_MOB) — vanilla serverAiStep kept",
         );
         return;
     }
-    if prove_handles("initMobAiHandles", "MOB_AI_HANDLES_OK") != Some(true) {
+    let (init_name, ok_name) = if native_mob && !mob_ai {
+        ("initNativeMobHandles", "NATIVE_MOB_HANDLES_OK")
+    } else {
+        ("initMobAiHandles", "MOB_AI_HANDLES_OK")
+    };
+    if prove_handles(init_name, ok_name) != Some(true) {
         MOB_DECLINED.store(true, Ordering::Release);
         cplug_sdk::log::info(
             "[c-entities] mob AI floor handle probe failed — vanilla serverAiStep kept",
@@ -2648,7 +2661,14 @@ fn precompute_mob(loader: jni::jobject) {
                 pc.insert(MOB_CLASS, weave_burn_probe(b));
             }
             MOB_WOVEN.store(true, Ordering::Release);
-            if set_java_bool("setMobAiOn", true) {
+            if native_mob && !mob_ai {
+                if set_java_bool("setNativeMobOn", true) {
+                    MOB_ARMED.store(true, Ordering::Release);
+                    cplug_sdk::log::info(
+                        "[c-entities] precomputed + armed the WHOLESALE native mob executor (N2-M0)",
+                    );
+                }
+            } else if set_java_bool("setMobAiOn", true) {
                 MOB_ARMED.store(true, Ordering::Release);
                 cplug_sdk::log::info("[c-entities] precomputed + armed the Mob AI floor");
             }
@@ -3599,6 +3619,60 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         "(I)[J",
         n_mob_ledger_take
             as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jlongArray
+    );
+    // N2-M0: the wholesale native-mob wire (mobcore.rs — the shim over the
+    // tested MobBatch protocol; the Java side gates on CE_NATIVE_MOB=1).
+    push!(
+        "nativeMobInit",
+        "(J)V",
+        crate::mobcore::n_mob_init
+            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64)
+    );
+    push!(
+        "nativeMobReset",
+        "()V",
+        crate::mobcore::n_mob_reset as extern "system" fn(*mut jni::JNIEnv, jni::jclass)
+    );
+    push!(
+        "nativeMobAdd",
+        "(IJDDDI)I",
+        crate::mobcore::n_mob_add as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+            i64,
+            f64,
+            f64,
+            f64,
+            i32,
+        ) -> i32
+    );
+    push!(
+        "nativeMobRemove",
+        "(J)I",
+        crate::mobcore::n_mob_remove
+            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64) -> i32
+    );
+    push!(
+        "nativeMobPlayers",
+        "([D[I)V",
+        crate::mobcore::n_mob_players as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            jni::jdoubleArray,
+            jni::jintArray,
+        )
+    );
+    push!(
+        "nativeMobBatch",
+        "(I[J[D)I",
+        crate::mobcore::n_mob_batch as extern "system" fn(
+            *mut jni::JNIEnv,
+            jni::jclass,
+            i32,
+            jni::jlongArray,
+            jni::jdoubleArray,
+        ) -> i32
     );
     match env.register_natives(cls, &methods) {
         Ok(()) => {

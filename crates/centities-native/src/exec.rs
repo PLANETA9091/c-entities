@@ -294,6 +294,13 @@ impl NativeTick {
         }
     }
 
+    /// N2-M0 batch wire: the last tick's stats (the same reused buffer
+    /// `tick` borrows — the batch layer reads it AFTER its own tick call
+    /// for the ledger/diagnostics and the twin tests).
+    pub fn last_stats(&self) -> &[AiStat] {
+        &self.stats_buf
+    }
+
     /// The whole managed tick. Returns the per-mob AI accounting — a
     /// borrow of the executor's REUSED stats buffer (wave3: the old code
     /// allocated a fresh 25k-slot Vec — ~1.2 MB — every tick; the buffer

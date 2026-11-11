@@ -41,6 +41,13 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeMobLedgerTake", "(I)[J"));
     // L89: the gate ledger — per-class canUse census read+reset
     s.insert(("nativeGlTake", "(I)[I"));
+    // N2-M0: the wholesale native-mob wire (mobcore.rs — MobBatch shim)
+    s.insert(("nativeMobInit", "(J)V"));
+    s.insert(("nativeMobReset", "()V"));
+    s.insert(("nativeMobAdd", "(IJDDDI)I"));
+    s.insert(("nativeMobRemove", "(J)I"));
+    s.insert(("nativeMobPlayers", "([D[I)V"));
+    s.insert(("nativeMobBatch", "(I[J[D)I"));
     s
 }
 

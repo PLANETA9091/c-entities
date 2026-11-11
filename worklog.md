@@ -453,3 +453,23 @@ Work Log:
 Stage Summary:
 - Параллельный executor: серийные фрагменты 0.44 → 0.14ms; −85% на 2 vCPU, −91.6% на 4 ядрах (проекция), −95% на 8.
 - Док 55 (docs/research/55-wave15-f-kill.md). Следующие рычаги: travel бит-заперт (atan2/sqrt — vanilla-модель), AI floor выжат волнами 5–13; остаток W — eval+клон+travel ≈ 2.3ms.
+
+---
+Task ID: 25
+Agent: main (Z.ai)
+Task: N2-M0 — wholesale JNI-провод мобов: один вызов на тик, Java = COPY-слой (док 56)
+
+Work Log:
+- СВЕЖИЕ ЧИСЛА post-wave15c (2 vCPU, 25k×400): PAR 1.27/1.18/1.16 vs SER 1.76/1.75/1.75 (−28…−34%; к ваниле 8.41 = −85…−86.2%); 100k: 4.80 vs 6.91; T1 2.19/T2 1.26 → F≈0.33, W≈1.86; par(4) ≈ 0.53–0.80 = −90.5…−93.7%. ДЕКОМПОЗИЦИЯ W сходится байт-в-байт: клон+протокол 0.25 + AI-флор 0.56 + travel 0.45 = 1.26. SoA-гипотеза УМЕРЛА: L3=504МБ — рабочий сет 2×6.2МБ резидентен, pass1 compute-bound. Бенч-форма исчерпана → рычаг = продакшн-фаза.
+- РАЗРЫВ: centities-native НЕ имел ни одного JNI-экспорта; единственный прод-провод мобов — пермобный L22a-флор (инт-массивные раунды на моба — форма, которую бенч похоронил). Док 42 §8: без N2 прод-клейм запрещён. → N2-M0.
+- ПРОТОКОЛ (batch.rs, centities-native, JNI-free): MobBatch над proven NativeTick (параллельный arm включён) — init/add(eid,seed,x,y,z)/remove/set_players/tick(gt,ids,pos)→Ok(n)|Err(needed); read-back: ids[2i]=eid, ids[2i+1]=nav<<32|no_action, pos[4i]=x,y,z,yaw; truncation = Err(pop) без записи. ГЕЙТ: twin batch_matches_direct_executor — 64 зомби × 400 тиков, статс-стрим PartialEq КАЖДЫЙ тик, read-back == полям стора КАЖДЫЙ тик, FNV (22 слова + все goal-рекорды) равен в конце. +3 теста (add/remove/re-add, truncation, players-echo). NativeTick получил last_stats().
+- JNI-КЛЕЙ (mobcore.rs, centities-module): 6 нативов на HOOKS_CLASS (Init(J)V/Reset()V/Add(IJDDDI)I/Remove(J)I/Players([D[I)V/Batch(I[J[D)I); thread-local executor + scratch, ноль аллокаций в steady-state; тик происходит ВСЕГДА, read-back может отстать на тик при скачке популяции (возврат −pop).
+- JAVA (CeHooks, гейт CE_NATIVE_MOB=1, DEFAULT OFF — шиппед-конфиг не тронут): arm через ТОТ ЖЕ serverAiStep EarlyReturnGuard + ЛЕГКИЙ initNativeMobHandles (zombie/yRot/deltaMovement/noActionTime/SHARED_RANDOM с ceSrOriginal-unwrap); sight = первый маршрут guard'а (ДО L22a-гейтов): zombie+aware → add при первом взгляде + skip тела; boundary = itemTickFlush (граница тика уровня, до n==0-выхода): push игроков → ОДИН nativeMobBatch → аплаер (noActionTime/yRot Unsafe same-value skip, Motion→0 (общий immutable Vec3), fallDistance→0, setPos при изменении) + removal по guard-saw.
+- ЧЕТЫРЕ ЖИВЫХ БАГА, УБИТЫХ НА СМОКЕ (живой Paper 26.3 + агент, консоль-summon): (1) thread-local раскол arm/тик — executor создавался на init-потоке, серверный видел None, add молча −1 → lazy-init из atomic seed; (2) кинематическое перетягивание: ванильная гравитация на старой дельте × снап-позиции аплаера = накопленный fall_distance, 5 dmg/s, смерть за 3с (NBT: OnGround=0, Motion=−0.304, fd=0.464) → аплаер владеет кинематикой (Motion→0/fd→0/pos); (3) кросс-левел-убийца: itemTickFlush плетётся на КАЖДЫЙ уровень (3 вызова/тик), глобальный saw-set давал churn 1276 add/1275 remove за 2551 тик → saw-set per-level (m.level()==level); (4) removal-driver: read-back diff НИКОГДА не видит Java-смерть (стор водил мёртвый объект) → драйвер = guard-saw-set.
+- ЖИВОЙ ПРУФ: «armed the WHOLESALE native mob executor (N2-M0)» + n=1 ads=1 rem=0 за ~1400 тиков + jpos == нативной позиции БИТ-В-БИТ на каждом полле + Health 20.0 стабильно + stroll-походка (walk→arrive→pause→walk). sum: summon → guard-skip → JNI-add → нативный тик (параллельный executor!) → read-back → аплаер — ЗАМКНУТО.
+- НАЙДЕНО (пре-существующее, НЕ N2): @e[type=zombie] пуст с модулем при живом тикающем зомби (ваниль находит; untyped @e работает) — подозреваемые: Level.getEntities/getEntitiesOfClass rewrites item-индекса; один SIGILL в CRUSSTY class_file_load_hook на самом первом boot'е (worldgen-late thread), не воспроизвёлся в трёх следующих — флейт песочницы.
+- ТЕСТЫ: 116 зелёных (native 24 + module 14 + swarm-sim 22 + core 49 + swarm-core 7, +1 ignored phase_probe); natives_parity-страж дополнен 6 дескрипторами. Коммит на main.
+
+Stage Summary:
+- N2-M0 LAND: протокол (JNI-free, twin-гейт) + JNI-клей + Java copy-layer (гейт CE_NATIVE_MOB, default OFF). Один JNI-переход на уровень-тик вместо пермобных раундов. Живой сервер: замкнутая петля без churn, бит-точный синк, выживание.
+- Следующее: M1 (aiStep-weave — полный скип Java-тела), M2 (e2e-стенд под гейтами: перф-ноги с ботом + JFR), M3 (N3 event-outbox: урон/звуки/дропы), N4 (транскрипты на границе executor'а).
