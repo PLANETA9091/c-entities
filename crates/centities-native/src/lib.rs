@@ -37,6 +37,7 @@
 //! they change WHERE mobs walk, never the tick cost structure. The crate
 //! states this in its API (`WorldRes::open_ground_v0` is a named constructor).
 pub mod batch;
+pub mod despawn;
 pub mod exec;
 pub mod facts;
 pub mod profile;
