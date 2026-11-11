@@ -48,6 +48,12 @@ jobs:
           - { name: items-25k,  SCALE: 25000,  PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: mobs-10k,   SCALE: 10000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: mobs-25k,   SCALE: 25000,  PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0,     TILE_F: 0,     MEASURE: 600, AB: '1' }
+          # N2-M2: the native wire under load — the SAME mobs-25k scenario,
+          # the mod leg boots with CE_NATIVE_MOB=1 (the wholesale executor:
+          # one JNI crossing per level tick, the whole Java mob body skipped).
+          # The bot activates the fill zombies (100% duty) — the production
+          # mspt line for the -90% goal lives here.
+          - { name: mobs-25k-native, SCALE: 25000, PCT_ITEMS: 0.0, PCT_STANDS: 0.0, TILE_H: 0, TILE_F: 0, MEASURE: 600, AB: '1', EXTRA: 'CE_NATIVE_MOB=1' }
           - { name: mixed-50k,  SCALE: 50000,  PCT_ITEMS: 0.7, PCT_STANDS: 0.2, TILE_H: 0,     TILE_F: 0,     MEASURE: 600 }
           - { name: tiles-25k,  SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 15000, TILE_F: 10000, MEASURE: 600 }
           - { name: tiles-100k, SCALE: 0,      PCT_ITEMS: 1.0, PCT_STANDS: 0.0, TILE_H: 60000, TILE_F: 40000, MEASURE: 600 }
@@ -120,7 +126,7 @@ jobs:
         if: matrix.AB == '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: |
           bash scripts/run-baseline.sh
-          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} ${{ github.event.inputs.ce_extra_env || '' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
+          MODULE=on CE_ITEM_TICK=${{ github.event.inputs.ce_item_tick || '1' }} CE_MERGE=${{ github.event.inputs.ce_merge || '1' }} ${{ matrix.EXTRA || github.event.inputs.ce_extra_env || '' }} RUN_NAME=${{ matrix.name }}-mod bash scripts/run-baseline.sh
       - name: Run baseline
         if: matrix.AB != '1' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only == '' || contains(github.event.inputs.only, matrix.name))
         run: bash scripts/run-baseline.sh

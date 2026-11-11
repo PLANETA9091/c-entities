@@ -185,3 +185,31 @@ fires). JFR after both waves: server-thread samples 999 → 790 → 504 over
 equal windows; the remaining mob-attributable server time is the applier
 (boundary 13.5%) and the tracker's data reads (~8%, needed for real
 players).
+
+## Addendum 2 — the first production A/B (the real runner, the real bot)
+
+`scripts/run-baseline.sh` executed locally end-to-end (2 vCPU sandbox, 4 GB
+box, the mineflayer bot via ViaVersion — a PLAYER in the world, 100%
+activation duty, the plugin fill: 10000 persistent helmeted zombies around
+the spawn, measure window 300 ticks, JFR):
+
+| leg | MSPT p50 | p90 | mean | TPS est. |
+|---|---:|---:|---:|---:|
+| vanilla (module off) | 174.7 | 313.9 | 179.9 | 5.7 |
+| **native M1.5 wire (CE_NATIVE_MOB=1)** | **49.6** | 119.0 | 65.1 | **20.0** |
+
+**−71.6% mspt p50 at 10k mobs, player-present, full duty.** The wire state
+across the whole native run: `n=10000 ads=10000 rem=0` — every fill zombie
+classified at its FIRST tick (the M1.5 route), zero churn, zero boundary
+failures, jpos bit-exact. The gap to the −90% line at 10k (17.5 ms) is the
+tracker's data reads (~8% of the server thread at 2k — scales) plus the
+applier's setPos for a walking population — the M2 CI legs (4 vCPU, 25k,
+mobs-25k-native matrix row added) carry the next measurement; the
+tracker/boundary shave is the next wave if the 25k numbers demand it.
+
+Infra notes: background processes are reaped between tool calls in this
+sandbox (the whole leg must run inside one call); a double `PATH=` in one
+`export` statement expands both against the ORIGINAL PATH — the runner
+silently got Java 21 and Paper's gate refused it; separate export lines.
+ViaVersion/ViaBackwards resolved from Hangar (the GitHub release asset
+names 404 on `latest/download`).
