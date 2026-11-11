@@ -7130,6 +7130,10 @@ public final class CeHooks {
                 // itemDispatch chain (mode table + fresh-flag belt + activation),
                 // and a false keeps the vanilla accept path exactly as before.
                 boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
+                // M2e: the mob fast route gate — computed once per walk (the
+                // retry body keeps the identical shape below)
+                final boolean mobRoute = !MOB_WALK_RAW && ACTIVE && cplugReady
+                        && NATIVE_MOB_ON && NATIVE_MOB_HANDLES_OK;
                 // TLO (addendum 17): the ACTUAL walk order at PD ticks — the
                 // plugin's TL stream reads the same raw array, so this line
                 // must be IDENTICAL to the OFF leg's TL at the mapped tick
@@ -7153,6 +7157,23 @@ public final class CeHooks {
                         if (collect && e instanceof ItemEntity
                                 && itemDispatch((ItemEntity) e)) {
                             continue; // native flush computes this tick
+                        }
+                        // M2e: the native MOB fast route — the same decision
+                        // chain the M2a dispatcher guard runs (residency +
+                        // passenger-less), one level UP: the vanilla lambda
+                        // (isRemoved read, the checkDespawn entry the M2c
+                        // weave already kills, the tickNonPassenger entry and
+                        // the M2a guard's own prologue) is dead weight for a
+                        // classified mob — the wire is the ticker, the applier
+                        // owns the kinematics and the tickCount mirror. No
+                        // list-membership change: disarm (mobRoute false)
+                        // routes the vanilla lambda again, zero bookkeeping.
+                        // Unaware/unclassified/non-zombie mobs decline inside
+                        // nativeMobTick and take the exact vanilla path.
+                        if (mobRoute && e instanceof net.minecraft.world.entity.Mob m
+                                && m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                            walkMobNative++;
+                            continue; // the wire computes this mob at the flush
                         }
                         consumer.accept(e);
                     }
@@ -7185,11 +7206,18 @@ public final class CeHooks {
                     set.createRawIterator();
                     try {
                         boolean collect = ACTIVE && ITEM_TICK_ON && cplugReady;
+                        final boolean mobRoute = !MOB_WALK_RAW && ACTIVE && cplugReady
+                                && NATIVE_MOB_ON && NATIVE_MOB_HANDLES_OK;
                         for (int i = 0; i < maxIndex; i++) {
                             Object o = arr[i];
                             if (o instanceof Entity e) {
                                 if (collect && e instanceof ItemEntity
                                         && itemDispatch((ItemEntity) e)) {
+                                    continue;
+                                }
+                                if (mobRoute && e instanceof net.minecraft.world.entity.Mob m
+                                        && m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                                    walkMobNative++;
                                     continue;
                                 }
                                 consumer.accept(e);
@@ -8643,6 +8671,14 @@ public final class CeHooks {
     public static volatile boolean NATIVE_MOB_HANDLES_OK = false;
     public static long nmAds = 0, nmRemoves = 0, nmApplies = 0, nmGrows = 0,
             nmTicks = 0, nmSkipped = 0;
+    /** M2e: the walk fast route refuses (bisect knob, mirrors
+     *  centities.tickListRaw) — vanilla lambda resumes for every mob. */
+    public static final boolean MOB_WALK_RAW =
+            "true".equals(System.getProperty("centities.mobWalkRaw", "false"));
+    /** M2e counter: natives routed straight from the walk mirror (the
+     *  lambda + isRemoved + checkDespawn + tickNonPassenger + the M2a
+     *  guard chain all SKIPPED — the frames were dead since M1.5/M2a). */
+    public static volatile long walkMobNative = 0;
     private static long nmEntryProbe = 0;
     private static long nmStepProbe = 0;
     private static long nmTickProbe = 0;
@@ -9945,6 +9981,7 @@ public final class CeHooks {
                 System.out.println("[c-entities] N2 poll: n=" + n
                         + " ads=" + nmAds + " rem=" + nmRemoves
                         + " skip=" + nmSkipped
+                        + " walk=" + walkMobNative
                         + " appl=" + nmApplies
                         + " dmob=" + dispMobNative
                         + " id0=" + NM_IDS[0]
