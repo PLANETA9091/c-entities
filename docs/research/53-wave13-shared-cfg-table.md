@@ -67,8 +67,24 @@ FMA variant bit-exactly. Closed without code.
 - skeleton ~0.12 ms: the fused loop + the ledger instrumentation
   (fences ~2 ns/mob when the probe is off).
 - cache interference ~0.2 ms: the fused single pass streams 25k ×
-  260 B = 6.5 MB through one core's L3 — was 9.8 MB pre-wave13.
+  252 B = 6.3 MB through one core's L3 — was 9.8 MB pre-wave13.
 
 The next honest magnitude still needs a relaxed constraint, but the
 floor moved: **~1.6-1.7 → ~1.5-1.6 ms at 25k** within the standing
 constraints.
+
+## wave13b+c addendum (fc60292)
+
+- **b — the n==0 apply hoist**: the empty action list (the majority
+  case) paid a full non-inlined `apply_actions` call (~10 ns) for one
+  `out[5]` load; the early-out rides the caller. The AI-slice
+  decomposition dropped 1.20 → 1.11 (−7.5% of the AI row); the full
+  tick ties on p50 (the load was cache-hot in the fused pass).
+- **c — the pack_fp field dies** (260 → 252 B/mob): the fp was
+  immutable per mob and identical across mobs; the z0 gate term folds
+  to compile-time `ZOMBIE_FP == ZOMBIE_FP` — the resident table is the
+  zombie shape BY CONSTRUCTION. `static_fp`/`ZOMBIE_FP` stay as the
+  classification oracle; the fp-sensitivity test compares the mutated
+  table against the constant.
+- Census 3745 == 3745; 104 suites green; A/B vs wave13a: statistical
+  tie on p50 — kept for the struct shrink + the dead-load removal.
