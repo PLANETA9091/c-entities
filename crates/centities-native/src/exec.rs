@@ -121,8 +121,10 @@ pub struct NativeTick {
     assign_buf: Vec<u64>,
     drawer_list: Vec<(u32, u32)>,
     bufs: Vec<WorkerBufs>,
-    /// WAVE14: the parallel-arm switch (default OFF until the twin gate
-    /// proves the arm; the bench/CI flips it through set_parallel).
+    /// WAVE14: the parallel-arm switch — the PRODUCTION DEFAULT (the twin
+    /// gate proved the arm bit-identical; the dispatch falls back to
+    /// serial for the twin-only shapes). `set_parallel(false)` / CE_SER=1
+    /// restores the serial fused walk (the A/B arm).
     parallel: bool,
 }
 
@@ -150,7 +152,7 @@ impl NativeTick {
             assign_buf: Vec::new(),
             drawer_list: Vec::new(),
             bufs: Vec::new(),
-            parallel: false,
+            parallel: true,
         }
     }
 
@@ -513,7 +515,14 @@ impl NativeTick {
         self.stats_buf.resize(alive_len, AiStat::default());
 
         let nthreads = rayon::current_num_threads().max(1);
-        let chunk = (n / (nthreads * 2)).clamp(256, 8192).max(1);
+        // the job-count knob: more, smaller jobs = better load balance (the
+        // chaser mobs cost more than the idlers); the rayon overhead per
+        // job stays in the noise down to ~1k mobs per job
+        let jobs = std::env::var("CE_JOBS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        let chunk = (n / (nthreads * jobs)).clamp(256, 8192).max(1);
         let nchunks = n.div_ceil(chunk);
         if self.bufs.len() != nchunks {
             // the resize keeps the GROWN buffers (scratch/out/pack) alive

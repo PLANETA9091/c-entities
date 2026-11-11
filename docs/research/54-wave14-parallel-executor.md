@@ -105,3 +105,16 @@ and 8 real cores; the box in hand (2 vCPUs) tops out at 1.49.
   threads while the compute divides).
 - vs the vanilla 8.41: **1.49 = −82.3%** at 2 cores; the 8-core projection
   crosses the −90% line.
+
+## The production default (the addendum)
+
+The parallel arm IS the default now (`parallel: true` in `NativeTick::new`;
+the dispatch still falls back to serial for the twin-only shapes). The A/B
+knob flipped accordingly: **CE_SER=1** restores the serial fused walk. All
+126 suites run green with the parallel default — the twins cover the arm,
+and the remaining executor tests now exercise it by default. Final
+interleave (default=parallel vs CE_SER): 1.49 / 1.50 / 1.48 vs 1.79 / 1.80
+/ 1.79; 100k × 400 parallel: 5.67. The job-granularity knob (`CE_JOBS`,
+the jobs-per-thread multiplier for the chunk sizing) measured flat 1.54-
+1.57 across 2/4/8/16 on the 2-core box — kept as the real-host tuning
+dial.
