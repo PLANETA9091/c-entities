@@ -10074,6 +10074,7 @@ public final class CeHooks {
                         + " skip=" + nmSkipped
                         + " walk=" + walkMobNative
                         + " appl=" + nmApplies
+                        + " dsp=" + nmDespawns
                         + " dmob=" + dispMobNative
                         + " id0=" + NM_IDS[0]
                         + " p=" + NM_POS[0] + "," + NM_POS[1] + "," + NM_POS[2]
