@@ -92,6 +92,8 @@ fn flat_env() -> TickEnv {
         border_min_z: -29_999_984.0,
         border_max_z: 29_999_984.0,
         border_margin: 2.0,
+            cur_tick: 0,
+            verdict_owned: false,
     }
 }
 

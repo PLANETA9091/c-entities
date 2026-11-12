@@ -43,6 +43,8 @@ fn main() {
         border_min_z: -29_999_984.0,
         border_max_z: 29_999_984.0,
         border_margin: 2.0,
+            cur_tick: 0,
+            verdict_owned: false,
     };
 
     // items in a 150x150 block area, falling from y=50 onto a floor at y=0
@@ -56,6 +58,9 @@ fn main() {
             y,
             z: fz,
             dx: 0.0,
+            activated_tick: 0,
+            default_activation: false,
+            is_temp: false,
             dy: 0.0,
             dz: 0.0,
             xo: fx,

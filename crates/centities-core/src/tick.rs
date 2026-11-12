@@ -87,6 +87,18 @@ pub struct ItemState {
     pub land_fall: f32,
     /// frictionState == TriState.FALSE (f = 1.0 exact; else block friction).
     pub friction_disabled: bool,
+    /// i0-a2 (doc 62): the activation mirror. activatedTick rides the
+    /// port's immunity stamps (cur + i); for native items the vanilla
+    /// sweep is out of the picture (playerless verdict ownership — the
+    /// sweep iterates level.players(), empty there; the player-present
+    /// worlds keep the Java port authoritative until the sweep
+    /// replication crosses the wire). defaultActivationState is a
+    /// per-entity constant. isTemporarilyActive is write-only state for
+    /// items (no readers outside the suppressed move path) — mirrored
+    /// so the Java field stays value-exact for the belt ticks.
+    pub activated_tick: i64,
+    pub default_activation: bool,
+    pub is_temp: bool,
 }
 
 impl ItemState {
@@ -120,6 +132,9 @@ impl ItemState {
             fr_step_special: false,
             land_fall: 0.0,
             friction_disabled: false,
+            activated_tick: 0,
+            default_activation: false,
+            is_temp: false,
         }
     }
 }
@@ -146,6 +161,16 @@ pub struct TickEnv {
     pub border_min_z: f64,
     pub border_max_z: f64,
     pub border_margin: f64,
+    /// i0-a2 (doc 62): MinecraftServer.currentTick — the activation
+    /// verdict's clock. 0 in the engine unit tests (the fixtures pin
+    /// activated_tick explicitly).
+    pub cur_tick: i32,
+    /// i0-a2: the verdict ownership gate — TRUE only for playerless
+    /// worlds (the vanilla sweep iterates level.players(); empty there
+    /// means the port is the ONLY activatedTick writer and the mirror
+    /// is authoritative). Player-present worlds keep the Java port
+    /// until the sweep replication crosses the wire.
+    pub verdict_owned: bool,
 }
 
 impl TickEnv {
