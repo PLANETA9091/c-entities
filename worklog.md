@@ -774,3 +774,54 @@ Stage Summary:
   counter, the populations self-apply, but the mob AI advances 3x per
   server tick on ANY real server) — the worklog's per-level cfg state
   item, now proven structural.
+
+---
+Task ID: 17
+Agent: main (Z.ai)
+Task: N3-N1 phase-2d live (the per-level executor split) + the dsp poll ride
+
+Work Log:
+- Phase-2d (44d84ea): THE PER-LEVEL EXECUTOR SPLIT — itemTickFlush is
+  woven PER LEVEL, so the ONE executor ticked the whole mob store 3x per
+  server tick (3 worlds boot: overworld + nether + the_end; no
+  allow-nether=false in the bench). The split gives each level its own
+  executor slot + per-level cfg state; the saw-set hid it from the walk
+  counter, the populations self-applied, but the mob AI advanced 3x per
+  server tick on any real server. Closed by construction: the per-level
+  wire drops the redundant crossings AND the 3x tick.
+- The dsp counter rides the N2 poll line (dc3e150): the phase-2b LIVE
+  smoke on a bot-present boot — 9 native hard-despawns fired (dsp=9),
+  the survivors stayed, jpos bit-exact, the per-level cfg printed per
+  level (3 worlds). The despawn decision is LIVE on the real server.
+- Sandbox re-verified on dc3e150 (2 vCPU): the whole workspace green
+  (17 suites), the 25k bench p50 1.26 ms/tick (−85.0% vs the 8.41
+  bench origin), shapes even_z0 54.5% / even_z1 45.5% / gen 0.
+- CI forensics: no baseline-results commit after Nov 8 — the publish
+  fix (HEAD:main) + the watchdog raise (RUN_TIMEOUT 3600, job timeout
+  330) were already ON main; the Nov-8 SUMMARY's mobs-25k-mod row (656
+  ms) is the plain no-knob leg (the mob wire needs CE_NATIVE_MOB=1 —
+  the mobs-25k-native row exists since 7caf5ef); the blackout is the
+  pre-L104 mod sides dying to the 45-min job timeout + the 36.7-min
+  per-side watchdog (run 341's signature), both fixed on main. The
+  next push re-arms the full-matrix arbiter.
+- Local paired items-25k A/B (26.3, this sandbox, same window):
+  vanilla p50 20.26 / mod 10.87 (−46.4%, mean 29.6 → 16.6). The item
+  wire is the weakest leg (CI −56% at 100k). The measure-window JFR:
+  the module cluster ~17% (tracker 2.8 + tickListForEach 2.7 + the
+  flush protocol 3.6 + rowQuery 4.0 + dispatch glue 1.2), the native
+  item tick itself invisible (the mirror carries the state; L8.2's
+  compact batch already side-packs only the cd entries). The L37f rest
+  arm is OFF by design (the 26.3 %4 exception) — rest=0 in the leg.
+  The next item wave rides the proven shapes: native merge-cadence
+  candidates in the compact read-back (rowQuery dies for the cadence
+  scans) + the native-side pre-decided dispatch skip.
+
+Stage Summary:
+- Push: 44d84ea + dc3e150 already on main; this entry re-arms CI.
+- The mob story: −87.4% paired @10k (CI), 1.26 ms/tick @25k in-bench
+  (2 vCPU), the despawn decision live, the per-level split structural.
+- The item story: −46% paired @25k local; the wire is stateful (L8.2),
+  the read-back compact (L79), the floor invisible; the fat is the
+  Java-side cadence scans + tracker pass.
+- Next: the item wave (the doc first), then the CI arbiter reads the
+  mob rows again (mobs-25k-native, spread, mixed ride the wire).
