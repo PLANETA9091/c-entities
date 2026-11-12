@@ -6367,8 +6367,16 @@ public final class CeHooks {
                     if ((bits & (1 << 13)) == 0) {
                         ItemEntity aw = IB_ITEM[i];
                         if (aw != null) {
-                            aw.activatedTick = (long) outD[i * 9 + 8];
-                            aw.isTemporarilyActive = (bits & (1 << 19)) != 0;
+                            // i0-a2c: write only on a real change — the echo
+                            // case (no stamp, isTemp already false in the
+                            // batch) is value-exact as a skip.
+                            if ((bits & (1 << 21)) != 0) {
+                                aw.activatedTick = (long) outD[i * 9 + 8];
+                            }
+                            boolean tv = (bits & (1 << 19)) != 0;
+                            if (tv || (IB_ATI[i * 3 + 2] & 1) != 0) {
+                                aw.isTemporarilyActive = tv;
+                            }
                         }
                     }
                 } else {

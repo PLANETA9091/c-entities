@@ -456,6 +456,10 @@ const B_IS_TEMP: i32 = 1 << 19;
 /// i0-a2b: the INACTIVE verdict — the fast path appends with
 /// IF_INACTIVE for these (the stamp covers ~100% of the steady state).
 const B_VERDICT_INACT: i32 = 1 << 20;
+/// i0-a2c: the activatedTick writeback is REAL (at_write was Some) — the
+/// applier writes the Java field only then; the echo case (None) leaves
+/// the field untouched (value-exact: the batch carried the current value).
+const B_AT_WRITE: i32 = 1 << 21;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -1123,11 +1127,18 @@ unsafe fn n_item_tick_impl(
                                                         ob |= B_IS_TEMP;
                                                     }
                                                     // od slot 8: the activatedTick the applier
-                                                    // writes back (the port's stamp, value-exact
-                                                    // even when None — the %4/no-write path leaves
-                                                    // the field at its pre-verdict value).
-                                                    od_c[j * 9 + 8] = at_write
-                                                        .unwrap_or(at_in) as f64;
+                                                    // writes back ONLY on a real stamp (bit 21);
+                                                    // the echo case leaves the field untouched —
+                                                    // the batch carried the current value and the
+                                                    // port had no side effect (the %4 early-return
+                                                    // and the already-false isTemp write skip).
+                                                    match at_write {
+                                                        Some(v) => {
+                                                            od_c[j * 9 + 8] = v as f64;
+                                                            ob |= B_AT_WRITE;
+                                                        }
+                                                        None => od_c[j * 9 + 8] = 0.0,
+                                                    }
                                                 }
                                                 oi_c[j * 4 + 2] = ob;
                                                 oi_c[j * 4 + 3] = st.tick_count;
