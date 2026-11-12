@@ -1126,6 +1126,7 @@ public final class CeHooks {
                 + " ds=" + dsame + "/" + dwrite
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
+                + "/f" + dispFast
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
                 + "/w" + travelWalk + "/n" + travelWalkNoMove
@@ -4497,7 +4498,7 @@ public final class CeHooks {
     // L15b: PLAIN (per non-player tick) — see the mergeChecks note.
     public static long dispChecks = 0, dispNative = 0,
             dispInactive = 0, dispPass = 0, dispGate = 0,
-            dispMobNative = 0;
+            dispMobNative = 0, dispFast = 0;
 
     /** World revision: bumped by the flush whenever any section changed
      *  since the previous flush. MODE_REV[slot] stamps the revision that
@@ -4564,6 +4565,27 @@ public final class CeHooks {
                 return false;
             }
             int slot = entId(e) & MAMASK;
+            // i0-a STAY fast path (doc 62): the core pre-approved this
+            // item's next dispatch — native-mode (MODE_VAL==1), revision
+            // fresh (MODE_REV==WORLD_REV), and the %4 rotation clause
+            // proven (the port returns TRUE side-effect-free there). The
+            // decision is value-identical to the slow chain's: itemCheck-
+            // Active's %4 clause early-returns BEFORE any field write, so
+            // skipping the gate chain (noPhysics/portal/stack/passengers/
+            // the activation port/dtrace) cannot change the observable
+            // state — every one of those gates is side-effect-free for a
+            // %4-hit item and none of them can flip for a native item
+            // without a probe wake (which clears MODE synchronously) or
+            // a section change (which stales MODE_REV). isRemoved stays:
+            // the removal driver may lag one boundary.
+            if (DISP_ID[slot] == (long) entId(e)
+                    && MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 1
+                    && MODE_REV[slot] == WORLD_REV
+                    && !e.isRemoved()) {
+                appendDispatch(e, true);
+                dispFast++;
+                return true;
+            }
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
                 if (REST_ID[slot] != entId(e)) {
                     // slot turnover: entity ids are monotonic per run, so a
@@ -4854,6 +4876,18 @@ public final class CeHooks {
     // monotonic per run, so a slot-colliding successor can never inherit
     // the fixed-point proof (the ARENA ref is kept as defense in depth).
     private static final long[] REST_ID = new long[1 << 22];
+    // i0-a STAY verdict (doc 62): the core's pre-decision for the NEXT
+    // dispatch — (tickCount+1+id) % 4 == 0, itemCheckActive's first
+    // clause, which returns TRUE with ZERO side effects (before the
+    // isTemporarilyActive=false write and the immunity bookkeeping).
+    // The flush applier stamps it per applied entry from the core's
+    // bit 17; entity ids are monotonic per run, so a slot-colliding
+    // successor can never inherit the verdict (the REST_ID pattern).
+    // The fast path keeps the mode checks (MODE_GEN/MODE_VAL/MODE_REV)
+    // so every wake gate stays live: an external mutation clears MODE
+    // synchronously (probe box/delta), a section change makes MODE_REV
+    // stale, a mode transition clears the slot in the applier.
+    private static final long[] DISP_ID = new long[1 << 22];
     // Per-section revision stamps: the flush drain stamps every invalidated
     // section with the post-bump WORLD_REV. A rest item whose environment
     // sections were not touched by the current revision keeps resting even
@@ -6251,6 +6285,7 @@ public final class CeHooks {
                 if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
                     MODE_REV[mSlot] = revBefore;
                     MODE_VAL[mSlot] = 0;
+                    DISP_ID[mSlot] = 0L; // i0-a: no verdict for a vanilla-routed plan
                     itemVanillaNext++;
                 } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
                     // L21 REST: a value-fixed-point tick — the dispatch guard
@@ -6284,10 +6319,16 @@ public final class CeHooks {
                         MODE_REV[mSlot] = revBefore;
                         MODE_VAL[mSlot] = 1;
                     }
+                    // i0-a: the STAY verdict rides the core's bit 17 — the
+                    // fast path fires only when the %4 clause is proven; the
+                    // verdict dies with the item's plan (cleared on any
+                    // non-native next tick).
+                    DISP_ID[mSlot] = (bits & (1 << 17)) != 0 ? IB_IDS[i] : 0L;
                 } else {
                     MODE_REV[mSlot] = revBefore;
                     MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
                                          // want_native next flush
+                    DISP_ID[mSlot] = 0L;
                 }
                 if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
                     // aborted (bit 13): the core did not compute — nothing to

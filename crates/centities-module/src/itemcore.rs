@@ -438,6 +438,16 @@ const B_REST_CAND: i32 = 1 << 15;
 /// after the counters — the skipped compares are exactly the ones the tails
 /// would skip themselves.
 const B_TAIL_NONE: i32 = 1 << 16;
+/// i0-a STAY verdict (doc 62): the Java dispatch guard's activation port
+/// early-returns TRUE with ZERO side effects on the %4 rotation clause
+/// ((tickCount+1+id) % 4 == 0 — itemCheckActive's first clause returns
+/// before isTemporarilyActive=false). The core owns tick_count (the
+/// applier mirrors it into e.tickCount) and the entity id, so the NEXT
+/// dispatch's fast-path verdict is computable exactly here: the Java
+/// guard (CeHooks.itemDispatch) skips the whole gate chain and appends
+/// active. Inactive entries and the 256-tick belt keep the proven slow
+/// chain (VANILLA_NEXT => no verdict; the applier clears the slot).
+const B_STAY: i32 = 1 << 17;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -987,6 +997,13 @@ unsafe fn n_item_tick_impl(
                                                         && st.fall_dist == pfall
                                                     {
                                                         ob |= B_REST_CAND;
+                                                    }
+                                                    // i0-a STAY verdict (doc 62): the %4 rotation
+                                                    // clause — the Java port's int arithmetic wraps
+                                                    // mod 2^32, and 2^32 % 4 == 0, so the i64 sum's
+                                                    // mod-4 equals the wrapped int's mod-4.
+                                                    if (st.tick_count as i64 + 1 + id) % 4 == 0 {
+                                                        ob |= B_STAY;
                                                     }
                                                 }
                                                 oi_c[j * 4 + 2] = ob;
