@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "L110 native pivot: the zero-Java entity executor — persistent AoS mob store, Seen grid, world resolver and the full native tick, Horizon-style"
 
+[features]
+dbg_despawn = []
+
 [dependencies]
 centities-core = { path = "../centities-core" }
 swarm-sim = { path = "../swarm-sim" }

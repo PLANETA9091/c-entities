@@ -11,6 +11,7 @@
 use swarm_sim::mob::{AiStat, MobAI, PackState, PlayerSnap};
 use swarm_sim::mob::TravelMth as Mth;
 
+use crate::despawn::{DespawnCfg, DespawnEvent};
 use crate::profile::{ai_guard, apply_guard, grid_guard, travel_guard};
 use crate::store::{MobSlot, MobStore, SeenGrid};
 use crate::world::{OpenGround, PlayerTick, Snapshot, WorldRes};
@@ -79,6 +80,92 @@ fn probe_lap(t: &mut Option<std::time::Instant>, c: &std::sync::atomic::AtomicU6
 /// serial executor owns once — the parallel arm needs one set per WORKING
 /// thread; every field is pure workspace, written before read per mob, so
 /// the per-thread copies are content-identical to the shared one).
+/// The read-back cause column (ids[2i+1] bits 48..56) — the N3-N1 event
+/// outbox riding the read-back rows (zero extra JNI crossings; the
+/// applier discards + collects, the removal driver unregisters).
+pub const DESPAWN_CAUSE_PEACEFUL: u8 = 1;
+pub const DESPAWN_CAUSE_HARD: u8 = 2;
+pub const DESPAWN_CAUSE_SOFT: u8 = 3;
+
+/// The wire's player-flag bit 1 — the PLAYER_AFFECTS_SPAWNING predicate
+/// (javap EntitySelector lambda$static$7: `!isSpectator() && isAlive()
+/// && affectsSpawning`). Bit 0 = alive && !spectator (the pre-N3 bit).
+pub const PF_AFFECTS_SPAWNING: i32 = 2;
+
+/// The read-back packing for one mob row: ids[2i+1] =
+/// no_action (bits 0..32) | nav_state (32..48, u16) | despawn cause (48..56).
+/// The Java applier reads noAct as the LOW 32 bits (unchanged contract);
+/// the cause column rides above the nav_state the M0 wire never read.
+#[inline]
+fn pack_readback(no_action: i32, nav_state: i32, cause: u8) -> i64 {
+    ((((cause as u64) & 0xFF) << 48)
+        | (((nav_state as u64) & 0xFFFF) << 32)
+        | ((no_action as u32 as u64) & 0xFFFF_FFFF)) as i64
+}
+
+/// N3-N1 phase-2b: ONE mob's despawn decision — the vanilla
+/// `lambda$tick$0` head (isRemoved/frozen guards are the wire's own
+/// liveness business; checkDespawn runs HERE, before the mob's tick).
+/// The nearest PLAYER_AFFECTS_SPAWNING player is selected exactly like
+/// the vanilla getNearestPlayer: strict-< 3D², the FIRST player in the
+/// snapshot order wins ties (the boundary fills the snapshot in
+/// level.players() order). The 1/800 roll draws from the mob's OWN
+/// mirror chain inside cfg.decide — per-mob state, never a shared-stream
+/// drawer, so the wave15 parallel shape is untouched.
+#[inline]
+fn despawn_step(
+    cfg: &DespawnCfg,
+    difficulty: i32,
+    players: &[PlayerSnap],
+    mob: &mut MobAI,
+) -> u8 {
+    let mut best: Option<(f64, usize)> = None;
+    for (i, p) in players.iter().enumerate() {
+        if p.flags & PF_AFFECTS_SPAWNING == 0 {
+            continue;
+        }
+        let dx = p.x - mob.x;
+        let dy = p.y - mob.y;
+        let dz = p.z - mob.z;
+        let d2 = dx * dx + dy * dy + dz * dz;
+        // strict <: the earlier player keeps the tie (getNearestPlayer bc
+        // 102-105: `d15 >= d10 -> skip`)
+        if best.map_or(true, |(b, _)| d2 < b) {
+            best = Some((d2, i));
+        }
+    }
+    let nearest = best.map(|(_, i)| {
+        let p = &players[i];
+        (p.x, p.y, p.z)
+    });
+    let persistent = mob.despawn & 1 != 0;
+    let rwf = mob.despawn & 2 != 0;
+    let peaceful = mob.despawn & 4 != 0;
+    let cat = (mob.despawn >> 8) as usize & 0xFF;
+    let mut seed = mob.seed;
+    let out = cfg.decide(
+        cat,
+        nearest,
+        (mob.x, mob.y, mob.z),
+        persistent,
+        mob.no_action,
+        rwf,
+        peaceful,
+        difficulty,
+        &mut seed,
+    );
+    mob.seed = seed;
+    if out.reset_no_action {
+        mob.no_action = 0;
+    }
+    match out.event {
+        Some(DespawnEvent::Peaceful) => DESPAWN_CAUSE_PEACEFUL,
+        Some(DespawnEvent::Hard) => DESPAWN_CAUSE_HARD,
+        Some(DespawnEvent::Soft) => DESPAWN_CAUSE_SOFT,
+        None => 0,
+    }
+}
+
 struct WorkerBufs {
     scratch: Vec<i32>,
     out: Vec<i32>,
@@ -183,6 +270,16 @@ pub struct NativeTick {
     /// chunked-parallel shape. 1024 in production; the big-draw twin pins
     /// it to 0 to drive EVERY drawer through the chunked branch.
     pass2_serial_max: usize,
+    /// N3-N1 phase-2b: the despawn config table (the nativeDespawnCfg
+    /// push) + the level's Difficulty ordinal (the batch call passes it
+    /// per tick — /difficulty changes are runtime-exact). None = the
+    /// decision is OFF (the M2c status quo — the SAFE default).
+    despawn_cfg: Option<DespawnCfg>,
+    difficulty: i32,
+    /// the per-slot despawn cause of the CURRENT tick — written by the
+    /// decision (both arms), read by the serial fallback fill and the
+    /// tombstone; cleared at tick start. Parallel to store.mobs.
+    pub(crate) despawn_cause: Vec<u8>,
 }
 
 impl NativeTick {
@@ -206,6 +303,9 @@ impl NativeTick {
             bufs: Vec::new(),
             parallel: true,
             pass2_serial_max: 1024,
+            despawn_cfg: None,
+            difficulty: 2, // NORMAL — the bench/parity default
+            despawn_cause: Vec::new(),
         }
     }
 
@@ -224,6 +324,18 @@ impl NativeTick {
     /// branch the production threshold never reaches at bench sizes).
     pub fn set_pass2_serial_max(&mut self, v: usize) {
         self.pass2_serial_max = v;
+    }
+
+    /// N3-N1 phase-2b: the despawn config table lands (the once-per-level
+    /// nativeDespawnCfg push). None clears the arm (the SAFE default).
+    pub fn set_despawn_cfg(&mut self, cfg: Option<DespawnCfg>) {
+        self.despawn_cfg = cfg;
+    }
+
+    /// The level's Difficulty ordinal (0 = PEACEFUL). Per-tick from the
+    /// batch call — a /difficulty change is exact on the next boundary.
+    pub fn set_difficulty(&mut self, d: i32) {
+        self.difficulty = d;
     }
 
     /// WAVE12 twin hook: restore the pre-wave12 approach-refresh PRE-PASS
@@ -308,19 +420,25 @@ impl NativeTick {
     pub fn tick(&mut self, game_time: i32) -> &[AiStat] {
         // WAVE14: the parallel arm owns the production shape (the fused
         // refresh + the resident pack); the twin-only shapes stay serial.
-        if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
+        let stats_len = if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
         {
-            self.tick_parallel(game_time, None)
+            self.tick_parallel(game_time, None).len()
         } else {
-            self.tick_serial(game_time)
-        }
+            self.tick_serial(game_time).len()
+        };
+        // N3-N1 phase-2b: the direct executor owns its events (no wire) —
+        // the despawned slots tombstone right after the arm.
+        self.finalize_despawns();
+        &self.stats_buf[..stats_len]
     }
 
-    /// N2-M0 the FUSED WIRE TICK: the parallel arm writes the read-back
+    /// N3-N1 phase-2b: the FUSED WIRE TICK: the parallel arm writes the read-back
     /// (ids/pos) DURING pass 1 / pass 2 (the same alive-rank k the stats
     /// use) — the batch's own post-tick fill loop would re-stream the whole
     /// store. Returns false when the arm did NOT fill (the serial/knob
-    /// shapes) — the caller falls back to its own fill.
+    /// shapes) — the caller falls back to its own fill AND finalizes the
+    /// despawn tombstones itself (the despawned rows must survive the
+    /// fallback fill).
     pub fn tick_wire_fused(
         &mut self,
         game_time: i32,
@@ -330,11 +448,56 @@ impl NativeTick {
         if self.parallel && !self.pack.full && !no_ai_on() && !self.prepass && !self.split_travel
         {
             self.tick_parallel(game_time, Some((ids, pos)));
+            // the fused fill completed inside the arm — the events are
+            // delivered; the despawned slots leave the store
+            self.finalize_despawns();
             true
         } else {
             self.tick_serial(game_time);
             false
         }
+    }
+
+    /// N3-N1 phase-2b: the tick-end tombstone — the despawned slots leave
+    /// the store AFTER this tick's read-back carried their event rows
+    /// (the applier discards + collects; the removal driver unregisters).
+    /// Clears the cause column.
+    pub fn finalize_despawns(&mut self) {
+        if self.despawn_cause.is_empty() {
+            return;
+        }
+        for slot in 0..self.store.mobs.len() {
+            let c = self.despawn_cause[slot];
+            self.despawn_cause[slot] = 0;
+            if c != 0 && self.store.mobs[slot].alive {
+                let id = self.store.mobs[slot].mob.id;
+                let _ = self.store.remove(id);
+                self.grid.dirty = true;
+            }
+        }
+    }
+
+    /// N3-N1 phase-2b: the serial-fallback read-back fill (the walk has
+    /// already run — the causes sit in the cause column, indexed BY SLOT;
+    /// the rows pack the cause column above the nav_state). The fused
+    /// parallel arm fills inside pass 1 instead.
+    pub fn fill_readback(&mut self, ids: &mut [i64], pos: &mut [f64]) -> usize {
+        let mut w = 0usize;
+        for (slot_i, slot) in self.store.mobs.iter().enumerate() {
+            if !slot.alive {
+                continue;
+            }
+            let m = &slot.mob;
+            let cause = self.despawn_cause.get(slot_i).copied().unwrap_or(0);
+            ids[w * 2] = m.id;
+            ids[w * 2 + 1] = pack_readback(m.no_action, m.nav_state, cause);
+            pos[w * 4] = m.x;
+            pos[w * 4 + 1] = m.y;
+            pos[w * 4 + 2] = m.z;
+            pos[w * 4 + 3] = m.yaw as f64;
+            w += 1;
+        }
+        w
     }
 
     /// The pre-wave14 SERIAL fused walk (the wave12b shape) — the A/B
@@ -378,6 +541,15 @@ impl NativeTick {
         // WAVE4: the tick-level player fingerprint (computed ONCE per tick;
         // the stamp check in ai_tick is free per mob)
         let tfp = MobAI::tick_fp(players);
+        // N3-N1 phase-2b: the despawn cause column (per-slot, cleared per
+        // tick — the tombstone and the serial fallback fill read it)
+        let despawn_n = self.store.mobs.len();
+        if self.despawn_cause.len() < despawn_n {
+            self.despawn_cause.resize(despawn_n, 0);
+        }
+        for c in &mut self.despawn_cause[..despawn_n] {
+            *c = 0;
+        }
         // WAVE12a: the melee approach refresh FUSED into the main loop —
         // the floor reads approach_x/z live (they must track the target's
         // CURRENT position; vanilla reads getTarget().position() per round
@@ -421,9 +593,25 @@ impl NativeTick {
         // x N) and its target stream advances through the tick.
         let mut res = WorldRes::open_ground_v0(snapshot, self.target_rng);
         res.fold_off = self.fold_off;
-        for slot in self.store.mobs.iter_mut() {
+        for (slot_i, slot) in self.store.mobs.iter_mut().enumerate() {
             if !slot.alive {
                 continue;
+            }
+            // N3-N1 phase-2b: the despawn decision — vanilla lambda$tick$0
+            // head: checkDespawn runs BEFORE the mob's tick. A despawned
+            // mob skips its tick (the ledger: the final-tick AI writes land
+            // on a removed entity); its event row carries the cause column.
+            if self.despawn_cfg.is_some() {
+                let cause = despawn_step(
+                    self.despawn_cfg.as_ref().unwrap(),
+                    self.difficulty,
+                    players,
+                    &mut slot.mob,
+                );
+                self.despawn_cause[slot_i] = cause;
+                if cause != 0 {
+                    continue;
+                }
             }
             // WAVE12a: the fused approach refresh — the two-field write
             // rides the SAME population stream the AI is about to pay for
@@ -580,6 +768,15 @@ impl NativeTick {
         probe_lap(&mut probe_t, &T_PLAYERS_NS);
 
         let n = self.store.mobs.len();
+        // N3-N1 phase-2b: the despawn cause column (per-slot, cleared per
+        // tick — the stale cause of a recycled slot must never poison a
+        // live row; the tombstone and the fallback fill read it)
+        if self.despawn_cause.len() != n {
+            self.despawn_cause.resize(n, 0);
+        }
+        for c in &mut self.despawn_cause[..] {
+            *c = 0;
+        }
         // the shadow buffer mirrors the store shape (the resizes are rare:
         // the population changes between ticks, the compact shrinks it)
         if self.pre_buf.len() > n {
@@ -621,6 +818,8 @@ impl NativeTick {
             skip_travel,
             compact_at,
             grid,
+            despawn_cfg,
+            despawn_cause,
             ..
         } = self;
 
@@ -630,6 +829,11 @@ impl NativeTick {
         let fold_off = *fold_off;
         let skip_travel = *skip_travel;
         let pass2_serial_max = self.pass2_serial_max;
+        let difficulty = self.difficulty;
+        // N3-N1 phase-2b: the despawn arm (None = the decision OFF — the
+        // M2c status quo). The cfg is read-only during the tick (the push
+        // lands between ticks); the workers share it by reference.
+        let despawn: Option<&DespawnCfg> = despawn_cfg.as_ref().map(|c| &*c);
 
         // ---- WAVE15 THE RANK PREFIX: the alive counts per chunk fused
         // with the base_k assignment. FAST PATH (no tombstones — the
@@ -702,15 +906,27 @@ impl NativeTick {
         } else {
             wire_chunks.resize_with(nchunks, || None);
         }
+        // N3-N1 phase-2b: the per-SLOT cause chunks (the pass-1 workers
+        // write the decision's outcome; width = chunk like the slot chunks)
+        let mut cause_rest: &mut [u8] = &mut despawn_cause[..n];
+        let mut cause_chunks: Vec<&mut [u8]> = Vec::with_capacity(nchunks);
+        while !cause_rest.is_empty() {
+            let w = chunk.min(cause_rest.len());
+            let (l, r) = cause_rest.split_at_mut(w);
+            cause_chunks.push(l);
+            cause_rest = r;
+        }
+        let despawn_args = despawn.map(|c| (c, difficulty));
         stat_slices
             .into_par_iter()
             .zip(bufs.par_chunks_mut(1))
             .zip(pre_buf.par_chunks_mut(chunk))
             .zip(store.mobs.par_chunks(chunk))
             .zip(wire_chunks)
+            .zip(cause_chunks)
             .enumerate()
             .for_each(
-                |(ci, (((((stats_region, b1), b_chunk), a_chunk), mut wire_r)))| {
+                |(ci, ((((((stats_region, b1), b_chunk), a_chunk), mut wire_r), cause_chunk)))| {
                     let bufs = &mut b1[0];
                     let _g = ai_guard();
                     let mut rank: usize = 0;
@@ -729,7 +945,26 @@ impl NativeTick {
                             &a.mob,
                             &mut b.mob,
                             players, players_raw, game_time, snapshot, fold_off, s0, tfp, bufs,
+                            despawn_args,
+                            &mut cause_chunk[j],
                         );
+                        if cause_chunk[j] != 0 {
+                            // despawned: the event row carries the PRE-tick
+                            // state + the cause column; no stats row (the
+                            // mob skipped its tick)
+                            if let Some((ids_r, pos_r)) = &mut wire_r {
+                                let m = &b.mob;
+                                ids_r[rank * 2] = m.id;
+                                ids_r[rank * 2 + 1] =
+                                    pack_readback(m.no_action, m.nav_state, cause_chunk[j]);
+                                pos_r[rank * 4] = m.x;
+                                pos_r[rank * 4 + 1] = m.y;
+                                pos_r[rank * 4 + 2] = m.z;
+                                pos_r[rank * 4 + 3] = m.yaw as f64;
+                            }
+                            rank += 1;
+                            continue;
+                        }
                         if !skip_travel {
                             let _t = travel_guard();
                             b.mob.move_tick(mth);
@@ -738,9 +973,7 @@ impl NativeTick {
                         if let Some((ids_r, pos_r)) = &mut wire_r {
                             let m = &b.mob;
                             ids_r[rank * 2] = m.id;
-                            ids_r[rank * 2 + 1] = ((((m.nav_state as i64) as u64) << 32)
-                                | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
-                                as i64;
+                            ids_r[rank * 2 + 1] = pack_readback(m.no_action, m.nav_state, 0);
                             pos_r[rank * 4] = m.x;
                             pos_r[rank * 4 + 1] = m.y;
                             pos_r[rank * 4 + 2] = m.z;
@@ -810,6 +1043,7 @@ impl NativeTick {
                     for i in 0..bufs[bi].drawers.len() {
                         let (slot, k, drew) = bufs[bi].drawers[i];
                         let assign = stream;
+                        let mut rcause = 0u8;
                         let (stat, redrew) = re_eval_mob(
                             &store.mobs[slot as usize].mob,
                             &mut pre_buf[slot as usize].mob,
@@ -821,11 +1055,16 @@ impl NativeTick {
                             assign,
                             tfp,
                             &mut local,
+                            despawn_args,
+                            &mut rcause,
                         );
                         debug_assert_eq!(
                             redrew, drew,
                             "the stroll draw count must be stream-value-independent"
                         );
+                        // a drawer reached the stroll gate — the decision
+                        // kept it alive; the re-decision must agree
+                        debug_assert_eq!(rcause, 0, "a drawer never despawns");
                         if !skip_travel {
                             let _t = travel_guard();
                             pre_buf[slot as usize].mob.move_tick(mth);
@@ -835,9 +1074,7 @@ impl NativeTick {
                             let m = &pre_buf[slot as usize].mob;
                             let local_rank = (k - bufs[bi].base_k) as usize;
                             ids_r[local_rank * 2] = m.id;
-                            ids_r[local_rank * 2 + 1] = ((((m.nav_state as i64) as u64) << 32)
-                                | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
-                                as i64;
+                            ids_r[local_rank * 2 + 1] = pack_readback(m.no_action, m.nav_state, 0);
                             pos_r[local_rank * 4] = m.x;
                             pos_r[local_rank * 4 + 1] = m.y;
                             pos_r[local_rank * 4 + 2] = m.z;
@@ -893,6 +1130,7 @@ impl NativeTick {
                             for i in 0..bufs.drawers.len() {
                                 let (slot, k, drew) = bufs.drawers[i];
                                 let assign = stream;
+                                let mut rcause = 0u8;
                                 let (stat, redrew) = re_eval_mob(
                                     &a_all[slot as usize].mob,
                                     &mut b_chunk[slot as usize - lo].mob,
@@ -904,11 +1142,14 @@ impl NativeTick {
                                     assign,
                                     tfp,
                                     bufs,
+                                    despawn_args,
+                                    &mut rcause,
                                 );
                                 debug_assert_eq!(
                                     redrew, drew,
                                     "the stroll draw count must be stream-value-independent"
                                 );
+                                debug_assert_eq!(rcause, 0, "a drawer never despawns");
                                 if !skip_travel {
                                     let _t = travel_guard();
                                     b_chunk[slot as usize - lo].mob.move_tick(mth);
@@ -918,10 +1159,8 @@ impl NativeTick {
                                     let m = &b_chunk[slot as usize - lo].mob;
                                     let local_rank = (k - bufs.base_k) as usize;
                                     ids_r[local_rank * 2] = m.id;
-                                    ids_r[local_rank * 2 + 1] = ((((m.nav_state as i64) as u64)
-                                        << 32)
-                                        | ((m.no_action as u32 as u64) & 0xFFFF_FFFF))
-                                        as i64;
+                                    ids_r[local_rank * 2 + 1] =
+                                        pack_readback(m.no_action, m.nav_state, 0);
                                     pos_r[local_rank * 4] = m.x;
                                     pos_r[local_rank * 4 + 1] = m.y;
                                     pos_r[local_rank * 4 + 2] = m.z;
@@ -981,7 +1220,14 @@ fn advance_stream(mut s: u64, steps: u32) -> u64 {
 /// placeholder stream) and pass 2 (the assigned value) run the SAME body
 /// — the only input that differs is `assign`, and the non-drawers never
 /// read it (their results are assign-independent).
+/// N3-N1 phase-2b: the despawn decision rides BEFORE the AI (vanilla
+/// lambda$tick$0 head); a despawned mob skips the tick entirely (the
+/// ledger: the final-tick AI writes land on a removed entity) and the
+/// cause lands in `cause_out` — the mob's seed chain (the 1/800 roll)
+/// and the no_action reset are per-mob state on the SHADOW (bit-identical
+/// between the serial and parallel arms by construction).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn re_eval_mob(
     a: &MobAI,
     target: &mut MobAI,
@@ -993,8 +1239,18 @@ fn re_eval_mob(
     assign: u64,
     tfp: u64,
     bufs: &mut WorkerBufs,
+    despawn: Option<(&DespawnCfg, i32)>,
+    cause_out: &mut u8,
 ) -> (AiStat, u32) {
     target.clone_from(a);
+    if let Some((cfg, difficulty)) = despawn {
+        let cause = despawn_step(cfg, difficulty, players, target);
+        if cause != 0 {
+            *cause_out = cause;
+            return (AiStat::default(), 0);
+        }
+    }
+    *cause_out = 0;
     // the WAVE12a fused approach refresh — rides the eval input (the
     // only reader of the fields is the mob itself; the write lands on
     // the SHADOW — the pristine slot A is pass-2's re-eval source)

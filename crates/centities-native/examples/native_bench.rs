@@ -147,7 +147,7 @@ fn main() {
         if let Some(b) = batch.as_mut() {
             // the buffers are REUSED (the JNI shim passes Java-pinned arrays;
             // the clone would meter the bench, not the wire)
-            b.tick(t, &mut ids_buf, &mut pos_buf).unwrap();
+            b.tick(t, 2, &mut ids_buf, &mut pos_buf).unwrap();
         } else {
             nt.tick(t);
         }

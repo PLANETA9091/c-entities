@@ -8671,6 +8671,8 @@ public final class CeHooks {
     public static volatile boolean NATIVE_MOB_HANDLES_OK = false;
     public static long nmAds = 0, nmRemoves = 0, nmApplies = 0, nmGrows = 0,
             nmTicks = 0, nmSkipped = 0;
+    /** N3-N1 phase-2b: the despawn events applied (the diagnostic poll). */
+    public static long nmDespawns = 0;
     /** M2e: the walk fast route refuses (bisect knob, mirrors
      *  centities.tickListRaw) — vanilla lambda resumes for every mob. */
     public static final boolean MOB_WALK_RAW =
@@ -9749,7 +9751,31 @@ public final class CeHooks {
             } catch (Throwable t) {
                 seed = NM_SEED_FALLBACK;
             }
-            nativeMobAdd(eid, seed, mob.getX(), mob.getY(), mob.getZ(), 0);
+            // N3-N1 phase-2b: the despawn kind bits (doc 61 §2-3) — the
+            // per-mob decision inputs resolved ONCE at classification:
+            //   bits 0..7  = the MobCategory ordinal,
+            //   bit  8     = isPersistenceRequired() || requiresCustomPersistence()
+            //                (the passenger/leash virtual folded here; a
+            //                mid-life leash is the accepted class-cache
+            //                ledger window),
+            //   bit  9     = removeWhenFarAway(dist2) — the virtual called
+            //                ONCE (the base Mob body returns true, javap bc
+            //                0-1; zombies never override it),
+            //   bit  10    = despawnInPeacefulOverride.toBooleanOrElse(
+            //                !type.isAllowedInPeaceful()) — the TriState is
+            //                a PUBLIC field, the resolution is exact.
+            int kind = mob.getType().getCategory().ordinal();
+            if (mob.persistenceRequired || mob.isPassenger() || mob.isLeashed()) {
+                kind |= 1 << 8;
+            }
+            if (mob.removeWhenFarAway(0.0)) {
+                kind |= 1 << 9;
+            }
+            if (mob.despawnInPeacefulOverride
+                    .toBooleanOrElse(!mob.getType().isAllowedInPeaceful())) {
+                kind |= 1 << 10;
+            }
+            nativeMobAdd(eid, seed, mob.getX(), mob.getY(), mob.getZ(), kind);
             NM_BYID.put(eid, mob);
             nmAds++;
             if (nmAds == 1) {
@@ -9878,10 +9904,22 @@ public final class CeHooks {
                 NM_PXYZ[i * 3 + 2] = pl.getZ();
                 NM_PF[i * 2] = pl.getId();
                 NM_PF[i * 2 + 1] = (pl.isAlive() && !pl.isSpectator()) ? 1 : 0;
+                // N3-N1 phase-2b: the PLAYER_AFFECTS_SPAWNING bit (javap
+                // EntitySelector lambda$static$7: !isSpectator && isAlive &&
+                // affectsSpawning) — the despawn decision's findNearbyPlayer
+                // predicate, computed once per player per boundary (doc 61
+                // §2). Bits: 1 = alive&&!spectator (the AI floor's bit),
+                // 2 = the full affects-spawning predicate.
+                if (pl.isAlive() && !pl.isSpectator() && pl.affectsSpawning) {
+                    NM_PF[i * 2 + 1] |= 2;
+                }
             }
             nativeMobPlayers(NM_PXYZ, NM_PF);
             pushDespawnCfgOnce(level);
-            int n = nativeMobBatch(CUR_TICK, NM_IDS, NM_POS);
+            // N3-N1 phase-2b: the Difficulty ordinal rides the batch — the
+            // peaceful gate is runtime-exact (a /difficulty change lands on
+            // the next boundary)
+            int n = nativeMobBatch(CUR_TICK, level.getDifficulty().ordinal(), NM_IDS, NM_POS);
             if (n < 0) {
                 int need = -n;
                 if (NM_IDS.length < need * 2) {
@@ -9926,6 +9964,21 @@ public final class CeHooks {
                 // predicate is exact for health deaths; isRemoved covers
                 // discard/chunk-unload.
                 if (U.getBoolean(m, O_ENT_DEAD) || m.isRemoved()) {
+                    nmCollectDead(eid);
+                    continue;
+                }
+                // N3-N1 phase-2b: the despawn event row — cause 1=Peaceful
+                // 2=Hard 3=Soft at ids[2i+1] bits 48..56. The vanilla
+                // checkDespawn called mob.discard(EntityRemoveEvent.Cause
+                // .DESPAWN) inside the walk lambda; the wire's M2e route
+                // routes the mob to the native decision, and the decision's
+                // discard lands HERE on the tick thread. The removal driver
+                // (nmCollectDead -> nativeMobRemove + NM_BYID.remove)
+                // unregisters the store slot in the same drain.
+                int nmCause = (int) ((NM_IDS[2 * i + 1] >>> 48) & 0xFF);
+                if (nmCause != 0) {
+                    m.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DESPAWN);
+                    nmDespawns++;
                     nmCollectDead(eid);
                     continue;
                 }
@@ -10739,7 +10792,7 @@ public final class CeHooks {
     public static native int nativeMobAdd(int eid, long seed, double x, double y, double z, int kind);
     public static native int nativeMobRemove(long eid);
     public static native void nativeMobPlayers(double[] xyz, int[] pf);
-    public static native int nativeMobBatch(int gameTick, long[] ids, double[] pos);
+    public static native int nativeMobBatch(int gameTick, int difficulty, long[] ids, double[] pos);
 
     /** N3-N1 (doc 61) phase-2a: the RESOLVED despawn config crosses to
      *  native ONCE per level at the first boundary (the paper config is

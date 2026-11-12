@@ -3964,10 +3964,13 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeMobBatch",
-        "(I[J[D)I",
+        // N3-N1 phase-2b: + the Difficulty ordinal (the peaceful gate reads
+        // it per tick — a /difficulty change is exact on the next boundary)
+        "(II[J[D)I",
         crate::mobcore::n_mob_batch as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
+            i32,
             i32,
             jni::jlongArray,
             jni::jdoubleArray,

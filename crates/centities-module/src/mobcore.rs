@@ -71,10 +71,10 @@ pub extern "system" fn n_mob_add(
     x: f64,
     y: f64,
     z: f64,
-    _kind: i32,
+    kind: i32,
 ) -> i32 {
     with_exec(|e| match e {
-        Some(e) => e.add(eid as i64, seed as u64, x, y, z) as i32,
+        Some(e) => e.add_kind(eid as i64, seed as u64, x, y, z, kind) as i32,
         None => -1,
     })
 }
@@ -138,6 +138,7 @@ pub extern "system" fn n_mob_batch(
     env: *mut jni::JNIEnv,
     _cls: jni::jclass,
     game_time: i32,
+    difficulty: i32,
     ids: jni::jlongArray,
     pos: jni::jdoubleArray,
 ) -> i32 {
@@ -162,7 +163,7 @@ pub extern "system" fn n_mob_batch(
                         // the tick ALWAYS happens — the world advances; the
                         // read-back is pure and may lag one tick on a
                         // population jump past the host arrays
-                        let _ = ex.tick(game_time, &mut iv, &mut pv);
+                        let _ = ex.tick(game_time, difficulty, &mut iv, &mut pv);
                         let fit = pop * 2 <= cap_ids && pop * 4 <= cap_pos;
                         if fit && pop > 0 {
                             ((*vt).SetLongArrayRegion)(raw, ids, 0, (pop * 2) as i32, iv.as_ptr());
@@ -271,7 +272,17 @@ pub extern "system" fn n_despawn_cfg(
                 }
             }
         }
-        DESPAWN_CFG.with(|d| *d.borrow_mut() = Some((ellipsoid == 1, cfg)));
+        DESPAWN_CFG.with(|d| *d.borrow_mut() = Some((ellipsoid == 1, cfg.clone())));
+        // N3-N1 phase-2b: the table lands on THIS thread's executor too —
+        // the decision reads the batch's own copy (the push runs before
+        // the first batch tick of the level that pushed it; a multi-level
+        // boot re-pushes per level and the LAST push rides the single
+        // executor — the M0 one-executor ledger, doc 56 §3)
+        with_exec(|ex| {
+            if let Some(ex) = ex {
+                ex.set_despawn_cfg(Some(cfg));
+            }
+        });
         1
     }
 }

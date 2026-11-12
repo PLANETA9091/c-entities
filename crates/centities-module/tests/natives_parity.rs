@@ -49,7 +49,7 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeMobAdd", "(IJDDDI)I"));
     s.insert(("nativeMobRemove", "(J)I"));
     s.insert(("nativeMobPlayers", "([D[I)V"));
-    s.insert(("nativeMobBatch", "(I[J[D)I"));
+    s.insert(("nativeMobBatch", "(II[J[D)I"));
     s
 }
 

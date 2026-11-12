@@ -313,6 +313,20 @@ pub struct MobAI {
     /// every running=true write; RECOMPUTED at every stop (the stops are
     /// rare — the stroll/RLA lifetimes). debug_assert-pinned at the gate.
     pub ar_running: bool,
+    /// N3-N1 phase-2b: the despawn-decision input bits (javap 26.3
+    /// Mob.checkDespawn + the wire's classification, doc 61 §2-3):
+    ///   bit 0 — persistent (isPersistenceRequired() ||
+    ///           requiresCustomPersistence() — the wire folds the
+    ///           passenger/leash virtual at first sight; a mid-life
+    ///           leash is the accepted class-cache ledger window),
+    ///   bit 1 — removeWhenFarAway (the virtual resolved once per mob —
+    ///           the base Mob body returns TRUE, javap bc 0-1; zombies
+    ///           never override it),
+    ///   bit 2 — peaceful despawn (despawnInPeacefulOverride
+    ///           .toBooleanOrElse(!type.isAllowedInPeaceful())),
+    ///   bits 8..16 — the MobCategory ordinal (MONSTER = 0).
+    /// Zombie defaults: !persistent, removeWhenFarAway, peaceful-despawn.
+    pub despawn: u32,
     // WAVE13c: the pack_fp FIELD is GONE — the fp was immutable per mob
     // and identical across mobs (one table in the system, built only by
     // zombie_table_res()); the gate term folds to the compile-time
@@ -408,6 +422,7 @@ impl MobAI {
             approach_z: 0.0,
             et_running: false,
             ar_running: false,
+            despawn: 0b110, // persistent(bit0)=0 | rwf(bit1)=1 | peaceful(bit2)=1; MONSTER(0)
         }
     }
 
