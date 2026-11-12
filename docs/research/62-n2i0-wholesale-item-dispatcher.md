@@ -350,3 +350,25 @@ best), merge=120931 — the proven state re-confirmed.
 - The merge wire: mergeScanNative stands (the v1/v2/v3 attempts
   documented in the addenda 3-5); the remaining item levers = the
   flush protocol polish (a minority cost).
+
+## Addendum 7 — THE STORM ROOT FOUND AND FIXED: i0-b v3 lands at −58.6%
+
+The bisect isolated the trigger: the v3 call with the IGNORED result ran
+CLEAN (p50 8.88, the merges intact) — the JNI crossing, the lock, the
+query, the fill are all innocent. The storm lived in the CONSUMPTION
+loop: **the arena-resolved candidates lacked the isRemoved check** — the
+arena still holds the entities absorbed EARLIER in the same batch until
+the removal driver runs, and tryToMerge on a dead entity corrupted the
+stacks and herded the population through the resync path (v1's and v3's
+identical storms; v2's thinning was the separate pre-query divergence).
+
+The one-line fix (other.isRemoved() in the consumption loop) landed with
+the full v3: the leg reads **p50 {7.474, 8.091}** vs the vanilla 18.793
+= **−58.6%** (from −47% pre-i0b), mergeOps 82244 (76696) — the
+absorptions UP, the scans cheaper (one crossing per scan, zero row
+materialization), the workspace green (145; the natives_parity contract
+rides nativeMergeScan).
+
+The item leg's ladder this session: −47% (i0-a2c) → −58.6% (i0-b v3+fix).
+The mob side: 1.26-1.31 ms/tick @25k in-bench (−85%, 2 vCPU); the −90%
+line = the CI 4-vCPU arbiter.
