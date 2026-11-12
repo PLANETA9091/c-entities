@@ -4592,7 +4592,7 @@ public final class CeHooks {
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
                 // by the last flush's writeback.
-                appendDispatch(e, DISP_VAL[slot] != 2);
+                appendDispatch(e, DISP_VAL[slot] == 1);
                 dispFast++;
                 return true;
             }
@@ -6358,9 +6358,9 @@ public final class CeHooks {
                     // core computed; DISP_VAL carries active(1)/inactive(2).
                     // The verdict dies with the item's plan (cleared on any
                     // non-native next tick).
-                    DISP_ID[mSlot] = (bits & (1 << 18)) != 0 ? IB_IDS[i] : 0L;
-                    DISP_VAL[mSlot] = (bits & (1 << 18)) != 0
-                            ? ((bits & (1 << 19)) != 0 ? 2 : 1) : 0;
+                    DISP_ID[mSlot] = (bits & ((1 << 18) | (1 << 20))) != 0 ? IB_IDS[i] : 0L;
+                    DISP_VAL[mSlot] = (bits & (1 << 18)) != 0 ? 1
+                            : ((bits & (1 << 20)) != 0 ? 2 : 0);
                     // i0-a2: the verdict's side effects — the writeback keeps
                     // the Java fields value-exact without running the port
                     // (the od slot 8 carries activatedTick; bit 19 isTemp).

@@ -453,6 +453,9 @@ const B_STAY: i32 = 1 << 17;
 /// writeback bit).
 const B_VERDICT: i32 = 1 << 18;
 const B_IS_TEMP: i32 = 1 << 19;
+/// i0-a2b: the INACTIVE verdict — the fast path appends with
+/// IF_INACTIVE for these (the stamp covers ~100% of the steady state).
+const B_VERDICT_INACT: i32 = 1 << 20;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
@@ -1113,6 +1116,8 @@ unsafe fn n_item_tick_impl(
                                                         );
                                                     if v_active {
                                                         ob |= B_VERDICT;
+                                                    } else {
+                                                        ob |= B_VERDICT_INACT;
                                                     }
                                                     if v_temp {
                                                         ob |= B_IS_TEMP;
