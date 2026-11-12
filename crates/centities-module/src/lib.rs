@@ -3934,10 +3934,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeMobAdd",
-        "(IJDDDI)I",
+        // N3-N1 phase-2d: + the level key (the per-level executor split)
+        "(IIJDDDI)I",
         crate::mobcore::n_mob_add as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
+            i32,
             i32,
             i64,
             f64,
@@ -3948,16 +3950,19 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeMobRemove",
-        "(J)I",
+        // N3-N1 phase-2d: + the level key
+        "(IJ)I",
         crate::mobcore::n_mob_remove
-            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i64) -> i32
+            as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32, i64) -> i32
     );
     push!(
         "nativeMobPlayers",
-        "([D[I)V",
+        // N3-N1 phase-2d: + the level key
+        "(I[D[I)V",
         crate::mobcore::n_mob_players as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
+            i32,
             jni::jdoubleArray,
             jni::jintArray,
         )
@@ -3965,11 +3970,13 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     push!(
         "nativeMobBatch",
         // N3-N1 phase-2b: + the Difficulty ordinal (the peaceful gate reads
-        // it per tick — a /difficulty change is exact on the next boundary)
-        "(II[J[D)I",
+        // it per tick — a /difficulty change is exact on the next boundary);
+        // phase-2d: + the level key (the per-level executor split)
+        "(III[J[D)I",
         crate::mobcore::n_mob_batch as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
+            i32,
             i32,
             i32,
             jni::jlongArray,
@@ -3980,10 +3987,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     // decision stays UNWIRED; the push only lands the numbers
     push!(
         "nativeDespawnCfg",
-        "(II[D[I)Z",
+        // N3-N1 phase-2d: + the level key (the cfg is per-level state)
+        "(III[D[I)Z",
         crate::mobcore::n_despawn_cfg as extern "system" fn(
             *mut jni::JNIEnv,
             jni::jclass,
+            i32,
             i32,
             i32,
             jni::jdoubleArray,

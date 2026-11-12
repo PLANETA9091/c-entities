@@ -100,3 +100,27 @@ compares), all inside the existing pass — the bench (25k, the decision
 OFF) reads p50 1.48 ms/tick unchanged; the live wire pays ~one f64
 distance compare per player per mob + one branch. The Java side pays one
 JNI crossing per despawn EVENT (rare by definition) — nothing per tick.
+
+## Phase-2d addendum: the per-level executor split
+
+The wire's itemTickFlush is woven per LEVEL — a default-properties boot
+(nether + end alive) fires the boundary 3x per server tick, and the ONE
+executor ticked the WHOLE store 3x (the mob AI advanced 3x per server
+tick on any real server; the walk counter hid it — the saw-set is
+per-level and the other dimensions' tick lists are empty — and the jpos
+poll is self-consistent by construction). The split:
+
+- mobcore's EXEC becomes `HashMap<level_id, MobBatch>` — each Level
+  ticks its OWN executor; the players snapshot, the despawn cfg
+  (paper-world.yml IS per-world state) and the Difficulty are per-level
+  too. The executor is created lazily on the level's first crossing.
+- The small level id: `nmLevelKey(Level)` — a WeakHashMap-assigned
+  stable int per Level object, riding EVERY wire crossing
+  (nativeMobAdd/Remove/Players/Batch/DespawnCfg all gained the leading
+  `int level`; the natives_parity guard pins the descriptors).
+- nativeMobInit stays global (the stroll-stream seed at arm); each
+  level's executor clones it; nativeMobReset drops ALL levels.
+
+The bench/parity worlds stay single-level and exact; the 3-dimension
+boots are now correct BY CONSTRUCTION (the 3x ticking hole is closed,
+not ledgered).

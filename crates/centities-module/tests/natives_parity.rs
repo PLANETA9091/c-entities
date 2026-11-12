@@ -38,7 +38,7 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // L22a: the native goal engine
     s.insert(("nativeMobAiFloor", "([I[I)I"));
     // N3-N1 phase-2a: the resolved despawn config table (doc 61)
-    s.insert(("nativeDespawnCfg", "(II[D[I)Z"));
+    s.insert(("nativeDespawnCfg", "(III[D[I)Z"));
     // doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) arm+drain
     s.insert(("nativeMobLedgerTake", "(I)[J"));
     // L89: the gate ledger — per-class canUse census read+reset
@@ -46,10 +46,10 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // N2-M0: the wholesale native-mob wire (mobcore.rs — MobBatch shim)
     s.insert(("nativeMobInit", "(J)V"));
     s.insert(("nativeMobReset", "()V"));
-    s.insert(("nativeMobAdd", "(IJDDDI)I"));
-    s.insert(("nativeMobRemove", "(J)I"));
-    s.insert(("nativeMobPlayers", "([D[I)V"));
-    s.insert(("nativeMobBatch", "(II[J[D)I"));
+    s.insert(("nativeMobAdd", "(IIJDDDI)I"));
+    s.insert(("nativeMobRemove", "(IJ)I"));
+    s.insert(("nativeMobPlayers", "(I[D[I)V"));
+    s.insert(("nativeMobBatch", "(III[J[D)I"));
     s
 }
 

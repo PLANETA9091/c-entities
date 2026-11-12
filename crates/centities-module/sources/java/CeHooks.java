@@ -8694,6 +8694,26 @@ public final class CeHooks {
      *  in the 2000-mob JFR profile. Removes use the classic cluster pull
      *  (Knuth 6.4 R) — rare (Java-side deaths). */
     private static final NmMap NM_BYID = new NmMap();
+
+    // N3-N1 phase-2d: the per-level executor split — itemTickFlush is
+    // woven per Level (a 3-dimension boot fires the boundary 3x per server
+    // tick) and ONE executor would tick every store 3x. The small stable
+    // id rides every wire crossing; the Rust side keeps one MobBatch per
+    // id (the store, the players snapshot and the despawn cfg are
+    // per-level state, exactly like the paper-world.yml the cfg came
+    // from). WeakHashMap: a Level unload frees its id.
+    private static final java.util.WeakHashMap<Object, Integer> NM_LEVEL_IDS =
+            new java.util.WeakHashMap<>();
+    private static int NM_LEVEL_SEQ = 0;
+
+    private static int nmLevelKey(net.minecraft.world.level.Level l) {
+        Integer k = NM_LEVEL_IDS.get(l);
+        if (k == null) {
+            k = NM_LEVEL_SEQ++;
+            NM_LEVEL_IDS.put(l, k);
+        }
+        return k;
+    }
     /** The dead-mob scratch of one boundary pass (ids collected while
      *  applying, drained right after — zero map walks in the steady
      *  state where nobody died). */
@@ -9775,7 +9795,7 @@ public final class CeHooks {
                     .toBooleanOrElse(!mob.getType().isAllowedInPeaceful())) {
                 kind |= 1 << 10;
             }
-            nativeMobAdd(eid, seed, mob.getX(), mob.getY(), mob.getZ(), kind);
+            nativeMobAdd(nmLevelKey(mob.level()), eid, seed, mob.getX(), mob.getY(), mob.getZ(), kind);
             NM_BYID.put(eid, mob);
             nmAds++;
             if (nmAds == 1) {
@@ -9914,12 +9934,16 @@ public final class CeHooks {
                     NM_PF[i * 2 + 1] |= 2;
                 }
             }
-            nativeMobPlayers(NM_PXYZ, NM_PF);
-            pushDespawnCfgOnce(level);
+            // N3-N1 phase-2d: the per-level key — this boundary ticks ONLY
+            // its own level's executor (the store, the players snapshot and
+            // the despawn cfg are per-level state)
+            int nmLevel = nmLevelKey(level);
+            nativeMobPlayers(nmLevel, NM_PXYZ, NM_PF);
+            pushDespawnCfgOnce(nmLevel, level);
             // N3-N1 phase-2b: the Difficulty ordinal rides the batch — the
             // peaceful gate is runtime-exact (a /difficulty change lands on
             // the next boundary)
-            int n = nativeMobBatch(CUR_TICK, level.getDifficulty().ordinal(), NM_IDS, NM_POS);
+            int n = nativeMobBatch(nmLevel, CUR_TICK, level.getDifficulty().ordinal(), NM_IDS, NM_POS);
             if (n < 0) {
                 int need = -n;
                 if (NM_IDS.length < need * 2) {
@@ -10038,7 +10062,7 @@ public final class CeHooks {
                 nmApplies++;
             }
             for (int i = 0; i < NM_DEAD_N; i++) {
-                nativeMobRemove((long) NM_DEAD[i]);
+                nativeMobRemove(nmLevel, (long) NM_DEAD[i]);
                 NM_BYID.remove(NM_DEAD[i]);
                 nmRemoves++;
             }
@@ -10789,10 +10813,10 @@ public final class CeHooks {
     // tested MobBatch protocol; the whole batch crosses JNI once per tick).
     public static native void nativeMobInit(long seed);
     public static native void nativeMobReset();
-    public static native int nativeMobAdd(int eid, long seed, double x, double y, double z, int kind);
-    public static native int nativeMobRemove(long eid);
-    public static native void nativeMobPlayers(double[] xyz, int[] pf);
-    public static native int nativeMobBatch(int gameTick, int difficulty, long[] ids, double[] pos);
+    public static native int nativeMobAdd(int level, int eid, long seed, double x, double y, double z, int kind);
+    public static native int nativeMobRemove(int level, long eid);
+    public static native void nativeMobPlayers(int level, double[] xyz, int[] pf);
+    public static native int nativeMobBatch(int level, int gameTick, int difficulty, long[] ids, double[] pos);
 
     /** N3-N1 (doc 61) phase-2a: the RESOLVED despawn config crosses to
      *  native ONCE per level at the first boundary (the paper config is
@@ -10807,7 +10831,7 @@ public final class CeHooks {
             new java.util.WeakHashMap<>();
     private static long O_DR_H2 = -1, O_DR_RATIO = -1, O_DR_VDEF = -1, O_DR_VLIM = -1;
 
-    private static void pushDespawnCfgOnce(net.minecraft.world.level.Level level) {
+    private static void pushDespawnCfgOnce(int nmLevel, net.minecraft.world.level.Level level) {
         if (DESPAWN_PUSHED.get(level) != null) {
             return;
         }
@@ -10851,7 +10875,7 @@ public final class CeHooks {
                 fillDespawnRange(pair.hard(), i * 2, geom, meta);
                 fillDespawnRange(pair.soft(), i * 2 + 1, geom, meta);
             }
-            DESPAWN_CFG_LIVE = nativeDespawnCfg(ellipsoid, present, geom, meta);
+            DESPAWN_CFG_LIVE = nativeDespawnCfg(nmLevel, ellipsoid, present, geom, meta);
             if (DESPAWN_CFG_LIVE) {
                 System.out.println("[c-entities] N3-N1: despawn cfg live (shape="
                         + (ellipsoid == 1 ? "ellipsoid" : "cylinder") + " present=" + present + ")");
@@ -10877,7 +10901,7 @@ public final class CeHooks {
         meta[slot] = v;
     }
 
-    public static native boolean nativeDespawnCfg(int ellipsoid, int present,
+    public static native boolean nativeDespawnCfg(int level, int ellipsoid, int present,
                                                   double[] geom, int[] meta);
 
     /** L89: the gate ledger — per-class canUse census (evals/no/staged/rolls
