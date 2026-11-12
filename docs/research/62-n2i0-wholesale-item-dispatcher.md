@@ -121,3 +121,61 @@ the absorption rows remain). items-25k local: ~10.9 → ~9.3 ms (−54%→
 mixed-150k inherits both (the 3x-tick hole is already closed by
 phase-2d). The tracker pass (i0-c) is the follow-up lever once i0-a/i0-b
 land — it shares the verdict bit, so the plumbing arrives with them.
+
+## Addendum — i0-a shipped; the i0-a2 ground truth (javap 26.3-249)
+
+i0-a (the %4-rotation verdict) landed at 53b1f5d: the local leg reads
+dispFast=2007656 of 8162946 dispatches — EXACTLY the %4 share (the
+rotation qualifies 1-of-4 ticks per item); dispChecks/dispInactive/ttlQ
+identical to the pre-i0a legs. The gain sits inside the sandbox noise
+band (p50 9.77 vs the 9.1-10.9 mod legs) — as projected, the gate chain
+is a minority of the walk.
+
+The full activation ownership (i0-a2) needs the sweep replicated. The
+javap ground truth from the paper-26.3-249 mapped jar
+(io.papermc.paper.entity.activation.ActivationRange):
+
+- `activateEntities(Level)`: per player — Player.activatedTick = cur;
+  the per-type boxes = player BB inflated by (range, getHeight(),
+  range); maxBB = min(simulationDistance*4 - 8, max(all ranges)); ONE
+  Level.getEntities(maxBB, predicate) per player; per hit
+  activateEntity(e).
+- `activateEntity(e)`: IF cur > e.activatedTick: defaultActivationState
+  → stamp cur; ELSE IF e.activationType.boundingBox.intersects(e.bb) →
+  stamp cur. Items are ActivationType.MISC. NOTE the `cur >
+  activatedTick` guard: a stamp never goes backwards, and an entity
+  stamped this tick is not re-checked for other players.
+- `checkEntityImmunities(e)` (the immunity for the 20-tick window):
+  checkInactiveWakeup first (> -1 wins), then fireTicks>0 → 2,
+  activatedImmunityTick >= cur → 1, (not WATER-type && inWater &&
+  pushedByFluid) → 100, onGround && |dv|² > 1e-5 → 100, ... (the port's
+  itemImmunities matches the item-relevant tail).
+- The port's `e.activatedImmunityTick >= cur` clause is dead for
+  module-owned items: CeHooks NEVER writes the field (javap cross-check:
+  the only writers are vanilla paths the module routes away), so the
+  field stays at its initial 0 and 0 >= cur is false for every tick
+  after boot.
+- The vanilla sweep STILL RUNS for items today (no weave) — its stamp
+  lands on e.activatedTick and the port reads it back. Any core-side
+  ownership MUST replicate the sweep (the player-present divergence:
+  the sweep activates near-player items; without the replication the
+  core would keep them inactive). The replication inputs: the per-tick
+  player snapshot (the mob wire already passes one), miscActivationRange
+  + the level height + ignoreSpectatorActivation + the
+  simulationDistance clamp (a push-once cfg — the phase-2a pattern).
+  The vanilla getEntities(maxBB) sweep query per player per tick rides
+  the query wire today (part of the rowQuery cluster) — the core-side
+  sweep makes it redundant for the native population.
+
+i0-a2 shape: the ItemState mirror gains activated_tick (i64) +
+default_activation (bool); the batch entry's IF_INACTIVE flag stops
+being authoritative (the core decides tick_item vs tick_item_inactive
+from its own verdict — the sweep + the port chain); the read-back
+carries the verdict + the activatedTick/isTemporarilyActive writeback;
+the applier writes the two fields per entry (the vanilla sweep keeps
+running for the VANILLA population only — native items must skip it in
+activateEntity, a new early-return weave — otherwise two writers
+diverge); the dispatch's fast path extends from the %4 share to ~100%
+of the steady state. The twins: the sweep+verdict arm vs the port arm
+over a player-walk scenario (the bench is playerless — the parity
+harness's player-present leg is the honest gate, the doc 61 lesson).
