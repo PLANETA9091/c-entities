@@ -307,3 +307,28 @@ pre-query. The options:
 (b) keep mergeScanNative and accept the wire cost (the 4% rowQuery
     cluster) — the honest floor.
 (a) is a ~60-line slice: the export + the registry + the loop B's call.
+
+## Addendum 5 — the v3 build storm + the honest close of the i0-b line
+
+The v3 build (nativeMergeScan: one crossing per scan at the loop B's
+timing) reproduced the v1 storm EXACTLY (p50 277ms, merges=0,
+itemResync=50000 = every native add re-ingesting, vanillaNext=25000 =
+one per item) — while v2 (NO JNI call, the pool read) only thinned the
+merges (31%). THE COMMON FACTOR OF THE STORMS IS THE JNI CALL INSIDE
+THE APPLY LOOP: a native crossing mid-apply disturbs the module's
+arm/mode state (the exact mechanism needs a fresh debug session — the
+candidates: the JVMTI/kernel reentrancy during the crossing, or the
+exception-check path clearing a gate). v2's thinning is a separate,
+cleaner divergence (the pre-query/post-absorption interleaving — the
+addendum 4).
+
+THE HONEST CLOSE: the merge wire STAYS mergeScanNative (the L3 path —
+the rowQuery/fastQuery machinery, the vanilla-order candidates, the
+4% rowQuery cluster stays). The item leg's remaining levers are the
+tracker pass (i0-c) and the flush protocol polish — both minority
+costs. The session's shipped increments (i0-a/a2/a2b/a2c) hold:
+dispFast 98.4%, the paired items-25k at −51..−57% (the sandbox band
+8.70-10.87 vs the vanilla 20.26), 145 tests green at every commit.
+
+The post-restore verification leg (restore2): p50 8.70 (the session's
+best), merge=120931 — the proven state re-confirmed.
