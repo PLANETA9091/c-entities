@@ -79,6 +79,7 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
     private long tickNo = 0;
     private long measureEndTick = -1;
     private int spawnedItems = 0, spawnedStands = 0, spawnedZombies = 0;
+    private boolean despawnMode = false;
     private int placedHoppers = 0, placedFurnaces = 0;
 
     // --- behavioral parity harness ---
@@ -119,6 +120,14 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         tileFurnaces = intEnv("TILE_FURNACES", 0);
         tileArea = intEnv("TILE_AREA", 260);
         parity = "1".equals(env("PARITY", "0"));
+        // N3-N1 phase-2c (doc 61b): DESPAWN=1 = the honest-gate scenario —
+        // the zombies spawn with the VANILLA despawn behavior
+        // (setRemoveWhenFarAway(true), non-persistent): the paired legs'
+        // identical spawn layouts (rnd seed 42) collapse to the same
+        // surviving strata — the OFF arm through vanilla checkDespawn, the
+        // ON arm through the native decision (the populations MUST match;
+        // the samples' entity-count column carries the curve).
+        despawnMode = intEnv("DESPAWN", 0) == 1;
         paritySeed = longEnv("PARITY_SEED", 4242L);
         traceId = (int) longEnv("PARITY_TRACE_ID", -1L);
         // L54 diag: the tick-list order stream rides a SYSTEM property
@@ -427,7 +436,10 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     spawnedStands++;
                 } else {
                     Zombie zb = (Zombie) en;
-                    zb.setRemoveWhenFarAway(false);
+                    // DESPAWN=1: the vanilla behavior (removeWhenFarAway
+                    // stays true — the hard/soft gates bind); the default
+                    // bench keeps the wire's persistence contract
+                    zb.setRemoveWhenFarAway(!despawnMode);
                     ItemStack helm = new ItemStack(Material.IRON_HELMET);
                     helm.addUnsafeEnchantment(Enchantment.UNBREAKING, 255);
                     zb.getEquipment().setHelmet(helm);

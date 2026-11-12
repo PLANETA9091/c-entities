@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  SCENARIOS: items-100k mobs-25k mixed-150k spread-100k
+  SCENARIOS: items-100k mobs-25k mixed-150k spread-100k mobs-despawn-10k
   REPEATS: '3'
   MEASURE: '400'
   GATE_MARGIN: '1.05'
@@ -61,16 +61,27 @@ jobs:
           # REPEATS=3 but tolerates missing samples per scenario.
           for SC in $SCENARIOS; do
             case "$SC" in
-              items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0; REPS=3;;
-              mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0; REPS=1;;
-              mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1;;
-              spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1;;
+              items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0; REPS=3; DESP=0; MOBW=0;;
+              mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0; REPS=1; DESP=0; MOBW=0;;
+              # N3-N1 phase-2c (doc 61b): the honest gate — non-persistent
+              # zombies (removeWhenFarAway=true) spread over +-350 blocks:
+              # the far ring (outside the hard 128) despawns in both arms,
+              # the soft band (32..128) rolls on noAction>600 — the OFF arm
+              # through vanilla checkDespawn, the ON arm through the native
+              # decision; the populations MUST converge (the samples' entity
+              # column carries the curve, the gate asserts the end delta).
+              mobs-despawn-10k) SCALE=10000; ITEMS=0.0; STANDS=0.0; AREA=700; REPS=1; DESP=1; MOBW=1;;
+              mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1; DESP=0; MOBW=0;;
+              spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1; DESP=0; MOBW=0;;
             esac
             # mixed-150k on a 2-vCPU runner: fill ~18m + warmup ~9m
             # (about 5.7 s/tick observed) — a 600-tick window does not
             # fit the budget; 300 ticks keep the gate meaningful.
             MEAS="$MEASURE"
             if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
+            # the soft band's noAction>600 gate needs >600 live ticks before
+            # the 1/800 rolls start firing inside the measure window
+            if [ "$SC" = "mobs-despawn-10k" ]; then MEAS='600'; fi
             for r in $(seq 1 "$REPS"); do
             for ARM in off on; do
                 if [ "$ARM" = "on" ]; then
@@ -81,7 +92,7 @@ jobs:
                 echo "=== pair r$r $SC arm=$ARM ==="
                 RUN_NAME="abp-r$r-$SC-$ARM" \
                 SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
-                AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
+                AREA="$AREA" DESPAWN="${DESP:-0}" CE_NATIVE_MOB="${MOBW:-0}" TILE_HOPPERS=0 TILE_FURNACES=0 \
                 MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
                 MODULE="$M" \
                 bash scripts/run-baseline.sh
@@ -116,6 +127,11 @@ jobs:
           scen = os.environ["SCENARIOS"].split()
           reps = int(os.environ["REPEATS"])
 
+          DESP_SCEN = {"mobs-despawn-10k"}
+          POP_TOL = 0.05  # the surviving-population delta the gate tolerates
+                          # (the arms run the IDENTICAL spawn layout — rnd
+                          # seed 42 — the populations must converge)
+
           def load(arm, sc):
               out = []
               for r in range(1, reps + 1):
@@ -125,6 +141,21 @@ jobs:
                   except Exception:
                       pass
               return out
+
+          def last_pop(arm, sc):
+              # the last MSPT sample's entity count (index 1) — the despawn
+              # curve's end state (the surviving strata)
+              vals = []
+              for r in range(1, reps + 1):
+                  p = f"bench/abp-r{r}-{sc}-{arm}/results/baseline.json"
+                  try:
+                      d = json.load(open(p))
+                      s = d.get("samples") or []
+                      if s:
+                          vals.append(s[-1][1])
+                  except Exception:
+                      pass
+              return vals
 
           rows, fails = [], []
           for sc in scen:
@@ -136,21 +167,34 @@ jobs:
               mo, mn = statistics.median(off), statistics.median(on)
               ratio = mn / mo if mo > 0 else float("inf")
               ok = ratio <= margin
+              popline = ""
+              if sc in DESP_SCEN:
+                  po, pn = last_pop("off", sc), last_pop("on", sc)
+                  if po and pn:
+                      delta = abs(statistics.median(po) - statistics.median(pn))
+                      base = max(statistics.median(po), 1.0)
+                      pok = delta / base <= POP_TOL
+                      popline = f"  pop off={statistics.median(po):.0f} on={statistics.median(pn):.0f} delta={delta:.0f} {'OK' if pok else 'POP-FAIL'}"
+                      if not pok:
+                          ok = False
+                  else:
+                      ok = False
+                      popline = "  pop MISSING"
               if not ok:
                   fails.append(sc)
-              rows.append((sc, off, on, (mo, mn, ratio, ok)))
+              rows.append((sc, off, on, (mo, mn, ratio, ok, popline)))
           print("scenario      off-samples            on-samples             med-off  med-on   ratio  verdict")
           for sc, off, on, res in rows:
               if res is None:
                   print(f"{sc:<14}{str(off):<24}{str(on):<24}{'-':>9}{'-':>9}{'-':>7}  FAIL(missing)")
                   continue
-              mo, mn, ratio, ok = res
-              print(f"{sc:<14}{str([round(x,1) for x in off]):<24}{str([round(x,1) for x in on]):<24}{mo:>9.2f}{mn:>9.2f}{ratio:>7.3f}  {'PASS' if ok else 'FAIL'}")
+              mo, mn, ratio, ok, popline = res
+              print(f"{sc:<14}{str([round(x,1) for x in off]):<24}{str([round(x,1) for x in on]):<24}{mo:>9.2f}{mn:>9.2f}{ratio:>7.3f}  {'PASS' if ok else 'FAIL'}{popline}")
           print()
           print("AB-PAIRED-GATE: " + ("PASS" if not fails else "FAIL: " + ",".join(fails)))
           sys.exit(1 if fails else 0)
           PY
         env:
-          SCENARIOS: items-100k mobs-25k mixed-150k spread-100k
+          SCENARIOS: items-100k mobs-25k mixed-150k spread-100k mobs-despawn-10k
           REPEATS: '3'
           GATE_MARGIN: '1.05'
