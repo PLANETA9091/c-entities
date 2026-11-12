@@ -713,3 +713,64 @@ Next: phase-2b — the executor slot (the decision rides the pack pass),
 the RNG walk-order draw prefix, the discard outbox (nativeMobDiscard ->
 mob.discard(DESPAWN) at the boundary), the per-level cfg state, and the
 player-present non-persistent bench scenario (doc 61's honest gate).
+
+---
+Task ID: 16
+Agent: main (Z.ai)
+Task: N3-N1 phase-2b LIVE (the despawn decision) + phase-2c (the honest gate) — a864230, 32e0c96
+
+Work Log:
+- Doc 61b written BEFORE the code: the ground truth re-pinned from the
+  paper-26.3-249 mapped jar (Mob.checkDespawn bc 0-309; the hard branch
+  FALLS THROUGH to the soft check; the roll runs IFF soft-hit &&
+  !persistent && noAction>600 BEFORE removeWhenFarAway; EntitySelector
+  lambda$static$7 = !isSpectator && isAlive && affectsSpawning — the
+  affectsSpawning field is PUBLIC; getNearestPlayer = strict-< 3D^2,
+  first-in-list wins ties, radius -1 = unlimited; MobCategory ordinals
+  MONSTER=0..MISC=7; removeWhenFarAway base = TRUE; the TriState is
+  public).
+- The executor slot: the decision rides re_eval_mob BEFORE the AI (the
+  vanilla lambda$tick$0 head) in BOTH arms (serial walk + wave15 pass 1)
+  — per-mob pure => bit-identical by construction. The roll draws from
+  the mob's OWN mirror inside decide (the doc 61 §4 walk-order note
+  re-framed: under the shipped per-mob-mirror semantics the order is
+  trivially per-mob; bound 800 is even => exactly one LCG step — the
+  wave15 parallel shape untouched, NO new drawer class).
+- The outbox became the CAUSE COLUMN on the read-back rows (ids[2i+1]
+  bits 48..56; nav_state moved to 32..48 — the M0 wire never read it):
+  zero extra JNI crossings; the applier discards(DESPAWN) + feeds the
+  removal driver; finalize_despawns tombstones AFTER the fill (fused:
+  inside tick_wire_fused; serial: after the batch's own fill — which
+  ALSO fixed a LATENT DOUBLE TICK: the old serial fallback re-ran
+  exec.tick after tick_wire_fused had already walked).
+- The kind bits ride nativeMobAdd (category + persistence||passenger||
+  leash + removeWhenFarAway(0.0) once + the public TriState resolution);
+  the Difficulty ordinal rides the batch call PER TICK (nativeMobBatch
+  (II[J[D)I) — /difficulty is runtime-exact; the affects-spawning bit
+  (bit 1 of NM_PF) computed per player per boundary.
+- Tests: the despawn strata twin (hard/soft-roll/missed-roll/persistent/
+  no-affects/in-soft-reset — the rows asserted on the read-back + the
+  whole-store dumps equal after the tombstones), the no-player gate, the
+  draw-order proof (the roll lands before the AI draws — pinned vs the
+  decision-OFF arm), the peaceful-branch unit set; the batch twins
+  serialize on the EXEC_TWIN_LOCK discipline. THE WHOLE WORKSPACE GREEN
+  (incl. the 25k bench: p50 1.48ms, census 3745==3745 — the decision OFF
+  in the bench costs zero).
+- Caught while wiring: the MobAI despawn word must ride the twins' dumps;
+  add() keeps MobAI::new defaults (kind==0 is NOT "the defaults" — a real
+  zombie's kind carries rwf|peaceful).
+
+Stage Summary:
+- Push: a864230 (phase-2b) + 32e0c96 (phase-2c) on main.
+- The bench honest gate: ab-paired mobs-despawn-10k (DESPAWN=1:
+  removeWhenFarAway(true), non-persistent, AREA=700, 600-tick measure,
+  CE_NATIVE_MOB=1 on the ON leg) — the identical spawn layout (rnd seed
+  42) collapses to the same strata in both arms; the gate asserts the
+  end-population delta <= 5% on top of the MSPT ratio.
+- Next: the per-level executor split (the M0 one-executor ledger: 3
+  levels boot on the bench (no allow-nether=false!) — itemTickFlush is
+  woven per Level => the boundary fires 3x per server tick and the ONE
+  executor ticks the whole store 3x; the saw-set hides it from the walk
+  counter, the populations self-apply, but the mob AI advances 3x per
+  server tick on ANY real server) — the worklog's per-level cfg state
+  item, now proven structural.
