@@ -250,3 +250,60 @@ The i0-b redesign (the next session's opening move, in order):
    grows, never truncates);
 4. the leg gate: merges=121k ±3%, dispFast ~98%, p50 in the 9.1-10.9
    band — the same discipline as the i0-a2 increments.
+
+## Addendum 4 — the i0-b v2 build also regressed (reverted; the open question)
+
+The v2 build (the pool offset in the OI 5-int stride, the od n*18+16,
+the capped-8 candidates + the total with the mergeScanNative fallback)
+compiled green, the whole workspace green (145) — and the leg regressed
+AGAIN: p50 11.41 (the band is 9.1-10.9), the merge rows collapsed to
+38294 (the baseline 121170, −68%), mergeOps 35412 (76696), rm rose to
+7596 (5923). NO crash, NO counter explosion — the wire ran, the fast
+path stayed at 98% — the MERGE DECISIONS THEMSELVES thinned.
+
+The v1/v2 shared delta vs the proven baseline: the scan moved from the
+applier's mergeScanNative wire (fastQuery at the loop B, the entity's
+LIVE bb, the resolve loop) to the flush's phase-3 index query (the
+mirror bb from the od's post-tick x/y/z, the store-mirror filter
+is_mergable, the arenaRef resolution). The collapse means ONE of the
+scan's inputs differs enough to change ~68% of the merge outcomes:
+
+1. the BOX: the mirror bb (x±0.125, y..y+0.25) vs the entity's live
+   getBoundingBox() — the 26.3 ItemEntity bb shape must be javap'd
+   (makeBoundingBox / the dimensions constant) — a 0.25-vs-0.3 shape
+   or a y-offset would shed exactly this many candidates;
+2. the FILTER: the store-mirror is_mergable (the flags2 bit 4 —
+   isMergableFast packed by the flush) vs the wire's isMergableFast
+   re-check per live candidate — the mirror's freshness (the
+   pickupDelay/age/count changes between the pack and the scan);
+3. the ORDER/timing: the phase-3 scan runs AFTER the whole batch's
+   commits — the earlier rows' absorptions removed candidates for the
+   later scans (the wire ran per-row DURING the loop B, the same
+   interleaving — hmm: the wire's scans also ran inside the loop B —
+   the SAME interleaving — but the wire re-queried per row (the index
+   updated by the absorptions) while the phase-3 scan PRE-QUERIED each
+   row's box BEFORE the earlier rows' absorptions were applied?? — NO:
+   the phase-3 scan runs IN the commit loop (per k, in order) — the
+   same interleaving — EXCEPT the phase-3's absorptions happen in JAVA
+   LATER (the loop B) — the phase-3's index never sees the earlier
+   absorptions (they haven't happened yet — the loop B is AFTER the
+   whole phase 3!) — **THE V1/V2 SMOKING GUN: the phase-3's candidate
+   lists include the entities the loop B will absorb EARLIER in the
+   same batch — the wire's per-row scans (inside the loop B) saw the
+   post-absorption index** — the candidate sets diverge for CHAINED
+   merges (the dense fill!) — the merge decisions thin exactly as
+   observed.
+
+THE v3 DESIGN (the next session): the scan returns to the loop B's
+per-row timing, but the QUERY crosses JNI-free: the phase-3 CANNOT
+pre-query. The options:
+(a) the loop B calls a NEW in-process query entry (a Rust JNI export
+    `nativeMergeScan(wid, x, y, z, r, yinf) -> [cnt, ids...]` — ONE
+    crossing per scan (121/tick), zero row materialization, the index
+    sees the post-absorption state ✓ the timing exact ✓) — the
+    candidates resolve via the arena as today; the Java keeps the
+    gates. The wire's rowQuery/fastQuery machinery dies; the crossing
+    and the resolve stay.
+(b) keep mergeScanNative and accept the wire cost (the 4% rowQuery
+    cluster) — the honest floor.
+(a) is a ~60-line slice: the export + the registry + the loop B's call.
