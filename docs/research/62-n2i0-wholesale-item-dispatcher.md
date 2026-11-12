@@ -179,3 +179,40 @@ diverge); the dispatch's fast path extends from the %4 share to ~100%
 of the steady state. The twins: the sweep+verdict arm vs the port arm
 over a player-walk scenario (the bench is playerless — the parity
 harness's player-present leg is the honest gate, the doc 61 lesson).
+
+## Addendum 2 — i0-b ground truth (javap 26.3-249: ItemEntity merge)
+
+The core sets MERGE on the cadence gate (tick_count % 40, or % 2 on a
+floor change — the EMPIRICAL all-post convention, runs
+40723397672/40733281619); the scan itself runs in JAVA via the woven
+getEntities → rowQuery (the ~4% cluster). The javap of
+ItemEntity.mergeWithNeighbours (26.3-249):
+
+- `isMergable()` gate first: isAlive && pickupDelay != 32767 && the
+  stack-count tail (count < maxStackSize).
+- the radius: `spigotConfig.itemMerge` (a double config, default 0.5);
+  the box = `bb.inflate(itemMerge, onlyMergeItemsHorizontally ? 0.0 :
+  itemMerge - 0.5, itemMerge)` — the paper `onlyMergeItemsHorizontally`
+  config zeroes the Y inflation (0.5 - 0.5 = 0.0 at the default).
+- the scan: `getEntitiesOfClass(ItemEntity, box,
+  lambda$mergeWithNeighbours$0)` — the predicate excludes self (+ the
+  same isMergable set per candidate inside the loop).
+- per candidate (in the query's vanilla order): the
+  `fixItemsMergingThroughWalls` config gate runs a clipDirect
+  (position→position, CollisionContext.of(self)) — a BLOCK hit skips
+  the candidate — then `tryToMerge(candidate)`; the loop stops when
+  `isRemoved()` (self absorbed).
+- tryToMerge holds the count math (the same-item + the maxStackSize
+  fit) — THE STACK STATE — which the mirror does not carry.
+
+i0-b shape (the next session's opening move): the core's index query
+replaces the scan (the same index, the same vanilla order — the doc-36b
+parity holds; the query is in-process under the held INDEX lock — the
+fr-memo hole-closer already queries the index inside the flush). The
+mirror gains `is_mergable` (ingest + the probe/writeback maintenance);
+the compact read-back rows gain a candidates segment
+([cnt, id0..idN-1] in the vanilla order); the Java loop keeps ONLY
+tryToMerge + the wall-clip gate (the clip is Java-side: the section
+provider's collision — or the core's, config-gated). The candidate
+filter = the mirror's is_mergable; the pairing/count math stays in
+Java with the real stacks. The vanilla-routed items keep their scans.
