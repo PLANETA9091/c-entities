@@ -448,9 +448,79 @@ const B_TAIL_NONE: i32 = 1 << 16;
 /// active. Inactive entries and the 256-tick belt keep the proven slow
 /// chain (VANILLA_NEXT => no verdict; the applier clears the slot).
 const B_STAY: i32 = 1 << 17;
+/// i0-a2 (doc 62): the full verdict's decision — the fast path's active
+/// flag (DISP_VAL); paired with B_IS_TEMP (the isTemporarilyActive
+/// writeback bit).
+const B_VERDICT: i32 = 1 << 18;
+const B_IS_TEMP: i32 = 1 << 19;
 
 // flags from Java (mirror of CeHooks.IF_*)
 const F_INACTIVE: i32 = 1;
+
+/// i0-a2 (doc 62): the activation verdict — the EXACT port of
+/// CeHooks.itemCheckActive, computed post-tick over the batch-carried
+/// truth: `at` = the Java activatedTick at the NEXT dispatch (the
+/// vanilla sweep's stamps ride it — the sweep runs before the
+/// dispatches), `was_temp` = the field's pre-verdict value, `def` =
+/// defaultActivationState. The clause order is the port's; the Java-
+/// visible side effects return packed: (is_active, at_write, is_temp).
+///
+/// The port for reference (the %4 clause first — ZERO side effects):
+///   tc = tickCount+1; if ((tc+id) % 4 == 0) return true;
+///   if (defaultActivationState) return true;
+///   if (tc < 200) return true;
+///   isActive = activatedTick >= cur; isTemporarilyActive = false;
+///   if (!isActive && (cur - activatedTick - 1) % 20 == 0) {
+///       i = itemImmunities(e); if (i >= 0) activatedTick = cur + i;
+///       else isTemporarilyActive = true; isActive = true; }
+///   return isActive;
+///
+/// itemImmunities for a NATIVE item reduces exactly: fire routes vanilla
+/// (the mirror carries no fire — the water/lava/fire gates), the
+/// activatedImmunityTick clause is dead (CeHooks never writes the field —
+/// javap cross-check), water routes vanilla — the remaining: !onGround →
+/// 100, onGround && |dv|² > 9.999999747378752E-6 → 100, else -1.
+#[inline]
+fn activation_verdict(
+    id: i64,
+    tc: i32,
+    tenv: &TickEnv,
+    at: i64,
+    was_temp: bool,
+    def: bool,
+    on_ground: bool,
+    dx: f64,
+    dz: f64,
+) -> (bool, Option<i64>, bool) {
+    if ((tc as i64 + id) % 4) == 0 {
+        return (true, None, was_temp);
+    }
+    if def {
+        return (true, None, was_temp);
+    }
+    if tc < 200 {
+        return (true, None, was_temp);
+    }
+    let cur = tenv.cur_tick as i64;
+    let mut is_active = at >= cur;
+    let mut at_write: Option<i64> = None;
+    let mut is_temp = false; // e.isTemporarilyActive = false (the port writes it)
+    if !is_active && (cur - at - 1) % 20 == 0 {
+        let dv2 = dx * dx + dz * dz;
+        let immunity: i64 = if !on_ground || dv2 > 9.999_999_747_378_752E-6 {
+            100
+        } else {
+            -1
+        };
+        if immunity >= 0 {
+            at_write = Some(cur + immunity);
+        } else {
+            is_temp = true;
+        }
+        is_active = true;
+    }
+    (is_active, at_write, is_temp)
+}
 #[allow(dead_code)]
 const F_NATIVE: i32 = 2;
 const F_RESYNC: i32 = 4;
@@ -498,6 +568,11 @@ thread_local! {
     static T_INI: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
     static T_OUTD: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
     static T_OUTI: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    /// i0-a2 (doc 62): the per-entry activation truth — [atLo, atHi, flags2]
+    /// (flags2: bit0 = isTemporarilyActive, bit1 = defaultActivationState),
+    /// packed by the flush from the live entities (the vanilla sweep's
+    /// stamps ride it).
+    static T_ATI: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// JNI native: env is live on the calling (server) thread.
@@ -516,12 +591,13 @@ pub extern "system" fn n_item_tick(
     env_i: jni::jintArray,
     out_d: jni::jdoubleArray,
     out_i: jni::jintArray,
+    at: jni::jintArray,
 ) -> i32 {
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
     // vtable pattern proven in lib.rs.
     return unsafe {
         n_item_tick_impl(
-            env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i,
+            env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i, at,
         )
     };
 }
@@ -541,6 +617,7 @@ unsafe fn n_item_tick_impl(
     env_i: jni::jintArray,
     out_d: jni::jdoubleArray,
     out_i: jni::jintArray,
+    at: jni::jintArray,
 ) -> i32 {
     let n = n.max(0) as usize;
     if n == 0 || wid < 0 || wid >= 8 {
@@ -564,16 +641,20 @@ unsafe fn n_item_tick_impl(
                 T_FLAGS.with(|tf| {
                     T_OUTD.with(|tod| {
                         T_OUTI.with(|toi| {
+                    T_ATI.with(|tat| {
                             let mut d = td.borrow_mut();
                             let mut iv = ti.borrow_mut();
                             let mut idv = tid.borrow_mut();
                             let mut fv = tf.borrow_mut();
                             let mut od = tod.borrow_mut();
                             let mut oi = toi.borrow_mut();
+                            let mut atv = tat.borrow_mut();
+                            atv.resize(n * 3, 0);
+                            ((*vt).GetIntArrayRegion)(raw, at, 0, (n * 3) as i32, atv.as_mut_ptr());
                             iv.resize(n * 4, 0);
                             idv.resize(n, 0);
                             fv.resize(n, 0);
-                            od.resize(n * 8, 0.0);
+                            od.resize(n * 9, 0.0);
                             // L7 outI layout: [age, pickupDelay, bits, tickCount] —
                             // the applier mirrors the dispatcher's tickCount++/totalEntityAge++
                             // for entries whose vanilla dispatcher was suppressed.
@@ -586,9 +667,9 @@ unsafe fn n_item_tick_impl(
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, in_i, 0, (n * 4) as i32, iv.as_mut_ptr());
                             let mut envv_d = [0.0f64; 6];
-                            let mut envv_i = [0i32; 4];
+                            let mut envv_i = [0i32; 6];
                             ((*vt).GetDoubleArrayRegion)(raw, env_d, 0, 6, envv_d.as_mut_ptr());
-                            ((*vt).GetIntArrayRegion)(raw, env_i, 0, 4, envv_i.as_mut_ptr());
+                            ((*vt).GetIntArrayRegion)(raw, env_i, 0, 6, envv_i.as_mut_ptr());
                             if e.exception_check() {
                                 e.exception_clear();
                                 return -1;
@@ -627,6 +708,8 @@ unsafe fn n_item_tick_impl(
                                 border_min_z: envv_d[3],
                                 border_max_z: envv_d[4],
                                 border_margin: envv_d[5],
+                                cur_tick: envv_i[4],
+                                verdict_owned: envv_i[5] != 0,
                             };
                             let items_native = envv_i[3] != 0;
                             let t0 = std::time::Instant::now();
@@ -729,6 +812,7 @@ unsafe fn n_item_tick_impl(
                                     fr_step_special: false,
                                     friction_disabled: (f & F_FRIC_OFF) != 0,
                                     land_fall: 0.0,
+                                    default_activation: false,
                                 };
                                 if (f & (F_RESYNC | F_FORCE_VANILLA)) != 0 {
                                     // vanilla body ran this tick: ingest the fresh
@@ -772,13 +856,20 @@ unsafe fn n_item_tick_impl(
                                     } else {
                                         bits |= B_VANILLA_NEXT;
                                     }
-                                    od[k * 8] = st.dx;
-                                    od[k * 8 + 1] = st.dy;
-                                    od[k * 8 + 2] = st.dz;
-                                    od[k * 8 + 3] = st.x;
-                                    od[k * 8 + 4] = st.y;
-                                    od[k * 8 + 5] = st.z;
-                                    od[k * 8 + 6] = st.fall_dist as f64;
+                                    od[k * 9] = st.dx;
+                                    od[k * 9 + 1] = st.dy;
+                                    od[k * 9 + 2] = st.dz;
+                                    od[k * 9 + 3] = st.x;
+                                    od[k * 9 + 4] = st.y;
+                                    od[k * 9 + 5] = st.z;
+                                    od[k * 9 + 6] = st.fall_dist as f64;
+                                    // i0-a2: the resync entries carry no verdict (the
+                                    // next dispatch re-derives on the slow path); the
+                                    // writeback echoes the batch's at so the applier
+                                    // never writes a stale slot-8 value.
+                                    od[k * 9 + 8] = ((atv[k * 3 + 1] as i64) << 32
+                                        | (atv[k * 3] as i64 & 0xFFFF_FFFF))
+                                        as f64;
                                     oi[k * 4] = st.age;
                                     oi[k * 4 + 1] = st.pickup_delay;
                                     oi[k * 4 + 2] = bits;
@@ -865,7 +956,7 @@ unsafe fn n_item_tick_impl(
                                 let grid = &*grid;
                                 use rayon::prelude::*;
                                 sts.par_chunks_mut(512)
-                                    .zip(od.par_chunks_mut(512 * 8))
+                                    .zip(od.par_chunks_mut(512 * 9))
                                     .zip(oi.par_chunks_mut(512 * 4))
                                     .zip(c_flag.par_chunks_mut(512))
                                     .zip(c_l6.par_chunks_mut(512))
@@ -873,8 +964,9 @@ unsafe fn n_item_tick_impl(
                                     .zip(aborts_in.par_chunks(512))
                                     .zip(idv.par_chunks(512))
                                     .zip(fv.par_chunks(512))
+                                    .zip(atv.par_chunks(512 * 3))
                                     .for_each(
-                                        |((((((((st_c, od_c), oi_c), cf_c), cl_c), tk_c), ab_c), id_c), f_c)| {
+                                        |(((((((((st_c, od_c), oi_c), cf_c), cl_c), tk_c), ab_c), id_c), f_c), at_c)| {
                                             let mut scratch = Scratch::new();
                                             let mut provider = make_provider(wid);
                                             let mut cache = SectionCache::new(grid, &mut provider);
@@ -936,14 +1028,14 @@ unsafe fn n_item_tick_impl(
                                                     cf_c[j] = if want { 2 } else { 3 };
                                                     continue;
                                                 }
-                                                od_c[j * 8] = st.dx;
-                                                od_c[j * 8 + 1] = st.dy;
-                                                od_c[j * 8 + 2] = st.dz;
-                                                od_c[j * 8 + 3] = st.x;
-                                                od_c[j * 8 + 4] = st.y;
-                                                od_c[j * 8 + 5] = st.z;
-                                                od_c[j * 8 + 6] = st.fall_dist as f64;
-                                                od_c[j * 8 + 7] = st.land_fall as f64;
+                                                od_c[j * 9] = st.dx;
+                                                od_c[j * 9 + 1] = st.dy;
+                                                od_c[j * 9 + 2] = st.dz;
+                                                od_c[j * 9 + 3] = st.x;
+                                                od_c[j * 9 + 4] = st.y;
+                                                od_c[j * 9 + 5] = st.z;
+                                                od_c[j * 9 + 6] = st.fall_dist as f64;
+                                                od_c[j * 9 + 7] = st.land_fall as f64;
                                                 oi_c[j * 4] = st.age;
                                                 oi_c[j * 4 + 1] = st.pickup_delay;
                                                 let mut ob = 0i32;
@@ -998,13 +1090,39 @@ unsafe fn n_item_tick_impl(
                                                     {
                                                         ob |= B_REST_CAND;
                                                     }
-                                                    // i0-a STAY verdict (doc 62): the %4 rotation
-                                                    // clause — the Java port's int arithmetic wraps
-                                                    // mod 2^32, and 2^32 % 4 == 0, so the i64 sum's
-                                                    // mod-4 equals the wrapped int's mod-4.
-                                                    if (st.tick_count as i64 + 1 + id) % 4 == 0 {
-                                                        ob |= B_STAY;
+                                                    // i0-a2 (doc 62): the FULL verdict, computed
+                                                    // POST-tick — tick_count is the post-T value
+                                                    // the T+1 dispatch will read; `at` rides the
+                                                    // batch (the post-sweep Java truth). The STAY
+                                                    // bit (the %4 clause) folds into the verdict:
+                                                    // the fast path fires from DISP_VAL for every
+                                                    // native entry whose decision the core knows.
+                                                    let at_in = ((at_c[j * 3 + 1] as i64) << 32)
+                                                        | (at_c[j * 3] as i64 & 0xFFFF_FFFF);
+                                                    let (v_active, at_write, v_temp) =
+                                                        activation_verdict(
+                                                            id,
+                                                            st.tick_count + 1,
+                                                            &tenv,
+                                                            at_in,
+                                                            (at_c[j * 3 + 2] & 1) != 0,
+                                                            (at_c[j * 3 + 2] & 2) != 0,
+                                                            st.on_ground,
+                                                            st.dx,
+                                                            st.dz,
+                                                        );
+                                                    if v_active {
+                                                        ob |= B_VERDICT;
                                                     }
+                                                    if v_temp {
+                                                        ob |= B_IS_TEMP;
+                                                    }
+                                                    // od slot 8: the activatedTick the applier
+                                                    // writes back (the port's stamp, value-exact
+                                                    // even when None — the %4/no-write path leaves
+                                                    // the field at its pre-verdict value).
+                                                    od_c[j * 9 + 8] = at_write
+                                                        .unwrap_or(at_in) as f64;
                                                 }
                                                 oi_c[j * 4 + 2] = ob;
                                                 oi_c[j * 4 + 3] = st.tick_count;
@@ -1075,12 +1193,12 @@ unsafe fn n_item_tick_impl(
                                     entry.speed = rec.speed;
                                     entry.fr_step_special = rec.flags & 4 != 0;
                                     // L7: mirror the full state back (dispatch-owned)
-                                    entry.x = od[k * 8 + 3];
-                                    entry.y = od[k * 8 + 4];
-                                    entry.z = od[k * 8 + 5];
-                                    entry.dx = od[k * 8];
-                                    entry.dy = od[k * 8 + 1];
-                                    entry.dz = od[k * 8 + 2];
+                                    entry.x = od[k * 9 + 3];
+                                    entry.y = od[k * 9 + 4];
+                                    entry.z = od[k * 9 + 5];
+                                    entry.dx = od[k * 9];
+                                    entry.dy = od[k * 9 + 1];
+                                    entry.dz = od[k * 9 + 2];
                                     entry.age = oi[k * 4];
                                     entry.pickup_delay = oi[k * 4 + 1];
                                     entry.tick_count = oi[k * 4 + 3];
@@ -1093,7 +1211,7 @@ unsafe fn n_item_tick_impl(
                                     // commit).
                                     let l78_pre_fd = entry.fall_dist;
                                     let l78_pre_ong = entry.on_ground;
-                                    entry.fall_dist = od[k * 8 + 6] as f32;
+                                    entry.fall_dist = od[k * 9 + 6] as f32;
                                     // L55-diag: the commit-side witness for the
                                     // traced id — the outcome bit AND the entry's
                                     // pre/post on_ground at the SAME line. The
@@ -1134,7 +1252,7 @@ unsafe fn n_item_tick_impl(
                                                 & (B_MOVED | B_IMPULSE | B_MERGE
                                                     | B_DESPAWN | B_VOID | B_LAND))
                                                 == 0
-                                            && (od[k * 8 + 6] as f32) == l78_pre_fd
+                                            && (od[k * 9 + 6] as f32) == l78_pre_fd
                                             && out_pd == pre_pd
                                             && ((bits_now & B_ON_GROUND) != 0) == l78_pre_ong
                                     };
@@ -1152,24 +1270,24 @@ unsafe fn n_item_tick_impl(
                                     }
                                 }
                                 // state extremes (garbage-detector diagnostics)
-                                let ad = od[k * 8]
+                                let ad = od[k * 9]
                                     .abs()
-                                    .max(od[k * 8 + 1].abs())
-                                    .max(od[k * 8 + 2].abs());
+                                    .max(od[k * 9 + 1].abs())
+                                    .max(od[k * 9 + 2].abs());
                                 if ad.is_finite() && ad > max_abs_delta {
                                     max_abs_delta = ad;
                                 }
-                                let ap = od[k * 8 + 3]
+                                let ap = od[k * 9 + 3]
                                     .abs()
-                                    .max(od[k * 8 + 4].abs())
-                                    .max(od[k * 8 + 5].abs());
+                                    .max(od[k * 9 + 4].abs())
+                                    .max(od[k * 9 + 5].abs());
                                 if ap.is_finite() && ap > max_abs_pos {
                                     max_abs_pos = ap;
                                 }
                             }
 
                             oi[n4] = cn as i32;
-                            ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 8) as i32, od.as_ptr());
+                            ((*vt).SetDoubleArrayRegion)(raw, out_d, 0, (n * 9) as i32, od.as_ptr());
                             ((*vt).SetIntArrayRegion)(raw, out_i, 0, (n4 + 1 + cn) as i32, oi.as_ptr());
                             {
                                 let dt = t0.elapsed().as_nanos() as u64;
@@ -1218,6 +1336,7 @@ unsafe fn n_item_tick_impl(
             })
         })
     })
+})
 }
 
 /// The friction-block position the memo is keyed by (mirrors the core's

@@ -3886,6 +3886,12 @@ public final class CeHooks {
 
     // ---- batch (server-thread confined; one world per tick segment) ----
     private static final int IB_CAP = 1 << 17;
+    // i0-a2 (doc 62): the per-entry activation truth packed by the flush —
+    // [atLo, atHi, flags2] (flags2: bit0 = isTemporarilyActive, bit1 =
+    // defaultActivationState). The vanilla sweep's activatedTick stamps ride
+    // it: the sweep runs before the dispatches, so the batch carries the
+    // exact inputs the port would have read.
+    private static final int[] IB_ATI = new int[IB_CAP * 3];
     private static final long[] IB_IDS = new long[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
@@ -4582,7 +4588,11 @@ public final class CeHooks {
                     && MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 1
                     && MODE_REV[slot] == WORLD_REV
                     && !e.isRemoved()) {
-                appendDispatch(e, true);
+                // i0-a2: the core's verdict IS the port's decision (the same
+                // inputs, the same clause order — the batch carried the
+                // post-sweep activatedTick); the side effects were applied
+                // by the last flush's writeback.
+                appendDispatch(e, DISP_VAL[slot] != 2);
                 dispFast++;
                 return true;
             }
@@ -4888,6 +4898,10 @@ public final class CeHooks {
     // synchronously (probe box/delta), a section change makes MODE_REV
     // stale, a mode transition clears the slot in the applier.
     private static final long[] DISP_ID = new long[1 << 22];
+    // i0-a2: the verdict's decision for the stamped slot — 0 = no verdict
+    // (the slot was cleared), 1 = active, 2 = inactive. The fast path
+    // appends with this flag instead of running the port.
+    private static final int[] DISP_VAL = new int[1 << 22];
     // Per-section revision stamps: the flush drain stamps every invalidated
     // section with the post-bump WORLD_REV. A rest item whose environment
     // sections were not touched by the current revision keeps resting even
@@ -6185,21 +6199,41 @@ public final class CeHooks {
             envD[3] = level.getWorldBorder().getMinZ();
             envD[4] = level.getWorldBorder().getMaxZ();
             envD[5] = 2.0; // border routing margin
-            int[] envI = new int[4];
+            int[] envI = new int[6];
             envI[0] = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection(level);
             envI[1] = ca.spottedleaf.moonrise.common.util.WorldUtil.getMaxSection(level);
             envI[2] = (voidDamageEnabled(level) && !isNether) ? 1 : 0;
             envI[3] = isNether ? 0 : 1; // itemsNative: nether worlds route vanilla
 
-            double[] outD = growD(n * 8); // dx,dy,dz,x,y,z,fallDist,landFall
+            double[] outD = growD(n * 9); // dx,dy,dz,x,y,z,fallDist,landFall,activatedTick (i0-a2)
             // L79 COMPACT APPLY: n*4 per-entry quads + outI[n*4] = cn + the
             // compact batch indices — the core lists the entries whose
             // post-counter tail is NOT the proven TAIL_NONE no-op, and the
             // applier's loop B walks only those.
             int[] outI = growI(n * 5 + 1); // age, pickupDelay, bits, tickCount (L7)
 
+            // i0-a2: the activation truth rides the batch — three plain
+            // field reads per entry replace the port's whole per-dispatch
+            // chain (the sweep's stamps are already inside activatedTick).
+            for (int i = 0; i < n; i++) {
+                ItemEntity ie = IB_ITEM[i];
+                if (ie == null) {
+                    IB_ATI[i * 3] = 0;
+                    IB_ATI[i * 3 + 1] = 0;
+                    IB_ATI[i * 3 + 2] = 0;
+                    continue;
+                }
+                long at = ie.activatedTick;
+                IB_ATI[i * 3] = (int) at;
+                IB_ATI[i * 3 + 1] = (int) (at >> 32);
+                IB_ATI[i * 3 + 2] = (ie.isTemporarilyActive ? 1 : 0)
+                        | (ie.defaultActivationState ? 2 : 0);
+            }
+            envI[4] = net.minecraft.server.MinecraftServer.currentTick;
+            envI[5] = 1; // the verdict kill-switch (doc 62; CE-verdict bisection flips it)
+
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
-                    envD, envI, outD, outI);
+                    envD, envI, outD, outI, IB_ATI);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
             }
@@ -6319,11 +6353,24 @@ public final class CeHooks {
                         MODE_REV[mSlot] = revBefore;
                         MODE_VAL[mSlot] = 1;
                     }
-                    // i0-a: the STAY verdict rides the core's bit 17 — the
-                    // fast path fires only when the %4 clause is proven; the
-                    // verdict dies with the item's plan (cleared on any
+                    // i0-a2: the verdict rides the core's bit 18 — the fast
+                    // path fires for every native entry whose decision the
+                    // core computed; DISP_VAL carries active(1)/inactive(2).
+                    // The verdict dies with the item's plan (cleared on any
                     // non-native next tick).
-                    DISP_ID[mSlot] = (bits & (1 << 17)) != 0 ? IB_IDS[i] : 0L;
+                    DISP_ID[mSlot] = (bits & (1 << 18)) != 0 ? IB_IDS[i] : 0L;
+                    DISP_VAL[mSlot] = (bits & (1 << 18)) != 0
+                            ? ((bits & (1 << 19)) != 0 ? 2 : 1) : 0;
+                    // i0-a2: the verdict's side effects — the writeback keeps
+                    // the Java fields value-exact without running the port
+                    // (the od slot 8 carries activatedTick; bit 19 isTemp).
+                    if ((bits & (1 << 13)) == 0) {
+                        ItemEntity aw = IB_ITEM[i];
+                        if (aw != null) {
+                            aw.activatedTick = (long) outD[i * 9 + 8];
+                            aw.isTemporarilyActive = (bits & (1 << 19)) != 0;
+                        }
+                    }
                 } else {
                     MODE_REV[mSlot] = revBefore;
                     MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
@@ -6441,7 +6488,7 @@ public final class CeHooks {
                     continue;
                 }
                 int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
-                int o = i * 8;
+                int o = i * 9; // i0-a2: the od stride gained the activatedTick slot
                 // L16 DELTA_SAME: when the core reports the post-tick delta
                 // is bit-identical to the pre-tick delta (the resting-item
                 // fixed point: gravity -0.04, collide zeroes the axis,
@@ -6856,7 +6903,7 @@ public final class CeHooks {
     public static native int nativeItemTick(
             int wid, int n, long[] ids, int[] flags,
             double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
-            double[] outD, int[] outI);
+            double[] outD, int[] outI, int[] at);
     public static native void nativeItemInvalidate(
             int wid, int n, int[] xs, int[] ys, int[] zs);
 

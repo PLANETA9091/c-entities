@@ -3853,7 +3853,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeItemTick",
-        "(II[J[I[DI[I[D[I[D[I)I",
+        "(II[J[I[DI[I[D[I[D[I[I)I",
         itemcore::n_item_tick as *const c_void
     );
     push!(

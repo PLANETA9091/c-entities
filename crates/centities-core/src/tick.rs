@@ -87,18 +87,10 @@ pub struct ItemState {
     pub land_fall: f32,
     /// frictionState == TriState.FALSE (f = 1.0 exact; else block friction).
     pub friction_disabled: bool,
-    /// i0-a2 (doc 62): the activation mirror. activatedTick rides the
-    /// port's immunity stamps (cur + i); for native items the vanilla
-    /// sweep is out of the picture (playerless verdict ownership — the
-    /// sweep iterates level.players(), empty there; the player-present
-    /// worlds keep the Java port authoritative until the sweep
-    /// replication crosses the wire). defaultActivationState is a
-    /// per-entity constant. isTemporarilyActive is write-only state for
-    /// items (no readers outside the suppressed move path) — mirrored
-    /// so the Java field stays value-exact for the belt ticks.
-    pub activated_tick: i64,
+    /// i0-a2 (doc 62): defaultActivationState — a per-entity CONSTANT,
+    /// ingested once (the batch's flags2 bit carries it per tick too; the
+    /// store copy covers the pre-first-batch verdicts).
     pub default_activation: bool,
-    pub is_temp: bool,
 }
 
 impl ItemState {
@@ -132,9 +124,7 @@ impl ItemState {
             fr_step_special: false,
             land_fall: 0.0,
             friction_disabled: false,
-            activated_tick: 0,
             default_activation: false,
-            is_temp: false,
         }
     }
 }
@@ -165,11 +155,10 @@ pub struct TickEnv {
     /// verdict's clock. 0 in the engine unit tests (the fixtures pin
     /// activated_tick explicitly).
     pub cur_tick: i32,
-    /// i0-a2: the verdict ownership gate — TRUE only for playerless
-    /// worlds (the vanilla sweep iterates level.players(); empty there
-    /// means the port is the ONLY activatedTick writer and the mirror
-    /// is authoritative). Player-present worlds keep the Java port
-    /// until the sweep replication crosses the wire.
+    /// i0-a2: the verdict kill-switch (CE-verdict bisection). TRUE in
+    /// production: the verdict is a pure re-derivation of the Java
+    /// port over the batch-carried truth (activatedTick post-sweep),
+    /// so the fast path it feeds is value-identical by construction.
     pub verdict_owned: bool,
 }
 
