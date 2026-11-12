@@ -913,3 +913,8 @@ Stage Summary:
   −58.6%** (from −47%), mergeOps UP (82244 vs 76696), the workspace
   green (145; the natives_parity contract rides nativeMergeScan).
   Push: dbb8fab + 3b524c0 + e69a8af.
+- The scaling datapoints (the current executor, 2 vCPU, the bench
+  binary): 25k = 1.26-1.31 ms/tick, 100k = 5.15-5.23 ms/tick — the
+  ratio 4.02× for the 4× population: LINEAR (the wave15 shape holds at
+  100k; the doc-55 datapoint 4.87 re-reads within the noise). The
+  probes: pass1 97% of the wall, the serial fragments dead.
