@@ -825,3 +825,67 @@ Stage Summary:
   Java-side cadence scans + tracker pass.
 - Next: the item wave (the doc first), then the CI arbiter reads the
   mob rows again (mobs-25k-native, spread, mixed ride the wire).
+
+---
+Task ID: 18
+Agent: main (Z.ai)
+Task: n2-i0 — the wholesale item dispatcher wave (doc 62): the fast path 0% -> 98.4%
+
+Work Log:
+- The sandbox recovered (the recycle wiped /tmp twice — the restore
+  script lives at scripts/restore_env.sh in the project dir). The CI
+  forensics: the Nov-8..11 results blackout = the pre-L104 mod sides
+  dying to the 45-min job timeout + the 36.7-min per-side watchdog —
+  BOTH fixes already on main; the pushes re-armed the full matrix
+  (the mobs-25k-native row rides since 7caf5ef).
+- The local paired items-25k A/B (26.3, 2 vCPU, seed 620856203):
+  vanilla p50 20.26 / mod 10.87..9.81 (−46..−51%). The measure-window
+  JFR (991 samples): the module cluster ~17.7% (the dispatcher walk
+  4.4 + rowQuery 4.0 + the flush protocol 3.6 + the tracker 2.8 + the
+  Unsafe mirrors 2.9), the native item tick invisible (L8.2's compact
+  batch already carries only id+flags for dispatch-owned entries).
+- doc 62 written + the javap ground truths (the activation sweep,
+  checkEntityImmunities, mergeWithNeighbours) — the i0-a2 design rides
+  the batch-carried activatedTick (the sweep's stamps are inside it by
+  construction).
+- i0-a (53b1f5d): the %4 rotation verdict (bit 17) — dispFast=25%
+  (exactly the rotation share), the counters identical.
+- i0-a2 (5a47611): THE FULL VERDICT RIDES THE BATCH — the flush packs
+  [atLo, atHi, flags2] per entry (the sweep's stamps ride activatedTick
+  by construction); the core re-derives the port POST-tick over the
+  batch truth (the clause order is the port's; the immunities reduce
+  exactly for native items: fire/water route vanilla, the
+  activatedImmunityTick clause is dead per javap); the od stride 9 (the
+  slot 8 = the activatedTick writeback, bit 19 = isTemp). THE 8-vs-9
+  DRIFT CAUGHT: the resync branch's old-stride writes fed the phase-3
+  reads garbage — an item at −134M blocks (the reasonable-bounds
+  warning) — fixed on both sides.
+- i0-a2b (be27cc0): the INACTIVE verdict stamps too (bit 20; the
+  DISP_VAL 1/2 split un-confused bit 19 from the decision — an
+  active-during-immunity item would have appended IF_INACTIVE).
+  dispFast=8032720/8164966 = **98.4%** of dispatches; the slow chain
+  serves only the fresh/wake/belt entries.
+- i0-a2c (2ba1bc7): the writeback skips idempotent cases (bit 21 gates
+  the activatedTick store; the isTemp write fires only on change).
+- The i0-b premise refined: mergeScanNative (L3) ALREADY rides the
+  query wire (fastQuery → the doc-36b vanilla order) — the scan is
+  Java-side through the wire, the candidates are vanilla-ordered. The
+  i0-b shape (the doc's addendum 2): the scan moves into the flush's
+  phase 3 (the in-process index query under the held lock — the fr-memo
+  hole-closer's pattern), the candidates ride a variable-length pool
+  (the fixed cap risks the dense-pile divergence — the vanilla loop
+  stops at the first absorption but the all-fail case iterates ALL),
+  the Java keeps tryToMerge + the wall-clip gate.
+- The whole workspace green (145 tests) at every pushed commit. The
+  25k mob bench unchanged (p50 1.26 ms/tick = −85% — the item wave
+  touches nothing mob-side).
+
+Stage Summary:
+- Push: 60cd475, 53b1f5d, 8cc7454, 9664ccc, 5a47611, be27cc0, 2ba1bc7,
+  b82b3d6 on main.
+- The item dispatch fast path: 0% -> 98.4%, bit-exact by construction
+  (the verdict is a pure re-derivation over the batch-carried truth).
+- The local paired A/B: items-25k −51% (20.26 -> 9.9); the CI arbiter
+  re-armed for the 4-vCPU certification (the mobs rows ride the wire).
+- Next: i0-b (the in-flush merge scan + the candidates pool), i0-c
+  (the tracker pass reads the verdict), then the CI arbiter reads.
