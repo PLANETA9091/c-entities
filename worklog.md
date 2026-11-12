@@ -889,3 +889,15 @@ Stage Summary:
   re-armed for the 4-vCPU certification (the mobs rows ride the wire).
 - Next: i0-b (the in-flush merge scan + the candidates pool), i0-c
   (the tracker pass reads the verdict), then the CI arbiter reads.
+
+- The i0-b line (the addenda 3-5 of doc 62): three builds attempted to
+  move the merge scan into the flush (the phase-3 pre-query + the pool;
+  then the in-process nativeMergeScan crossing at the loop B's timing) —
+  ALL reverted: the v1/v3 storms (the JNI-in-apply-loop trigger, the
+  exact mechanism pending a fresh debug session) and the v2 thinning
+  (the pre-query/post-absorption interleaving — the chained merges).
+  The merge wire STAYS mergeScanNative. The post-restore leg: p50 8.70
+  (the session's best), merge=120931 — the proven state re-confirmed.
+  The phase probe (the current executor): pass1 1.949 (97% of the wall),
+  the fragments dead — wave15's shape holds, the −90% belongs to the
+  CI 4-vCPU arbiter.
