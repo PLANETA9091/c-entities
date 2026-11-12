@@ -216,3 +216,37 @@ tryToMerge + the wall-clip gate (the clip is Java-side: the section
 provider's collision — or the core's, config-gated). The candidate
 filter = the mirror's is_mergable; the pairing/count math stays in
 Java with the real stacks. The vanilla-routed items keep their scans.
+
+## Addendum 3 — the i0-b first build FAILED and was reverted (the forensics)
+
+The phase-3 scan's first build collapsed the leg to p50 280ms with
+merges=0 and a resync storm (itemResync=50000 — every native add
+re-ingested every tick). The od layout carried the pool offset in the
+row's slot 9 (`od[k*9+9]`) — **for the last batch row (k=n-1) that
+index is exactly n*9, the pool's first cell** — the offset write
+clobbered the first merge row's candidate count (and vice versa), and
+the dense-fill scans produced 25-50 candidates per box (25k freshly
+spawned items in a tight pile, every one isMergable) so the 4096-double
+pool overflowed within ~80 rows and the truncation marked every later
+row VANILLA_NEXT — the MODE stamping then herded the whole population
+through the resync path (the full 14-double state copy per item per
+tick) while the merge counter read zero.
+
+The revert restored 4978f5f exactly (the leg: p50 10.60, merge=121290,
+dispFast=8.04M/98.4% — the i0-a2c state verified live).
+
+The i0-b redesign (the next session's opening move, in order):
+1. the row's pool offset moves to the OI ints (the stride 4 -> 5: the
+   5th int = the pool offset; the od slot 9 dies) — the ints and the
+   doubles never share a cell;
+2. the pool grows past the truncation instead of marking rows: the od
+   Vec extends (`od.resize(n*9 + pool_used)` per flush) and the Java
+   outD sizing follows (`growD(n*9 + pool_used)` — the Set region
+   already writes od.len()), so the overflow case DISAPPEARS instead of
+   degrading;
+3. the dense-fill guard: the scan's candidate list is UNBOUNDED (the
+   vanilla loop stops at the first absorption — the candidates after it
+   are irrelevant; the all-fail case needs the full list — the pool
+   grows, never truncates);
+4. the leg gate: merges=121k ±3%, dispFast ~98%, p50 in the 9.1-10.9
+   band — the same discipline as the i0-a2 increments.
