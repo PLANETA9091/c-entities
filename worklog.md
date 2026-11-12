@@ -901,3 +901,15 @@ Stage Summary:
   The phase probe (the current executor): pass1 1.949 (97% of the wall),
   the fragments dead — wave15's shape holds, the −90% belongs to the
   CI 4-vCPU arbiter.
+
+- THE I0-B STORM ROOT FOUND (the bisect: the call with the ignored
+  result ran clean at 8.88) — the arena-resolved candidates lacked the
+  isRemoved check: the arena holds the entities absorbed earlier in the
+  SAME batch until the removal driver; tryToMerge on a dead entity
+  corrupted the stacks (the v1/v3 identical storms). The one-line fix
+  landed with the full v3 (nativeMergeScan: one crossing per scan at
+  the loop B's timing, the vanilla-order candidates, the exact
+  fallback): **items-25k p50 {7.474, 8.091} vs the vanilla 18.793 =
+  −58.6%** (from −47%), mergeOps UP (82244 vs 76696), the workspace
+  green (145; the natives_parity contract rides nativeMergeScan).
+  Push: dbb8fab + 3b524c0 + e69a8af.
