@@ -3856,6 +3856,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         "(II[J[I[DI[I[D[I[D[I[I)I",
         itemcore::n_item_tick as *const c_void
     );
+    // THE STORM BISECT: the call happens, the result is ignored.
+    push!(
+        "nativeMergeScan",
+        "(IDDDDDJ[J)I",
+        itemcore::n_merge_scan as *const c_void
+    );
     push!(
         "nativeItemInvalidate",
         "(II[I[I[I)V",

@@ -1441,6 +1441,74 @@ unsafe fn n_item_invalidate_impl(
     }
 }
 
+/// THE STORM BISECT (doc 62 addendum 5): the v3 export re-applied — the
+/// Java call happens but the result is IGNORED (fast=false always). If the
+/// storm persists, the CALL ITSELF is the trigger; if not, the absorption.
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn n_merge_scan(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    wid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    r: f64,
+    yinf: f64,
+    self_id: jni::jlong,
+    out: jni::jlongArray,
+) -> i32 {
+    if wid < 0 || wid >= 8 || r.is_nan() {
+        return -1;
+    }
+    let Ok(mut g) = crate::INDEX.try_lock() else {
+        return -1;
+    };
+    let cst = g.get_or_insert_with(crate::new_state);
+    let Some(core) = cst.items.as_mut() else {
+        return -1;
+    };
+    if wid as usize >= core.worlds.len() || core.worlds[wid as usize].is_none() {
+        return -1;
+    }
+    let world = core.world(wid as usize);
+    let qbox = centities_core::Aabb::new(
+        x - 0.125 - r,
+        y - yinf,
+        z - 0.125 - r,
+        x + 0.125 + r,
+        y + 0.25 + yinf,
+        z + 0.125 + r,
+    );
+    let mut cands: Vec<i64> = Vec::with_capacity(16);
+    cst.idx.query(wid as u16, &qbox, &mut cands);
+    let mut n = 0usize;
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let raw = e.raw();
+        let vt = *raw;
+        let out_len = ((*vt).GetArrayLength)(raw, out) as usize;
+        let mut buf: Vec<i64> = Vec::with_capacity(out_len);
+        for &cid in cands.iter() {
+            if cid == self_id {
+                continue;
+            }
+            let cslot = (cid as u64 & STORE_MASK) as usize;
+            let ctag = (cid as u64 >> 17) | 1;
+            let ce = &world.entries[cslot];
+            if ce.tag != ctag {
+                continue;
+            }
+            if n >= out_len {
+                return -1;
+            }
+            buf.push(cid);
+            n += 1;
+        }
+        ((*vt).SetLongArrayRegion)(raw, out, 0, n as i32, buf.as_ptr());
+    }
+    n as i32
+}
+
 #[cfg(test)]
 mod parse_tests {
     use super::*;

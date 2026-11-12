@@ -3892,6 +3892,7 @@ public final class CeHooks {
     // it: the sweep runs before the dispatches, so the batch carries the
     // exact inputs the port would have read.
     private static final int[] IB_ATI = new int[IB_CAP * 3];
+    private static final long[] MS_CAND_IDS = new long[256];
     private static final long[] IB_IDS = new long[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
@@ -6561,6 +6562,46 @@ public final class CeHooks {
                     e.needsSync = true;
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
+                    // i0-b v3 (doc 62): the scan crosses ONE in-process JNI
+                    // call (nativeMergeScan) at the loop B's per-row timing —
+                    // the index sees the post-absorption state of the earlier
+                    // rows (the exact vanilla interleaving). THE STORM ROOT
+                    // (the addenda 3-5): the arena-resolved candidates must
+                    // carry the isRemoved check — the arena still holds the
+                    // entities absorbed earlier in the same batch until the
+                    // removal driver runs; tryToMerge on a dead entity
+                    // corrupted the stacks (the v1/v3 resync storm).
+                    boolean walls = level.paperConfig().fixes.fixItemsMergingThroughWalls;
+                    double mr = level.spigotConfig.itemMerge;
+                    double myinf = level.paperConfig().entities.behavior.onlyMergeItemsHorizontally
+                            ? 0.0 : mr - 0.5;
+                    int cands = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
+                            mr, myinf, e.getId(), MS_CAND_IDS);
+                    boolean fast = cands >= 0;
+                    if (fast) {
+                        for (int k2 = 0; k2 < cands; k2++) {
+                            ItemEntity other = (ItemEntity) arenaRef(MS_CAND_IDS[k2]);
+                            if (other == null || other.isRemoved()) continue;
+                            if (!isMergableFast(other)) continue;
+                            if (walls
+                                    && level.clipDirect(e.position(), other.position(),
+                                           net.minecraft.world.phys.shapes.CollisionContext.of(e))
+                                    == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                                continue;
+                            }
+                            MH_TRY_MERGE.invokeExact(e, other);
+                            if (e.isRemoved() | other.isRemoved()) mergeOps++;
+                            if (e.isRemoved()) break;
+                        }
+                    }
+                    if (!fast) {
+                        // A refusal (the lock, the overflow) or a disabled fast
+                        // path MUST fall back — an ignored false here DROPPED
+                        // merges (observed: 104,383 in one spread leg).
+                        if (!mergeScanNative(e)) {
+                            runVanillaMerge(e);
+                        }
+                    }
                     itemMerge++;
                     // MS diagnostics: the flush path decided this scan; mv
                     // carries the Rust cadence's floor-change verdict (rate 2
@@ -6912,6 +6953,9 @@ public final class CeHooks {
             int wid, int n, long[] ids, int[] flags,
             double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
             double[] outD, int[] outI, int[] at);
+    public static native int nativeMergeScan(
+            int wid, double x, double y, double z, double r, double yinf,
+            long selfId, long[] out);
     public static native void nativeItemInvalidate(
             int wid, int n, int[] xs, int[] ys, int[] zs);
 
