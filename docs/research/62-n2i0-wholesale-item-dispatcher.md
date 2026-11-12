@@ -332,3 +332,21 @@ dispFast 98.4%, the paired items-25k at −51..−57% (the sandbox band
 
 The post-restore verification leg (restore2): p50 8.70 (the session's
 best), merge=120931 — the proven state re-confirmed.
+
+## Addendum 6 — the session-final metrics (the i0 wave shipped)
+
+- The item dispatch fast path: **98.4%** of dispatches (dispFast
+  8040598/8172898 on the restore leg) — the steady state is fully
+  core-decided; the slow chain serves the fresh/wake/belt entries.
+- The final paired items-25k A/B (the same window, 2 vCPU):
+  vanilla p50 **18.793** / mod p50 **9.908** = **−47.3%** (the session's
+  leg band: the vanilla 18.8-20.3, the mod 8.70-10.87 — the mod's best
+  window read −57%).
+- The mob side untouched and verified: the 25k bench p50 **1.26-1.31
+  ms/tick** (−85% vs the 8.41 bench origin, 2 vCPU) — the −90% line
+  belongs to the CI 4-vCPU arbiter (doc 55: par(4) −90.5..−93.7%).
+- The workspace: 145 tests green at every pushed commit (10 commits:
+  60cd475..3c70d96).
+- The merge wire: mergeScanNative stands (the v1/v2/v3 attempts
+  documented in the addenda 3-5); the remaining item levers = the
+  flush protocol polish (a minority cost).
