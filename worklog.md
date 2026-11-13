@@ -949,3 +949,28 @@ Stage Summary:
   manifest). The #462/#463 runs re-measure with the leak dead — the
   mob numbers should improve again (the 2GB QSCRATCH was burning
   bandwidth in run #461's code).
+
+- L116 — THE ALLOCATOR ALIGNMENT FIX (the CI core-job SIGSEGV, bisected
+  to 3b874fd). The module workflow died on EVERY push since #313
+  (3m40-4m43s runs) while the sandbox stayed green: the L111 counting
+  allocator returned raw+16 as the user pointer for EVERY allocation,
+  and for any request with align > 16 (rayon's CachePadded worker cells
+  ride align 64) that pointer violated the GlobalAlloc alignment
+  contract — hard UB, instant SIGSEGV in every centities-core binary.
+  The dynamic bisect: default-semantics realloc alone still crashed;
+  the pure-counting allocator (no header) passed — the header scheme
+  itself was the killer. The fix: allocate sz+HDR+align bytes, align
+  the user pointer UP to the request, and the header carries
+  [sz, raw|site<<56] so dealloc never re-derives the raw pointer (the
+  per-site live attribution — the L114 merge_keys-leak methodology — is
+  preserved exactly; the site rides the pointer's top bits, x86-64 user
+  space < 2^48). realloc rides the default alloc+copy+free semantics
+  (the header-aware variant re-derived layouts across the alignment
+  jiggle). Local: the FULL core suite green in debug (69) and release
+  (69) — flush_zip 0.01s; the module suite green (14); the 25k mob
+  bench p50 1.24 ms/tick (the band was 1.26-1.31 — no regression, the
+  common path is byte-for-byte the old cost). Push: 7cc38bd. The
+  natives_parity drift red on #313 was the SAME commit's
+  nativeAllocStats declaration missing from the hand registry — a25c999
+  already fixed that side; the sandbox's stale target/ cache masked
+  both until a clean-tree run.
