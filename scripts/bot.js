@@ -23,7 +23,15 @@ function connect(attempt) {
     version: process.env.BOT_VERSION || '26.1',
   })
   bot.on('login', () => console.log('BOT-LOGGED-IN'))
-  bot.on('spawn', () => console.log('BOT-SPAWNED'))
+  bot.on('spawn', () => {
+    // L119: the client-side physics OFF — mineflayer's gravity/flying sim
+    // emits position packets the 26.3 server (via ViaVersion) rejects with
+    // "moved too quickly" -> "Invalid move player packet" -> the kick loop.
+    // An AFK bot needs NO movement: the activation range only wants the
+    // player PRESENT at spawn. The bot holds its spawn position silently.
+    bot.physicsEnabled = false
+    console.log('BOT-SPAWNED (physics off)')
+  })
   bot.on('kicked', (r) => console.log('BOT-KICKED', String(r).slice(0, 200)))
   bot.on('error', (e) => console.log('BOT-ERROR', e && e.message))
   bot.on('end', (r) => {
