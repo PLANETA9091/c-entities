@@ -1008,3 +1008,29 @@ Stage Summary:
   (keeps #461's sane 1983-row/246µs passes, kills the 25k-row spawn
   monsters on every runner speed); (2) BIGBOX_DEFAULT_MIRR_NS = 100µs —
   unmeasured buckets REFUSE until 16 samples land. Push: 8de8aad.
+
+- L118 — THE FOUR-ROOT PARITY RESTORATION (the items scenario, red since
+  i0-a2). The local parity-items pair (20000 items, the seeded fill, the
+  void floor) bisected four roots: (1) the i0-b v3 edit left the legacy
+  mergeScanNative call behind the new nativeMergeScan crossing — a
+  DOUBLE scan per cadence tick, absorbing 20% of the population away
+  (n 16537 -> 13197); (2) the vanilla merge cadence gates the SURVIVOR
+  with isMergable() (javap) — the module scanned from inert survivors
+  (the fill's setPickupDelay(32767) pool) and absorbed neighbours INTO
+  them; (3) the activation verdict served the NEXT tick's sweep with
+  dispatch-time conventions — every clause shifted by one, the no-player
+  legs went 100% inactive, the full body never ran, the merge cadence
+  (which lives in the full body) never fired (merge=0, 20000 intact);
+  (4) the %4 move gate's body-tc phase never coincided with the
+  verdict's sweep-tc phase — the move never fired, the gravity
+  accumulated unbounded (vy=-4.6) — replaced with the provable
+  fixed-point gate (a grounded zero-delta item replicates its state
+  through vanilla's active tick bit-exactly). PLUS the bootstrap: the
+  survivor gate gated the scan behind handles that initialized only
+  inside the scan itself — the gate now inits first, an init failure
+  routes the vanilla body. The health guard: an unpopulated index
+  refuses the merge scan (the void-world fast=true-zero-candidates
+  silent wrong answer). The ladder: 13197 (over-merge) -> 20000 (no
+  merge) -> 16518 vs the vanilla 16537. The remaining delta: the
+  collision-remainder dust decay (vx/vz 1e-93 vs 1e-208) + 19 extra
+  absorptions (0.5%) — the next hunt. Push: 4a41d10.
