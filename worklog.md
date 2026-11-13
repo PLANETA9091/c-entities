@@ -918,3 +918,34 @@ Stage Summary:
   ratio 4.02× for the 4× population: LINEAR (the wave15 shape holds at
   100k; the doc-55 datapoint 4.87 re-reads within the noise). The
   probes: pass1 97% of the wall, the serial fragments dead.
+
+- THE CI FORENSICS CLOSED (the two blockers named and fixed):
+  (1) the Nov 8 collapse (run #353, e61e688) — the hooks line read
+  bigbox=5562973/44143244714: the L104 constant refuse (1024 rows)
+  walked 44.1 BILLION scan rows per leg and paid the vanilla mirror on
+  top of every refusal (a double body); fast 8%, mobs-25k-mod 656ms vs
+  vanilla 565ms. L111: the adaptive refuse follows the measured mirror
+  price of the gate cell (predicted resolve n*(112+12)ns vs MIRR_EMA,
+  16-sample bootstrap, 65536 ceiling) — the October shape restored.
+  (2) the Nov 12 death (run 43313112458): the module leg's native heap
+  climbed 3.1 -> 14.9GB against NMT committed 2.65GB; the local repro
+  (10k zombies) blew 704MB -> 3346MB in 80s while the items leg
+  stabilized. The counting allocator (header-pinned per-site deltas +
+  backtrace-on-huge) named it: **THE MERGE_KEYS LEAK** — every
+  multi-tile query pushed the order key of every scan survivor into ONE
+  Vec that nothing cleared between queries (only the full reset);
+  ~26M queries x survivors = the 2^30-byte buffer retained forever.
+  L114: merge_keys.clear() rides merge_segs.clear() per cell. The local
+  leg after the fix: RSS plateau 2238MB, alloc live flat 543-545MB,
+  rc=0. Guards shipped alongside (the entry sanitizer batch+direct,
+  the QUERY_STORM refusal at 1M candidates, the oversize cap, the
+  L113 entity/cell/IdMap-cap/alloc-live phantom guards) — the module
+  can never break the server on a burst again.
+- THE CI NUMBERS ARE BACK (run #461, 3b874fd, L111+L113): **mobs-25k-
+  native 38.080ms vs vanilla 542.652 = −93.0%** (the goal −90% crossed),
+  mixed-150k-mod −76.7%, spread-100k-mod −62.0%, items-100k-mod −60.6%,
+  mobs-25k-mod −42.6% (the query-wire story; the native wire is the
+  production row). Pushes: 3b874fd, acc080a (L114), a25c999 (the
+  manifest). The #462/#463 runs re-measure with the leak dead — the
+  mob numbers should improve again (the 2GB QSCRATCH was burning
+  bandwidth in run #461's code).
