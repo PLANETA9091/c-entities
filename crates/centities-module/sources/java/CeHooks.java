@@ -1748,6 +1748,7 @@ public final class CeHooks {
                 int paSlot = paId & AMASK;
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
+                RM_BIT[paSlot] = 0; // L115: fresh slot — alive
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
                 batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
             }
@@ -1769,6 +1770,7 @@ public final class CeHooks {
                 ARENA[prSlot] = null;
                 ARENA_ID[prSlot] = 0;
                 REST_GEN[prSlot] = 0; // gone: drop the rest state
+                RM_BIT[prSlot] = 1;   // L115: the removed-bit mirror
                 batchRemove(prId);
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
@@ -2229,6 +2231,17 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
+
+    // L115 REMOVED-BIT MIRROR: the hot guards (itemSkip / itemInactiveCollect /
+    // the dispatch rest gates) read e.isRemoved() on every entity every tick
+    // (13.76% of the items-100k-mod profile — the removal-reason field load
+    // + the virtual shape the JIT refuses to fold at this volume). The
+    // remove/add probes ALREADY run at EntityLookup's choke points
+    // (probesRemove/probesAdd): flip a plain int slot there and the guards
+    // read an L1-resident array instead. Entity ids are monotonic per run
+    // (no slot reuse mid-run) and the ARENA identity checks at the readers
+    // tolerate stale slots — the mirror is exact.
+    public static final int[] RM_BIT = new int[AMASK + 1];
     // PARITY ORDER: the last section-Y seen per id (probeBox) — a change
     // within the same home cell is a vanilla re-append and must force a
     // dirty republish (see the rowNeutral classification in probeBox).
@@ -4665,7 +4678,7 @@ public final class CeHooks {
                     // cheap gates (the same set the native path runs): any
                     // hit leaves rest — vanilla computes the tick exactly
                     // and the resync re-arms the mode (the L6 protocol)
-                    if (e.isRemoved() || e.noPhysics
+                    if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
                             || e.portalProcess != null || e.isOnPortalCooldown()
                             || stackEmptyDispatch(e)
                             || !e.getPassengers().isEmpty()
@@ -4752,7 +4765,7 @@ public final class CeHooks {
             // cheap fresh-flag gates: always plain field reads
             // (stackEmptyDispatch: the cached empty bit replaces the
             // SynchedEntityData read — 6.55% MSPT on items-100k)
-            if (e.isRemoved() || e.noPhysics
+            if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
                     || e.portalProcess != null || e.isOnPortalCooldown()
                     || stackEmptyDispatch(e)) {
                 dispPass++;
@@ -6039,7 +6052,7 @@ public final class CeHooks {
             // wakeup's active body read !st.on_ground and ran a SPURIOUS
             // move+friction vanilla's gate skipped — 53 items at t=413, one
             // 0.588 vx/vz step each, 1214 by T639).
-            if (e.isRemoved() || e.noPhysics || e.isInWater() || e.isInLava()
+            if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
                 appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
