@@ -666,6 +666,10 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
                     .append(", \"probesBox\": ").append(hookField("probesBox"))
                     .append(", \"batchesFlushed\": ").append(hookField("batchesFlushed"))
                     .append(", \"batchEntries\": ").append(hookField("batchEntries"))
+                    .append(", \"bigboxRefused\": ").append(hookField("bigboxRefused"))
+                    .append(", \"bigboxCand\": ").append(hookField("bigboxCand"))
+                    .append(", \"bigboxAdaptivePassed\": ").append(hookField("bigboxAdaptivePassed"))
+                    .append(", \"bigboxAdaptivePassedRows\": ").append(hookField("bigboxAdaptivePassedRows"))
                     .append("},\n");
         }
         j.append("  \"samples\": [\n");

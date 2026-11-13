@@ -110,7 +110,7 @@ pub extern "system" fn n_mob_players(
     level: i32,
     xyz: jni::jdoubleArray,
     pf: jni::jintArray,
-) {
+) { let _site_guard = centities_core::SiteGuard::enter(12); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
@@ -153,7 +153,7 @@ pub extern "system" fn n_mob_batch(
     difficulty: i32,
     ids: jni::jlongArray,
     pos: jni::jdoubleArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(13); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
@@ -220,7 +220,7 @@ pub extern "system" fn n_despawn_cfg(
     present: i32,
     geom: jni::jdoubleArray,
     meta: jni::jintArray,
-) -> u8 {
+) -> u8 { let _site_guard = centities_core::SiteGuard::enter(11); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();

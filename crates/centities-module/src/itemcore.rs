@@ -599,7 +599,7 @@ pub extern "system" fn n_item_tick(
     out_d: jni::jdoubleArray,
     out_i: jni::jintArray,
     at: jni::jintArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(6); 
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
     // vtable pattern proven in lib.rs.
     return unsafe {
@@ -1456,7 +1456,7 @@ pub extern "system" fn n_merge_scan(
     yinf: f64,
     self_id: jni::jlong,
     out: jni::jlongArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(5); 
     if wid < 0 || wid >= 8 || r.is_nan() {
         return -1;
     }

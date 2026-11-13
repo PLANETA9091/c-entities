@@ -86,23 +86,37 @@ public final class CeHooks {
     private static final boolean L109_TRUST =
             !"0".equals(System.getenv("CE_L109"));
     public static volatile long l109Skip = 0, l109Trim = 0;
-    // L104 BIG-BOX REFUSE: the fast path pays ~112 ns per candidate inside
-    // the Java resolve loop (ARENA load + live-box deref + AABB test), the
-    // Rust scan itself is ~12 ns/row, so a query returning thousands of
-    // rows (mob target / LookAtPlayer scans over 60-70-block boxes at
-    // spread density = ~1800-3200 candidates) costs ~350 us in fast while
-    // the vanilla section walk resolves the same volume at ~25-40 ns/cand.
-    // Above BIG_N_REFUSE rows the vanilla scan is cheaper BY CONSTRUCTION
-    // (it IS the vanilla cost) and order-exact by definition: refuse and
-    // let the caller run the vanilla body. The refusal also feeds the gate
-    // clean mirror samples — the big buckets' MIRR_EMA was rare/biased
-    // (run 340: b15 fast=330us vs mirror=2538us would imply a 9 s/tick
-    // vanilla tick, contradicting the measured 479 ms). Item merge scans
-    // (n <= ~300 at items-100k density) and the push kernel (Rust-side)
-    // stay on the fast path. Tunable: the bigbox counters in the hooks
-    // line + the harvest JFR name the n-distribution.
-    public static final int BIG_N_REFUSE = 1024;
+    // L104→L111 ADAPTIVE BIG-BOX REFUSE: the resolve loop pays ~112 ns per
+    // candidate inside the Java resolve (ARENA load + live-box deref + AABB
+    // test), the Rust scan itself is ~12 ns/row. The L104 shape refused
+    // every query above a CONSTANT 1024 rows — and that constant killed the
+    // mob scenarios on CI: run #353 (mobs-25k-mod, Nov 8) printed
+    // bigbox=5562973/44143244714 — 5.56M refusals which had ALREADY walked
+    // 44.1 BILLION scan rows before refusing, then paid the vanilla mirror
+    // on top (a double body per refused query, strictly worse than vanilla
+    // alone: mod 656 ms vs vanilla 565 ms p50, fast path collapsed to 8%).
+    // The refusal prices NO EMA, so the router stayed blind and the latch
+    // died on every refusal — the collapse never recovered. Meanwhile the
+    // same gate cell measured fast 22 us vs mirror 3064 us when fast WAS
+    // let through (b15, 193k samples) — the constant refused the queries
+    // the fast path wins 140x.
+    // L111 policy: the refuse follows the MEASURED mirror price of the
+    // gate cell. Refuse only when the predicted fast resolve
+    // (n * (resolve + scan) ns) would cost MORE than the vanilla body the
+    // caller is about to pay anyway (MIRR_EMA[gi], known after 16 samples)
+    // — and never above the degenerate ceiling: a poisoned-low mirror EMA
+    // must not authorize a million-row resolve (BIG_N_REFUSE stays, raised
+    // from 1024 to 65536 rows ≈ 7.9 ms worst case). Unknown mirror (fewer
+    // than 16 samples) serves fast — the bootstrap philosophy, and the
+    // October shape (run 782b603: 8.87M fast queries, mobs-25k-mod p50
+    // 159.8 ms, −48%) restored. On spread (mirror genuinely cheaper) the
+    // refusal survives: there the predicted resolve really is dearer.
+    public static final int FAST_RESOLVE_NS_PER_CAND = 112;
+    public static final int FAST_SCAN_NS_PER_ROW = 12;
+    public static final int MIRR_KNOWN_MIN = 16;
+    public static final int BIG_N_REFUSE = 65536;
     public static volatile long bigboxRefused = 0, bigboxCand = 0;
+    public static volatile long bigboxAdaptivePassed = 0, bigboxAdaptivePassedRows = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
     public static volatile long mNotServerLevel = 0, mBadWorld = 0, mNotReady = 0;
     public static volatile long mRegrowFail = 0, mDesync = 0, mDisabled = 0;
@@ -1091,6 +1105,34 @@ public final class CeHooks {
     }
 
     /** One-line diagnostic snapshot (all counters). */
+    /** L112: the live Rust allocation counters, sites with |v| > 1MB. */
+    private static String allocLine() {
+        try {
+            nativeAllocStats(ALLOC_STATS);
+            StringBuilder sb = new StringBuilder(64);
+            sb.append(ALLOC_STATS[0]).append('/').append(ALLOC_STATS[2]);
+            for (int i = 3; i < 25; i++) {
+                long v = ALLOC_STATS[i];
+                if (v > 1_000_000 || v < -1_000_000) {
+                    sb.append(" s").append(i - 3).append('=').append(v);
+                }
+            }
+            sb.append(" h");
+            for (int i = 25; i < ALLOC_STATS.length - 2; i++) {
+                long v = ALLOC_STATS[i];
+                if (v > 1_000_000) {
+                    sb.append(' ').append(1L << (i - 25)).append(':').append(v >> 20).append('M');
+                }
+            }
+            sb.append(" idx=").append(ALLOC_STATS[ALLOC_STATS.length - 2])
+              .append('/').append(ALLOC_STATS[ALLOC_STATS.length - 1]);
+            return sb.toString();
+        } catch (Throwable t) {
+            System.out.println("[ce-baseline] allocLine failed: " + t);
+            return "off";
+        }
+    }
+
     public static String stats() {
         return "fast=" + queriesFast + " mirror=" + queriesMirror
                 + " (nslevel=" + mNotServerLevel + " badWorld=" + mBadWorld
@@ -1103,7 +1145,9 @@ public final class CeHooks {
                 + " cand=" + candidatesSeen + "/" + candidatesResolved
                 + " marginExtra=" + marginExtra
                 + " l109=" + l109Skip + "/" + l109Trim
+                + " alloc=" + allocLine()
                 + " bigbox=" + bigboxRefused + "/" + bigboxCand
+                + " bigboxPass=" + bigboxAdaptivePassed + "/" + bigboxAdaptivePassedRows
                 + " arenaMiss=" + arenaMiss + " stale=" + staleCand
                 + " susp=" + suspends + " res=" + resumes + " resync=" + resyncEnts
                 + " reprobe=" + fastProbes + "/" + mirrorProbes
@@ -2765,15 +2809,29 @@ public final class CeHooks {
         }
         if (prof) queryNanos += System.nanoTime() - t1;
 
-        // L104: cap the resolve-loop work BEFORE paying it. The scan (and
-        // the flush-merged batch application, already done above) is cheap;
-        // the per-candidate Java resolve is not. n here is the index's
-        // margin-superset result size.
+        // L111: the adaptive big-box refuse (the L104 constant killed the
+        // mob scenarios — see the block comment at BIG_N_REFUSE). The scan
+        // is already paid here; refuse ONLY when the predicted resolve
+        // would cost more than the vanilla body the caller pays anyway.
         if (n > BIG_N_REFUSE) {
             bigboxRefused++;
             bigboxCand += n;
             fastRefuse = "bigbox";
             return null;
+        }
+        int giL111 = wid * GBUCKETS + bucketOf(box);
+        if (n > 1024 && MIRR_N[giL111] >= MIRR_KNOWN_MIN) {
+            long predicted = (long) n * (FAST_RESOLVE_NS_PER_CAND + FAST_SCAN_NS_PER_ROW);
+            if (predicted > MIRR_EMA[giL111]) {
+                bigboxRefused++;
+                bigboxCand += n;
+                fastRefuse = "bigbox-a";
+                return null;
+            }
+        }
+        if (n > 1024) {
+            bigboxAdaptivePassed++;
+            bigboxAdaptivePassedRows += n;
         }
 
         ArrayList<Entity> out = useScratch
@@ -11050,6 +11108,10 @@ public final class CeHooks {
      *  armed; null when the interval was not armed. `on` arms the NEXT
      *  interval. */
     private static native int[] nativeGlTake(int on);
+
+    // L112 leak probe: the Rust allocator counters ([live,total,peak,s0..s18]).
+    public static final long[] ALLOC_STATS = new long[59];
+    public static native int nativeAllocStats(long[] out);
 
     /** doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) — the staged
      *  continuation witness for the t=157 residual. Records are 7 longs:

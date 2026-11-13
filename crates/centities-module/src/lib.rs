@@ -18,6 +18,8 @@ pub mod mobcore;
 pub mod patch;
 pub use centities_core::pushcore;
 
+
+
 use cplug_abi::{CPluginApi, JavaVmPtr};
 use jvmti_bindings::prelude::*;
 use jvmti_bindings::sys::jni;
@@ -96,6 +98,28 @@ const ROW_SENTINEL: i64 = 0x7FF; // count-field value marking a killed row
 const DIRECT_CAP: usize = 1 << 16; // off-thread event queue bound
 
 pub(crate) static INDEX: Mutex<Option<CeState>> = Mutex::new(None);
+
+// L113 phantom-guard thresholds + the rebuild window. The caps sit far
+// above every legitimate census (bench tops at 150k entities; the probe
+// stream mirrors Java adds/removes 1:1) — crossing one is a burst.
+const ENTITY_CAP: usize = 2_000_000;
+const CELL_CAP: usize = 4_000_000;
+/// L113c: the IdMap TABLE cap — the table only grows when DISTINCT entity
+/// ids flow in; a bench never legitimately holds >2M distinct ids (bench
+/// tops at 150k entities + respawn churn). The Nov 12 legs held ~11.7M
+/// (the table reached 2^25 keys = 268MB + 134MB vals, retained forever
+/// after the phantom ids were removed — backward-shift deletion never
+/// shrinks the vector). Crossing the cap reclaims via clear + mirror.
+const IDMAP_CAP: usize = 1 << 21;
+/// L113b: the allocator-live cap — contains ANY retained-growth bug (the
+/// Nov 12 CI legs died with ~12GB of module-side native heap). Crossing it
+/// drops the index + push state and forces the mirror until repopulated;
+/// the steady state never comes close (PushCore's 541MB of slot arrays +
+/// a 150k-entity index ≈ 600MB).
+const ALLOC_LIVE_CAP: u64 = 3_000_000_000;
+static REBUILD_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+static IDX_ENTITIES: AtomicU64 = AtomicU64::new(0);
+static IDX_CELLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 static PATCHES_OK: AtomicU64 = AtomicU64::new(0);
@@ -3915,6 +3939,11 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
             ) -> i32
     );
     push!(
+        "nativeAllocStats",
+        "([J)I",
+        n_alloc_stats as extern "system" fn(*mut jni::JNIEnv, jni::jclass, jni::jlongArray) -> i32
+    );
+    push!(
         "nativeGlTake",
         "(I)[I",
         n_gl_take as extern "system" fn(*mut jni::JNIEnv, jni::jclass, i32) -> jni::jintArray
@@ -4611,14 +4640,64 @@ unsafe fn locked_flush_query(
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
     out: &mut Vec<i64>,
-) -> bool {
+) -> bool { let _site_guard = centities_core::SiteGuard::enter(8); 
     let mut g = match INDEX.lock() {
         Ok(g) => g,
         Err(_) => return false,
     };
     let st = g.get_or_insert_with(new_state);
-    drain_direct(st);
+    // L113 PHANTOM GUARD: the CI baseline legs (Nov 12) died with the
+    // module-side native heap climbing to ~12GB against a stable vanilla
+    // leg — the local leak probe attributed the growth to the index state
+    // inside locked_flush_query (live allocations retained across ticks,
+    // none of the per-call temporaries). The honest containment: when the
+    // index population explodes past any legitimate bench/production
+    // census (the probe stream cannot create entities — it mirrors Java
+    // adds/removes — so a population burst is a phantom burst: garbage
+    // entries upserted from a corrupted batch), DROP the index and force
+    // the mirror until the probe stream repopulates it. The query fns
+    // return -1 ("not ready") while REBUILD_UNTIL holds, which the Java
+    // gate already treats as the safe vanilla path (mNotReady). Parity is
+    // never violated: vanilla answers everything during the rebuild.
+    {
+        let stt = st.idx.stats();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms < REBUILD_UNTIL_MS.load(Ordering::Acquire) {
+            // still rebuilding — skip the apply/publish work entirely
+            return false;
+        }
+        IDX_ENTITIES.store(stt.entities as u64, Ordering::Relaxed);
+        IDX_CELLS.store(stt.cells as u64, Ordering::Relaxed);
+        if stt.entities > ENTITY_CAP
+            || stt.cells > CELL_CAP
+            || stt.idmap_cap > IDMAP_CAP
+            || centities_core::ALLOC_LIVE.load(Ordering::Relaxed) > ALLOC_LIVE_CAP
+        {
+            cplug_sdk::log::info(&format!(
+                "[c-entities] L113 guard: entities={} cells={} idmapCap={} allocLive={} — state cleared, mirror until repopulated",
+                stt.entities,
+                stt.cells,
+                stt.idmap_cap,
+                centities_core::ALLOC_LIVE.load(Ordering::Relaxed)
+            ));
+            st.idx.clear();
+            st.push.clear();
+            REBUILD_UNTIL_MS.store(
+                now_ms + 10_000,
+                Ordering::Release,
+            );
+            return false;
+        }
+    }
+    {
+        let _ss = centities_core::SiteGuard::enter(15);
+        drain_direct(st);
+    }
     if bn > 0 {
+        let _ss = centities_core::SiteGuard::enter(16);
         BIDBUF.with(|b| {
             let mut b = b.borrow_mut();
             b.clear();
@@ -4662,12 +4741,18 @@ unsafe fn locked_flush_query(
             });
         });
     }
-    publish(e, st);
-    st.idx.query(
-        world as u16,
-        &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
-        out,
-    );
+    {
+        let _ss = centities_core::SiteGuard::enter(17);
+        publish(e, st);
+    }
+    {
+        let _ss = centities_core::SiteGuard::enter(18);
+        st.idx.query(
+            world as u16,
+            &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
+            out,
+        );
+    }
     true
 }
 
@@ -4689,7 +4774,7 @@ pub extern "system" fn n_query(
     batch_boxes: jni::jdoubleArray,
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(3); 
     // FLUSH-MERGED QUERY (iteration 3): the caller's pending probe batch is
     // applied under the SAME lock acquisition right before the query — one
     // JNI crossing and one lock per query (2b paid a separate flush call).
@@ -4818,7 +4903,7 @@ pub extern "system" fn n_query2(
     batch_boxes: jni::jdoubleArray,
     batch_sy: jni::jintArray,
     batch_seq: jni::jintArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(4); 
     let bn = if batch_n > 0 { batch_n as usize } else { 0 };
     let n = unsafe {
         let e = JniEnv::from_raw(env);
@@ -5037,7 +5122,7 @@ pub extern "system" fn n_push(
     cur_tick: i32,
     real_ncol: i32,
     diag: i32,
-) -> i64 {
+) -> i64 { let _site_guard = centities_core::SiteGuard::enter(0); 
     let res = with_state(|st| {
         drain_direct(st);
         let slot = match st.push.slot_of(self_id as i64) {
@@ -5314,7 +5399,7 @@ pub extern "system" fn n_push_ncol(
     _cls: jni::jclass,
     id: i32,
     cur_tick: i32,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(1); 
     with_state(|st| match st.push.slot_of(id as i64) {
         Some(s) => {
             if st.push.ncol_tick[s] == cur_tick as u32 && cur_tick > 0 {
@@ -5340,7 +5425,7 @@ pub extern "system" fn n_index_box(
     world: i32,
     id: i64,
     out: jni::jdoubleArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(2); 
     let g = match INDEX.lock() {
         Ok(g) => g,
         Err(_) => return 0,
@@ -5452,7 +5537,7 @@ pub extern "system" fn n_mob_ai_floor(
     _cls: jni::jclass,
     in_arr: jni::jintArray,
     out_arr: jni::jintArray,
-) -> i32 {
+) -> i32 { let _site_guard = centities_core::SiteGuard::enter(7); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
@@ -5493,6 +5578,33 @@ pub extern "system" fn n_mob_ai_floor(
     }
 }
 
+
+/// L112: the leak-probe counters over JNI — [live, total, peak, s0..s18].
+pub extern "system" fn n_alloc_stats(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    out: jni::jlongArray,
+) -> i32 {
+    unsafe {
+        let e = JniEnv::from_raw(env);
+        let mut v: Vec<i64> = Vec::with_capacity(22);
+        v.push(centities_core::ALLOC_LIVE.load(Ordering::Relaxed) as i64);
+        v.push(centities_core::ALLOC_TOTAL.load(Ordering::Relaxed) as i64);
+        v.push(centities_core::ALLOC_PEAK.load(Ordering::Relaxed) as i64);
+        for sv in centities_core::ALLOC_SITE.iter() {
+            v.push(sv.load(Ordering::Relaxed) as i64);
+        }
+        for hv in centities_core::ALLOC_HIST.iter() {
+            v.push(hv.load(Ordering::Relaxed) as i64);
+        }
+        v.push(IDX_ENTITIES.load(Ordering::Relaxed) as i64);
+        v.push(IDX_CELLS.load(Ordering::Relaxed) as i64);
+        let n = v.len() as i32;
+        e.set_long_array_region(out, 0, v.len() as i32, &v);
+        n
+    }
+}
+
 /// nativeGlTake(int on) -> int[] — the L89 gate ledger read+reset.
 /// Java calls it once per level-tick at the entity-loop boundary: the return
 /// carries the ledger collected while armed (27 ints: evals/no/staged per
@@ -5502,7 +5614,7 @@ pub extern "system" fn n_gl_take(
     env: *mut jni::JNIEnv,
     _cls: jni::jclass,
     on: i32,
-) -> jni::jintArray {
+) -> jni::jintArray { let _site_guard = centities_core::SiteGuard::enter(9); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();
@@ -5531,7 +5643,7 @@ pub extern "system" fn n_mob_ledger_take(
     env: *mut jni::JNIEnv,
     _cls: jni::jclass,
     arm: i32,
-) -> jni::jlongArray {
+) -> jni::jlongArray { let _site_guard = centities_core::SiteGuard::enter(10); 
     unsafe {
         let e = JniEnv::from_raw(env);
         let raw = e.raw();

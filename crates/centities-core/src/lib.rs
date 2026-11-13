@@ -20,6 +20,150 @@
 
 #![deny(unsafe_code)]
 
+// ---------------------------------------------------------------------------
+// L112 leak-probe counting allocator (the ONE process-global allocator —
+// the module reads these statics over JNI; every crate's allocation flows
+// through it). Sites: [0]=n_push [1]=n_push_ncol [2]=n_index_box [3]=n_query
+// [4]=n_query2 [5]=n_merge_scan [6]=n_item_tick [7]=n_mob_ai_floor
+// [8]=flush-total [9]=n_gl_take [10]=n_mob_ledger_take [11]=n_despawn_cfg
+// [12]=n_mob_players [13]=n_mob_batch [14]=other-module [15]=drain_direct
+// [16]=batch-apply [17]=publish [18]=idx.query [19]=ensure_cell_order
+// [20]=query-per-cell [21]=default-other.
+// ---------------------------------------------------------------------------
+pub static ALLOC_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOC_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOC_HIST: [std::sync::atomic::AtomicU64; 32] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+#[inline]
+fn hist_bucket(sz: usize) -> usize {
+    let b = 64 - sz.max(1).leading_zeros() as usize;
+    b.min(31)
+}
+pub static ALLOC_SITE: [std::sync::atomic::AtomicU64; 22] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+thread_local! {
+    static SITE_CUR: std::cell::Cell<u32> = const { std::cell::Cell::new(21) };
+}
+#[doc(hidden)]
+pub struct SiteGuard(pub u32);
+impl SiteGuard {
+    pub fn enter(site: u32) -> SiteGuard {
+        SITE_CUR.with(|c| { let p = c.get(); c.set(site); SiteGuard(p) })
+    }
+}
+impl Drop for SiteGuard {
+    fn drop(&mut self) { SITE_CUR.with(|c| c.set(self.0)); }
+}
+#[allow(unsafe_code)]
+struct CoreCountingAlloc;
+impl CoreCountingAlloc {
+    // Header-pinned attribution: each block carries [magic:u64, site:u64] in
+    // the 16 bytes BEFORE the user pointer, so a free decrements the site
+    // that ALLOCATED the block (cross-thread / cross-guard frees stay
+    // attributed to their origin — the per-site deltas are then self-
+    // contained and the leak names its owner directly).
+    const HDR: usize = 16;
+}
+#[allow(unsafe_code)]
+unsafe impl std::alloc::GlobalAlloc for CoreCountingAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let site = SITE_CUR.with(|c| c.get()) as u64;
+        let sz = layout.size();
+        let raw_layout = std::alloc::Layout::from_size_align_unchecked(
+            sz + Self::HDR, layout.align().max(16));
+        let raw = std::alloc::System.alloc(raw_layout);
+        if raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        *(raw as *mut u64) = 0x_CEA7_1122_0000_0000 + site;
+        *(raw.add(8) as *mut u64) = sz as u64;
+        let p = raw.add(Self::HDR);
+        use std::sync::atomic::Ordering;
+        ALLOC_LIVE.fetch_add(sz as u64, Ordering::Relaxed);
+        ALLOC_TOTAL.fetch_add(sz as u64, Ordering::Relaxed);
+        ALLOC_HIST[hist_bucket(sz)].fetch_add(sz as u64, Ordering::Relaxed);
+        let l = ALLOC_LIVE.load(Ordering::Relaxed);
+        ALLOC_PEAK.fetch_max(l, Ordering::Relaxed);
+        ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
+        p
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, _layout: std::alloc::Layout) {
+        let raw = p.sub(Self::HDR);
+        let hdr = *(raw as *mut u64);
+        let site = if (hdr & 0xFFFF_FFFF_0000_0000) == 0xCEA7_1122_0000_0000 {
+            (hdr & 0xFFFF) as usize
+        } else {
+            21
+        };
+        let sz = (*(raw.add(8) as *mut u64)) as usize;
+        use std::sync::atomic::Ordering;
+        ALLOC_LIVE.fetch_sub(sz as u64, Ordering::Relaxed);
+        ALLOC_HIST[hist_bucket(sz)].fetch_sub(sz as u64, Ordering::Relaxed);
+        ALLOC_SITE[site].fetch_sub(sz as u64, Ordering::Relaxed);
+        let raw_layout = std::alloc::Layout::from_size_align_unchecked(
+            sz + Self::HDR, _layout.align().max(16));
+        std::alloc::System.dealloc(raw, raw_layout)
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, ns: usize) -> *mut u8 {
+        // attribute the delta to the ALLOCATING site (read from the header)
+        let raw = p.sub(Self::HDR);
+        let hdr = *(raw as *mut u64);
+        let osite = if (hdr & 0xFFFF_FFFF_0000_0000) == 0xCEA7_1122_0000_0000 {
+            (hdr & 0xFFFF) as usize
+        } else {
+            21
+        };
+        let osz = (*(raw.add(8) as *mut u64)) as usize;
+        let np = self.alloc(std::alloc::Layout::from_size_align_unchecked(ns, layout.align()));
+        if np.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(p, np, osz.min(ns));
+        self.dealloc(p, layout);
+        use std::sync::atomic::Ordering;
+        let d = ns as i64 - osz as i64;
+        if d > 0 {
+            ALLOC_SITE[osite].fetch_add(d as u64, Ordering::Relaxed);
+        } else if d < 0 {
+            ALLOC_SITE[osite].fetch_sub((-d) as u64, Ordering::Relaxed);
+        }
+        np
+    }
+}
+#[global_allocator]
+static CORE_ALLOC: CoreCountingAlloc = CoreCountingAlloc;
+
 pub mod goals;
 pub mod itemtick;
 pub mod mobtravel;
@@ -439,6 +583,14 @@ pub struct Stats {
     pub entities: usize,
     pub cells: usize,
     pub oversize: usize,
+    /// L113: the IdMap TABLE capacity (slots), not the entry count — a
+    /// transient phantom-id burst inflates the table FOREVER (backward-
+    /// shift deletion shrinks len, never the vector). The module's phantom
+    /// guard watches this: a bench never legitimately holds >1M distinct
+    /// entity ids, so a table past the cap is a burst that must be
+    /// reclaimed (clear + mirror window), or the native heap never comes
+    /// back (the Nov 12 CI death).
+    pub idmap_cap: usize,
 }
 
 /// L5 — contiguous per-cell SoA storage.
@@ -521,7 +673,9 @@ impl EntityIndex {
     }
 
     pub fn stats(&self) -> Stats {
-        self.stats.clone()
+        let mut st = self.stats.clone();
+        st.idmap_cap = self.idmap.keys.len();
+        st
     }
 
     /// Current tracked max half-span (diagnostic; tests assert the bound).
@@ -791,6 +945,7 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
                 if n == 0 {
                     continue;
                 }
+                let _ss = crate::SiteGuard::enter(20);
                 // vanilla order for this cell's members (versioned; no-op
                 // when the layout is already current)
                 self.ensure_cell_order(cid as u32);
@@ -958,6 +1113,7 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
     /// cell's current order version. Amortized: runs once per cell between
     /// actual order changes, not once per query.
     fn ensure_cell_order(&mut self, cell: u32) {
+        let _ss = crate::SiteGuard::enter(19);
         let c = cell as usize;
         let v = self.cell_vers[c];
         if (v >> 32) == (v & 0xFFFF_FFFF) {
