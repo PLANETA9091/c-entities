@@ -94,11 +94,21 @@ impl Drop for SiteGuard {
 #[allow(unsafe_code)]
 struct CoreCountingAlloc;
 impl CoreCountingAlloc {
-    // Header-pinned attribution: each block carries [magic:u64, site:u64] in
-    // the 16 bytes BEFORE the user pointer, so a free decrements the site
-    // that ALLOCATED the block (cross-thread / cross-guard frees stay
-    // attributed to their origin — the per-site deltas are then self-
-    // contained and the leak names its owner directly).
+    // Header-pinned attribution: each block carries [sz:u64, raw:u64] in the
+    // 16 bytes BEFORE the user pointer, so a free releases the RAW block
+    // (self-contained even when the alignment jiggle shifted the user
+    // pointer) and decrements the size the allocation carried.
+    //
+    // L116 THE ALIGNMENT FIX (the CI core-job SIGSEGV, bisected to 3b874fd):
+    // the previous scheme returned raw+16 as the user pointer — for any
+    // request with align > 16 (rayon's CachePadded cells ride align 64)
+    // that pointer violated the GlobalAlloc alignment contract, and the
+    // misaligned block round-tripped through dealloc with a re-derived
+    // layout — hard UB, instant SIGSEGV in every centities-core binary
+    // (the flush_zip crash; CI module #313-#316 red while locally green).
+    // The fix: allocate sz+HDR+align bytes, align the user pointer UP to
+    // the requested alignment, and let the header carry the raw pointer so
+    // dealloc never re-derives it from p.
     const HDR: usize = 16;
 }
 #[allow(unsafe_code)]
@@ -107,21 +117,58 @@ unsafe impl std::alloc::GlobalAlloc for CoreCountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let site = SITE_CUR.with(|c| c.get()) as u64;
         let sz = layout.size();
+        let a = layout.align();
+        use std::sync::atomic::Ordering;
+        if a > Self::HDR {
+            // aligned path: [HDR slack][user block aligned to a]
+            let total = sz + Self::HDR + a;
+            let raw = std::alloc::System.alloc(
+                std::alloc::Layout::from_size_align_unchecked(total, a));
+            if raw.is_null() {
+                return std::ptr::null_mut();
+            }
+            let base = raw as usize + Self::HDR;
+            let p = ((base + a - 1) & !(a - 1)) as *mut u8;
+            // site rides the pointer's top bits (x86-64 user space < 2^48)
+            *(p.sub(8) as *mut u64) = (raw as u64) | ((site & 0x1F) << 56);
+            *(p.sub(16) as *mut u64) = sz as u64;
+            ALLOC_LIVE.fetch_add(sz as u64, Ordering::Relaxed);
+            ALLOC_TOTAL.fetch_add(sz as u64, Ordering::Relaxed);
+            ALLOC_HIST[hist_bucket(sz)].fetch_add(sz as u64, Ordering::Relaxed);
+            let l = ALLOC_LIVE.load(Ordering::Relaxed);
+            ALLOC_PEAK.fetch_max(l, Ordering::Relaxed);
+            ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
+            if sz > 67_108_864 {
+                let n = ALLOC_BIG_CNT.fetch_add(1, Ordering::SeqCst);
+                if n < 8 {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let bt_head: String = bt
+                        .to_string()
+                        .lines()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    println!("[alloc-huge] site={site} size={sz} n={n}\n{bt_head}");
+                }
+            }
+            return p;
+        }
         let raw_layout = std::alloc::Layout::from_size_align_unchecked(
-            sz + Self::HDR, layout.align().max(16));
+            sz + Self::HDR, 16);
         let raw = std::alloc::System.alloc(raw_layout);
         if raw.is_null() {
             return std::ptr::null_mut();
         }
-        *(raw as *mut u64) = 0x_CEA7_1122_0000_0000 + site;
-        *(raw.add(8) as *mut u64) = sz as u64;
+        *(raw.add(8) as *mut u64) = (raw as u64) | ((site & 0x1F) << 56);
+        *(raw as *mut u64) = sz as u64;
         let p = raw.add(Self::HDR);
-        use std::sync::atomic::Ordering;
         ALLOC_LIVE.fetch_add(sz as u64, Ordering::Relaxed);
         ALLOC_TOTAL.fetch_add(sz as u64, Ordering::Relaxed);
         ALLOC_HIST[hist_bucket(sz)].fetch_add(sz as u64, Ordering::Relaxed);
+        let l = ALLOC_LIVE.load(Ordering::Relaxed);
+        ALLOC_PEAK.fetch_max(l, Ordering::Relaxed);
+        ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
         if sz > 67_108_864 {
-            ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
             let n = ALLOC_BIG_CNT.fetch_add(1, Ordering::SeqCst);
             if n < 8 {
                 let bt = std::backtrace::Backtrace::force_capture();
@@ -134,52 +181,38 @@ unsafe impl std::alloc::GlobalAlloc for CoreCountingAlloc {
                 println!("[alloc-huge] site={site} size={sz} n={n}\n{bt_head}");
             }
         }
-        let l = ALLOC_LIVE.load(Ordering::Relaxed);
-        ALLOC_PEAK.fetch_max(l, Ordering::Relaxed);
-        ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
         p
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, _layout: std::alloc::Layout) {
-        let raw = p.sub(Self::HDR);
-        let hdr = *(raw as *mut u64);
-        let site = if (hdr & 0xFFFF_FFFF_0000_0000) == 0xCEA7_1122_0000_0000 {
-            (hdr & 0xFFFF) as usize
-        } else {
-            21
-        };
-        let sz = (*(raw.add(8) as *mut u64)) as usize;
+        // the header carries [sz:u64 @ p-16, raw|site<<56:u64 @ p-8] — never
+        // re-derive the raw pointer from p (the aligned path shifted it)
+        let sz = (*(p.sub(16) as *mut u64)) as usize;
+        let tagged = (*(p.sub(8) as *mut u64)) as usize;
+        let raw = (tagged & 0x00FF_FFFF_FFFF_FFFF) as *mut u8;
+        let site = (tagged >> 56) & 0x1F;
         use std::sync::atomic::Ordering;
         ALLOC_LIVE.fetch_sub(sz as u64, Ordering::Relaxed);
         ALLOC_HIST[hist_bucket(sz)].fetch_sub(sz as u64, Ordering::Relaxed);
         ALLOC_SITE[site].fetch_sub(sz as u64, Ordering::Relaxed);
+        // recompute the raw layout EXACTLY as the matching alloc path did
+        let a = _layout.align();
+        let total = if a > Self::HDR { sz + Self::HDR + a } else { sz + Self::HDR };
         let raw_layout = std::alloc::Layout::from_size_align_unchecked(
-            sz + Self::HDR, _layout.align().max(16));
+            total, a.max(16));
         std::alloc::System.dealloc(raw, raw_layout)
     }
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, ns: usize) -> *mut u8 {
-        // attribute the delta to the ALLOCATING site (read from the header)
-        let raw = p.sub(Self::HDR);
-        let hdr = *(raw as *mut u64);
-        let osite = if (hdr & 0xFFFF_FFFF_0000_0000) == 0xCEA7_1122_0000_0000 {
-            (hdr & 0xFFFF) as usize
-        } else {
-            21
-        };
-        let osz = (*(raw.add(8) as *mut u64)) as usize;
+        // default realloc semantics (the header-aware variant re-derived
+        // layouts across the alignment jiggle — the L116 lesson): a fresh
+        // block, a copy, a free. The copy size is the REQUESTED size — the
+        // contract guarantees the old layout's size was live there.
         let np = self.alloc(std::alloc::Layout::from_size_align_unchecked(ns, layout.align()));
         if np.is_null() {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(p, np, osz.min(ns));
+        std::ptr::copy_nonoverlapping(p, np, layout.size().min(ns));
         self.dealloc(p, layout);
-        use std::sync::atomic::Ordering;
-        let d = ns as i64 - osz as i64;
-        if d > 0 {
-            ALLOC_SITE[osite].fetch_add(d as u64, Ordering::Relaxed);
-        } else if d < 0 {
-            ALLOC_SITE[osite].fetch_sub((-d) as u64, Ordering::Relaxed);
-        }
         np
     }
 }
