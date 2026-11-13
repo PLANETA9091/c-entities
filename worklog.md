@@ -974,3 +974,37 @@ Stage Summary:
   nativeAllocStats declaration missing from the hand registry — a25c999
   already fixed that side; the sandbox's stale target/ cache masked
   both until a clean-tree run.
+
+- i0-c (doc 62) — THE TRACKER-QUIET EXPANSION: the L92 quiet cohort was
+  TAIL_NONE-gated, but the dy oscillation (3-of-4 ticks accumulate
+  -0.04k before the collision zeroes it) broke the out-delta equality —
+  the resting stamp rate sat at 3.2% while the tracker cluster burned
+  ~11% of the items profile (#461 JFR: the walk 4.92% + the list
+  iteration 4.34% + the skip 1.27% + the cached path 1.0%). The stamp
+  moves to the END of the loop-B tail: quiet iff (not MOVED) && (not
+  HAS_IMPULSE) && (no merge cadence) && (no despawn/void/land) &&
+  !syncVelocity && the L92 pins. The javap ground truth
+  (ServerEntity.sendChanges, 26.3): items ride trackDelta=false and are
+  never LivingEntity — the velocity block is skipped unless needsSync;
+  the move packet needs a position change; fallDistance is a PLAIN
+  public field (no DATA_FALL_DISTANCE accessor — not synced);
+  pickupDelay/age are not EntityData. The surviving body's work (the
+  delta Vec3 write, the pd decrement, the fd/onGround flips) is
+  tracker-INVISIBLE. Push: 15213fa.
+- THE CI VERDICT (the same-day run): items-100k-mod 28.089 -> **24.247
+  ms** = **−65.3%** vs the vanilla 69.960 (the i0-c share −13.7% on top
+  of L115's leg); mixed-150k-mod −64.6%, spread-100k-mod −60.2%,
+  mobs-25k-native-mod −90.6% (the run predated the L117 brake).
+- L117 — THE RUNAWAY BRAKE (run #464 forensics): mobs-25k-mod collapsed
+  to 2946ms (6x vanilla) — the L111 adaptive gate's bootstrap
+  pass-through (unknown mirror serves fast) plus a slow runner's
+  inflated mirror EMA form a feedback loop: 5.33M big-box passes
+  (99x #461's 53.8k) starved the mirror count below MIRR_KNOWN_MIN,
+  the refuse path disabled outright, and the resolve walked **43.1
+  BILLION rows** (the L104 catastrophe through the adaptive back door;
+  #461 sat at 106.7M rows). The profile: getEntitiesOfClass 44.87%
+  self-time + the ArrayList churn 7%. The brake: (1)
+  BIGBOX_ABS_BUDGET_NS = 500µs — the absolute per-query resolve budget
+  (keeps #461's sane 1983-row/246µs passes, kills the 25k-row spawn
+  monsters on every runner speed); (2) BIGBOX_DEFAULT_MIRR_NS = 100µs —
+  unmeasured buckets REFUSE until 16 samples land. Push: 8de8aad.
