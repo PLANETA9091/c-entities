@@ -1969,6 +1969,16 @@ public final class CeHooks {
     // the loop — vanilla's getEntities sees them PRE-move there).
     private static final int[] B_POS = new int[BATCH_CAP];
     private static int batchGenCur = 0;
+    // L119: flushUpTo's stable-partition scratch — static, single-threaded
+    private static final long[] S_IDS = new long[BATCH_CAP];
+    private static final double[] S_BOX = new double[BATCH_CAP * 6];
+    private static final int[] S_PF = new int[BATCH_CAP];
+    private static final double[] S_PXZ = new double[BATCH_CAP * 2];
+    private static final double[] S_DV = new double[BATCH_CAP * 3];
+    private static final int[] S_VID = new int[BATCH_CAP];
+    private static final int[] S_SY = new int[BATCH_CAP];
+    private static final int[] S_SEQ = new int[BATCH_CAP];
+    private static final int[] S_POS = new int[BATCH_CAP];
     // L12 delta-only batch (probeDelta events without a box change)
     private static final long[] DB_IDS = new long[BATCH_CAP];
     private static final double[] DB_DV = new double[BATCH_CAP * 3];
@@ -2139,15 +2149,18 @@ public final class CeHooks {
         // (pos <= maxPos) then the kept, both in their batched order, then
         // write everything back (in-place permutation would clobber a not-
         // yet-read source — the classic forward-copy corruption).
-        long[] sIds = new long[bN];
-        double[] sBox = new double[bN * 6];
-        int[] sPf = new int[bN];
-        double[] sPxz = new double[bN * 2];
-        double[] sDv = new double[bN * 3];
-        int[] sVid = new int[bN];
-        int[] sSy = new int[bN];
-        int[] sSeq = new int[bN];
-        int[] sPos = new int[bN];
+        // L119: the scratch is STATIC preallocated (the single server
+        // thread owns it) — the per-drain allocation would churn the GC at
+        // the 100k-item scale (a drain happens at every expiring scanner).
+        long[] sIds = S_IDS;
+        double[] sBox = S_BOX;
+        int[] sPf = S_PF;
+        double[] sPxz = S_PXZ;
+        double[] sDv = S_DV;
+        int[] sVid = S_VID;
+        int[] sSy = S_SY;
+        int[] sSeq = S_SEQ;
+        int[] sPos = S_POS;
         int w = 0;
         for (int q = 0; q < bN; q++) {
             if (B_POS[q] > maxPos) continue;
