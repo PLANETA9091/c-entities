@@ -1034,3 +1034,35 @@ Stage Summary:
   merge) -> 16518 vs the vanilla 16537. The remaining delta: the
   collision-remainder dust decay (vx/vz 1e-93 vs 1e-208) + 19 extra
   absorptions (0.5%) — the next hunt. Push: 4a41d10.
+
+- L118b — THE TRUE FIXED POINT (the L118 commit-phase carrier bug). The
+  four-root restoration replaced the %4 move gate with the fixed-point
+  gate (grounded + delta exactly zero -> skip the move) but LEFT the
+  commit-phase gravity-carrier write: st.dy = dy_g = -0.04 ran on EVERY
+  tick, closed gate included — the skip did NOT replicate vanilla (the
+  vanilla active tick ends at dy=0: the gravity is eaten by the
+  distance-zero sweep collision), so the next tick saw dy != 0, re-opened
+  the gate, and every resting item paid the full sweep at a 1-in-2
+  cadence while its stored velocity oscillated 0/-0.04 against vanilla's
+  constant 0. Three stale tests asserted the carrier (itemtick_trace x2 +
+  flush_zip's "expected the dy oscillation" proof-of-life) — the suite
+  was RED on origin/main since 289964f. The fix: the delta writeback
+  gates the dy carrier (st.dy = dy_g iff the gate is OPEN; dx/dz are
+  identity copies). Tests rewritten to the PROVEN contract: the resting
+  item is a bit-exact fixed point FOREVER (itemtick_trace: 12 ticks, the
+  delta triple stays (0,0,0), no V_COLL/H_COLL/LAND/HAS_IMPULSE, the
+  merge cadence 40 intact); the gate opens on ANY nonzero delta exactly
+  once for a dy perturbation (the sweep runs, collide zeroes, the next
+  tick is closed again) and id-irrelevance is asserted across 4 ids; the
+  flush_zip proof-of-life became the UNIVERSAL fixed-point check (5000
+  items: dx=dy=0, y untouched, age 100->101, rec bits == ON_GROUND
+  exactly) + the slot-pairing check. FULL suite green: 22/22 suites,
+  0 failed. The perf side: the resting population now skips the sweep
+  EVERY tick (was every other) — the i0-c stamp rate should jump toward
+  ~100% on the resting cohort; the 25k mob bench p50 1.22 ms/tick (the
+  band was 1.22-1.31 — no regression). The dust hunt (vx/vz 1e-93 vs
+  1e-208) is NEXT: the candidate is now sharper — the carrier kept the
+  gate OPEN every other tick for resting items, and the OPEN path's
+  friction stage multiplied dx by the ground friction on those ticks
+  while vanilla multiplies EVERY tick; a resting item with residual dust
+  dx decayed at HALF the vanilla rate under the carrier regime.

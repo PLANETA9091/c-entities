@@ -1,7 +1,9 @@
 //! L8 flush plumbing test: the rayon chunk-zip must pair each item's state
 //! with the right od/oi/recs slots, and every tickable item must produce a
-//! commit record with nonzero post-tick deltas (the resting-item dy
-//! oscillation proves the tick really ran).
+//! commit record. Under the L118b fixed-point gate the resting population
+//! proves the tick ran via age++ (oi) and the ON_GROUND bit, while the
+//! post-tick deltas stay EXACTLY zero for every item — the fixed point
+//! holds universally, no gravity carrier, no oscillation.
 
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid};
@@ -135,14 +137,25 @@ fn parallel_chunk_zip_commits_every_tickable_item() {
         committed, N,
         "every tickable item must produce a commit record"
     );
-    // The resting-item dy oscillation: items whose (tickCount+id)%4 != 0 carry
-    // a nonzero pre-gate dy — at least SOME of 5000 items must show nonzero
-    // post-tick dy (the gate ticks zero it, the others accumulate -0.04k).
-    let nonzero_dy = (0..N).filter(|&k| od[k * 8 + 1] != 0.0).count();
-    assert!(
-        nonzero_dy > N / 8,
-        "expected the dy oscillation to show up; got {nonzero_dy}"
-    );
+    // L118b THE FIXED POINT, UNIVERSAL over 5000 items: every post-tick
+    // delta is EXACTLY zero (dx=dy=dz=0 — no gravity carrier on the closed
+    // gate), the position is untouched, ON_GROUND is set, and the age
+    // increment (100 -> 101) proves the body really ran. (The pre-L118b
+    // proof-of-life asserted a nonzero dy oscillation — the carrier bug.)
+    for k in 0..N {
+        assert_eq!(
+            (od[k * 8], od[k * 8 + 1]),
+            (0.0, 0.0),
+            "item {k}: the fixed point must hold"
+        );
+        assert_eq!(od[k * 8 + 4], -60.0, "item {k}: y untouched");
+        assert_eq!(oi[k * 4], 101, "item {k}: age incremented");
+        assert_eq!(
+            recs[k],
+            Some(2u32),
+            "item {k}: ON_GROUND only — no MOVED, no flags"
+        );
+    }
     // Slots must not cross: item k's rec must equal its own oi bits.
     for k in (0..N).step_by(977) {
         assert_eq!(

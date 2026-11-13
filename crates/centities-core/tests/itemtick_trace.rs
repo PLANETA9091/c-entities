@@ -1,10 +1,14 @@
 //! L6 trace tests: hand-computed bit-exact sequences from the vanilla
 //! ItemEntity.tick + Entity.move semantics (decompiled Paper 1.21.8).
 //!
-//! The resting-item trace is the load-bearing one: a resting item's delta
-//! oscillates (gravity on every tick, the move gate every 4th tick zeroes
-//! it via collide + updateEntityMovementAfterFallOn) while the POSITION
-//! freezes exactly — reproduced here to the last bit.
+//! The resting-item trace is the load-bearing one: under the L118 fixed-
+//! point move gate a resting item (grounded, delta exactly zero) REPLICATES
+//! its state every tick — vanilla's active tick ends at dy=0 (the gravity
+//! -0.04 is eaten by the distance-zero sweep collision), so the closed gate
+//! returns it unchanged while the POSITION freezes exactly. L118b removed
+//! the gravity-carrier write on the closed gate: the carrier re-opened the
+//! gate every other tick and oscillated the stored velocity against
+//! vanilla's constant zero.
 
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid, AIR_IDX};
@@ -113,21 +117,23 @@ fn resting_item() -> ItemState {
 }
 
 #[test]
-fn resting_item_position_freezes_and_delta_oscillates() {
+fn resting_item_is_a_bit_exact_fixed_point() {
+    // L118/L118b: the closed move gate (grounded, delta exactly zero) comes
+    // back bit-identical EVERY tick — no gravity carrier, no oscillation,
+    // no distance-zero sweep. The old %4 gate accumulated -0.04k over three
+    // ticks and zeroed on the fourth; the fixed-point gate never opens at
+    // all, which is what lets the i0-c tracker-quiet stamp fire at ~100%.
     let env = flat_env();
     let mut sg = SectionGrid::new();
     let mut prov = flat_world(None);
     let mut scratch = Scratch::new();
     let mut st = resting_item();
 
-    // Java float friction for the stone ground: (0.6f32 * 0.98f32) as f64.
-    let ground_friction = (0.6f32 * 0.98f32) as f64;
-
     for tick in 1..=12i32 {
         // st.tick_count carries the POST value (ingest mirrors es+1) which
-        // EQUALS the tickCount the vanilla gate reads: commonTick (tc++)
+        // EQUALS the tickCount the vanilla cadences read: commonTick (tc++)
         // runs BEFORE entity.tick (ServerLevel.tickNonPassenger, 26.3
-        // bytecode offset 56/69). Gate fires when (POST+id)%4==0.
+        // bytecode offset 56/69).
         st.tick_count = tick;
         let before = (st.x, st.y, st.z);
         let out = {
@@ -143,24 +149,19 @@ fn resting_item_position_freezes_and_delta_oscillates() {
         assert!(!out.has(TickOutcome::MOVED), "tick {tick}");
         assert!(out.has(TickOutcome::ON_GROUND), "tick {tick}");
         assert_eq!(st.age, tick);
-        if tick % 4 == 0 {
-            // gate tick (POST tickCount): gravity accumulated then the move
-            // zeroes dy. HAS_IMPULSE needs |ddelta|^2 > 0.01: 3 accumulated
-            // gravity ticks (0.12^2 = 0.0144) clear it — the first gate tick
-            // (tick 4) already has them.
-            assert_eq!(st.dy, 0.0, "tick {tick}");
-            assert!(out.has(TickOutcome::V_COLL), "tick {tick}");
-            assert!(out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
-        } else {
-            let k = tick % 4; // gravity ticks since the last zeroing
-            assert_eq!(st.dy, -(k as f64) * 0.04, "tick {tick}");
-            assert!(!out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
-        }
-        // delta x/z stay exactly zero (friction multiplies by ground friction
-        // on gate ticks; 0 * f == 0)
-        assert_eq!(st.dx, 0.0);
-        assert_eq!(st.dz, 0.0);
-        let _ = ground_friction;
+        // THE FIXED POINT: the full delta stays exactly zero forever —
+        // no gravity carrier (the L118b commit-phase gating), no oscillation
+        assert_eq!(
+            (st.dx, st.dy, st.dz),
+            (0.0, 0.0, 0.0),
+            "tick {tick}: the fixed point must hold"
+        );
+        // closed gate: no sweep ran, so no collision flags, no land, and
+        // the out-delta equality (dd^2 = 0) keeps HAS_IMPULSE quiet
+        assert!(!out.has(TickOutcome::V_COLL), "tick {tick}");
+        assert!(!out.has(TickOutcome::H_COLL), "tick {tick}");
+        assert!(!out.has(TickOutcome::LAND), "tick {tick}");
+        assert!(!out.has(TickOutcome::HAS_IMPULSE), "tick {tick}");
         // merge cadence 40 (floor never changes): EMPIRICAL (see tick.rs) —
         // the merge reads the POST-increment tickCount
         assert_eq!(out.has(TickOutcome::MERGE), tick % 40 == 0, "tick {tick}");
@@ -270,33 +271,90 @@ fn falling_item_lands_exactly_on_ground_with_land_event() {
 }
 
 #[test]
-fn gate_phase_follows_tick_count_plus_id() {
+fn gate_opens_on_nonzero_delta_and_airborne_never_on_phase() {
+    // L118: the gate no longer phases on (tickCount + id) % 4 — the
+    // dispatcher's F_INACTIVE routing owns the active-tick selection and the
+    // gate only skips vanilla's active-tick body for the PROVEN fixed point
+    // (grounded, delta exactly zero). Everything else opens it on EVERY
+    // active tick: any nonzero delta component, airborne, the big horizontal
+    // dust — and the entity id is irrelevant to the phase (the old
+    // (tc+id)%4 clause belonged to the pre-i0-a2b era when the gate stood in
+    // for the inactive ticks).
     let env = flat_env();
     let mut sg = SectionGrid::new();
     let mut prov = flat_world(None);
     let mut scratch = Scratch::new();
-    // id = 1: gate fires when (POST tickCount + 1) % 4 == 0 -> ticks 3, 7
-    // (commonTick increments BEFORE the body — ServerLevel.tickNonPassenger,
-    // 26.3 — so the PTRACE field value IS the gate-time value; run
-    // 40754993404 item 29: vanilla moved at field-tc 15 = (15+29)%4==0.)
+
+    // (a) id is irrelevant: resting items with different ids stay on the
+    // closed gate forever — identical flag streams, identical fixed point.
+    for id in [0i64, 1, 7, 12345] {
+        let mut st = resting_item();
+        for tick in 1..=6i32 {
+            st.tick_count = tick;
+            let out = {
+                let mut sc = SectionCache::new(&sg, &mut prov);
+                tick_item(&mut st, id, &env, &mut sc, &mut scratch)
+            };
+            assert_eq!(
+                (st.dx, st.dy, st.dz),
+                (0.0, 0.0, 0.0),
+                "id {id} tick {tick}: closed gate is the fixed point"
+            );
+            assert!(!out.has(TickOutcome::V_COLL), "id {id} tick {tick}");
+            assert!(!out.has(TickOutcome::MOVED), "id {id} tick {tick}");
+        }
+    }
+
+    // (b) a one-tick dy perturbation re-opens the gate EXACTLY once: the
+    // gravity-carried sweep moves down by dy_g = -0.04 - 1e-300, hits the
+    // floor at a nonzero distance, collide zeroes dy, friction multiplies
+    // zeros — the item is back ON the fixed point and the next tick is
+    // closed again.
     let mut st = resting_item();
-    st.tick_count = 0;
+    st.dy = 1.0e-300;
+    st.tick_count = 1;
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
+    assert!(out.has(TickOutcome::V_COLL), "perturbed tick: the sweep ran");
+    assert_eq!((st.dx, st.dy, st.dz), (0.0, 0.0, 0.0));
+    assert_eq!(st.y, 64.0, "position unchanged");
+    st.tick_count = 2;
+    let out = {
+        let mut sc = SectionCache::new(&sg, &mut prov);
+        tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
+    };
+    assert!(!out.has(TickOutcome::V_COLL), "next tick: closed again");
+    assert_eq!((st.dx, st.dy, st.dz), (0.0, 0.0, 0.0));
+
+    // (c) grounded horizontal dust: the gate stays open while dx != 0 and
+    // the friction decays it every tick (0.588f32 per tick on stone).
+    let mut st = ItemState {
+        x: 0.4,
+        y: 64.0,
+        z: 0.5,
+        dx: 0.5,
+        on_ground: true,
+        despawn_rate: 6000,
+        ..ItemState::new()
+    };
+    let f = (0.6f32 * 0.98f32) as f64;
+    let mut x = 0.4;
+    let mut dx = 0.5;
     for tick in 1..=8i32 {
         st.tick_count = tick;
         let out = {
             let mut sc = SectionCache::new(&sg, &mut prov);
-            tick_item(&mut st, 1, &env, &mut sc, &mut scratch)
+            tick_item(&mut st, 0, &env, &mut sc, &mut scratch)
         };
-        let gate_tick = tick % 4 == 3; // (tick + 1) % 4 == 0
-        assert_eq!(out.has(TickOutcome::V_COLL), gate_tick, "tick {tick}");
-        // gravity ticks since the last zeroing: no gate before tick 3, so
-        // the first two ticks accumulate from the spawn (dy starts 0)
-        let k = if tick < 3 { tick } else { (tick + 1) % 4 };
-        assert_eq!(
-            st.dy,
-            if gate_tick { 0.0 } else { -(k as f64) * 0.04 },
-            "tick {tick}"
-        );
+        assert!(out.has(TickOutcome::MOVED), "tick {tick}: dust moves");
+        assert!(st.dx != 0.0, "tick {tick}: friction never zeroes exactly");
+        // move by the PRE-friction delta, then friction applies
+        x += dx;
+        dx *= f;
+        assert_eq!(st.x, x, "tick {tick}");
+        assert_eq!(st.dx, dx, "tick {tick}");
     }
 }
 

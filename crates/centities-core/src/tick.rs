@@ -339,6 +339,8 @@ pub fn tick_item(
         || st.dx != 0.0
         || st.dy != 0.0
         || st.dz != 0.0;
+    // (the commit phase honors this proof: a CLOSED gate writes the delta
+    // back UNCHANGED — no gravity carrier; see the L118b note below)
 
     // collide inputs (read-only)
     let mut mv = mv0;
@@ -513,10 +515,23 @@ pub fn tick_item(
     st.xo = st.x;
     st.yo = st.y;
     st.zo = st.z;
-    // the delta post-tick carries gravity even when the gate stayed closed
+    // L118b THE TRUE FIXED POINT: the CLOSED gate (grounded, delta exactly
+    // zero) must return the state bit-identical — vanilla's active tick on
+    // this state ends at dy=0 (the gravity -0.04 is eaten by the
+    // distance-zero sweep collision), so skipping the move AND the
+    // gravity-carrier write replicates it. The carrier write (dy -> dy_g =
+    // -0.04 on a closed gate) broke the proof: the next tick saw dy != 0,
+    // re-opened the gate, and every resting item paid the full sweep at a
+    // 1-in-2 cadence while its stored velocity oscillated 0/-0.04 against
+    // vanilla's constant 0. The OPEN gate keeps the carrier write: the
+    // collide/friction stage below rewrites st.dy from dy_g exactly as
+    // vanilla does (mv0.0/mv0.2 are identity copies of st.dx/st.dz unless
+    // stuck_applied, which zeroes the delta separately below).
     st.dx = mv0.0;
-    st.dy = dy_g;
     st.dz = mv0.2;
+    if gate {
+        st.dy = dy_g;
+    }
 
     if stuck_applied {
         st.stuck = (0.0, 0.0, 0.0);
