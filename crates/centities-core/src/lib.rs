@@ -30,6 +30,14 @@
 // [16]=batch-apply [17]=publish [18]=idx.query [19]=ensure_cell_order
 // [20]=query-per-cell [21]=default-other.
 // ---------------------------------------------------------------------------
+pub static PUSH_STORM_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// L114b: set by query() when the candidate stream crosses the sane cap —
+/// the caller (the module's locked_flush_query) turns it into a refusal
+/// ("not ready" -> the vanilla mirror answers), so a runaway candidate
+/// stream can never blow the out buffer to gigabytes (the Nov 12 family).
+pub static QUERY_STORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const OUT_STORM_CAP: usize = 1_048_576;
+pub static ALLOC_BIG_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ALLOC_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ALLOC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -112,6 +120,20 @@ unsafe impl std::alloc::GlobalAlloc for CoreCountingAlloc {
         ALLOC_LIVE.fetch_add(sz as u64, Ordering::Relaxed);
         ALLOC_TOTAL.fetch_add(sz as u64, Ordering::Relaxed);
         ALLOC_HIST[hist_bucket(sz)].fetch_add(sz as u64, Ordering::Relaxed);
+        if sz > 67_108_864 {
+            ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
+            let n = ALLOC_BIG_CNT.fetch_add(1, Ordering::SeqCst);
+            if n < 8 {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_head: String = bt
+                    .to_string()
+                    .lines()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("[alloc-huge] site={site} size={sz} n={n}\n{bt_head}");
+            }
+        }
         let l = ALLOC_LIVE.load(Ordering::Relaxed);
         ALLOC_PEAK.fetch_max(l, Ordering::Relaxed);
         ALLOC_SITE[site as usize].fetch_add(sz as u64, Ordering::Relaxed);
@@ -950,6 +972,12 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
                 // when the layout is already current)
                 self.ensure_cell_order(cid as u32);
                 let (ox, oz) = cell_origin(cx, cz);
+                let out_before_cell = out.len();
+                if out.len() > OUT_STORM_CAP {
+                    QUERY_STORM.store(true, std::sync::atomic::Ordering::Relaxed);
+                    out.clear();
+                    return;
+                }
                 // QUADRANT SUB-PARTITION (doc 37): dense cells scan only the
                 // 2x2 XZ sub-stores the margin-expanded box can touch — a
                 // provable superset skip (Quad doc), survivors in the same
@@ -957,6 +985,16 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
                 let mut cell_sources = 0usize;
                 match self.cell_quad[cid].as_ref() {
                     Some(q) => {
+                        if PUSH_STORM_LOG.load(std::sync::atomic::Ordering::Relaxed) < 6
+                            && n > out.len().max(64)
+                        {
+                            PUSH_STORM_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            println!(
+                                "[push-storm] cid={cid} n={n} qnb={:?} out={} cellids={} box=({},{}..{},{}; {},{})",
+                                q.nb, out.len(), self.cell_ids[cid].len(),
+                                b.x0, b.x1, b.z0, b.z1, b.y0, b.y1
+                            );
+                        }
                         const QEPS: f64 = 1.0e-2; // doc-21 slack (f32 storage)
                         // L60 split: the skip test and the exact test must
                         // use the SAME bounds — the raw query box (the walk
@@ -966,6 +1004,20 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
                         let rel_x1 = b.x1 - ox;
                         let rel_z0 = b.z0 - oz;
                         let rel_z1 = b.z1 - oz;
+                        // L114c THE LEAK (the Nov 12 CI death): merge_keys
+                        // accumulated the order key of every scan survivor
+                        // of EVERY multi-tile query since the index was
+                        // born — nothing cleared it between queries (only
+                        // the full reset in clear()); the capacity grew
+                        // monotonically with the query volume (mobs-25k:
+                        // ~26M queries x survivors -> the 2^30-byte Vec the
+                        // probes traced; the module leg's native heap blew
+                        // past 12GB and the runner died). The keys of one
+                        // query are only read by THIS cell's interleave
+                        // (segments carry their own k0 windows) — clearing
+                        // per cell costs nothing and bounds the buffer to
+                        // the largest single query.
+                        self.merge_keys.clear();
                         self.merge_segs.clear();
                         for qb in 0..16 {
                             let nq = q.nb[qb] as usize;
@@ -1573,6 +1625,27 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
         } else if let Some(p) = self.oversize.iter().position(|o| o.id == id) {
             self.oversize[p] = Oversize { id, world, b, sy, seq };
             return UpsertEv::OversizeSame;
+        }
+        // L114 oversize telemetry: the first NEW entries name the box shape
+        // that feeds the oversize list — the CI legs never carry a legit
+        // oversize population, so any entry here is a suspect for the
+        // phantom burst (an exploded list makes EVERY query push its
+        // intersections into out — the QSCRATCH grow-to-2GB family).
+        let n = self.stats.oversize;
+        if n < 8 {
+            println!(
+                "[ov-tele] n={n} id={id} w={world} b=({}, {}, {}, {}, {}, {}) sy={sy} seq={seq}",
+                b.x0, b.y0, b.z0, b.x1, b.y1, b.z1
+            );
+        }
+        // L114: the oversize list cap — a garbage-box storm (infinite /
+        // inverted boxes) would land millions of one-shot ids here; every
+        // later query walks the list and pushes intersections. A legit
+        // oversize population re-registers from the probe stream; the cap
+        // just bounds the blast radius.
+        if self.oversize.len() >= 100_000 {
+            self.oversize.clear();
+            self.stats.oversize = 0;
         }
         self.oversize.push(Oversize { id, world, b, sy, seq });
         self.stats.oversize += 1;

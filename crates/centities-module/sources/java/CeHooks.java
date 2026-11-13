@@ -1124,8 +1124,9 @@ public final class CeHooks {
                     sb.append(' ').append(1L << (i - 25)).append(':').append(v >> 20).append('M');
                 }
             }
-            sb.append(" idx=").append(ALLOC_STATS[ALLOC_STATS.length - 2])
-              .append('/').append(ALLOC_STATS[ALLOC_STATS.length - 1]);
+            sb.append(" idx=").append(ALLOC_STATS[ALLOC_STATS.length - 3])
+              .append('/').append(ALLOC_STATS[ALLOC_STATS.length - 2])
+              .append(" badB=").append(ALLOC_STATS[ALLOC_STATS.length - 1]);
             return sb.toString();
         } catch (Throwable t) {
             System.out.println("[ce-baseline] allocLine failed: " + t);
@@ -11110,7 +11111,7 @@ public final class CeHooks {
     private static native int[] nativeGlTake(int on);
 
     // L112 leak probe: the Rust allocator counters ([live,total,peak,s0..s18]).
-    public static final long[] ALLOC_STATS = new long[59];
+    public static final long[] ALLOC_STATS = new long[60];
     public static native int nativeAllocStats(long[] out);
 
     /** doc-41 L101: the per-mob serve ledger (CE_MOB_LEDGER) — the staged

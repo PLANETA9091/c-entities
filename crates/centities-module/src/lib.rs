@@ -119,6 +119,8 @@ const IDMAP_CAP: usize = 1 << 21;
 const ALLOC_LIVE_CAP: u64 = 3_000_000_000;
 static REBUILD_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 static IDX_ENTITIES: AtomicU64 = AtomicU64::new(0);
+pub static BAD_BATCH: AtomicU64 = AtomicU64::new(0);
+pub static OUT_STORM_REFUSED: AtomicU64 = AtomicU64::new(0);
 static IDX_CELLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
@@ -311,7 +313,28 @@ fn drain_direct(st: &mut CeState) {
     };
     for ev in taken {
         match ev {
-            DirEv::Upsert { id, wid, b } => st.upsert(id, wid, &b),
+            DirEv::Upsert { id, wid, b } => {
+                // L114: the off-thread probes ride the same sanity contract
+                // as the batch (finite, min<=max, <=64 per axis) — a garbage
+                // box lands in the oversize list and poisons every query.
+                let sane = b.x0.is_finite()
+                    && b.y0.is_finite()
+                    && b.z0.is_finite()
+                    && b.x1.is_finite()
+                    && b.y1.is_finite()
+                    && b.z1.is_finite()
+                    && b.x1 >= b.x0
+                    && b.y1 >= b.y0
+                    && b.z1 >= b.z0
+                    && (b.x1 - b.x0) <= 64.0
+                    && (b.y1 - b.y0) <= 64.0
+                    && (b.z1 - b.z0) <= 64.0;
+                if sane {
+                    st.upsert(id, wid, &b);
+                } else {
+                    BAD_BATCH.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             DirEv::Remove { id } => st.remove(id),
         }
     }
@@ -4719,19 +4742,45 @@ unsafe fn locked_flush_query(
                         let ev = st.idx.remove(*l & 0xFFFF_FFFF);
                         st.note_remove(ev);
                     } else {
-                        let wid = ((*l >> 32) & 0xFFFF) as u16;
+                        // L114 ENTRY SANITIZER: the CI legs fed the index
+                        // garbage entries (a 70x70x70 box 30 blocks below
+                        // the flat world's bedrock, inverted min/max pairs
+                        // — no vanilla entity box looks like that). One
+                        // garbage entry with half-span > MAX_HALF_SPAN
+                        // lands in the oversize list, never matches a
+                        // removal id, and EVERY later query pushes its
+                        // intersections into out — the QSCRATCH grow-to-2GB
+                        // family, the idmap 2^25 table, the 12GB CI death.
+                        // Vanilla boxes are finite, min<=max, and (for any
+                        // mob/item/stand) <= 64 blocks per axis; everything
+                        // else is dropped with a counter.
                         let o = i * 6;
+                        let x0 = bx[o];
+                        let y0 = bx[o + 1];
+                        let z0 = bx[o + 2];
+                        let x1 = bx[o + 3];
+                        let y1 = bx[o + 4];
+                        let z1 = bx[o + 5];
+                        let sane = x0.is_finite()
+                            && y0.is_finite()
+                            && z0.is_finite()
+                            && x1.is_finite()
+                            && y1.is_finite()
+                            && z1.is_finite()
+                            && x1 >= x0
+                            && y1 >= y0
+                            && z1 >= z0
+                            && (x1 - x0) <= 64.0
+                            && (y1 - y0) <= 64.0
+                            && (z1 - z0) <= 64.0;
+                        if !sane {
+                            BAD_BATCH.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let ev = st.idx.upsert_ord(
                             *l & 0xFFFF_FFFF,
-                            wid,
-                            &centities_core::Aabb::new(
-                                bx[o],
-                                bx[o + 1],
-                                bx[o + 2],
-                                bx[o + 3],
-                                bx[o + 4],
-                                bx[o + 5],
-                            ),
+                            ((*l >> 32) & 0xFFFF) as u16,
+                            &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
                             syb[i],
                             seqb[i] as i64,
                         );
@@ -4747,11 +4796,18 @@ unsafe fn locked_flush_query(
     }
     {
         let _ss = centities_core::SiteGuard::enter(18);
+        centities_core::QUERY_STORM.store(false, Ordering::Relaxed);
         st.idx.query(
             world as u16,
             &centities_core::Aabb::new(x0, y0, z0, x1, y1, z1),
             out,
         );
+        if centities_core::QUERY_STORM.load(Ordering::Relaxed) {
+            // the candidate stream crossed the sane cap — refuse, the Java
+            // gate answers vanilla (n_query returns -1 = "not ready")
+            OUT_STORM_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
     }
     true
 }
@@ -5599,6 +5655,7 @@ pub extern "system" fn n_alloc_stats(
         }
         v.push(IDX_ENTITIES.load(Ordering::Relaxed) as i64);
         v.push(IDX_CELLS.load(Ordering::Relaxed) as i64);
+        v.push(BAD_BATCH.load(Ordering::Relaxed) as i64);
         let n = v.len() as i32;
         e.set_long_array_region(out, 0, v.len() as i32, &v);
         n
