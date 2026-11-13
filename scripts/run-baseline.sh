@@ -199,7 +199,7 @@ java -Xms"${XMS:-2G}" -Xmx"$XMX" -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:+ExitO
   ${AIFLOOR_PROP} \
   ${EXTRA_JVM:-} \
   "${AGENT_ARGS[@]}" \
-  -XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m,stackdepth=64" \
+  ${RUN_JFR:+-XX:StartFlightRecording="filename=$R/rec.jfr,settings=profile,dumponexit=true,maxsize=256m,stackdepth=64"} \
   -jar paper.jar nogui --noconsole < /dev/null > "$R/server.log" 2>&1 &
 JPID=$!
 

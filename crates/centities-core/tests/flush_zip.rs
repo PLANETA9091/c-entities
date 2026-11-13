@@ -1,9 +1,10 @@
 //! L8 flush plumbing test: the rayon chunk-zip must pair each item's state
 //! with the right od/oi/recs slots, and every tickable item must produce a
-//! commit record. Under the L118b fixed-point gate the resting population
-//! proves the tick ran via age++ (oi) and the ON_GROUND bit, while the
-//! post-tick deltas stay EXACTLY zero for every item — the fixed point
-//! holds universally, no gravity carrier, no oscillation.
+//! commit record. Under the L119 vanilla %4 move gate (javap ItemEntity.tick
+//! 26.3-249 offsets 226-265) a grounded small-horiz item carries the skip
+//! tick's gravity (dy = -0.04 when (tc+id)%4 != 0) and zeroes it on the
+//! gate tick — the per-item phase is computable exactly, so the whole
+//! 5000-item pattern is asserted.
 
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid};
@@ -137,17 +138,21 @@ fn parallel_chunk_zip_commits_every_tickable_item() {
         committed, N,
         "every tickable item must produce a commit record"
     );
-    // L118b THE FIXED POINT, UNIVERSAL over 5000 items: every post-tick
-    // delta is EXACTLY zero (dx=dy=dz=0 — no gravity carrier on the closed
-    // gate), the position is untouched, ON_GROUND is set, and the age
-    // increment (100 -> 101) proves the body really ran. (The pre-L118b
-    // proof-of-life asserted a nonzero dy oscillation — the carrier bug.)
+    // L119 the vanilla %4 move gate, UNIVERSAL over 5000 items: the gate
+    // fires when ((tc + id) % 4 == 0) — the move's distance-zero sweep
+    // zeroes dy; the skip ticks carry gravity (dy = -0.04). The position
+    // is untouched, ON_GROUND is set either way, age 100 -> 101 proves the
+    // body ran (both paths reach the tail), and the rec bits are
+    // ON_GROUND only (the distance-zero sweep sets no MOVED).
     for k in 0..N {
+        let tc = (k % 37) as i32;
+        let phase = (tc + k as i32) % 4;
         assert_eq!(
-            (od[k * 8], od[k * 8 + 1]),
-            (0.0, 0.0),
-            "item {k}: the fixed point must hold"
+            od[k * 8 + 1],
+            if phase == 0 { 0.0 } else { -0.04 },
+            "item {k}: the %4 dy pattern must hold"
         );
+        assert_eq!(od[k * 8], 0.0, "item {k}: dx stays zero");
         assert_eq!(od[k * 8 + 4], -60.0, "item {k}: y untouched");
         assert_eq!(oi[k * 4], 101, "item {k}: age incremented");
         assert_eq!(

@@ -1066,3 +1066,56 @@ Stage Summary:
   friction stage multiplied dx by the ground friction on those ticks
   while vanilla multiplies EVERY tick; a resting item with residual dust
   dx decayed at HALF the vanilla rate under the carrier regime.
+
+- L119 — THE VANILLA %4 GATE RESTORED + THE MERGE-PAIRING TRIPLE FIX (the
+  items parity RED since i0-a2 → BIT-EXACT GREEN). The javap ground truth
+  (the mapped 26.3-249 jar, byte offsets verified): (1) ItemEntity.tick
+  offsets 226-265 carry the %4 MOVE GATE — `onGround &&
+  horizontalDistanceSqr <= 9.999999747378752E-6 && (tickCount + getId()) % 4
+  != 0` skips ONLY the move+friction while gravity (offset 136) and the
+  FULL tail (merge cadence, age++, hasImpulse, despawn — offsets 386-598)
+  still run; L118's fixed-point replacement made the native item move
+  EVERY tick (vanilla moves 1-in-4) and the friction decayed the
+  collision-remainder dust at 4x the vanilla rate (all 16199 common items'
+  vx/vz diverged); (2) ServerLevel.tickNonPassenger offsets 55-62: commonTick
+  (tickCount++) runs BEFORE checkIfActive — the sweep reads the POST value,
+  so the L118 verdict port's "-1" and "tc < 201" were off-by-ones inverting
+  the %4 activation phase (the Java itemCheckActive was always right); (3)
+  the skip tick's gravity IS vanilla (dy accumulates -0.04k) — the L118b
+  carrier removal was wrong. Restored: the verbatim %4 gate, the carrier,
+  the verdict clauses ((tc+id)%4, tc<200). Suite: the stale tests rewritten
+  to the javap contract, merge_margin.rs added (the marginal-overlap + the
+  strict-boundary contracts), 23/23 green.
+- THE MERGE-PAIRING TRIPLE (the parity-items 24-25 amt divergence → 0):
+  the ItemMergeEvent stream (the new BaselinePlugin listener — both legs
+  fire the REAL tryToMerge, so the streams must match) + the UPT/MSCAN
+  surgical traces named three roots. (a) THE STALE-INDEX SCAN: the
+  applier's setPos fires probeBox -> the pending batch the index sees only
+  on the next drain — the v3 nativeMergeScan crossing skipped the drain
+  the legacy fastQuery honored; (b) THE POSITIONAL VIEW: vanilla's scan is
+  the LIVE entity list at the scanner's LOOP POSITION — the rows after it
+  are PRE-move; the fresh-belt items route vanilla WITHOUT a batch row,
+  their bodies' moves hit probeBox mid-loop, and ANY full drain before the
+  scan exposed their post-move boxes to scanners vanilla would not show
+  them to (t=159: 971's scan saw 1827 at y=-58.84 where vanilla sees the
+  spawn y=-59.0 through the 0.0061-tall marginal y band). THE FIX: THE
+  POSITIONAL DRAIN — BATCH_POS/BATCH_GEN stamped for EVERY ItemEntity at
+  the guard entry (belt items included), B_POS rides every batch entry,
+  flushUpTo(scannerIdx) drains pos<=idx (spawn adds = -1 always drain,
+  removals -1) and HOLDS the rest; the full flush at the flush boundary +
+  batchGenCur++. DRAIN_CAP 64->4096 (the held fills: 500/tick).
+  (c) THE SUPerset CONSUMED RAW: the index answers the eps-slack superset
+  (the f32 store + the 1e-2 EPSF — the doc-21 contract) and n_merge_scan
+  fed it to tryToMerge untrimmed — the 0.0006-tall GAP case (t=168
+  (1709,1212)) merged where vanilla's strict AABB.intersects refused (24
+  extra events). THE FIX: the exact view trim in n_merge_scan (the strict
+  intersect on the stored boxes — which ARE the scan-time view under the
+  positional drain; the Java live-box trim was wrong: the live bb is
+  POST-loop). THE VERDICT: the parity-items pair (20000 items, 900 ticks,
+  the full merge cascade 3502 events) — the merge-event stream IDENTICAL,
+  the PH hash stream identical across all 484 samples, and the T389/T639/
+  final snapshots BIT-IDENTICAL (PARITY-GATE: PASS) — the scenario is
+  green for the first time since i0-a2. The mobs pair re-verified green
+  (T382/T632/final PASS); the 25k bench p50 1.29 ms/tick (the band
+  1.22-1.31 — no regression). The ME listener + tickOf + the UPT/MSCAN/
+  BORD diagnostics stay env/dump-gated for the next hunt.

@@ -312,35 +312,35 @@ pub fn tick_item(
     }
 
     // move gate (pre-move delta = post-gravity delta in vanilla).
-    // L118 THE FIXED-POINT GATE (replaces the %4 rotation clause): the full
-    // body IS vanilla's ACTIVE tick — vanilla moves on EVERY active tick
-    // (gravity -> move -> collide -> friction), so the gate must not phase-
-    // filter the move. The old (tickCount + id) % 4 clause belonged to the
-    // era when the batch ran the full body EVERY tick and the gate stood in
-    // for the inactive ticks; since i0-a2b the routing (F_INACTIVE ->
-    // tick_item_inactive) owns the active-tick selection, and the gate's
-    // body-tc phase (sweep+1) never coincided with the verdict's sweep-tc
-    // phase — the move never fired, the -0.04 gravity accumulated unbounded
-    // (the parity-items vy=-4.6 divergence), and the vanilla-routed cleanup
-    // that masked it in the old legs is gone.
-    // The replacement is the PROVABLE fixed point: a grounded item with an
-    // exactly-zero delta replicates its state through vanilla's active tick
-    // bit-exactly (gravity -0.04 -> the vertical sweep hits the floor at
-    // distance zero -> the collided dy=0, the position unchanged, the
-    // friction multiplies zeros, onGround stays true) — the move is skipped
-    // for exactly that state and runs for everything else (the dust, the
-    // falls, the pushes all move vanilla-exactly).
+    // L119 THE VANILLA %4 GATE RESTORED (javap ItemEntity.tick 26.3-249,
+    // offsets 226-265 — the ground truth L118 replaced with a fixed point):
+    //   if (onGround && delta.horizontalDistanceSqr() <= 9.999999747378752E-6
+    //       && (tickCount + getId()) % 4 != 0) {
+    //       applyEffectsFromBlocksForLastMovements(); goto tail;  // NO move
+    //   }
+    // The gate sits AFTER gravity (offset 136) — the skip tick still applies
+    // gravity (dy accumulates -0.04k), still runs the noPhysics probe, the
+    // pickupDelay/--, xo/yo/zo, and the FULL tail (merge cadence, age++,
+    // hasImpulse, despawn — offsets 386-598, reached by the skip jump).
+    // Only the move + airDrag/friction + landing damping are skipped.
+    // L118's fixed-point replacement made the native item move EVERY tick:
+    // vanilla moves 1-in-4 for grounded small-horiz items — the friction
+    // decayed the collision-remainder dust at ~4x the vanilla rate (every
+    // common item's vx/vz diverged in the parity pair; the byte-exact
+    // ground trace, run tr29-off/off id 29: friction applied at POST tc
+    // 15,19,23 — exactly (tc+id)%4==0 — never between).
+    // GATE_HORZ_SQR = 1.0e-5f32 as f64 = 9.999999747378752e-6 — the
+    // bytecode constant (the float 1.0E-5F widened). st.tick_count is the
+    // POST-commonTick value = the tickCount the vanilla gate reads
+    // (ServerLevel.tickNonPassenger offsets 55-62: commonTick THEN
+    // checkIfActive THEN tick).
     let dy_g = st.dy - ITEM_GRAVITY;
     let delta_pre_gravity = (st.dx, st.dy, st.dz);
     let mv0 = (st.dx, dy_g, st.dz);
     let horiz_sqr = st.dx * st.dx + st.dz * st.dz;
     let gate = !st.on_ground
         || horiz_sqr > GATE_HORZ_SQR
-        || st.dx != 0.0
-        || st.dy != 0.0
-        || st.dz != 0.0;
-    // (the commit phase honors this proof: a CLOSED gate writes the delta
-    // back UNCHANGED — no gravity carrier; see the L118b note below)
+        || (st.tick_count.wrapping_add(id as i32)) % 4 == 0;
 
     // collide inputs (read-only)
     let mut mv = mv0;
@@ -515,23 +515,18 @@ pub fn tick_item(
     st.xo = st.x;
     st.yo = st.y;
     st.zo = st.z;
-    // L118b THE TRUE FIXED POINT: the CLOSED gate (grounded, delta exactly
-    // zero) must return the state bit-identical — vanilla's active tick on
-    // this state ends at dy=0 (the gravity -0.04 is eaten by the
-    // distance-zero sweep collision), so skipping the move AND the
-    // gravity-carrier write replicates it. The carrier write (dy -> dy_g =
-    // -0.04 on a closed gate) broke the proof: the next tick saw dy != 0,
-    // re-opened the gate, and every resting item paid the full sweep at a
-    // 1-in-2 cadence while its stored velocity oscillated 0/-0.04 against
-    // vanilla's constant 0. The OPEN gate keeps the carrier write: the
-    // collide/friction stage below rewrites st.dy from dy_g exactly as
-    // vanilla does (mv0.0/mv0.2 are identity copies of st.dx/st.dz unless
-    // stuck_applied, which zeroes the delta separately below).
+    // L119: the gravity carrier on the CLOSED gate IS vanilla — the skip
+    // tick runs applyGravity (offset 136, BEFORE the gate at 226) and the
+    // skipped move never zeroes it: dy accumulates -0.04k across the three
+    // skip ticks and the fourth tick's collide+friction zeroes it
+    // (PTRACE run tr29: vy -0.04, -0.04, -0.08, -0.12, 0, ... exactly).
+    // The OPEN gate keeps the carrier too: the collide/friction stage below
+    // rewrites st.dy from dy_g exactly as vanilla does (mv0.0/mv0.2 are
+    // identity copies of st.dx/st.dz unless stuck_applied, which zeroes the
+    // delta separately below).
     st.dx = mv0.0;
+    st.dy = dy_g;
     st.dz = mv0.2;
-    if gate {
-        st.dy = dy_g;
-    }
 
     if stuck_applied {
         st.stuck = (0.0, 0.0, 0.0);

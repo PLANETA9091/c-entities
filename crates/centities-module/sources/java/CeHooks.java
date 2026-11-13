@@ -1908,7 +1908,12 @@ public final class CeHooks {
                 LAST_SY[entId(e) & AMASK] = curSy;
                 boolean rowNeutral = !syMoved && oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
-                batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral);
+                // L119 POSITIONAL DRAIN: a box change from THIS flush's batch
+                // member carries its dispatch-loop position — flushUpTo at the
+                // merge scans holds it until vanilla's loop reaches the owner.
+                int posSlot = entId(e) & AMASK;
+                int pos = BATCH_GEN[posSlot] == batchGenCur ? BATCH_POS[posSlot] : -1;
+                batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral, pos);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -1938,7 +1943,7 @@ public final class CeHooks {
      *  pending batch within the row path's PENDING_CAP, so the zero-JNI row
      *  path stays servable between drains. The total apply+publish work is
      *  invariant — only its placement moves from queries to probes. */
-    private static final int DRAIN_CAP = 64;
+    private static final int DRAIN_CAP = 4096;
     private static final long[] B_IDS = new long[BATCH_CAP];
     private static final double[] B_BOX = new double[BATCH_CAP * 6];
     // L12 push-state extension: per entry — flag bits, exact x/z, delta xyz,
@@ -1953,6 +1958,17 @@ public final class CeHooks {
     // from the mirrored px/pz at sort time).
     private static final int[] B_SY = new int[BATCH_CAP];
     private static final int[] B_SEQ = new int[BATCH_CAP];
+    // L119 THE POSITIONAL DRAIN: per entry — the dispatch-loop position of
+    // its entity in THIS flush's batch (BATCH_POS, valid while BATCH_GEN
+    // matches), or -1 = "visible from the tick start" (spawn adds, non-
+    // dispatched entities). flushUpTo(scannerIdx) drains the entries whose
+    // entity's vanilla body already ran BEFORE the scanner's loop position
+    // and holds the rest — the scan view equals vanilla's mid-loop live
+    // entity state (the merge-pairing root: the full drain let a scanner
+    // see the post-move boxes of items whose vanilla bodies run LATER in
+    // the loop — vanilla's getEntities sees them PRE-move there).
+    private static final int[] B_POS = new int[BATCH_CAP];
+    private static int batchGenCur = 0;
     // L12 delta-only batch (probeDelta events without a box change)
     private static final long[] DB_IDS = new long[BATCH_CAP];
     private static final double[] DB_DV = new double[BATCH_CAP * 3];
@@ -1962,6 +1978,11 @@ public final class CeHooks {
             ThreadLocal.withInitial(() -> "Server thread".equals(Thread.currentThread().getName()));
 
     private static void batchUpsert(int id, int wid, Entity e, AABB b, boolean rowNeutral) {
+        batchUpsert(id, wid, e, b, rowNeutral, -1);
+    }
+
+    private static void batchUpsert(int id, int wid, Entity e, AABB b, boolean rowNeutral,
+            int pos) {
         if (!SERVER_THREAD.get()) {
             // off-thread: the push mirror is server-thread state; off-thread
             // spawns refresh it on the next server-thread box event (every
@@ -1976,6 +1997,7 @@ public final class CeHooks {
         int o = bN * 6;
         B_BOX[o] = b.minX; B_BOX[o + 1] = b.minY; B_BOX[o + 2] = b.minZ;
         B_BOX[o + 3] = b.maxX; B_BOX[o + 4] = b.maxY; B_BOX[o + 5] = b.maxZ;
+        B_POS[bN] = pos;
         // PARITY ORDER (doc 36b): the exact (sectionY, insertion seq) stamps
         // travel with EVERY entry — items merge-scan through the same index
         // and their ties are order-sensitive (vanilla EntityLookup order:
@@ -2067,6 +2089,7 @@ public final class CeHooks {
             return;
         }
         B_IDS[bN] = (1L << 63) | (id & 0xFFFF_FFFFL); // negative long = remove
+        B_POS[bN] = -1; // removals are position-free (the discard is real-time)
         bN++;
         if (bN >= DRAIN_CAP) flush();
     }
@@ -2083,6 +2106,88 @@ public final class CeHooks {
             bN = 0;
             dbN = 0;
         }
+    }
+
+    /** L119 POSITIONAL DRAIN: drain the pending entries whose entity's
+     *  vanilla body ran at or before loop position maxPos, hold the rest.
+     *  Stable: the drained subset keeps the batched order (the probe order =
+     *  the real-time order vanilla's live view follows); the kept subset is
+     *  compacted to the front preserving its order. The db (delta-only)
+     *  entries carry no position — they drain in full (velocity mirrors,
+     *  order-insensitive for the item scans). */
+    private static void flushUpTo(int maxPos) {
+        if (bN == 0) {
+            return;
+        }
+        int keep = 0;
+        for (int q = 0; q < bN; q++) {
+            if (B_POS[q] > maxPos) keep++;
+        }
+        if (keep == bN) {
+            return; // nothing drains yet — zero JNI cost
+        }
+        int drainN = bN - keep;
+        batchesFlushed++;
+        batchEntries += drainN;
+        if (keep == 0) {
+            nativeFlush(drainN, B_IDS, B_BOX, B_PF, B_PXZ, B_DV, B_VID, B_SY, B_SEQ,
+                    0, DB_IDS, DB_DV);
+            bN = 0;
+            return;
+        }
+        // stable partition via a full scratch pass: gather the drained
+        // (pos <= maxPos) then the kept, both in their batched order, then
+        // write everything back (in-place permutation would clobber a not-
+        // yet-read source — the classic forward-copy corruption).
+        long[] sIds = new long[bN];
+        double[] sBox = new double[bN * 6];
+        int[] sPf = new int[bN];
+        double[] sPxz = new double[bN * 2];
+        double[] sDv = new double[bN * 3];
+        int[] sVid = new int[bN];
+        int[] sSy = new int[bN];
+        int[] sSeq = new int[bN];
+        int[] sPos = new int[bN];
+        int w = 0;
+        for (int q = 0; q < bN; q++) {
+            if (B_POS[q] > maxPos) continue;
+            sIds[w] = B_IDS[q];
+            System.arraycopy(B_BOX, q * 6, sBox, w * 6, 6);
+            sPf[w] = B_PF[q];
+            sPxz[w * 2] = B_PXZ[q * 2]; sPxz[w * 2 + 1] = B_PXZ[q * 2 + 1];
+            sDv[w * 3] = B_DV[q * 3]; sDv[w * 3 + 1] = B_DV[q * 3 + 1]; sDv[w * 3 + 2] = B_DV[q * 3 + 2];
+            sVid[w] = B_VID[q];
+            sSy[w] = B_SY[q]; sSeq[w] = B_SEQ[q];
+            sPos[w] = B_POS[q];
+            w++;
+        }
+        for (int q = 0; q < bN; q++) {
+            if (B_POS[q] <= maxPos) continue;
+            sIds[w] = B_IDS[q];
+            System.arraycopy(B_BOX, q * 6, sBox, w * 6, 6);
+            sPf[w] = B_PF[q];
+            sPxz[w * 2] = B_PXZ[q * 2]; sPxz[w * 2 + 1] = B_PXZ[q * 2 + 1];
+            sDv[w * 3] = B_DV[q * 3]; sDv[w * 3 + 1] = B_DV[q * 3 + 1]; sDv[w * 3 + 2] = B_DV[q * 3 + 2];
+            sVid[w] = B_VID[q];
+            sSy[w] = B_SY[q]; sSeq[w] = B_SEQ[q];
+            sPos[w] = B_POS[q];
+            w++;
+        }
+        nativeFlush(drainN, sIds, sBox, sPf, sPxz, sDv, sVid, sSy, sSeq,
+                0, DB_IDS, DB_DV);
+        // copy the kept tail back into the pending batch (positions included)
+        for (int q = drainN; q < bN; q++) {
+            int dst = q - drainN;
+            B_IDS[dst] = sIds[q];
+            System.arraycopy(sBox, q * 6, B_BOX, dst * 6, 6);
+            B_PF[dst] = sPf[q];
+            B_PXZ[dst * 2] = sPxz[q * 2]; B_PXZ[dst * 2 + 1] = sPxz[q * 2 + 1];
+            B_DV[dst * 3] = sDv[q * 3]; B_DV[dst * 3 + 1] = sDv[q * 3 + 1]; B_DV[dst * 3 + 2] = sDv[q * 3 + 2];
+            B_VID[dst] = sVid[q];
+            B_SY[dst] = sSy[q]; B_SEQ[dst] = sSeq[q];
+            B_POS[dst] = sPos[q];
+        }
+        bN = keep;
     }
 
     // ------------------------------------------------------------------
@@ -2262,6 +2367,12 @@ public final class CeHooks {
     // within the same home cell is a vanilla re-append and must force a
     // dirty republish (see the rowNeutral classification in probeBox).
     private static final int[] LAST_SY = new int[ARENA.length];
+    // L119 POSITIONAL DRAIN: per-entity dispatch-loop position in THIS
+    // flush's batch (valid while BATCH_GEN matches batchGenCur) — the merge
+    // scans hold the box changes of the entities vanilla's mid-loop scan
+    // would still see PRE-move.
+    private static final int[] BATCH_POS = new int[ARENA.length];
+    private static final int[] BATCH_GEN = new int[ARENA.length];
     // L100a: the id mirror of the ARENA — ARENA_ID[si] is the FULL id of the
     // entity ARENA[si] holds (0 when null). Every ARENA write pairs with an
     // ARENA_ID write (probeAdd/probeRemove/probeDie/probeBox/ordBackfill), so
@@ -4646,6 +4757,12 @@ public final class CeHooks {
         if (!ITEM_TICK_ON) return false;
         if (!(ent instanceof ItemEntity e)) return false;
         if (ibN >= IB_CAP) return false;
+        // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
+        // stamps its loop position — including the fresh-belt items that
+        // route vanilla WITHOUT a batch row (their bodies move them and the
+        // probeBox must hold that box until vanilla's loop reaches them).
+        BATCH_POS[entId(e) & AMASK] = ibN;
+        BATCH_GEN[entId(e) & AMASK] = batchGenCur;
         try {
             // L66: the direct client check — javap 26.3: e.level() reads the
             // private `level` field, isClientSide() the private final
@@ -6321,6 +6438,17 @@ public final class CeHooks {
             envI[4] = net.minecraft.server.MinecraftServer.currentTick;
             envI[5] = 1; // the verdict kill-switch (doc 62; CE-verdict bisection flips it)
 
+            // L119-DIAG: the batch's dispatch order at the dump ticks — the
+            // apply order = this order (the compact list preserves it), so
+            // the merge-scan interleaving question needs the raw sequence.
+            if (phDumpTickNow() && n > 0) {
+                StringBuilder bb2 = new StringBuilder(160);
+                bb2.append("BORD t=").append(CUR_TICK).append(" n=").append(n);
+                for (int q = 0; q < n; q++) {
+                    bb2.append(' ').append((int) (IB_IDS[q] & 0xFFFF_FFFFL));
+                }
+                System.out.println("[ce-baseline] " + bb2);
+            }
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI, IB_ATI);
             if (rc != 0) {
@@ -6707,14 +6835,38 @@ public final class CeHooks {
                     // entities absorbed earlier in the same batch until the
                     // removal driver runs; tryToMerge on a dead entity
                     // corrupted the stacks (the v1/v3 resync storm).
+                    // L119 POSITIONAL DRAIN: hold this scanner's not-yet-
+                    // reached entities' post-move boxes (their vanilla bodies
+                    // ran during the loop but vanilla's mid-loop scan sees
+                    // them PRE-move at the scanner's position).
+                    flushUpTo(i);
                     boolean walls = level.paperConfig().fixes.fixItemsMergingThroughWalls;
                     double mr = level.spigotConfig.itemMerge;
                     double myinf = level.paperConfig().entities.behavior.onlyMergeItemsHorizontally
                             ? 0.0 : mr - 0.5;
                     int cands = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
                             mr, myinf, e.getId(), MS_CAND_IDS);
+                    // L119-DIAG: the fast-path scan's candidate list at PH_DUMP
+                    // ticks (the merge pairing hunt: the t=159 direction flip
+                    // needs the exact order the native scan handed over).
+                    // cands >= 0: the zero-candidate scans print too — a
+                    // missing line means the scan did not run at all.
+                    if (cands >= 0 && phDumpTickNow()) {
+                        StringBuilder msb = new StringBuilder(96);
+                        msb.append("MSN t=").append(CUR_TICK)
+                                .append(" self=").append(e.getId())
+                                .append(" tc=").append(e.tickCount)
+                                .append(" y=").append(e.getY())
+                                .append(" n=").append(cands);
+                        for (int k2 = 0; k2 < Math.min(cands, 24); k2++) {
+                            msb.append(' ').append((int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL));
+                        }
+                        System.out.println("[ce-baseline] " + msb);
+                    }
                     boolean fast = cands >= 0;
                     if (fast) {
+                        // L119: the exact view trim happens RUST-SIDE now (the
+                        // stored boxes = the scan-time view — see n_merge_scan).
                         for (int k2 = 0; k2 < cands; k2++) {
                             ItemEntity other = (ItemEntity) arenaRef(MS_CAND_IDS[k2]);
                             if (other == null || other.isRemoved()) continue;
@@ -6831,6 +6983,12 @@ public final class CeHooks {
                 }
             }
             MODE_EPOCH = epoch;
+            // L119 POSITIONAL DRAIN: the boundary — the held leftovers (the
+            // boxes of the entities whose vanilla bodies ran after the last
+            // scanner) drain in full here; the index is the tick-end state
+            // for the next flush, exactly like the post-loop live world.
+            flush();
+            batchGenCur++; // the next tick's dispatch stamps are fresh
             } finally {
                 IN_ITEM_APPLY = false;
             }

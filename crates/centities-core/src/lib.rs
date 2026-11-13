@@ -1731,6 +1731,51 @@ let v = &mut self.cell_vers[home as usize]; *v = (*v & 0xFFFF_FFFF_0000_0000) | 
             .filter(|k| *k != 0)
     }
 
+    /// L119-DIAG: the scan trace for one query box — the cells it walks and
+    /// EVERY row in them with its stored box + the exact-f64 intersect
+    /// verdict. The merge-pairing hunt's surgical probe (the t=159 scan
+    /// found n=0 where vanilla found the 0.006-tall y overlap).
+    pub fn debug_scan_trace(&self, world: u16, b: &Aabb) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "qbox=({:.6},{:.6},{:.6})..({:.6},{:.6},{:.6})",
+            b.x0, b.y0, b.z0, b.x1, b.y1, b.z1);
+        let ex = self.max_half_span + MARGIN as f64;
+        let cx0 = ((b.x0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cx1 = ((b.x1 + ex).floor() as i32) >> CELL_SHIFT;
+        let cz0 = ((b.z0 - ex).floor() as i32) >> CELL_SHIFT;
+        let cz1 = ((b.z1 + ex).floor() as i32) >> CELL_SHIFT;
+        let _ = writeln!(s, "cells x[{}..{}] z[{}..{}] max_half_span={:.3}", cx0, cx1, cz0, cz1, self.max_half_span);
+        for cz in cz0..=cz1 {
+            for cx in cx0..=cx1 {
+                let key = cell_key(world, cx, cz);
+                let Some(cid) = self.cellmap.find(key) else {
+                    continue;
+                };
+                let cid = cid as usize;
+                let ids = &self.cell_ids[cid];
+                let _ = writeln!(s, "cell ({},{}) rows={}", cx, cz, ids.len());
+                for &id in ids.iter() {
+                    let bo = self.box_of(world, id);
+                    match bo {
+                        Some(bb) => {
+                            // the vanilla AABB.intersects (strict <)
+                            let hit = bb[3] > b.x0 && bb[0] < b.x1
+                                && bb[4] > b.y0 && bb[1] < b.y1
+                                && bb[5] > b.z0 && bb[2] < b.z1;
+                            let _ = writeln!(s, "  id={} box=({:.6},{:.6},{:.6})..({:.6},{:.6},{:.6}) hit={}",
+                                id, bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], hit);
+                        }
+                        None => {
+                            let _ = writeln!(s, "  id={} box=None", id);
+                        }
+                    }
+                }
+            }
+        }
+        s
+    }
+
     /// The count of `cell`: push up to `cap` ids into `out`, return
     /// (total_count, overflow) where overflow = total > cap. The full count
     /// is always computed (the publisher needs it to decide publishability),

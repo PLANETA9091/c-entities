@@ -161,6 +161,25 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
 
+        // L119-DIAG: the merge-event stream. ItemMergeEvent fires from the
+        // REAL vanilla tryToMerge (both legs — the native path invokes the
+        // same method), so the streams must be IDENTICAL across the A/B:
+        // the first mismatching (tick, source, target) triple names the
+        // exact diverging absorption — the pairing hunt's decisive probe.
+        getServer().getPluginManager().registerEvent(org.bukkit.event.entity.ItemMergeEvent.class,
+                (org.bukkit.event.Listener) this, org.bukkit.event.EventPriority.NORMAL,
+                (lst, ev) -> {
+                    if (parity) {
+                        org.bukkit.event.entity.ItemMergeEvent m = (org.bukkit.event.entity.ItemMergeEvent) ev;
+                        org.bukkit.entity.Item a = m.getEntity();
+                        org.bukkit.entity.Item b = m.getTarget();
+                        getLogger().info(String.format(Locale.ROOT,
+                                "[ce-baseline] ME t=%d src=%d tc=%d amt=%d y=%.4f tgt=%d tc=%d amt=%d y=%.4f",
+                                tickNo, a.getEntityId(), tickOf(a), a.getItemStack().getAmount(), a.getLocation().getY(),
+                                b.getEntityId(), tickOf(b), b.getItemStack().getAmount(), b.getLocation().getY()));
+                    }
+                }, this);
+
         // Always-on hook diagnostics: every 100 ticks, any phase.
         Bukkit.getScheduler().runTaskTimer(this,
                 () -> { String h = hookStats(); if (h != null) getLogger().info("hooks@T" + tickNo + ": " + h); },
@@ -803,6 +822,19 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
             PARITY_NCOL;
     private static volatile java.lang.reflect.Method PQ_METHOD;
     private static volatile Object PQ_LEVEL;
+
+    /** L119-DIAG: the NMS tickCount of a Bukkit entity for the ME stream
+     *  (the scanner-direction forensics: the event alone does not name the
+     *  scanner — the counts + the tc values do). -1 = unbound/failed. */
+    private int tickOf(org.bukkit.entity.Entity e) {
+        try {
+            if (PARITY_GET_HANDLE == null || PARITY_TICK_COUNT == null) return -1;
+            Object nms = PARITY_GET_HANDLE.invoke(e);
+            return PARITY_TICK_COUNT.getInt(nms);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
     private static volatile java.lang.reflect.Method PQ_BB;
 
     // ------------------------------------------------------------------

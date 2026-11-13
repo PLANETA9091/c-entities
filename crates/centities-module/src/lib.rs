@@ -4784,6 +4784,21 @@ unsafe fn locked_flush_query(
                             syb[i],
                             seqb[i] as i64,
                         );
+                        // L119-DIAG: per-id upsert trace (CE_UPT_TRACE=<id>) —
+                        // which boxes reach the index and in what order.
+                        static UT_ID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+                        let ut = *UT_ID.get_or_init(|| {
+                            std::env::var("CE_UPT_TRACE")
+                                .ok()
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .unwrap_or(-1)
+                        });
+                        if ut == (*l & 0xFFFF_FFFF) {
+                            cplug_sdk::log::info(&format!(
+                                "[ce] UPT id={} box=({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4}) sy={} seq={} ev={:?}",
+                                *l & 0xFFFF_FFFF, x0, y0, z0, x1, y1, z1, syb[i], seqb[i], ev
+                            ));
+                        }
                         st.note_upsert(ev);
                     }
                 }
@@ -5101,6 +5116,21 @@ pub extern "system" fn n_flush(
                         box_buf[o + 5],
                     );
                     let ev = st.idx.upsert_ord(id, wid, &b, sy_buf[i], seq_buf[i] as i64);
+                    // L119-DIAG: per-id upsert trace (CE_UPT_TRACE=<id>) —
+                    // the n_flush wire's boxes (the Java flush() batch path).
+                    static UT2_ID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+                    let ut2 = *UT2_ID.get_or_init(|| {
+                        std::env::var("CE_UPT_TRACE")
+                            .ok()
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(-1)
+                    });
+                    if ut2 == id {
+                        cplug_sdk::log::info(&format!(
+                            "[ce] UPT2 id={} box=({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4}) sy={} seq={} ev={:?}",
+                            id, b.x0, b.y0, b.z0, b.x1, b.y1, b.z1, sy_buf[i], seq_buf[i], ev
+                        ));
+                    }
                     st.note_upsert(ev);
                     if pf_buf[i] & (pushcore::PF_PUSHABLE as i32) != 0 {
                         let evicted = st.push.upsert(

@@ -524,13 +524,24 @@ fn activation_verdict(
     dx: f64,
     dz: f64,
 ) -> (bool, Option<i64>, bool) {
-    if ((tc as i64 - 1 + id) % 4) == 0 {
+    // L119 THE PHASE FIX (the L118 sweep-time note mis-read tickNonPassenger):
+    // the verdict tc argument = st.tick_count + 1 = POST_{T+1} = EXACTLY the
+    // tickCount the vanilla checkIfActive reads — ServerLevel.tickNonPassenger
+    // 26.3-249 offsets 55-62: commonTick (tickCount++) runs BEFORE
+    // checkIfActive, so the sweep sees the POST value, not the PRE. The Java
+    // source (CeHooks.itemCheckActive, tc = e.tickCount + 1) was always
+    // right; the port's "- 1" and "tc < 201" were the off-by-ones — the
+    // %4 activation phase was inverted (vanilla-active ticks went inactive
+    // and vice versa) and POST=200 granted one extra active tick (the L52
+    // bug class, reintroduced). Byte-exact ground trace: run tr29, OFF id 29
+    // moved at POST tc 15/19/23 = (tc+id)%4==0 with tc<200 active-everywhere.
+    if ((tc as i64 + id) % 4) == 0 {
         return (true, None, was_temp);
     }
     if def {
         return (true, None, was_temp);
     }
-    if tc < 201 {
+    if tc < 200 {
         return (true, None, was_temp);
     }
     let cur = tenv.cur_tick as i64 + 1;
@@ -1550,8 +1561,44 @@ pub extern "system" fn n_merge_scan(
         y + 0.25 + yinf,
         z + 0.125 + r,
     );
+    // L119-DIAG: the surgical scan trace — CE_MSCAN_TRACE=<entity id>
+    // dumps the walked cells + every row's stored box + the exact-f64
+    // intersect verdict for THAT scanner's query, before the query runs.
+    static MT_ID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let mt = *MT_ID.get_or_init(|| {
+        std::env::var("CE_MSCAN_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
+    });
+    if mt == self_id {
+        eprintln!(
+            "[ce] MSCAN self={} {}",
+            self_id,
+            cst.idx.debug_scan_trace(wid as u16, &qbox)
+        );
+    }
     let mut cands: Vec<i64> = Vec::with_capacity(16);
     cst.idx.query(wid as u16, &qbox, &mut cands);
+    // L119 THE EXACT VIEW TRIM: the index answers a PROVABLE SUPERSET (the
+    // f32 store's 7.6e-6 cell-relative rounding + the 1e-2 EPSF prefilter —
+    // the doc-21 contract; the caller was expected to exactify). The stored
+    // boxes ARE the scan-time view (the positional drain holds every not-
+    // yet-reached entity's post-move box, so the stored box equals the live
+    // box vanilla's mid-loop getEntities would read). Trim here with the
+    // vanilla strict AABB.intersects on the stored boxes — the Java-side
+    // live-box trim was WRONG (the live bb is POST-loop for the not-yet-
+    // reached entities, which ate the true 0.0061-tall t=159 overlap).
+    cands.retain(|&cid| {
+        match cst.idx.box_of(wid as u16, cid) {
+            Some(b) => {
+                b[3] > qbox.x0 && b[0] < qbox.x1
+                    && b[4] > qbox.y0 && b[1] < qbox.y1
+                    && b[5] > qbox.z0 && b[2] < qbox.z1
+            }
+            None => false,
+        }
+    });
     MS_RAW.fetch_add(cands.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut n = 0usize;
     unsafe {
