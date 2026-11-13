@@ -106,15 +106,30 @@ public final class CeHooks {
     // caller is about to pay anyway (MIRR_EMA[gi], known after 16 samples)
     // — and never above the degenerate ceiling: a poisoned-low mirror EMA
     // must not authorize a million-row resolve (BIG_N_REFUSE stays, raised
-    // from 1024 to 65536 rows ≈ 7.9 ms worst case). Unknown mirror (fewer
-    // than 16 samples) serves fast — the bootstrap philosophy, and the
-    // October shape (run 782b603: 8.87M fast queries, mobs-25k-mod p50
-    // 159.8 ms, −48%) restored. On spread (mirror genuinely cheaper) the
-    // refusal survives: there the predicted resolve really is dearer.
+    // from 1024 to 65536 rows ≈ 7.9 ms worst case).
+    //
+    // L117 THE RUNAWAY BRAKE (run #464 forensics): the bootstrap pass-through
+    // (unknown mirror serves fast) plus a slow runner's inflated mirror EMA
+    // form a feedback loop — the gate passes 5.33M big-box queries, the
+    // mirror count starves below MIRR_KNOWN_MIN, the refuse path disables
+    // outright, and the resolve walks **43.1 BILLION rows** (the L104
+    // catastrophe through the adaptive back door; #461 sat at 106.7M rows /
+    // 53.8k passes = the sane 2µs-per-row equilibrium). Two layers:
+    // (1) BIGBOX_ABS_BUDGET_NS — the absolute per-query resolve budget; a
+    // resolve the mirror could never match (the vanilla body walks the same
+    // population with a cheaper per-row shape) is refused regardless of the
+    // EMA. 500µs keeps #461's sane passes (1983 rows ≈ 246µs) and kills the
+    // 25k-row spawn monsters (3.1ms) on every runner speed.
+    // (2) BIGBOX_DEFAULT_MIRR_NS — the unknown-bucket default: unmeasured
+    // mirror buckets REFUSE the dear resolves until 16 samples land (the
+    // mirror body serves them at its bounded vanilla cost and feeds the
+    // EMA) — the pass-through only resumes on evidence.
     public static final int FAST_RESOLVE_NS_PER_CAND = 112;
     public static final int FAST_SCAN_NS_PER_ROW = 12;
     public static final int MIRR_KNOWN_MIN = 16;
     public static final int BIG_N_REFUSE = 65536;
+    public static final long BIGBOX_ABS_BUDGET_NS = 500_000;
+    public static final long BIGBOX_DEFAULT_MIRR_NS = 100_000;
     public static volatile long bigboxRefused = 0, bigboxCand = 0;
     public static volatile long bigboxAdaptivePassed = 0, bigboxAdaptivePassedRows = 0;
     // Mirror-reason counters (diagnostics): why the fast path was skipped.
@@ -2835,16 +2850,16 @@ public final class CeHooks {
             return null;
         }
         int giL111 = wid * GBUCKETS + bucketOf(box);
-        if (n > 1024 && MIRR_N[giL111] >= MIRR_KNOWN_MIN) {
+        if (n > 1024) {
             long predicted = (long) n * (FAST_RESOLVE_NS_PER_CAND + FAST_SCAN_NS_PER_ROW);
-            if (predicted > MIRR_EMA[giL111]) {
+            boolean mirrKnown = MIRR_N[giL111] >= MIRR_KNOWN_MIN;
+            long budget = mirrKnown ? MIRR_EMA[giL111] : BIGBOX_DEFAULT_MIRR_NS;
+            if (predicted > BIGBOX_ABS_BUDGET_NS || predicted > budget) {
                 bigboxRefused++;
                 bigboxCand += n;
                 fastRefuse = "bigbox-a";
                 return null;
             }
-        }
-        if (n > 1024) {
             bigboxAdaptivePassed++;
             bigboxAdaptivePassedRows += n;
         }
