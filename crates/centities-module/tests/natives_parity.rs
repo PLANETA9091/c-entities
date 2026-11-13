@@ -38,6 +38,10 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     // loop B's timing; the candidates fill in the vanilla order)
     s.insert(("nativeMergeScan", "(IDDDDDJ[J)I"));
     s.insert(("nativeItemInvalidate", "(II[I[I[I)V"));
+    // L112/L114: the leak-probe counters ([live,total,peak,s0..s21,32
+    // size-buckets,idx entities/cells,badB]) — the hooks stats line reads
+    // them once per stats print; a no-op for the runtime paths.
+    s.insert(("nativeAllocStats", "([J)I"));
     // L22a: the native goal engine
     s.insert(("nativeMobAiFloor", "([I[I)I"));
     // N3-N1 phase-2a: the resolved despawn config table (doc 61)
