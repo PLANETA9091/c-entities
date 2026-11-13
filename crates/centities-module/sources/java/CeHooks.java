@@ -1196,6 +1196,7 @@ public final class CeHooks {
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
                 + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
+                + "/i0c=" + ttlQuietI0C
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -6716,6 +6717,46 @@ public final class CeHooks {
                     e.level().gameEvent(GameEvent.HIT_GROUND, e.position(),
                             GameEvent.Context.of(e, s));
                 }
+                // i0-c (doc 62): the tracker-quiet expansion — the tail RAN
+                // and every tracker-visible output it owns is unchanged.
+                // The javap 26.3 ground truth (ServerEntity.sendChanges):
+                // items ride trackDelta=false and are never LivingEntity, so
+                // the velocity block is skipped unless needsSync (bit 2 —
+                // excluded); the move packet needs a position change (bit 0 —
+                // excluded); the metadata dirty set stays empty unless a
+                // merge touched the stack (bit 5 — excluded); fallDistance
+                // is a PLAIN public field in 26.3 (javap Entity — no
+                // DATA_FALL_DISTANCE accessor — not synced), pickupDelay/age
+                // are not EntityData either. The despawn/void/land events
+                // (bits 7/8/9) are removals or events — excluded. The
+                // surviving body's work (the delta Vec3 write, the pd
+                // decrement, the fd/onGround flips) is tracker-INVISIBLE —
+                // the slot earns the L92 quiet skip: the mirror bump pays
+                // the tickCount debt and the tracker pass serves ONE array
+                // read instead of the full cached chain. The dy oscillation
+                // (the TAIL_NONE killer — 3-of-4 ticks accumulate -0.04k) no
+                // longer herds resting items through the tracker body.
+                if (quietStampArm) {
+                    Object[] rq3 = TT_REF;
+                    long[] fq3 = TT_FLAT;
+                    if (rq3 != null && fq3 != null) {
+                        int mq3 = (int) (IB_IDS[i] & AMASK);
+                        int obq3 = mq3 * 5;
+                        if (rq3[obq3 + 2] == e) {
+                            if ((bits & ((1) | (1 << 2) | (1 << 5) | (1 << 7)
+                                    | (1 << 8) | (1 << 9))) == 0
+                                    && !e.syncVelocity) {
+                                long sh3 = fq3[mq3 * 2];
+                                if ((sh3 & TT_OK) != 0 && (sh3 & TT_SIT) == 0) {
+                                    TT_QUIET[mq3 >> 6] |= 1L << (mq3 & 63);
+                                    ttlQuietI0C++;
+                                }
+                            } else {
+                                TT_QUIET[mq3 >> 6] &= ~(1L << (mq3 & 63));
+                            }
+                        }
+                    }
+                }
             }
             MODE_EPOCH = epoch;
             } finally {
@@ -11505,6 +11546,7 @@ public final class CeHooks {
             !"false".equals(System.getProperty("centities.trackerLoop", "true"));
     public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
     public static long ttlQuiet = 0, ttlQuietBumps = 0; // L92
+    public static long ttlQuietI0C = 0; // i0-c: the loop-B expansion stamps
     // L59a/L61 decline-site counters (the fuse verdict, per site) + the
     // per-pass chunk memo (reset at every newTrackerTick$ entry).
     public static long ttlDeclChunk = 0, ttlDeclSeen = 0, ttlDeclSe = 0,
