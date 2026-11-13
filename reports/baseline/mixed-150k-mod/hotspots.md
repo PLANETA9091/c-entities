@@ -1,106 +1,106 @@
 # JVM hotspots (JFR ExecutionSample)
 
-Samples: 37622
+Samples: 29983
 
 ## Top 60 by self-time (leaf frames)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 3.14% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7107` |
-| 2 | 3.10% | `jdk.internal.misc.ScopedMemoryAccess.getLongUnalignedInternal(MemorySessionImpl, Object, long, boolean) line: 3858` |
-| 3 | 3.08% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 10970` |
-| 4 | 2.89% | `jdk.internal.misc.Unsafe.getLongUnaligned(Object, long, boolean) line: 3571` |
-| 5 | 2.62% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 6 | 2.04% | `jdk.internal.misc.Unsafe.convEndian(boolean, long) line: 3835` |
-| 7 | 1.82% | `java.util.ImmutableCollections$ListItr.next() line: 397` |
-| 8 | 1.69% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
-| 9 | 1.65% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
-| 10 | 1.57% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
-| 11 | 1.40% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2731` |
-| 12 | 1.39% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 13 | 1.25% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 14 | 1.24% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 15 | 1.16% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 87` |
-| 16 | 1.08% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 6344` |
-| 17 | 1.07% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getAcquire(VarHandle, Object) line: 113` |
-| 18 | 0.93% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getInstance(Holder) line: 46` |
-| 19 | 0.85% | `net.minecraft.world.entity.ai.attributes.AttributeInstance.getModifier(Identifier) line: 66` |
-| 20 | 0.83% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
-| 21 | 0.79% | `net.minecraft.world.entity.Entity.isInterpolating() line: 3584` |
-| 22 | 0.78% | `dev.planeta9091.centities.CeHooks.tickEffectsNoOp(LivingEntity) line: 11430` |
-| 23 | 0.72% | `java.util.HashMap.getNode(Object) line: 586` |
-| 24 | 0.70% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
-| 25 | 0.65% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getValue(Holder) line: 59` |
-| 26 | 0.62% | `net.minecraft.world.entity.Entity.setOldPos(Vec3) line: 2409` |
-| 27 | 0.61% | `it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap$ValuesCollection.forEach(Consumer) line: 698` |
-| 28 | 0.56% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 29 | 0.54% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 88` |
-| 30 | 0.54% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 31 | 0.54% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2889` |
-| 32 | 0.53% | `net.minecraft.server.level.ServerChunkCache.getChunk(int, int, ChunkStatus, boolean) line: 312` |
-| 33 | 0.53% | `net.minecraft.world.entity.Entity.computeSpeed() line: 965` |
-| 34 | 0.52% | `java.util.EnumMap.get(Object) line: 248` |
-| 35 | 0.52% | `net.minecraft.world.entity.EntityFluidInteraction.update(Entity, boolean) line: 39` |
-| 36 | 0.51% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getVolatile(VarHandle, Object) line: 99` |
-| 37 | 0.50% | `net.minecraft.world.entity.ai.goal.WrappedGoal.getFlags() line: 73` |
-| 38 | 0.50% | `java.util.AbstractCollection.containsAll(Collection) line: 310` |
-| 39 | 0.49% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
-| 40 | 0.47% | `dev.planeta9091.centities.CeHooks.vtabHash(int) line: 411` |
-| 41 | 0.45% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2638` |
-| 42 | 0.45% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3401` |
-| 43 | 0.40% | `dev.planeta9091.centities.CeHooks.goalSelectorTick(GoalSelector) line: 7627` |
-| 44 | 0.39% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3147` |
-| 45 | 0.37% | `net.minecraft.world.entity.LivingEntity.getHealth() line: 1395` |
-| 46 | 0.37% | `net.minecraft.world.entity.LivingEntity.refreshDirtyAttributes() line: 1332` |
-| 47 | 0.37% | `net.minecraft.core.component.DataComponentPatch.getFromPatchAndPrototype(Reference2ObjectMap, DataComponentGetter, DataComponentType) line: 167` |
-| 48 | 0.36% | `dev.planeta9091.centities.CeHooks.appendDispatch(ItemEntity, boolean) line: 4764` |
-| 49 | 0.36% | `it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap.get(Object) line: 323` |
-| 50 | 0.35% | `net.minecraft.world.level.chunk.LevelChunkSection.hasFluid() line: 177` |
-| 51 | 0.35% | `java.util.Arrays.fill(Object[], int, int, Object) line: 3450` |
-| 52 | 0.34% | `dev.planeta9091.centities.CeHooks.shadowOf(Object) line: 7280` |
-| 53 | 0.33% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 10832` |
-| 54 | 0.32% | `net.minecraft.world.level.chunk.ChunkAccess.getSectionIndexFromSectionY(int) line: 535` |
-| 55 | 0.32% | `java.lang.invoke.VarHandleReferences$Array.getAcquire(VarHandle, Object, int) line: 637` |
-| 56 | 0.31% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 911` |
-| 57 | 0.30% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2821` |
-| 58 | 0.30% | `net.minecraft.world.entity.EntityFluidInteraction.isEyeInFluid(TagKey) line: 190` |
-| 59 | 0.30% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.processTicketUpdates() line: 1517` |
-| 60 | 0.28% | `net.minecraft.world.item.enchantment.Enchantment.entityContext(ServerLevel, int, Entity, Vec3) line: 509` |
+| 1 | 5.71% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7355` |
+| 2 | 5.61% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 11977` |
+| 3 | 3.66% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 4 | 2.94% | `net.minecraft.world.entity.Entity.setOldPos(Vec3) line: 2409` |
+| 5 | 2.56% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 6 | 1.97% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks() line: 1420` |
+| 7 | 1.76% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 8 | 1.61% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 87` |
+| 9 | 1.55% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
+| 10 | 1.53% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getInstance(Holder) line: 46` |
+| 11 | 1.38% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 12 | 1.35% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
+| 13 | 1.16% | `it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap$ValuesCollection.forEach(Consumer) line: 698` |
+| 14 | 1.07% | `net.minecraft.world.entity.Entity.isInterpolating() line: 3584` |
+| 15 | 1.05% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 898` |
+| 16 | 1.00% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 17 | 0.96% | `dev.planeta9091.centities.CeHooks.vtabHash(int) line: 425` |
+| 18 | 0.84% | `net.minecraft.world.entity.ai.attributes.AttributeInstance.getModifier(Identifier) line: 66` |
+| 19 | 0.84% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
+| 20 | 0.84% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 11839` |
+| 21 | 0.83% | `net.minecraft.world.entity.EntityFluidInteraction.update(Entity, boolean) line: 39` |
+| 22 | 0.82% | `net.minecraft.world.entity.EntityFluidInteraction.isEyeInFluid(TagKey) line: 190` |
+| 23 | 0.77% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
+| 24 | 0.76% | `net.minecraft.server.level.ServerChunkCache.getChunk(int, int, ChunkStatus, boolean) line: 312` |
+| 25 | 0.67% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
+| 26 | 0.67% | `sun.misc.Unsafe.getDouble(Object, long) line: 409` |
+| 27 | 0.65% | `java.util.Arrays.copyOf(Object[], int) line: 3478` |
+| 28 | 0.64% | `net.minecraft.world.entity.Entity.computeSpeed() line: 965` |
+| 29 | 0.64% | `net.minecraft.world.level.chunk.LevelChunkSection.hasFluid() line: 177` |
+| 30 | 0.60% | `java.util.EnumMap.get(Object) line: 248` |
+| 31 | 0.55% | `net.minecraft.world.entity.Entity.checkInsideBlocks(List, InsideBlockEffectApplier$StepBasedCollector) line: 1867` |
+| 32 | 0.53% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.processTicketUpdates() line: 1517` |
+| 33 | 0.52% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.getNode(long) line: 237` |
+| 34 | 0.52% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
+| 35 | 0.51% | `net.minecraft.world.entity.LivingEntity.refreshDirtyAttributes() line: 1334` |
+| 36 | 0.51% | `net.minecraft.core.Vec3i.getY() line: 67` |
+| 37 | 0.49% | `net.minecraft.world.entity.Entity.commonTick() line: 877` |
+| 38 | 0.48% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks(List) line: 1466` |
+| 39 | 0.47% | `net.minecraft.world.entity.Mob.isPersistenceRequired() line: 1308` |
+| 40 | 0.47% | `net.minecraft.world.entity.LivingEntity.getHealth() line: 1395` |
+| 41 | 0.47% | `net.minecraft.world.phys.AABB.inflate(double, double, double) line: 185` |
+| 42 | 0.46% | `java.util.Collections$UnmodifiableCollection$1.<init>(Collections$UnmodifiableCollection) line: 1077` |
+| 43 | 0.46% | `net.minecraft.world.level.chunk.ChunkAccess.getSectionIndexFromSectionY(int) line: 535` |
+| 44 | 0.46% | `net.minecraft.world.entity.ElytraAnimationState.tick() line: 28` |
+| 45 | 0.43% | `net.minecraft.world.phys.Vec3.<init>(double, double, double) line: 73` |
+| 46 | 0.42% | `net.minecraft.world.entity.LivingEntity.getItemBySlot(EquipmentSlot) line: 2901` |
+| 47 | 0.38% | `java.lang.invoke.VarHandleReferences$Array.getAcquire(VarHandle, Object, int) line: 637` |
+| 48 | 0.38% | `net.minecraft.world.entity.Entity.setDeltaMovement(Vec3) line: 5079` |
+| 49 | 0.37% | `dev.planeta9091.centities.CeHooks.rowQuery(ServerLevel, int, Entity, AABB, Predicate, boolean) line: 3460` |
+| 50 | 0.37% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 51 | 0.37% | `net.minecraft.world.entity.item.ItemEntity.getItem() line: 513` |
+| 52 | 0.36% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 11843` |
+| 53 | 0.35% | `it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap$ValuesCollection.forEach(Consumer) line: 697` |
+| 54 | 0.34% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 324` |
+| 55 | 0.33% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7346` |
+| 56 | 0.33% | `it.unimi.dsi.fastutil.objects.Reference2ObjectArrayMap.values() line: 715` |
+| 57 | 0.33% | `dev.planeta9091.centities.CeHooks.tickEffectsNoOp(LivingEntity) line: 12437` |
+| 58 | 0.32% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 77` |
+| 59 | 0.32% | `net.minecraft.world.level.chunk.LevelChunk.getBlockStateFinal(int, int, int) line: 285` |
+| 60 | 0.31% | `java.util.Arrays.fill(Object[], int, int, Object) line: 3450` |
 
 ## Top 30 callers of hot leaves
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 4.01% | `net.minecraft.network.syncher.SynchedEntityData.get(EntityDataAccessor) line: 53` |
-| 2 | 3.50% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer)` |
-| 3 | 3.41% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate) line: 2599` |
-| 4 | 3.11% | `net.minecraft.server.level.ChunkMap.newTrackerTick()` |
-| 5 | 3.10% | `jdk.internal.misc.ScopedMemoryAccess.getLongUnaligned(MemorySessionImpl, Object, long, boolean) line: 3849` |
-| 6 | 2.89% | `jdk.internal.misc.ScopedMemoryAccess.getLongUnalignedInternal(MemorySessionImpl, Object, long, boolean) line: 3861` |
-| 7 | 2.23% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2638` |
-| 8 | 2.04% | `jdk.internal.misc.Unsafe.getLongUnaligned(Object, long, boolean) line: 3571` |
-| 9 | 1.73% | `net.minecraft.server.level.ServerChunkCache.tickChunks(ProfilerFiller) line: 567` |
-| 10 | 1.69% | `net.minecraft.world.level.Level.tickBlockEntities()` |
-| 11 | 1.58% | `net.minecraft.world.item.enchantment.EnchantmentHelper.runIterationOnEquipment(LivingEntity, EnchantmentHelper$EnchantmentInSlotVisitor) line: 159` |
-| 12 | 1.56% | `dev.planeta9091.centities.CeHooks.entId(Entity) line: 4984` |
-| 13 | 1.51% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 6262` |
-| 14 | 1.51% | `java.util.Map.computeIfAbsent(Object, Function) line: 1065` |
-| 15 | 1.29% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup.getEntities(Class, Entity, AABB, List, Predicate) line: 722` |
-| 16 | 1.04% | `net.minecraft.world.entity.EntityFluidInteraction.update(Entity, boolean) line: 39` |
-| 17 | 1.03% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable$TableEntry.getNextAcquire() line: 1837` |
-| 18 | 0.97% | `net.minecraft.world.entity.LivingEntity.tickEffects()` |
-| 19 | 0.93% | `net.minecraft.world.entity.LivingEntity.getAttribute(Holder) line: 2817` |
-| 20 | 0.87% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick()` |
-| 21 | 0.87% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3792` |
-| 22 | 0.85% | `net.minecraft.world.entity.LivingEntity.removeFrost() line: 558` |
-| 23 | 0.83% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3696` |
-| 24 | 0.78% | `java.util.HashMap.get(Object) line: 565` |
-| 25 | 0.78% | `net.minecraft.world.entity.Entity.baseTick() line: 903` |
-| 26 | 0.73% | `net.minecraft.world.entity.LivingEntity.travel(Vec3)` |
-| 27 | 0.70% | `net.minecraft.world.entity.LivingEntity.getAttributeValue(Holder) line: 2821` |
-| 28 | 0.69% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 11065` |
-| 29 | 0.66% | `dev.planeta9091.centities.CeHooks.entityDataValueIdx(Entity, int) line: 8126` |
-| 30 | 0.65% | `net.minecraft.world.entity.Entity.setOldPos() line: 2401` |
+| 1 | 6.28% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer)` |
+| 2 | 6.22% | `net.minecraft.network.syncher.SynchedEntityData.get(EntityDataAccessor) line: 53` |
+| 3 | 5.65% | `net.minecraft.server.level.ChunkMap.newTrackerTick()` |
+| 4 | 3.10% | `net.minecraft.world.entity.Entity.setOldPos() line: 2401` |
+| 5 | 2.18% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 2683` |
+| 6 | 1.87% | `net.minecraft.world.entity.EntityFluidInteraction.update(Entity, boolean) line: 39` |
+| 7 | 1.76% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 8 | 1.73% | `net.minecraft.server.level.ServerChunkCache.tickChunks(ProfilerFiller) line: 567` |
+| 9 | 1.71% | `java.util.Map.computeIfAbsent(Object, Function) line: 1065` |
+| 10 | 1.60% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 12072` |
+| 11 | 1.56% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.applyAndClear(Entity) line: 54` |
+| 12 | 1.53% | `dev.planeta9091.centities.CeHooks.entId(Entity) line: 5122` |
+| 13 | 1.53% | `net.minecraft.world.entity.LivingEntity.getAttribute(Holder) line: 2817` |
+| 14 | 1.40% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3792` |
+| 15 | 1.15% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.get(long) line: 264` |
+| 16 | 1.12% | `dev.planeta9091.centities.CeHooks.entityDataValueIdx(Entity, int) line: 8389` |
+| 17 | 1.10% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7376` |
+| 18 | 1.09% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3696` |
+| 19 | 0.96% | `dev.planeta9091.centities.CeHooks.vtabGet(int) line: 439` |
+| 20 | 0.96% | `net.minecraft.world.entity.Entity.applyEffectsFromBlocks(List) line: 1476` |
+| 21 | 0.95% | `net.minecraft.world.entity.Entity.updateFluidInteraction() line: 2218` |
+| 22 | 0.90% | `net.minecraft.world.entity.Entity.baseTick() line: 903` |
+| 23 | 0.84% | `net.minecraft.world.entity.LivingEntity.removeFrost() line: 558` |
+| 24 | 0.82% | `net.minecraft.world.entity.Entity.isEyeInFluid(TagKey) line: 2311` |
+| 25 | 0.81% | `net.minecraft.server.level.ServerChunkCache.runDistanceManagerUpdates() line: 453` |
+| 26 | 0.69% | `net.minecraft.world.level.Level.getChunk(int, int, ChunkStatus, boolean) line: 1040` |
+| 27 | 0.69% | `net.minecraft.world.entity.Entity.tick() line: 873` |
+| 28 | 0.69% | `net.minecraft.server.level.ServerLevel.tickNonPassenger(Entity) line: 1408` |
+| 29 | 0.66% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 10255` |
+| 30 | 0.65% | `dev.planeta9091.centities.CeHooks.mirrorTyped(Level, Class, AABB, Predicate) line: 1461` |
 
 GC pauses: 0, total 0 ms
 
