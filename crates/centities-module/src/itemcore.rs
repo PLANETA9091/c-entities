@@ -438,6 +438,17 @@ const B_REST_CAND: i32 = 1 << 15;
 /// after the counters — the skipped compares are exactly the ones the tails
 /// would skip themselves.
 const B_TAIL_NONE: i32 = 1 << 16;
+
+// L118-diag: the outcome-bits census (the merge=0 hunt) — module-level so
+// both the per-item body and the flush-stats print reach them.
+static CB_MERGE_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CB_ACT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CB_INACT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CB_TICKS_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+use CB_MERGE_S as CB_MERGE;
+use CB_ACT_S as CB_ACT;
+use CB_INACT_S as CB_INACT;
+use CB_TICKS_S as CB_TICKS;
 /// i0-a STAY verdict (doc 62): the Java dispatch guard's activation port
 /// early-returns TRUE with ZERO side effects on the %4 rotation clause
 /// ((tickCount+1+id) % 4 == 0 — itemCheckActive's first clause returns
@@ -482,6 +493,20 @@ const F_INACTIVE: i32 = 1;
 ///       else isTemporarilyActive = true; isActive = true; }
 ///   return isActive;
 ///
+/// L118 THE SWEEP-TIME CONVENTIONS (the parity-items zero-merge root, red
+/// since i0-a2b): the verdict serves the NEXT tick's ACTIVATION SWEEP, and
+/// the sweep reads the entity's tickCount BEFORE that tick's dispatcher
+/// increment plus the NEXT MinecraftServer.currentTick — the port's
+/// dispatch-time conventions (tc = post-++ tickCount, cur = this tick)
+/// shifted EVERY clause by one: the %4 exception fired on the wrong tick
+/// (the no-player parity legs went 100% inactive — the full body never
+/// ran — tick_item_inactive served counters only — the merge cadence,
+/// which lives in the full body, never fired: merge=0, the ON leg kept
+/// 20000 items while vanilla merged 3463). The javap ground truth
+/// (ActivationRange.checkIfActive, 26.3-249): the sweep's tickCount = the
+/// post-previous-tick value = st.tick_count (the core's post-body mirror)
+/// = tc - 1, and the sweep's currentTick = this batch's cur_tick + 1.
+///
 /// itemImmunities for a NATIVE item reduces exactly: fire routes vanilla
 /// (the mirror carries no fire — the water/lava/fire gates), the
 /// activatedImmunityTick clause is dead (CeHooks never writes the field —
@@ -499,16 +524,16 @@ fn activation_verdict(
     dx: f64,
     dz: f64,
 ) -> (bool, Option<i64>, bool) {
-    if ((tc as i64 + id) % 4) == 0 {
+    if ((tc as i64 - 1 + id) % 4) == 0 {
         return (true, None, was_temp);
     }
     if def {
         return (true, None, was_temp);
     }
-    if tc < 200 {
+    if tc < 201 {
         return (true, None, was_temp);
     }
-    let cur = tenv.cur_tick as i64;
+    let cur = tenv.cur_tick as i64 + 1;
     let mut is_active = at >= cur;
     let mut at_write: Option<i64> = None;
     let mut is_temp = false; // e.isTemporarilyActive = false (the port writes it)
@@ -1054,6 +1079,18 @@ unsafe fn n_item_tick_impl(
                                                 }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
                                                 if outcome.has(TickOutcome::MERGE2) { ob |= B_MERGE2; }
+                                                // L118-diag: the outcome-bits census (the merge=0 hunt)
+                                                // (the counters are module-level: CB_*_S, aliased
+                                                // CB_* above — the print in the flush-stats reads
+                                                // the same pair)
+                                                CB_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                {
+                                                    let tcc = CB_TICKS.load(std::sync::atomic::Ordering::Relaxed);
+                                                    if tcc % 20000 == 0 {
+                                                        eprintln!("[ce] tickc={} merge={} id={}", tcc, CB_MERGE.load(std::sync::atomic::Ordering::Relaxed), id);
+                                                    }
+                                                }
+                                                if ob & B_MERGE != 0 { CB_MERGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                                                 if outcome.has(TickOutcome::DESPAWN) { ob |= B_DESPAWN; }
                                                 if outcome.has(TickOutcome::VOID) { ob |= B_VOID; }
                                                 if outcome.has(TickOutcome::LAND) { ob |= B_LAND; }
@@ -1314,7 +1351,7 @@ unsafe fn n_item_tick_impl(
                                     let g = &world.grid;
                                     let idx_stats = cst.idx.stats();
                                     cplug_sdk::log::info(&format!(
-                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={} cd={} rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{} stuck{} unl{} fld{} cpx{} fal{})",
+                                        "[c-entities] item-flush: {} flushes, avg {:.1}us, last n={} cd={} rss={}MB, upcalls={} errs={} grid pop={} look={} idx ents={} cells={} oversize={} secX[{}..{}] secY[{}..{}] secZ[{}..{}] maxD{} maxP{} ok{} ab{} stuck{} unl{} fld{} cpx{} fal{}) bits(merge={} act={} inact={} ticks={})",
                                         cnt,
                                         total as f64 / cnt as f64 / 1000.0,
                                         n,
@@ -1342,6 +1379,10 @@ unsafe fn n_item_tick_impl(
                                         cst_ab(&AB_FLUID),
                                         cst_ab(&AB_COMPLEX),
                                         cst_ab(&AB_FALL),
+                                        CB_MERGE.load(std::sync::atomic::Ordering::Relaxed),
+                                        CB_ACT.load(std::sync::atomic::Ordering::Relaxed),
+                                        CB_INACT.load(std::sync::atomic::Ordering::Relaxed),
+                                        CB_TICKS.load(std::sync::atomic::Ordering::Relaxed),
                                     ));
                                 }
                             }
@@ -1457,19 +1498,49 @@ pub extern "system" fn n_merge_scan(
     self_id: jni::jlong,
     out: jni::jlongArray,
 ) -> i32 { let _site_guard = centities_core::SiteGuard::enter(5); 
+    // L118-diag: the scan's candidate census (the parity-items zero-merge
+    // hunt) — the counters ride the hooks line via MS_STATS take.
+    static MS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MS_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MS_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MS_ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static MS_STATS: [std::sync::atomic::AtomicU64; 7] = [
+        std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ];
+    let refused = |which: usize| -> i32 {
+        MS_STATS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        -1
+    };
     if wid < 0 || wid >= 8 || r.is_nan() {
-        return -1;
+        return refused(1);
     }
     let Ok(mut g) = crate::INDEX.try_lock() else {
-        return -1;
+        return refused(2);
     };
     let cst = g.get_or_insert_with(crate::new_state);
     let Some(core) = cst.items.as_mut() else {
-        return -1;
+        return refused(3);
     };
     if wid as usize >= core.worlds.len() || core.worlds[wid as usize].is_none() {
-        return -1;
+        return refused(4);
     }
+    // L118 HEALTH GUARD: the merge scan's fast=true-with-zero-candidates on
+    // an UNPOPULATED index silently preempts the vanilla-body fallback (the
+    // parity legs: the void-world index never populated while the items
+    // store rode the batch — the ON leg performed ZERO merges where vanilla
+    // merged 3463). An empty index means the scan cannot know the truth:
+    // refuse (-1) and let the legacy scanner's own refusal route the exact
+    // vanilla body. The perf legs hold a populated index — the guard never
+    // fires there.
+    if cst.idx.stats.entities == 0 {
+        return refused(6);
+    }
+    MS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let world = core.world(wid as usize);
     let qbox = centities_core::Aabb::new(
         x - 0.125 - r,
@@ -1481,6 +1552,7 @@ pub extern "system" fn n_merge_scan(
     );
     let mut cands: Vec<i64> = Vec::with_capacity(16);
     cst.idx.query(wid as u16, &qbox, &mut cands);
+    MS_RAW.fetch_add(cands.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut n = 0usize;
     unsafe {
         let e = JniEnv::from_raw(env);
@@ -1496,16 +1568,39 @@ pub extern "system" fn n_merge_scan(
             let ctag = (cid as u64 >> 17) | 1;
             let ce = &world.entries[cslot];
             if ce.tag != ctag {
+                MS_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             if n >= out_len {
-                return -1;
+                return refused(5);
             }
             buf.push(cid);
             n += 1;
         }
         ((*vt).SetLongArrayRegion)(raw, out, 0, n as i32, buf.as_ptr());
     }
+    if n == 0 {
+        let z = MS_ZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if z % 2000 == 0 {
+            eprintln!(
+                "[ms] calls={} raw={} stale={} zero={} refused={{1:{},2:{},3:{},4:{},5:{}}}",
+                MS_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                MS_RAW.load(std::sync::atomic::Ordering::Relaxed),
+                MS_STALE.load(std::sync::atomic::Ordering::Relaxed),
+                z,
+                MS_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
+                MS_STATS[2].load(std::sync::atomic::Ordering::Relaxed),
+                MS_STATS[3].load(std::sync::atomic::Ordering::Relaxed),
+                MS_STATS[4].load(std::sync::atomic::Ordering::Relaxed),
+                MS_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+    MS_STATS[0].store(MS_CALLS.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[1].store(MS_RAW.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[2].store(MS_STALE.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[3].store(MS_ZERO.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[4].store(MS_REFUSED.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     n as i32
 }
 

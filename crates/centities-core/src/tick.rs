@@ -311,21 +311,34 @@ pub fn tick_item(
         return out;
     }
 
-    // move gate (pre-move delta = post-gravity delta in vanilla)
-    // (st.tick_count + id) % 4 — st.tick_count is the ingest POST value
-    // (collect pre-baseTick field + 1), which EQUALS the tickCount the
-    // vanilla gate reads (Entity.baseTick increments BEFORE the gate).
-    // The previous `.wrapping_sub(1)` (PRE convention) fired the gate one
-    // tick late for every grounded idle item — run 40754993404 item 29:
-    // vanilla moved at field-tc 15,15.. the module at 16,16.. (parity
-    // PTRACE diff, both legs tc identical, positions one tick apart).
+    // move gate (pre-move delta = post-gravity delta in vanilla).
+    // L118 THE FIXED-POINT GATE (replaces the %4 rotation clause): the full
+    // body IS vanilla's ACTIVE tick — vanilla moves on EVERY active tick
+    // (gravity -> move -> collide -> friction), so the gate must not phase-
+    // filter the move. The old (tickCount + id) % 4 clause belonged to the
+    // era when the batch ran the full body EVERY tick and the gate stood in
+    // for the inactive ticks; since i0-a2b the routing (F_INACTIVE ->
+    // tick_item_inactive) owns the active-tick selection, and the gate's
+    // body-tc phase (sweep+1) never coincided with the verdict's sweep-tc
+    // phase — the move never fired, the -0.04 gravity accumulated unbounded
+    // (the parity-items vy=-4.6 divergence), and the vanilla-routed cleanup
+    // that masked it in the old legs is gone.
+    // The replacement is the PROVABLE fixed point: a grounded item with an
+    // exactly-zero delta replicates its state through vanilla's active tick
+    // bit-exactly (gravity -0.04 -> the vertical sweep hits the floor at
+    // distance zero -> the collided dy=0, the position unchanged, the
+    // friction multiplies zeros, onGround stays true) — the move is skipped
+    // for exactly that state and runs for everything else (the dust, the
+    // falls, the pushes all move vanilla-exactly).
     let dy_g = st.dy - ITEM_GRAVITY;
     let delta_pre_gravity = (st.dx, st.dy, st.dz);
     let mv0 = (st.dx, dy_g, st.dz);
     let horiz_sqr = st.dx * st.dx + st.dz * st.dz;
     let gate = !st.on_ground
         || horiz_sqr > GATE_HORZ_SQR
-        || (st.tick_count.wrapping_add(id as i32) % 4) == 0;
+        || st.dx != 0.0
+        || st.dy != 0.0
+        || st.dz != 0.0;
 
     // collide inputs (read-only)
     let mut mv = mv0;

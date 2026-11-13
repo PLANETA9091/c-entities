@@ -698,7 +698,7 @@ pub struct EntityIndex {
     idmap: IdMap,
     oversize: Vec<Oversize>,
     max_half_span: f64, // tracked high-water mark; removal keeps it (safe direction)
-    stats: Stats,
+    pub stats: Stats,
 }
 
 impl EntityIndex {

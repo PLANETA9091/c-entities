@@ -6397,6 +6397,26 @@ public final class CeHooks {
             IN_ITEM_APPLY = true;
             try {
             int epoch = MODE_EPOCH + 1;
+            // L118-diag: the outcome-bits census — the merge=0 hunt (which
+            // bits does the core actually emit in the parity legs?)
+            if ((itemFlushes & 2047) == 0 && n > 0) {
+                int b5 = 0, b16 = 0, b18 = 0, b20 = 0, b13 = 0, b11 = 0, nat = 0;
+                for (int di = 0; di < n; di++) {
+                    int db = outI[di * 4 + 2];
+                    if ((db & (1 << 5)) != 0) b5++;
+                    if ((db & (1 << 16)) != 0) b16++;
+                    if ((db & (1 << 18)) != 0) b18++;
+                    if ((db & (1 << 20)) != 0) b20++;
+                    if ((db & (1 << 13)) != 0) b13++;
+                    if ((db & (1 << 11)) != 0) b11++;
+                    if ((IB_FLAGS[di] & IF_NATIVE) != 0) nat++;
+                }
+                System.out.println("[bits] flush=" + itemFlushes + " n=" + n
+                        + " nat=" + nat + " b5(MERGE)=" + b5 + " b16(TAILNONE)=" + b16
+                        + " b18(ACT)=" + b18 + " b20(INACT)=" + b20
+                        + " b13(ABORT)=" + b13 + " b11(VNEXT)=" + b11
+                        + " tick=" + CUR_TICK);
+            }
             // L92: one volatile read per flush - TT_MIRROR flips only in
             // the tracker reconcile (between flushes), never mid-flush.
             final boolean quietStampArm = TTL_QUIET_ON && TT_MIRROR;
@@ -6650,6 +6670,34 @@ public final class CeHooks {
                     e.needsSync = true;
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
+                    // L118 THE SURVIVOR GATE (the parity-items divergence,
+                    // n 16537 -> 13197): the javap ItemEntity.tick cadence is
+                    // `tickCount % (floor_changed ? 2 : 40) == 0 &&
+                    // **isMergable()** -> mergeWithNeighbours()` — the
+                    // SURVIVOR must itself be mergable (alive && pd != 32767
+                    // && age != -32768 && age < despawnRate && count < max).
+                    // The core's MERGE verdict carries the timing only (the
+                    // count/max term lives in the Java ItemStack — the core's
+                    // ItemState has no stack fields), so the gate rides HERE,
+                    // on the real method: without it the bench's 50% inert
+                    // pool (the fill's setPickupDelay(32767)) scanned from
+                    // inert survivors and absorbed mergable neighbours INTO
+                    // them (the pd=32767 amt=2 shape, 3332 extra merges).
+                    // The candidate side was already exact (isMergableFast —
+                    // the real isMergable handle).
+                    //
+                    // L118 BOOTSTRAP: the merge method handles live in
+                    // initMergeMhs — pre-L118 they were initialized as a
+                    // side effect of mergeScanNative (the legacy wire ran
+                    // unconditionally); with the survivor gate gating the
+                    // scan, a null handle made isMergableFast throw (caught
+                    // -> false) and the scans died permanently — the
+                    // 216k MERGE verdicts the core emitted never crossed a
+                    // single scan (merge=0/0/0/0/0/0). The gate now inits
+                    // the handles first; an init failure routes the exact
+                    // vanilla body (a dropped merge is the one red line —
+                    // the 104,383-lesson).
+                    if (initMergeMhs(e) && isMergableFast(e)) {
                     // i0-b v3 (doc 62): the scan crosses ONE in-process JNI
                     // call (nativeMergeScan) at the loop B's per-row timing —
                     // the index sees the post-absorption state of the earlier
@@ -6700,17 +6748,26 @@ public final class CeHooks {
                     // L44: this scanner's batch index = its vanilla body
                     // position; the view entries after it are seen PRE-move.
                     MS_KIDX = i;
-                    // A refusal (index unsure) or a disabled fast path
-                    // (CE_MERGE=0 knob) MUST fall back to the vanilla body —
-                    // an ignored false here DROPPED the merge outright
-                    // (observed: 104,383 dropped merges in one spread leg).
-                    // State is fresh: age/pickupDelay/pos are already applied
-                    // above in vanilla tick order, so mergeWithNeighbours
-                    // sees exactly what vanilla's mid-tick body would see.
-                    if (!mergeScanNative(e)) {
-                        runVanillaMerge(e);
-                    }
+                    // L118 THE DOUBLE-SCAN REMOVAL (the parity-items second
+                    // root, red since the i0-b era): the v3 edit added the
+                    // nativeMergeScan crossing + the (!fast) legacy fallback
+                    // above but LEFT the pre-v3 wire call behind — the legacy
+                    // mergeScanNative then ran a SECOND scan per cadence tick
+                    // with the survivor's post-absorption state, absorbing
+                    // neighbours vanilla's single-scan cadence never would
+                    // (the mergeOps UP signature: 82244 vs the proven 76696;
+                    // the parity n 16537 -> 13197). The refusal fallback chain
+                    // lives entirely in the (!fast) branch above: a v3 refusal
+                    // crosses the legacy scanner once, and ITS refusal routes
+                    // runVanillaMerge. Nothing else runs after the scan.
                     if (e.isRemoved()) continue;
+                    } else if (!initMergeMhs(e)) {
+                        // the reflective init failed: the exact vanilla body
+                        // (a dropped merge is the one red line)
+                        runVanillaMerge(e);
+                        itemMerge++;
+                        if (e.isRemoved()) continue;
+                    }
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
                     int rate = VH_DESPAWN_RATE.getInt(e);
