@@ -4842,6 +4842,94 @@ public final class CeHooks {
      * true = the vanilla dispatcher body is suppressed (the Rust core
      * computes this item's tick natively at the flush).
      */
+    // L123: the stand mirror toggle. Default ON; CE_STAND_MIRROR=0 kills
+    // the wire (the bisect knob, same shape as CE_VEC_CACHE).
+    public static final boolean STAND_MIRROR_ON =
+            !"0".equals(System.getenv("CE_STAND_MIRROR"));
+    // L124: the delta writeback store shape. Default PLAIN (every reader
+    // runs on the server thread; the reference store is atomic);
+    // CE_DELTA_VOL=1 restores the volatile store for the bisect.
+    public static final boolean DELTA_VOL =
+            "1".equals(System.getenv("CE_DELTA_VOL"));
+    public static long dispStand = 0, dispStandMiss = 0;
+
+    /** L123: the L92 quiet-bit stamp for a mirrored stand — the exact
+     *  shape of the item applier's TAIL_NONE stamp (slot identity + the
+     *  fill-validated TT_OK + no live interp step + no pending velocity
+     *  sync), so the tracker pass for the slot reduces to the mirror bump. */
+    private static void standQuietStamp(
+            net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
+        if (!TTL_QUIET_ON || !TT_MIRROR) return;
+        Object[] rq = TT_REF;
+        long[] fq = TT_FLAT;
+        if (rq == null || fq == null) return;
+        int ob = sid * 5;
+        if (rq[ob + 2] != as) return;
+        long sh = fq[sid * 2];
+        if ((sh & TT_OK) == 0 || (sh & TT_SIT) != 0) return;
+        if (as.syncVelocity) return;
+        TT_QUIET[sid >> 6] |= 1L << (sid & 63);
+    }
+
+    /** L123: the L99 reset — a mirror MISS means the vanilla body runs and
+     *  may change tracker-visible state; the slot must go full-path again. */
+    private static void standQuietClear(
+            net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
+        if (!TTL_QUIET_ON || !TT_MIRROR) return;
+        Object[] rq = TT_REF;
+        if (rq == null || rq[sid * 5 + 2] != as) return;
+        TT_QUIET[sid >> 6] &= ~(1L << (sid & 63));
+    }
+
+    /** L123 STAND MIRROR — the static marker ArmorStand dispatch (see the
+     *  L123 design comment at the weave point). true = the vanilla body is
+     *  suppressed; the mirror ran the dispatcher prologue + the exact
+     *  active/inactive reduction. */
+    private static boolean standMirror(
+            net.minecraft.world.entity.decoration.ArmorStand as) {
+        if (!STAND_MIRROR_ON) return false;
+        try {
+            int sid = entId(as) & AMASK;
+            // the stateless static classification — every read is live;
+            // any miss routes the exact vanilla body for this tick.
+            // (noTickEquipmentDirty is private and only ever set for
+            // !canTick stands — the !as.canTick gate already routes those.)
+            if (RM_BIT[sid] == 1 || !as.canTick
+                    || !as.isMarker() || !as.isNoGravity()
+                    || !as.getPassengers().isEmpty() || as.isPassenger()
+                    || !as.isAlive()) {
+                dispStandMiss++;
+                standQuietClear(as, sid);
+                return false;
+            }
+            // the dispatcher prologue mirror FIRST — the vanilla order is
+            // tickCount++ THEN checkIfActive (the tc>=200 clause and the
+            // ItemEntity %4 clause READ the POST-bump counter; the mirror's
+            // checkIfActive on the pre-bump value flipped the tc=200
+            // transition tick active and lost exactly one noActionTime++),
+            as.tickCount = as.tickCount + 1;
+            as.totalEntityAge = as.totalEntityAge + 1;
+            // the dispatcher branch — the REAL checkIfActive (the byte-exact
+            // isTemporarilyActive=false side effect + the wake/portal clauses)
+            boolean active = io.papermc.paper.entity.activation.ActivationRange
+                    .checkIfActive(as);
+            if (!active) {
+                // the exact inactiveTick body — javap: Entity.inactiveTick is
+                // EMPTY and LivingEntity adds only `noActionTime++` (the
+                // field is protected; the public accessor pair is the same
+                // field read + plain store)
+                as.setNoActionTime(as.getNoActionTime() + 1);
+            }
+            // active: the full LivingEntity.tick for a static bare marker
+            // stand is observably a no-op (the design comment).
+            dispStand++;
+            standQuietStamp(as, sid);
+            return true;
+        } catch (Throwable t) {
+            return false; // route the exact vanilla body — never break a stand
+        }
+    }
+
     // L119b-diag: per-dispatch route trace for the hunt ids (CE_DISP_TRACE="469,830") —
     // names WHO took the vanilla body vs the native batch at the divergence tick.
     private static final java.util.HashSet<Long> DISP_TRACE = new java.util.HashSet<>();
@@ -4894,6 +4982,30 @@ public final class CeHooks {
                 return true;
             }
             return false; // a non-native mob NEVER takes the item path
+        }
+        // L123 STAND MIRROR: a static marker ArmorStand's dispatch is
+        // observably a no-op — the javap-anchored reduction (26.3-249):
+        //   ArmorStand.tick -> canTick=true -> LivingEntity.tick(), whose
+        //   body for a bare marker stand writes NOTHING observable:
+        //   travel() is empty (hasPhysics=false for markers), pushEntities()
+        //   returns at isPushable()=isCollidable(false)=false BEFORE any
+        //   query, baseTick's fire/portal/inside-block paths read nothing
+        //   (the stand floats in air), no effects/equipment/food/regen run,
+        //   and the head/body-rot lerps are value-same writes. The
+        //   dispatcher branches on the REAL ActivationRange.checkIfActive
+        //   (its isTemporarilyActive=false side effect runs byte-exact):
+        //   active -> the no-op body; inactive -> inactiveTick() whose
+        //   ENTIRE body is `noActionTime++` (javap LivingEntity.inactiveTick:
+        //   super is EMPTY for Entity). The dispatcher prologue
+        //   (tickCount++/totalEntityAge++) is mirrored here. The tracker
+        //   earns the L92 quiet skip (nothing tracker-visible changed).
+        // The classification is STATELESS (re-verified per tick from live
+        // fields) — an external change (marker flip, mount, equipment,
+        // gravity, death) misses the classification that tick and routes
+        // the exact vanilla body; the quiet bit is cleared on the miss
+        // (the L99 reset contract). CE_STAND_MIRROR=0 kills the wire.
+        if (ent instanceof net.minecraft.world.entity.decoration.ArmorStand as) {
+            return standMirror(as);
         }
         if (!ITEM_TICK_ON) { if (ent instanceof ItemEntity ie) dispDiag(ie, "off"); return false; }
         if (!(ent instanceof ItemEntity e)) return false;
@@ -6942,6 +7054,15 @@ public final class CeHooks {
                     // field keeps the old value; no probe fires on the
                     // guard path either — the deltaNoOp !isFinite early
                     // return precedes the capture).
+                    // L124: the volatile store was 11-17% of the
+                    // items-100k-mod profile (the store + the Unsafe frame)
+                    // once L122 removed the allocation that used to amortize
+                    // it. The delta REFERENCE write is atomic either way and
+                    // EVERY reader runs on the server thread (the tick body,
+                    // sendChanges, the batch ingest) — the plain putObject is
+                    // value- and visibility-identical here, one StoreLoad
+                    // barrier cheaper per item per tick. CE_DELTA_VOL=1
+                    // restores the volatile shape for the A/B bisect.
                     if (O_ENT_DELTA > 0 && U != null
                             && REST_GEN[idSlot & AMASK] == 0) {
                         if (Double.isFinite(outD[o]) && Double.isFinite(outD[o + 1])
@@ -6950,8 +7071,12 @@ public final class CeHooks {
                             // fresh-allocation identity term is served by
                             // the cache only when x/y/z compare equal, so
                             // the field's observable value is exact.
-                            U.putObjectVolatile(e, O_ENT_DELTA,
-                                    vec3Cached(idSlot, outD[o], outD[o + 1], outD[o + 2]));
+                            Object dv = vec3Cached(idSlot, outD[o], outD[o + 1], outD[o + 2]);
+                            if (DELTA_VOL) {
+                                U.putObjectVolatile(e, O_ENT_DELTA, dv);
+                            } else {
+                                U.putObject(e, O_ENT_DELTA, dv);
+                            }
                         }
                     } else {
                         e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
