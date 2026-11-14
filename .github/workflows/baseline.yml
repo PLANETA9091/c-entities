@@ -96,6 +96,11 @@ jobs:
       # 5G still died on the new ubuntu-26 images — 4G plus the JFR maxsize
       # cap keeps the JVM footprint well inside the runner budget.
       XMX: '4G'
+      # The hotspot tables (hotspots.md / the committed REPORT rows) read the
+      # rec.jfr the runner script writes when this is set — it regressed to
+      # unset at some point and every recent baseline artifact came back with
+      # "(jfr parse failed)". Both A/B legs get it, so the pairing stays fair.
+      RUN_JFR: '1'
       MODULE: ${{ matrix.MODULE || 'off' }}
     steps:
       - uses: actions/checkout@v4

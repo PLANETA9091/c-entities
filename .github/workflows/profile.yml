@@ -78,7 +78,7 @@ jobs:
           SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
           AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
           MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
-          MODULE='on' \
+          MODULE='on' RUN_JFR='1' \
           bash scripts/run-baseline.sh
           LOG="bench/prof-$SC-on/results/server.log"
           grep -q "ARMED" "$LOG" || { echo "FATAL: not armed"; exit 1; }
