@@ -1944,6 +1944,25 @@ public final class CeHooks {
      *  path stays servable between drains. The total apply+publish work is
      *  invariant — only its placement moves from queries to probes. */
     private static final int DRAIN_CAP = 4096;
+    /** L119b THE RELEASE CURSOR: the highest arena index whose entry the
+     *  positional-drain contract has already released. The apply loop sets
+     *  it to the item it just applied; the merge tails advance it via
+     *  flushUpTo(i). The DRAIN_CAP overflow in batchUpsert must drain ONLY
+     *  the entries at or behind this cursor — draining past it (the old
+     *  unconditional flush()) released the not-yet-reached entities' boxes
+     *  mid-flush, which collapsed the hold semantics exactly like the
+     *  mixed t=152 case: 830's body entry (pos 586) drained at the cap
+     *  while scanner 469 (i=334) was still behind it, the index row
+     *  showed the POST-t152 box where vanilla's mid-loop view has the
+     *  PRE-move one, and the strict trim passed a false overlap the live
+     *  boxes never had. batchRemove/probeDelta keep flush(): removals are
+     *  position-free (the discard is real-time) and the delta mirror has
+     *  no box semantics. */
+    private static int drainCursor = -1;
+    /** The soft memory bound: past it the held entries alone would risk
+     *  the 65536-entry batch arrays, so a full drain wins over the hold
+     *  (the same last-resort trade the original cap made at 4096). */
+    private static final int DRAIN_SOFT_CAP = DRAIN_CAP * 15;
     private static final long[] B_IDS = new long[BATCH_CAP];
     private static final double[] B_BOX = new double[BATCH_CAP * 6];
     // L12 push-state extension: per entry — flag bits, exact x/z, delta xyz,
@@ -1968,7 +1987,14 @@ public final class CeHooks {
     // see the post-move boxes of items whose vanilla bodies run LATER in
     // the loop — vanilla's getEntities sees them PRE-move there).
     private static final int[] B_POS = new int[BATCH_CAP];
-    private static int batchGenCur = 0;
+    // L119b: starts at 1 so the NEVER-STAMPED entities (the mobs/stands —
+    // itemDispatch stamps only ItemEntity) have BATCH_GEN=0 != batchGenCur
+    // forever, and their probes always compute pos=-1 (position-free). The
+    // old 0 init collided with the mobs-scenario flushes (every flush sees
+    // n==0, so batchGenCur never bumped): the zombie probes then carried
+    // pos=BATCH_POS=0, flushUpTo(-1) HELD them, the push-mirror went stale
+    // and the mob pushes diverged (the mixed-fix mobs regression).
+    private static int batchGenCur = 1;
     // L119: flushUpTo's stable-partition scratch — static, single-threaded
     private static final long[] S_IDS = new long[BATCH_CAP];
     private static final double[] S_BOX = new double[BATCH_CAP * 6];
@@ -2031,7 +2057,18 @@ public final class CeHooks {
             B_VID[bN] = 0;
         }
         bN++;
-        if (bN >= DRAIN_CAP) flush();
+        // L119b: the cap overflow releases ONLY the entries at or behind the
+        // release cursor — the not-yet-reached entities' boxes stay held (the
+        // positional-drain contract). The full flush() here (the old code)
+        // released the held boxes mid-flush and produced the stale-row false
+        // overlaps (the mixed t=152 merge). The soft-cap full drain is the
+        // memory last resort; the parity scenarios never reach it.
+        if (bN >= DRAIN_CAP) {
+            flushUpTo(drainCursor);
+            if (bN >= DRAIN_SOFT_CAP) {
+                flush();
+            }
+        }
     }
 
     /** L12: the pushableBy predicate's stateful slice, folded into flag bits.
@@ -2126,6 +2163,9 @@ public final class CeHooks {
      *  entries carry no position — they drain in full (velocity mirrors,
      *  order-insensitive for the item scans). */
     private static void flushUpTo(int maxPos) {
+        if (maxPos > drainCursor) {
+            drainCursor = maxPos;
+        }
         if (bN == 0) {
             return;
         }
@@ -4046,7 +4086,9 @@ public final class CeHooks {
         if (!MS_INIT_PRINTED) {
             MS_INIT_PRINTED = true;
             System.out.println("[ce-baseline] CE-INIT MS_WINDOW=" + java.util.Arrays.toString(MS_WINDOW)
-                    + " PH_DUMP=" + System.getenv("PH_DUMP"));
+                    + " PH_DUMP=" + System.getenv("PH_DUMP")
+                    + " CE_DISP_TRACE=" + System.getenv("CE_DISP_TRACE")
+                    + " ON=" + DISP_TRACE_ON + " SET=" + DISP_TRACE.size());
         }
         for (int i = 0; i + 1 < MS_WINDOW.length; i += 2) {
             if (CUR_TICK >= MS_WINDOW[i] && CUR_TICK <= MS_WINDOW[i + 1]) {
@@ -4668,12 +4710,33 @@ public final class CeHooks {
      *  returns 1 when found, 0 when the id is not indexed. CE_FQ_IBOX=1 only. */
     private static native int nativeIndexBox(int world, long id, double[] out);
 
-    /** Drain any pending probe batches before a kernel call: the kernel
+    /** Drain the pending probe batches before a kernel call: the kernel
      *  reads the push mirror, so its view must be current. No-op when the
-     *  batch is empty (the steady state — the DRAIN_CAP=64 policy keeps the
-     *  batch small, and the kernel call is per-entity). */
+     *  batch is empty (the steady state — the DRAIN_CAP policy keeps the
+     *  batch small, and the kernel call is per-entity).
+     *  L119b: this runs MID-DISPATCH-LOOP (the push dispatch fires from the
+     *  woven LivingEntity.pushEntities), and a full flush() here released
+     *  the merge tails' HELD entries — the not-yet-reached items whose
+     *  vanilla bodies ran later in the same loop got their post-move boxes
+     *  into the index rows, the native scanner's flush-time scan then saw
+     *  an overlap the vanilla mid-loop view never had, and the extra merge
+     *  absorbed 469 into 830 at the mixed t=152 (the parity red since the
+     *  L119 merge-pairing fix). The drain now releases only the entries at
+     *  or behind the CURRENT dispatch position (ibN = the items appended so
+     *  far — exactly the entities whose vanilla bodies already ran, which
+     *  is also what the live view vanilla's own pushEntities reads). The
+     *  held entries keep their pre-move rows for the merge tails. The drain
+     *  releases ONLY the position-free entries (pos == -1: the non-item
+     *  probes whose BATCH_GEN never matched a flush gen, the spawn adds,
+     *  the removals) — those carry the mob/push-mirror state the kernel
+     *  needs, and none of them is a merge-scan box. The item box entries
+     *  keep their hold regardless of how far the dispatch loop advanced:
+     *  a mob ticking after item 830 must not publish 830's post-move box
+     *  while scanner 469 (dispatched earlier) is still entitled to the
+     *  pre-move row. The mobs are not push-relevant holders: they are the
+     *  pushers themselves and every push candidate is a non-item. */
     static void flushIfPending() {
-        flush();
+        flushUpTo(-1);
     }
 
     // ==================================================================
@@ -4735,6 +4798,27 @@ public final class CeHooks {
      * true = the vanilla dispatcher body is suppressed (the Rust core
      * computes this item's tick natively at the flush).
      */
+    // L119b-diag: per-dispatch route trace for the hunt ids (CE_DISP_TRACE="469,830") —
+    // names WHO took the vanilla body vs the native batch at the divergence tick.
+    private static final java.util.HashSet<Long> DISP_TRACE = new java.util.HashSet<>();
+    private static volatile boolean DISP_TRACE_ON = false;
+    static {
+        String sdt = System.getenv("CE_DISP_TRACE");
+        if (sdt != null && !sdt.isBlank()) {
+            DISP_TRACE_ON = true;
+            for (String tok : sdt.split(",")) {
+                try { DISP_TRACE.add(Long.parseLong(tok.trim())); } catch (NumberFormatException ignored) { }
+            }
+        }
+    }
+    private static void dispDiag(Entity e, String route) {
+        if (!DISP_TRACE_ON) return;
+        int id = entId(e);
+        if (DISP_TRACE.contains((long) id)) {
+            System.out.println("[ce] DISP t=" + CUR_TICK + " ibn=" + ibN + " id=" + id + " route=" + route);
+        }
+    }
+
     public static boolean itemDispatch(Entity ent) {
         dispChecks++;
         if (!ACTIVE || !cplugReady) return false;
@@ -4767,9 +4851,9 @@ public final class CeHooks {
             }
             return false; // a non-native mob NEVER takes the item path
         }
-        if (!ITEM_TICK_ON) return false;
+        if (!ITEM_TICK_ON) { if (ent instanceof ItemEntity ie) dispDiag(ie, "off"); return false; }
         if (!(ent instanceof ItemEntity e)) return false;
-        if (ibN >= IB_CAP) return false;
+        if (ibN >= IB_CAP) { dispDiag(e, "cap"); return false; }
         // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
         // stamps its loop position — including the fresh-belt items that
         // route vanilla WITHOUT a batch row (their bodies move them and the
@@ -4785,8 +4869,9 @@ public final class CeHooks {
             Object lv = O_ENT_LEVEL >= 0 ? U != null
                     ? U.getObject(e, O_ENT_LEVEL) : null : null;
             if (lv == null || O_LEVEL_CLIENT < 0) {
-                if (e.level().isClientSide()) return false;
+                if (e.level().isClientSide()) { dispDiag(e, "client"); return false; }
             } else if (U.getBoolean(lv, O_LEVEL_CLIENT)) {
+                dispDiag(e, "client");
                 return false;
             }
             int slot = entId(e) & MAMASK;
@@ -4813,6 +4898,7 @@ public final class CeHooks {
                 // by the last flush's writeback.
                 appendDispatch(e, DISP_VAL[slot] == 1);
                 dispFast++;
+                dispDiag(e, DISP_VAL[slot] == 1 ? "fast-native" : "fast-inactive");
                 return true;
             }
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
@@ -4832,6 +4918,7 @@ public final class CeHooks {
                         MODE_VAL[slot] = 0;
                         restExits++;
                         dispPass++;
+                        dispDiag(e, "rest-exit");
                         return false;
                     }
                     if (MODE_REV[slot] != WORLD_REV) {
@@ -4844,6 +4931,7 @@ public final class CeHooks {
                             MODE_VAL[slot] = 0;
                             restExits++;
                             dispPass++;
+                            dispDiag(e, "rest-exit-rev");
                             return false;
                         }
                         MODE_REV[slot] = WORLD_REV; // stale-but-boring
@@ -4876,6 +4964,7 @@ public final class CeHooks {
                         pdDec = true;
                     }
                     if (active && e.tickCount % 40 == 0) {
+                        dispDiag(e, "rest-scan");
                         if (!mergeScanNative(e)) {
                             // index unsure: UNDO the mirror and let the
                             // vanilla body compute the whole tick (counters
@@ -4901,11 +4990,13 @@ public final class CeHooks {
                     }
                     MODE_GEN[slot] = MODE_EPOCH; // keep the recency stamp alive
                     dispRest++;
+                    dispDiag(e, "rest-tick");
                     return true;
                 }
             }
             if (MODE_GEN[slot] != MODE_EPOCH || MODE_VAL[slot] == 0) {
                 dispPass++;
+                dispDiag(e, "pass-gen");
                 return false;
             }
             // cheap fresh-flag gates: always plain field reads
@@ -4915,10 +5006,12 @@ public final class CeHooks {
                     || e.portalProcess != null || e.isOnPortalCooldown()
                     || stackEmptyDispatch(e)) {
                 dispPass++;
+                dispDiag(e, "pass-gate");
                 return false;
             }
             if (!e.getPassengers().isEmpty()) {
                 dispPass++;
+                dispDiag(e, "pass-pax");
                 return false;
             }
             // the world's block set changed since this item's last native
@@ -4928,6 +5021,7 @@ public final class CeHooks {
                 if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
                         || despawnTimeOf(e) >= 0) {
                     dispPass++;
+                    dispDiag(e, "pass-rev");
                     return false;
                 }
             }
@@ -4945,6 +5039,7 @@ public final class CeHooks {
             boolean active = itemCheckActive(e, true);
             dtrace(e, "dispatch", active);
             appendDispatch(e, active);
+            dispDiag(e, active ? "native" : "inactive");
             if (active) {
                 dispNative++;
             } else {
@@ -6183,8 +6278,8 @@ public final class CeHooks {
      */
     public static boolean itemSkip(ItemEntity e) {
         itemChecks++;
-        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) return false;
-        if (e.level().isClientSide()) return false; // client-side ticks stay vanilla
+        if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) { dispDiag(e, "skip-off"); return false; }
+        if (e.level().isClientSide()) { dispDiag(e, "skip-client"); return false; } // client-side ticks stay vanilla
         try {
             boolean nativeMode = MODE_GEN[entId(e) & MAMASK] == MODE_EPOCH
                     && MODE_VAL[entId(e) & MAMASK] != 0;
@@ -6202,11 +6297,13 @@ public final class CeHooks {
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
                 appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
+                dispDiag(e, "skip-force-vanilla");
                 return false;
             }
             appendItem(e, (nativeMode ? IF_NATIVE : IF_RESYNC)
                     | (frictionDisabled(e) ? IF_FRIC_OFF : 0)
                     | (e.onGround() ? IF_ON_GROUND : 0));
+            dispDiag(e, nativeMode ? "skip-native" : "skip-resync");
             return nativeMode;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -6352,6 +6449,17 @@ public final class CeHooks {
         if (NATIVE_MOB_ON && (level instanceof net.minecraft.server.level.ServerLevel)) {
             nativeMobBoundary(level);
         }
+        // L119b NOTE (the skipped-flush boundary): the n==0 flushes (the
+        // levels whose arena slice was already consumed by the processing
+        // flush) MUST stay pure skips. Draining or bumping batchGenCur here
+        // releases the SAME-TICK dispatch-loop probes that the processing
+        // flush's merge tails are still entitled to hold (the positional-
+        // drain contract), which collapsed the mid-loop scan views and
+        // diverged 24725 fields (the run 11 disaster). The gen only bumps
+        // at the processing flush's boundary, and the pending batch only
+        // drains there — the cross-flush pos numbering stays consistent
+        // because the dispatch walk order (hence the arena indices) is
+        // stable across ticks.
         if (n == 0) return;
         ibN = 0;
         int cdN = ibCDN;
@@ -6562,6 +6670,11 @@ public final class CeHooks {
             // the tracker reconcile (between flushes), never mid-flush.
             final boolean quietStampArm = TTL_QUIET_ON && TT_MIRROR;
             for (int i = 0; i < n; i++) {
+                // L119b: the release cursor rides the apply loop - the entries
+                // this item's writeback probes are at or behind its own arena
+                // index, so the DRAIN_CAP overflow may release exactly them
+                // (the vanilla mid-loop view) and nothing past it.
+                drainCursor = i;
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
@@ -6811,6 +6924,7 @@ public final class CeHooks {
                     e.needsSync = true;
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
+                    dispDiag(e, "merge-verdict");
                     // L118 THE SURVIVOR GATE (the parity-items divergence,
                     // n 16537 -> 13197): the javap ItemEntity.tick cadence is
                     // `tickCount % (floor_changed ? 2 : 40) == 0 &&
@@ -6859,6 +6973,7 @@ public final class CeHooks {
                             ? 0.0 : mr - 0.5;
                     int cands = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
                             mr, myinf, e.getId(), MS_CAND_IDS);
+                    dispDiag(e, "merge-scan cands=" + cands + " i=" + i + " n=" + n);
                     // L119-DIAG: the fast-path scan's candidate list at PH_DUMP
                     // ticks (the merge pairing hunt: the t=159 direction flip
                     // needs the exact order the native scan handed over).
@@ -7002,6 +7117,7 @@ public final class CeHooks {
             // for the next flush, exactly like the post-loop live world.
             flush();
             batchGenCur++; // the next tick's dispatch stamps are fresh
+            drainCursor = -1; // the next flush's arena starts behind every entry
             } finally {
                 IN_ITEM_APPLY = false;
             }

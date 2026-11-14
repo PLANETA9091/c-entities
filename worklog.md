@@ -1119,3 +1119,43 @@ Stage Summary:
   (T382/T632/final PASS); the 25k bench p50 1.29 ms/tick (the band
   1.22-1.31 — no regression). The ME listener + tickOf + the UPT/MSCAN/
   BORD diagnostics stay env/dump-gated for the next hunt.
+
+- L120 — THE POSITIONAL-DRAIN HOLD FIXES (the mixed parity t=152 root, red since
+  the L119 merge-pairing fix → BIT-EXACT GREEN). The hunt chain: the local mixed
+  pair reproduced the CI failure exactly (469 absorbed into 830, amt 1→2, all
+  three snapshots); the first PH divergence tick t=152; the PD diff named 469
+  (gone in ON) + 830 (amt flipped); the PTRACE showed 469 native-ticked at
+  tc=2..5 then vanilla-routed at t=152 while 830 spawned at t=152 (tc=1, the
+  toss vy=+0.2); the exact-f64 geometry: 469's post-move scan box vs 830's
+  PRE-t152 box = NO overlap (the 0.119 Y gap) vs 830's POST-t152 box = overlap —
+  the ON leg's scan saw the POST-t152 box. The CE_DISP_TRACE instrumentation
+  (itemDispatch routes + itemSkip collects) pinned the scan: [ce] DISP t=454
+  merge-scan cands=1 i=334 n=635 + the [ce] MSCAN dump printed 830's INDEX ROW =
+  its POST-t152 box (71.4251,-58.84,43.3044) — hit=true. The writers of that row:
+  830's vanilla body ran mid-loop (skip-resync) and its setPos probe entered the
+  pending batch (pos=586, same gen); the drains that should have HELD it until
+  vanilla's loop reached it were TWO: (1) flushIfPending() — the push dispatch's
+  pre-kernel drain — ran flush() (the FULL drain) MID-LOOP, publishing every
+  later body's post-move box while scanner 469 (i=334) was still behind it;
+  (2) the DRAIN_CAP=4096 overflow in batchUpsert ran flush() mid-apply with the
+  same effect. THE FIXES: flushIfPending() now calls flushUpTo(-1) — releasing
+  ONLY the position-free entries (pos==-1: the non-item probes whose BATCH_GEN
+  never matched a flush gen, the spawn adds, the removals), which carry exactly
+  the mob/push-mirror state the kernel needs, and none of them is a merge-scan
+  box; batchUpsert's cap overflow releases only the entries at/behind the NEW
+  release cursor (drainCursor: set by the apply loop per item, advanced by
+  flushUpTo, reset at every flush boundary), with a 61448-entry soft cap as the
+  memory last resort; batchGenCur now starts at 1 so the NEVER-STAMPED entities
+  (mobs/stands — itemDispatch stamps only ItemEntity) always compute pos=-1 (the
+  old 0-init collided with the mobs scenario where every flush sees n==0 and the
+  gen never bumps: the zombie probes carried pos=BATCH_POS=0, flushUpTo(-1) held
+  them, the push mirror went stale, and the mob pushes diverged — caught by the
+  local mobs pair, fixed, re-verified). The diag: CE_DISP_TRACE=<id,id> streams
+  the per-dispatch route (fast-native/pass-gen/skip-resync/merge-verdict/scan
+  cands) and the CE-INIT line now prints the trace set — env-gated, ships inert.
+  The parity verification (fresh clean bench dirs, matched fill phase t=141 in
+  both legs — the ±1 fill-anchor race documented at BaselinePlugin.fillStep bit
+  one local pair, invalidating two runs): mixed PASS (bit-identical, reproduced
+  twice), items PASS (bit-identical, 20000 items), mobs PASS (bit-identical,
+  2509 zombies), core suite 71/71 green. NEXT: push → CI parity (all four
+  scenarios incl. spread), then the speed target -90%.
