@@ -2559,7 +2559,11 @@ public final class CeHooks {
     }
 
     private static int slotOf(long eid) {
-        int p = (int) ((eid * 0x9E3779B97F4A7C15L >>> 17) & IDMAP_MASK);
+        // L150c-2: the DIRECT id mask — entity ids are monotonic per run, so
+        // the walk order STREAMS the low id range; the multiplicative hash
+        // turned that into a random probe and cost 7.3% self (the 51dac4f
+        // items leg). The exact id verify handles the id>=IDMAP_CAP wrap.
+        int p = (int) eid & IDMAP_MASK;
         while (true) {
             int s1 = ID2SLOT[p];
             if (s1 == 0) return -1;
@@ -2575,7 +2579,7 @@ public final class CeHooks {
         int s = slotAlloc(eid);
         if (s < 0) return -1;
         SLOT2ID[s] = eid;
-        int p = (int) ((eid * 0x9E3779B97F4A7C15L >>> 17) & IDMAP_MASK);
+        int p = (int) eid & IDMAP_MASK; // the direct mask — see slotOf
         while (ID2SLOT[p] != 0) {
             p = (p + 1) & IDMAP_MASK;
         }
@@ -2645,7 +2649,7 @@ public final class CeHooks {
             for (int s = 0; s < SLOT_CAP; s++) {
                 long sid = SLOT2ID[s];
                 if (sid <= 0) continue;
-                int p = (int) ((sid * 0x9E3779B97F4A7C15L >>> 17) & IDMAP_MASK);
+                int p = (int) sid & IDMAP_MASK;
                 while (ID2SLOT[p] != 0) {
                     p = (p + 1) & IDMAP_MASK;
                 }
@@ -2665,7 +2669,7 @@ public final class CeHooks {
             for (int s = 0; s < SLOT_CAP; s++) {
                 long sid = SLOT2ID[s];
                 if (sid <= 0) continue;
-                int pp = (int) ((sid * 0x9E3779B97F4A7C15L >>> 17) & (nmc - 1));
+                int pp = (int) sid & (nmc - 1);
                 while (nim[pp] != 0) {
                     pp = (pp + 1) & (nmc - 1);
                 }
