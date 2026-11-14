@@ -2406,6 +2406,50 @@ public final class CeHooks {
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
 
+    // L122 WRITEBACK VEC3 CACHE: the flush apply writes the item's delta
+    // EVERY tick (the %4 cycle: gravity on closed ticks, friction+landing
+    // on open ticks — the ds=0/38M verdict says the value never repeats
+    // the PRE-tick input), and the write allocates a fresh Vec3 per item
+    // per tick: ~63k allocations/tick on items-100k, ~6 MB/tick of young-
+    // gen garbage — the GC sawtooth behind the periodic 90 ms tick bursts
+    // (12-14 slow ticks every ~65 ticks, JFR GC pauses... in the young
+    // cycles). A settled item's delta CONVERGES to an exact f64 2-cycle:
+    // a_closed = -0.49*(a_closed - 0.04) with dx/dz contracted to 0.0 by
+    // the ground friction — so a 2-way per-slot cache turns every steady
+    // write into a value-equality hit and the allocation disappears.
+    // EXACTNESS: the reuse is value-identical (the cached instance is
+    // served only when x/y/z compare equal); Vec3 is an immutable value
+    // type, the field's observable value is unchanged, and a stale slot
+    // (entity turnover) can only be served for an equal VALUE — which is
+    // exactly what vanilla's fresh instance would carry. CE_VEC_CACHE=0
+    // restores the fresh-allocation shape for A/B bisects.
+    private static final Object[] VEC_CACHE = new Object[2 * (AMASK + 1)];
+    private static final boolean VEC_CACHE_ON =
+            !"0".equals(System.getenv("CE_VEC_CACHE"));
+
+    /** The delta Vec3 for a writeback — reused from the 2-way per-slot
+     *  cache when a cached instance carries the exact value. */
+    private static Vec3 vec3Cached(int idSlot, double x, double y, double z) {
+        if (!VEC_CACHE_ON) {
+            return new Vec3(x, y, z);
+        }
+        int base = (idSlot & AMASK) * 2;
+        Object a = VEC_CACHE[base];
+        if (a instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
+            return v;
+        }
+        Object b = VEC_CACHE[base + 1];
+        if (b instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
+            VEC_CACHE[base] = b;
+            VEC_CACHE[base + 1] = a;
+            return v;
+        }
+        Vec3 fresh = new Vec3(x, y, z);
+        VEC_CACHE[base + 1] = a;
+        VEC_CACHE[base] = fresh;
+        return fresh;
+    }
+
     // L115 REMOVED-BIT MIRROR: the hot guards (itemSkip / itemInactiveCollect /
     // the dispatch rest gates) read e.isRemoved() on every entity every tick
     // (13.76% of the items-100k-mod profile — the removal-reason field load
@@ -6894,8 +6938,12 @@ public final class CeHooks {
                             && REST_GEN[idSlot & AMASK] == 0) {
                         if (Double.isFinite(outD[o]) && Double.isFinite(outD[o + 1])
                                 && Double.isFinite(outD[o + 2])) {
+                            // L122: the value-identical Vec3 cache — the
+                            // fresh-allocation identity term is served by
+                            // the cache only when x/y/z compare equal, so
+                            // the field's observable value is exact.
                             U.putObjectVolatile(e, O_ENT_DELTA,
-                                    new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                                    vec3Cached(idSlot, outD[o], outD[o + 1], outD[o + 2]));
                         }
                     } else {
                         e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
