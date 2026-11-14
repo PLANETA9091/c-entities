@@ -6,31 +6,31 @@ Server: `26.3-249-1a995d6 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 63004 -> 63004) |
+| entities spawned | 100000 (items 100000 / stands 0 / zombies 0) (merge shrink: 62988 -> 62989) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 30.864 / 56.295 / 126.073 / 217.255 |
-| MSPT mean, ms | 39.216 |
+| MSPT p50 / p90 / p99 / max, ms | 27.798 / 43.724 / 124.595 / 307.576 |
+| MSPT mean, ms | 34.868 |
 | TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 1724.0 / 4096.0 |
+| heap used / max, MB | 1591.2 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 15.26% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 7056` |
-| 2 | 5.21% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 3 | 5.09% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7808` |
-| 4 | 4.82% | `dev.planeta9091.centities.CeHooks.appendDispatch(ItemEntity, boolean) line: 5185` |
-| 5 | 4.51% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
-| 6 | 4.06% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 87` |
-| 7 | 2.90% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 8 | 1.83% | `sun.misc.Unsafe.putObjectVolatile(Object, long, Object) line: 1277` |
-| 9 | 1.74% | `dev.planeta9091.centities.CeHooks.ttlQuietSkip(Entity, int) line: 12290` |
-| 10 | 1.34% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 12440` |
-| 11 | 1.14% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
-| 12 | 1.14% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 6597` |
-| 13 | 1.10% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
-| 14 | 1.01% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 15 | 0.78% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 1 | 12.12% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 7008` |
+| 2 | 4.98% | `dev.planeta9091.centities.CeHooks.appendDispatch(ItemEntity, boolean) line: 5141` |
+| 3 | 4.22% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 4 | 4.05% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 87` |
+| 5 | 3.67% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7770` |
+| 6 | 3.42% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
+| 7 | 2.61% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 7760` |
+| 8 | 2.50% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 12392` |
+| 9 | 2.43% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 10 | 2.33% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 6553` |
+| 11 | 1.77% | `sun.misc.Unsafe.putObjectVolatile(Object, long, Object) line: 1277` |
+| 12 | 1.77% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
+| 13 | 1.62% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 14 | 1.16% | `dev.planeta9091.centities.CeHooks.ttlQuietSkip(Entity, int) line: 12242` |
+| 15 | 1.06% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean) line: 89` |
 
