@@ -2469,6 +2469,13 @@ public final class CeHooks {
     // scans hold the box changes of the entities vanilla's mid-loop scan
     // would still see PRE-move.
     private static final int[] BATCH_POS = new int[ARENA.length];
+    // L150b: the dispatch's cached level reference + its isClientSide bit —
+    // the walk is contiguous per level, so the per-item cost drops to ONE
+    // L1 reference compare; the Unsafe boolean read fires only when the
+    // level reference changes. Plain fields: the single server thread owns
+    // the walk (the applier runs later on the same thread).
+    private static Object DL_LAST = null;
+    private static boolean DL_CLIENT = false;
     private static final int[] BATCH_GEN = new int[ARENA.length];
     // L100a: the id mirror of the ARENA — ARENA_ID[si] is the FULL id of the
     // entity ARENA[si] holds (0 when null). Every ARENA write pairs with an
@@ -5014,23 +5021,39 @@ public final class CeHooks {
         // stamps its loop position — including the fresh-belt items that
         // route vanilla WITHOUT a batch row (their bodies move them and the
         // probeBox must hold that box until vanilla's loop reaches them).
-        BATCH_POS[entId(e) & AMASK] = ibN;
-        BATCH_GEN[entId(e) & AMASK] = batchGenCur;
+        // L150b: ONE entity-id read per item per tick — the previous shape
+        // called entId(e) three times (BATCH_POS, the slot, the fast-path
+        // stamp) and appendDispatch re-read it a fourth; entId was 2.1%
+        // self in items-100k.
+        final int eid = entId(e);
+        BATCH_POS[eid & AMASK] = ibN;
+        BATCH_GEN[eid & AMASK] = batchGenCur;
         try {
-            // L66: the direct client check — javap 26.3: e.level() reads the
-            // private `level` field, isClientSide() the private final
-            // `isClientSide` boolean; two typed Unsafe reads replace the
-            // virtual call pair. A null level (never for a ticking entity)
-            // or an unresolved offset routes the exact vanilla pair.
-            Object lv = O_ENT_LEVEL >= 0 ? U != null
-                    ? U.getObject(e, O_ENT_LEVEL) : null : null;
-            if (lv == null || O_LEVEL_CLIENT < 0) {
-                if (e.level().isClientSide()) { dispDiag(e, "client"); return false; }
-            } else if (U.getBoolean(lv, O_LEVEL_CLIENT)) {
+            // L150b: the direct client check, level-reference cached. The
+            // walk is contiguous per level (one EntityTickList per Level),
+            // so the cached compare hits L1 for the whole cohort and the
+            // isClientSide bit is read only when the level reference CHANGES
+            // (the previous shape paid TWO Unsafe reads per item per tick:
+            // the level field AND the boolean — 3.5% self in items-100k).
+            Object lv = O_ENT_LEVEL >= 0 && U != null
+                    ? U.getObject(e, O_ENT_LEVEL) : null;
+            boolean client;
+            if (lv == DL_LAST) {
+                client = DL_CLIENT;
+            } else {
+                DL_LAST = lv;
+                if (lv == null || O_LEVEL_CLIENT < 0) {
+                    client = e.level().isClientSide();
+                } else {
+                    client = U.getBoolean(lv, O_LEVEL_CLIENT);
+                }
+                DL_CLIENT = client;
+            }
+            if (client) {
                 dispDiag(e, "client");
                 return false;
             }
-            int slot = entId(e) & MAMASK;
+            int slot = eid & MAMASK;
             // i0-a STAY fast path (doc 62): the core pre-approved this
             // item's next dispatch — native-mode (MODE_VAL==1), revision
             // fresh (MODE_REV==WORLD_REV), and the %4 rotation clause
@@ -5044,7 +5067,7 @@ public final class CeHooks {
             // without a probe wake (which clears MODE synchronously) or
             // a section change (which stales MODE_REV). isRemoved stays:
             // the removal driver may lag one boundary.
-            if (DISP_ID[slot] == (long) entId(e)
+            if (DISP_ID[slot] == (long) eid
                     && MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 1
                     && MODE_REV[slot] == WORLD_REV
                     && !e.isRemoved()) {
@@ -5052,7 +5075,7 @@ public final class CeHooks {
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
                 // by the last flush's writeback.
-                appendDispatch(e, DISP_VAL[slot] == 1);
+                appendDispatch(e, DISP_VAL[slot] == 1, eid);
                 dispFast++;
                 dispDiag(e, DISP_VAL[slot] == 1 ? "fast-native" : "fast-inactive");
                 return true;
@@ -5194,7 +5217,7 @@ public final class CeHooks {
             // way.
             boolean active = itemCheckActive(e, true);
             dtrace(e, "dispatch", active);
-            appendDispatch(e, active);
+            appendDispatch(e, active, eid);
             dispDiag(e, active ? "native" : "inactive");
             if (active) {
                 dispNative++;
@@ -5288,13 +5311,26 @@ public final class CeHooks {
      *  fills its own quads) or behind the (f & IF_NATIVE) != 0
      *  short-circuit (the rateOk arms). Three stores per item per tick
      *  off the dispatch append (the #2 items leaf). */
-    private static void appendDispatch(ItemEntity e, boolean active) {
+    private static void appendDispatch(ItemEntity e, boolean active, int eid) {
         int i = ibN;
         ibN = i + 1;
-        IB_IDS[i] = entId(e);
+        IB_IDS[i] = eid;
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
         IB_ITEM[i] = e;
         IB_I[i * 4 + 2] = e.pickupDelay;
+        // L150b: the activation truth stamped AT APPEND. No vanilla body
+        // runs between the append and the flush for a native-routed entry
+        // (the walk route skips it, the tick guard suppresses the body),
+        // and nothing outside the activation phase mutates activatedTick —
+        // so these are the exact values the flush re-read produced. The
+        // flush pass keeps re-reading ONLY the resync/force-vanilla entries
+        // (a vanilla body ran at dispatch time for those) — 3 reads + 2
+        // writes per item per tick off the 100k scale.
+        long at = e.activatedTick;
+        IB_ATI[i * 3] = (int) at;
+        IB_ATI[i * 3 + 1] = (int) (at >> 32);
+        IB_ATI[i * 3 + 2] = (e.isTemporarilyActive ? 1 : 0)
+                | (e.defaultActivationState ? 2 : 0);
     }
 
     /** L7: an external mutation of this item (box or velocity change
@@ -6437,8 +6473,11 @@ public final class CeHooks {
         if (!ACTIVE || !ITEM_TICK_ON || !cplugReady || ibN >= IB_CAP) { dispDiag(e, "skip-off"); return false; }
         if (e.level().isClientSide()) { dispDiag(e, "skip-client"); return false; } // client-side ticks stay vanilla
         try {
-            boolean nativeMode = MODE_GEN[entId(e) & MAMASK] == MODE_EPOCH
-                    && MODE_VAL[entId(e) & MAMASK] != 0;
+            // L150b: one entId read for the whole guard chain (was: three —
+            // the nativeMode pair plus the RM_BIT gate each re-read it)
+            int eid = entId(e);
+            boolean nativeMode = MODE_GEN[eid & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[eid & MAMASK] != 0;
             // fresh-flag gates: anything the core cannot compute exactly runs
             // vanilla THIS tick (the flush re-evaluates the mode afterwards).
             // L55: the onGround flag MUST ride every RESYNC-flavored batch
@@ -6449,7 +6488,7 @@ public final class CeHooks {
             // wakeup's active body read !st.on_ground and ran a SPURIOUS
             // move+friction vanilla's gate skipped — 53 items at t=413, one
             // 0.588 vx/vz step each, 1214 by T639).
-            if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics || e.isInWater() || e.isInLava()
+            if (RM_BIT[eid & AMASK] == 1 || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
                 appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
@@ -6521,6 +6560,17 @@ public final class CeHooks {
             ibResyncN++;
         }
         IB_ITEM[i] = e;
+        // L150b: a native-flagged append with a SUPPRESSED body (the tick
+        // guard's nativeMode route) — no vanilla body runs after this, so
+        // the append-time activation stamp is the flush-time truth. The
+        // flush pass re-reads only the resync/force-vanilla entries.
+        if ((flags & IF_NATIVE) != 0) {
+            long at = e.activatedTick;
+            IB_ATI[i * 3] = (int) at;
+            IB_ATI[i * 3 + 1] = (int) (at >> 32);
+            IB_ATI[i * 3 + 2] = (e.isTemporarilyActive ? 1 : 0)
+                    | (e.defaultActivationState ? 2 : 0);
+        }
         // L8.2: side-pack the collector-data stride into IB_CD, slot ci+1
         int ci = ibCDN;
         int o = ci * 14;
@@ -6703,6 +6753,12 @@ public final class CeHooks {
             // i0-a2: the activation truth rides the batch — three plain
             // field reads per entry replace the port's whole per-dispatch
             // chain (the sweep's stamps are already inside activatedTick).
+            // L150b: the dispatch/append paths stamp the truth AT APPEND for
+            // every native-routed entry (no vanilla body runs between the
+            // append and this read — identical values); only entries whose
+            // body RAN vanilla (resync / force-vanilla / the inactive
+            // collect) or missing items re-read here. 3 reads + 2 writes per
+            // native item per tick off the 100k scale.
             for (int i = 0; i < n; i++) {
                 ItemEntity ie = IB_ITEM[i];
                 if (ie == null) {
@@ -6710,6 +6766,9 @@ public final class CeHooks {
                     IB_ATI[i * 3 + 1] = 0;
                     IB_ATI[i * 3 + 2] = 0;
                     continue;
+                }
+                if ((IB_FLAGS[i] & (IF_RESYNC | IF_FORCE_VANILLA)) == 0) {
+                    continue; // append-time stamp already exact
                 }
                 long at = ie.activatedTick;
                 IB_ATI[i * 3] = (int) at;
@@ -7177,8 +7236,15 @@ public final class CeHooks {
                         // L119: the exact view trim happens RUST-SIDE now (the
                         // stored boxes = the scan-time view — see n_merge_scan).
                         for (int k2 = 0; k2 < cands; k2++) {
-                            ItemEntity other = (ItemEntity) arenaRef(MS_CAND_IDS[k2]);
-                            if (other == null || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
+                            // L150a: vanilla's merge query predicate accepts
+                            // ONLY ItemEntity — a non-item leaking through
+                            // (an index round-trip past the Rust membership
+                            // filter) must SKIP, never cast: a ClassCast-
+                            // Exception here disarms the whole module
+                            // mid-run (the mixed-150k disarm at T458).
+                            Object candObj = arenaRef(MS_CAND_IDS[k2]);
+                            if (!(candObj instanceof ItemEntity other)
+                                    || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                             if (!isMergableFast(other)) continue;
                             if (walls
                                     && level.clipDirect(e.position(), other.position(),

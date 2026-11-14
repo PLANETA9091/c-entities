@@ -38,6 +38,14 @@ fn rtrace_id() -> i64 {
 #[derive(Clone, Copy)]
 struct ItemEntry {
     tag: u64, // (id >> 17) | 1 — validity check against slot aliasing
+    /// THE EXACT entity id. The tag degenerates below 2^18 ids — every id
+    /// 0..262143 folds to (id>>17)|1 == 1, so at the 150k-entity scale a
+    /// zombie's masked slot can carry a MATCHING tag (the mixed-150k
+    /// ClassCastException disarm: the merge scan returned a zombie id whose
+    /// tag equaled the live item's). The full id is the only honest
+    /// membership test; entry() stamps it at ingest, fresh(empty) writes 0
+    /// (ids are strictly positive) so an empty slot matches nothing.
+    id: i64,
     // L7 dispatch-owned state: for IF_NATIVE entries the STORE is the source
     // of truth (the dispatch guard suppresses the whole vanilla dispatcher,
     // so nothing else reads or writes these fields between flushes; the
@@ -75,6 +83,7 @@ impl ItemEntry {
     fn fresh(tag: u64) -> ItemEntry {
         ItemEntry {
             tag,
+            id: 0,
             x: 0.0,
             y: 0.0,
             z: 0.0,
@@ -169,10 +178,23 @@ impl ItemWorld {
         let slot = (id as u64 & STORE_MASK) as usize;
         let tag = (id as u64 >> 17) | 1;
         let e = &mut self.entries[slot];
-        if e.tag != tag {
+        if e.tag != tag || e.id != id {
             *e = ItemEntry::fresh(tag);
+            e.id = id;
         }
         e
+    }
+
+    /// The exact item-membership test for index candidates: the shared
+    /// query index holds EVERY entity (the push/mob wires), so a merge scan
+    /// over a cell can hit a zombie standing on a dropped stack. The entry
+    /// table is items-only (entry() ingests item state exclusively), and
+    /// the id compare is exact — a live item in this world matches, a
+    /// never-ingested or aliased slot does not.
+    #[inline]
+    fn is_live_item(&self, id: i64) -> bool {
+        let e = &self.entries[(id as u64 & STORE_MASK) as usize];
+        e.id == id
     }
 
     pub fn invalidate_section(&mut self, cx: i32, cy: i32, cz: i32) {
@@ -1484,9 +1506,10 @@ unsafe fn n_item_invalidate_impl(
         cst.idx.query(wid as u16, &box_, &mut hits);
         for id in hits {
             let slot = (id as u64 & STORE_MASK) as usize;
-            let tag = (id as u64 >> 17) | 1;
             let e = &mut world.entries[slot];
-            if e.tag == tag {
+            // exact id (the tag degenerates below 2^18 — an aliased clear
+            // would wipe an innocent item's friction memo)
+            if e.id == id {
                 e.fr_pos = (i32::MIN, i32::MIN, i32::MIN);
             }
         }
@@ -1611,10 +1634,15 @@ pub extern "system" fn n_merge_scan(
             if cid == self_id {
                 continue;
             }
-            let cslot = (cid as u64 & STORE_MASK) as usize;
-            let ctag = (cid as u64 >> 17) | 1;
-            let ce = &world.entries[cslot];
-            if ce.tag != ctag {
+            // L150a EXACT MEMBERSHIP: the shared index answers with EVERY
+            // entity in the box — a zombie overlapping the scan qbox carried
+            // a matching degenerate tag ((id>>17)|1 == 1 for ALL ids below
+            // 2^18 — the whole 150k fill) and reached the Java cast as an
+            // ItemEntity, disarming the module mid-run (the mixed-150k
+            // ClassCastException). The entry table is items-only; the full
+            // id compare is the exact filter, and it also kills the latent
+            // stale-skip hole the tag scheme had at this scale.
+            if !world.is_live_item(cid) {
                 MS_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
