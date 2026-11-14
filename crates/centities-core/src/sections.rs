@@ -510,45 +510,21 @@ impl SectionGrid {
 // ---------------------------------------------------------------------------
 
 /// Per-worker-turn read-through cache over a shared [`SectionGrid`].
-///
-/// L121: the backing store is a TWO-WAY SET-ASSOCIATIVE direct-mapped array,
-/// not a HashMap. The item tick touches 4-6 sections per item per tick (the
-/// noPhysics probe + the move-collide gather); at CI items-100k scale the
-/// batch order walks the pile spatially, so a worker's 512 items revisit the
-/// same ~100-110 sections constantly. The old HashMap paid TWO hash probes
-/// (contains_key + get) plus pointer-chasing nodes per hit — the flush's
-/// 606k looks/flush were ~80% probe tax (~200 ns/item, the JFR self-time of
-/// the gather path). A direct-mapped hit is ONE multiply, ONE mask, ONE
-/// sequential array load and a key compare (~4 ns); the 2-way buckets absorb
-/// the key clustering (110 live sections over 256 sets). Exactness: the same
-/// `SectionData` is served, misses still fill through `get_or_populate`.
 pub struct SectionCache<'a> {
     grid: &'a SectionGrid,
     provider: SectionProvider<'a>,
-    /// Two-way set associative: slots[2*set] and slots[2*set + 1], each
-    /// (key, data) with key == 0 meaning EMPTY (sec_key packs cx<<40 |
-    /// cz<<16 | cy with cx/cz masked to 24 bits — a zero key is a legal
-    /// section (0,0,0), so EMPTY is encoded as u64::MAX, which sec_key can
-    /// never produce: cx/cz are 24-bit (<<40 / <<16) and cy 16-bit, the
-    /// top byte 0xFF is unreachable).
-    slots: Vec<(u64, Option<Arc<SectionData>>)>,
+    local: HashMap<u64, Arc<SectionData>, ShardBuild>,
     /// Section visits served locally (folded into the shared counter once
     /// per chunk instead of one contended atomic per visit).
     pub visits: u64,
 }
-
-/// 256 sets x 2 ways. 110 live sections at CI items-100k scale fit with
-/// room for the 16x-wide spread legs; a hostile world with more live
-/// sections than sets just degrades to the miss path (correct, slower).
-const SC_SETS: usize = 256;
-const SC_EMPTY: u64 = u64::MAX;
 
 impl<'a> SectionCache<'a> {
     pub fn new(grid: &'a SectionGrid, provider: SectionProvider<'a>) -> SectionCache<'a> {
         SectionCache {
             grid,
             provider,
-            slots: vec![(SC_EMPTY, None); SC_SETS * 2],
+            local: HashMap::with_capacity_and_hasher(1 << 12, ShardBuild),
             visits: 0,
         }
     }
@@ -556,32 +532,13 @@ impl<'a> SectionCache<'a> {
     #[inline]
     fn data(&mut self, cx: i32, cy: i32, cz: i32, load: bool) -> Result<&SectionData, ()> {
         let key = sec_key(cx, cy, cz);
-        let set = ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 41) as usize) & (SC_SETS - 1);
-        let b0 = set * 2;
-        // Resolve the way FIRST (no reference held), mutate only on the
-        // miss path, and produce the served reference in the tail
-        // expression — the borrow then ties to the &mut self lifetime the
-        // same way the old HashMap get() did.
-        let way = if self.slots[b0].0 == key {
-            b0
-        } else if self.slots[b0 + 1].0 == key {
-            b0 + 1
-        } else {
+        if !self.local.contains_key(&key) {
             let arc = self
                 .grid
                 .get_or_populate(cx, cy, cz, load, &mut *self.provider)?;
-            // Fill the LRU-ish way: replace way 0 unless way 0 is newer
-            // than way 1 (a 2-entry round-robin per set — good enough for
-            // the section locality; misses are once-per-section-per-worker).
-            let w = if self.slots[b0].0 == SC_EMPTY { b0 } else { b0 + 1 };
-            self.slots[w] = (key, Some(arc));
-            w
-        };
-        self.visits += 1;
-        // Serve through the slot: the cache owns the Arc, the reference
-        // borrows it for the gather's lifetime. A failed populate returned
-        // Err above (the ?), so the data is Some() on every path here.
-        Ok(self.slots[way].1.as_ref().unwrap())
+            self.local.insert(key, arc);
+        }
+        Ok(self.local.get(&key).unwrap())
     }
 
     /// Gather — same exactness contract as [`SectionGrid::gather`], served
