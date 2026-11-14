@@ -198,6 +198,12 @@ type ShardMap = std::collections::HashMap<u64, Arc<SectionData>, ShardBuild>;
 
 /// Per-world section cache.
 pub struct SectionGrid {
+    /// L150e: the GLOBAL grid revision — bumped on EVERY mutation
+    /// (invalidate / invalidate_all / a populate after a miss). The item
+    /// kernel's probe memo validates against this one atomic load; a block
+    /// change, a chunk (re)load or any section (re)population re-gathers
+    /// exactly once and re-memos.
+    pub rev: std::sync::atomic::AtomicU64,
     shards: Vec<RwLock<ShardMap>>,
     pub populated: AtomicU64,
     pub lookups: AtomicU64,
@@ -222,6 +228,7 @@ impl SectionGrid {
                 .collect(),
             populated: AtomicU64::new(0),
             lookups: AtomicU64::new(0),
+            rev: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -231,6 +238,7 @@ impl SectionGrid {
     }
 
     pub fn invalidate_all(&self) {
+        self.rev.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for s in &self.shards {
             let mut m = s.write().unwrap_or_else(|e| e.into_inner());
             m.clear();
@@ -238,9 +246,16 @@ impl SectionGrid {
     }
 
     pub fn invalidate(&self, cx: i32, cy: i32, cz: i32) {
+        self.rev.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = sec_key(cx, cy, cz);
         let mut m = self.shard(key).write().unwrap_or_else(|e| e.into_inner());
         m.remove(&key);
+    }
+
+    /// L150e: the current grid revision for the probe-memo validity check.
+    #[inline]
+    pub fn rev(&self) -> u64 {
+        self.rev.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[inline]
@@ -267,6 +282,9 @@ impl SectionGrid {
         let mut m = shard.write().unwrap_or_else(|e| e.into_inner());
         self.populated
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // L150e: a (re)population is a grid mutation — the probe memos must
+        // re-gather once against the new payload.
+        self.rev.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Double-check insert: a concurrent worker may have published the
         // same section while the up-call ran — keep exactly one payload.
         Ok(Arc::clone(m.entry(key).or_insert_with(|| Arc::clone(&arc))))
@@ -535,6 +553,14 @@ pub struct SectionCache<'a> {
     /// Section visits served locally (folded into the shared counter once
     /// per chunk instead of one contended atomic per visit).
     pub visits: u64,
+}
+
+impl<'a> SectionCache<'a> {
+    /// L150e: the grid revision for the probe-memo validity check.
+    #[inline]
+    pub fn grid_rev(&self) -> u64 {
+        self.grid.rev()
+    }
 }
 
 /// 256 sets x 2 ways. 110 live sections at CI items-100k scale fit with

@@ -32,7 +32,7 @@ use crate::itemtick::{
     mth_equal, mth_floor, perform_collisions, voxel_shape_intersect, Aabb6, EPS7,
     FRICTION_F32_AS_F64, GATE_HORZ_SQR, ITEM_GRAVITY, MOVE_EPS, Y_DRAG,
 };
-use crate::sections::SectionCache;
+use crate::sections::{GatherFlags, SectionCache};
 
 /// Vanilla defaults for air / unloaded blocks (Block friction 0.6F,
 /// speedFactor 1.0F).
@@ -40,6 +40,9 @@ pub const AIR_FRICTION: f32 = 0.6;
 pub const AIR_SPEED: f32 = 1.0;
 /// CobwebBlock.entityInside: makeStuckInBlock(state, new Vec3(0.25, 0.05, 0.25)).
 pub const COBWEB_STUCK: (f64, f64, f64) = (0.25, 0.05, 0.25);
+
+pub static NP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static NP_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per-item state owned by Rust between flushes. Synced from the Java
 /// entity at registration, at K-tick resyncs, on probe wakes, and whenever
@@ -85,6 +88,21 @@ pub struct ItemState {
     /// fallDistance BEFORE resetFallDistance on LAND ticks (the Java
     /// fallOn snippet needs it; cleared after the writeback).
     pub land_fall: f32,
+    /// L150e: the noPhysics-probe memo. A resting item re-gathers the SAME
+    /// deflated box against the SAME sections every tick (the box is
+    /// bit-stable: the skip tick applies no move, the gate-open tick's
+    /// collision cancels at the exact pre-tick position). Validity = (the
+    /// grid rev unchanged) AND (the box bits equal); the verdict is a pure
+    /// function of (box, sections) and the sections a gather reads are
+    /// exactly the ones the pre-memo kernel read. Any grid mutation (block
+    /// change, chunk (re)load, a section (re)population) bumps the rev and
+    /// forces exactly one re-gather.
+    pub np_valid: bool,
+    pub np_rev: u64,
+    pub np_stuck: bool,
+    /// GatherFlags packed: complex | any_fluid<<1 | unloaded<<2 | fall_special<<3
+    pub np_flags: u8,
+    pub np_box: Aabb6,
     /// frictionState == TriState.FALSE (f = 1.0 exact; else block friction).
     pub friction_disabled: bool,
     /// i0-a2 (doc 62): defaultActivationState — a per-entity CONSTANT,
@@ -125,6 +143,11 @@ impl ItemState {
             land_fall: 0.0,
             friction_disabled: false,
             default_activation: false,
+            np_valid: false,
+            np_rev: 0,
+            np_stuck: false,
+            np_flags: 0,
+            np_box: Aabb6::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -288,19 +311,52 @@ pub fn tick_item(
     // The probe happens after gravity in vanilla but reads only the box, so
     // hoisting it before the mutation phase is exact.
     let deflated = box_now.deflate(1.0e-7);
-    let flags_np = sc.gather(
-        &deflated,
-        env.min_section_y,
-        env.max_section_y,
-        &mut scratch.boxes,
-    );
+    // L150e: the probe memo (see ItemState.np_*). A memo hit replaces the
+    // whole gather + the voxel-intersect walk; the verdict is value-identical
+    // because it is a pure function of (box, section payloads) and the grid
+    // rev gates every payload change.
+    let (flags_np, stuck_in_block) = {
+        let memo_hit = st.np_valid
+            && st.np_rev == sc.grid_rev()
+            && st.np_box == deflated;
+        if memo_hit {
+            NP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            NP_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if memo_hit {
+            let f = GatherFlags {
+                complex: st.np_flags & 1 != 0,
+                any_fluid: st.np_flags & 2 != 0,
+                unloaded: st.np_flags & 4 != 0,
+                fall_special: st.np_flags & 8 != 0,
+            };
+            (f, st.np_stuck)
+        } else {
+            let flags_np = sc.gather(
+                &deflated,
+                env.min_section_y,
+                env.max_section_y,
+                &mut scratch.boxes,
+            );
+            let stuck_in_block = scratch
+                .boxes
+                .iter()
+                .any(|b| voxel_shape_intersect(&deflated, b));
+            st.np_valid = true;
+            st.np_rev = sc.grid_rev();
+            st.np_box = deflated;
+            st.np_flags = (flags_np.complex as u8)
+                | ((flags_np.any_fluid as u8) << 1)
+                | ((flags_np.unloaded as u8) << 2)
+                | ((flags_np.fall_special as u8) << 3);
+            st.np_stuck = stuck_in_block;
+            (flags_np, stuck_in_block)
+        }
+    };
     if flags_np.unloaded || flags_np.complex || flags_np.any_fluid {
         out.set(TickOutcome::VANILLA_NEXT);
     }
-    let stuck_in_block = scratch
-        .boxes
-        .iter()
-        .any(|b| voxel_shape_intersect(&deflated, b));
     if stuck_in_block {
         AB_STUCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // vanilla would run moveTowardsClosestSpace + a noPhysics move;

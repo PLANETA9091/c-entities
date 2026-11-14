@@ -83,6 +83,7 @@ fn main() {
             fr_step_special: false,
             friction_disabled: false,
             land_fall: 0.0,
+            ..Default::default()
         });
     }
 

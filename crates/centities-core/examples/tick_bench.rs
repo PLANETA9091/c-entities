@@ -1,7 +1,7 @@
 //! L6 core bench: where does the per-item tick time go?
 use centities_core::itemtick::Aabb6;
 use centities_core::sections::{PaletteEntry, SectionCache, SectionData, SectionGrid, AIR_IDX};
-use centities_core::tick::{tick_item, ItemState, Scratch, TickEnv};
+use centities_core::tick::{tick_item, tick_item_inactive, ItemState, Scratch, TickEnv};
 use std::time::Instant;
 
 const MIN_SEC: i32 = 0;
@@ -107,6 +107,44 @@ fn main() {
         moved += o.0 as u32 & 1;
     }
     let dt = t.elapsed();
+    // L150e-diag: the phase split — the gather alone vs the full tick.
+    let t2 = Instant::now();
+    let mut boxes_out: Vec<Aabb6> = Vec::with_capacity(64);
+    for (k, st) in states.iter_mut().enumerate() {
+        let bb = Aabb6::item_box(st.x, st.y, st.z).deflate(1.0e-7);
+        let mut lsc = SectionCache::new(&sg, &mut prov);
+        let _ = lsc.gather(&bb, env.min_section_y, env.max_section_y, &mut boxes_out);
+        let _ = k;
+    }
+    let gather_dt = t2.elapsed();
+    let t3 = Instant::now();
+    for (k, st) in states.iter_mut().enumerate() {
+        let bb = Aabb6::item_box(st.x, st.y, st.z).deflate(1.0e-7);
+        let _ = (bb.x0, k);
+    }
+    let box_dt = t3.elapsed();
+    let t4 = Instant::now();
+    for (k, st) in states.iter_mut().enumerate() {
+        st.tick_count = (k % 4 + 1) as i32;
+        let _ = tick_item_inactive(st);
+        let _ = k;
+    }
+    let inact_dt = t4.elapsed();
+    println!(
+        "np memo: hits {} misses {}",
+        centities_core::tick::NP_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        centities_core::tick::NP_MISS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    println!(
+        "inactive-only: {:.1} ns/item",
+        inact_dt.as_nanos() as f64 / n as f64,
+    );
+    println!(
+        "split: full {:.1} ns/item | gather-only {:.1} | box-only {:.1}",
+        dt.as_nanos() as f64 / n as f64,
+        gather_dt.as_nanos() as f64 / n as f64,
+        box_dt.as_nanos() as f64 / n as f64,
+    );
     println!(
         "tick_item x{}: {:.1}ns/item (moved {}), grid: {} lookups, {} populated",
         n,

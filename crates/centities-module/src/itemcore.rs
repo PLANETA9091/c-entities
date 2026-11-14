@@ -77,6 +77,12 @@ struct ItemEntry {
     friction: f32,
     speed: f32,
     fr_step_special: bool,
+    /// L150e: the noPhysics-probe memo (persists across flushes)
+    np_rev: u64,
+    np_valid: bool,
+    np_stuck: bool,
+    np_flags: u8,
+    np_box: [f64; 6],
 }
 
 impl ItemEntry {
@@ -107,6 +113,11 @@ impl ItemEntry {
             friction: 0.6,
             speed: 1.0,
             fr_step_special: false,
+            np_rev: 0,
+            np_valid: false,
+            np_stuck: false,
+            np_flags: 0,
+            np_box: [0.0; 6],
         }
     }
 }
@@ -142,6 +153,12 @@ struct L6Rec {
     speed: f32,
     /// sup_present | sup_no_blocks<<1 | fr_step_special<<2
     flags: u8,
+    /// L150e: the noPhysics-probe memo (see ItemState.np_* in tick.rs)
+    np_rev: u64,
+    np_valid: bool,
+    np_stuck: bool,
+    np_flags: u8,
+    np_box: [f64; 6],
 }
 
 /// The full per-entry state snapshot used by the L7 dispatch protocol.
@@ -875,6 +892,12 @@ unsafe fn n_item_tick_impl(
                                     friction: 0.6,
                                     speed: 1.0,
                                     fr_step_special: false,
+                                    // L150e: the memo hydrates from the store below
+                                    np_valid: false,
+                                    np_rev: 0,
+                                    np_stuck: false,
+                                    np_flags: 0,
+                                    np_box: Aabb6::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                                     friction_disabled: (f & F_FRIC_OFF) != 0,
                                     land_fall: 0.0,
                                     default_activation: false,
@@ -957,6 +980,20 @@ unsafe fn n_item_tick_impl(
                                         st.speed = entry.speed;
                                         st.fr_step_special = entry.fr_step_special;
                                     }
+                                    // L150e: the probe memo rides the store across
+                                    // flushes (the tick validates rev+box)
+                                    st.np_valid = entry.np_valid;
+                                    st.np_rev = entry.np_rev;
+                                    st.np_stuck = entry.np_stuck;
+                                    st.np_flags = entry.np_flags;
+                                    st.np_box = Aabb6::new(
+                                        entry.np_box[0],
+                                        entry.np_box[1],
+                                        entry.np_box[2],
+                                        entry.np_box[3],
+                                        entry.np_box[4],
+                                        entry.np_box[5],
+                                    );
                                 }
                                 // L7 dispatch-owned entries: the STORE is the state
                                 // source (the vanilla dispatcher was suppressed, the
@@ -1225,6 +1262,18 @@ unsafe fn n_item_tick_impl(
                                                     flags: (st.sup_present as u8)
                                                         | ((st.on_ground_no_blocks as u8) << 1)
                                                         | ((st.fr_step_special as u8) << 2),
+                                                    np_rev: st.np_rev,
+                                                    np_valid: st.np_valid,
+                                                    np_stuck: st.np_stuck,
+                                                    np_flags: st.np_flags,
+                                                    np_box: [
+                                                        st.np_box.x0,
+                                                        st.np_box.y0,
+                                                        st.np_box.z0,
+                                                        st.np_box.x1,
+                                                        st.np_box.y1,
+                                                        st.np_box.z1,
+                                                    ],
                                                 };
                                             }
                                             // one shared-counter bump per chunk (not per
@@ -1278,6 +1327,12 @@ unsafe fn n_item_tick_impl(
                                     entry.friction = rec.friction;
                                     entry.speed = rec.speed;
                                     entry.fr_step_special = rec.flags & 4 != 0;
+                                    // L150e: the probe memo persists
+                                    entry.np_valid = rec.np_valid;
+                                    entry.np_rev = rec.np_rev;
+                                    entry.np_stuck = rec.np_stuck;
+                                    entry.np_flags = rec.np_flags;
+                                    entry.np_box = rec.np_box;
                                     // L7: mirror the full state back (dispatch-owned)
                                     entry.x = od[k * 9 + 3];
                                     entry.y = od[k * 9 + 4];
