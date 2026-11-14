@@ -4930,12 +4930,11 @@ public final class CeHooks {
 
     /** L151: the checkEntityImmunities slice for an ArmorStand (javap
      *  26.3): checkInactiveWakeup returns -1 for MISC; the water branch is
-     *  NOT type-gated; the arrow branch is dead; !onGround && !flies → 10
-     *  (stands are absent from ENTITIES_THAT_FLY — a ctor-fixed set); the
-     *  LivingEntity slice is LIVE (a stand can hold effects/climb state);
-     *  the tail's {Mob(→0), Bee, Villager, Llama, Animal, Sheep, Creeper,
-     *  Pillager, ExperienceOrb} branches are all instanceof-gated and
-     *  stands match none → -1. */
+     *  NOT type-gated; the arrow branch is dead; !onGround → 100 (bc 80-84)
+     *  and on-ground-moving → 100; the LivingEntity slice is LIVE (a stand
+     *  can hold effects/climb state); the tail's {Mob(→0), Bee, Villager,
+     *  Llama, Animal, Sheep, Creeper, Pillager, ExperienceOrb} branches are
+     *  all instanceof-gated and stands match none → -1. */
     private static int standImmunities(
             net.minecraft.world.entity.decoration.ArmorStand as) {
         if (as.getRemainingFireTicks() > 0) return 2;
@@ -4948,9 +4947,15 @@ public final class CeHooks {
                 return 100;
             }
         } else {
-            // javap bc 120-136: !onGround and not an ENTITIES_THAT_FLY
-            // member → 10 (a floating stand is immune-stamped for 10 ticks)
-            return 10;
+            // javap bc 80-84: `ifeq 101` — NOT on ground returns 100 (the
+            // same constant as the on-ground-moving case; the bc 120-136
+            // `bipush 10` tail is UNREACHABLE — bc 84 already returned for
+            // every !onGround input and bc 121 re-reads the same flag).
+            // The parity leg caught the first port draft returning 10 here:
+            // the stands' activatedTick drifted exactly by the immunity
+            // under-stamp (off=453 vs on=396 at T389) with every other
+            // field bit-identical.
+            return 100;
         }
         // the LivingEntity slice (javap bc 147-218)
         java.util.Optional<net.minecraft.core.BlockPos> cl =
@@ -5105,7 +5110,12 @@ public final class CeHooks {
         // stamp) and appendDispatch re-read it a fourth; entId was 2.1%
         // self in items-100k.
         final int eid = entId(e);
-        BATCH_POS[eid & AMASK] = ibN;
+        // L152: BATCH_POS doubles as the cohort's row memory — the store
+        // fires only on an order shift (a stable cohort keeps the value);
+        // BATCH_GEN stays unconditional (the generation bumps every flush).
+        if (BATCH_POS[eid & AMASK] != ibN) {
+            BATCH_POS[eid & AMASK] = ibN;
+        }
         BATCH_GEN[eid & AMASK] = batchGenCur;
         try {
             // L150b: the direct client check, level-reference cached. The
@@ -5164,7 +5174,38 @@ public final class CeHooks {
                 // by the last flush's writeback. L151: the inactive verdict
                 // rides the stamp's top bit.
                 boolean act = st >= 0L;
-                appendDispatch(e, act, eid);
+                // L152: the row-cohort hit — the row at ibN is this item's
+                // own row from last tick, byte-exact except for the three
+                // per-tick variables, which are refreshed conditionally.
+                // Anything else (a fresh row, an order shift, a slot
+                // successor) falls to the full append (appendDispatch bumps
+                // ibN itself) and re-stamps.
+                int aslot = eid & AMASK;
+                if (COHORT_ID[aslot] == eid && BATCH_POS[aslot] == ibN) {
+                    int k = ibN;
+                    ibN = k + 1;
+                    int wantF = IF_NATIVE | (act ? 0 : IF_INACTIVE);
+                    if (IB_FLAGS[k] != wantF) {
+                        IB_FLAGS[k] = wantF;
+                    }
+                    int pd = e.pickupDelay;
+                    if (IB_I[k * 4 + 2] != pd) {
+                        IB_I[k * 4 + 2] = pd;
+                    }
+                    long at = e.activatedTick;
+                    int a0 = (int) at, a1 = (int) (at >> 32);
+                    int af = (e.isTemporarilyActive ? 1 : 0)
+                            | (e.defaultActivationState ? 2 : 0);
+                    if (IB_ATI[k * 3] != a0 || IB_ATI[k * 3 + 1] != a1
+                            || IB_ATI[k * 3 + 2] != af) {
+                        IB_ATI[k * 3] = a0;
+                        IB_ATI[k * 3 + 1] = a1;
+                        IB_ATI[k * 3 + 2] = af;
+                    }
+                } else {
+                    appendDispatch(e, act, eid);
+                    COHORT_ID[aslot] = eid;
+                }
                 dispFast++;
                 dispDiag(e, act ? "fast-native" : "fast-inactive");
                 return true;
@@ -5404,6 +5445,24 @@ public final class CeHooks {
      *  fills its own quads) or behind the (f & IF_NATIVE) != 0
      *  short-circuit (the rateOk arms). Three stores per item per tick
      *  off the dispatch append (the #2 items leaf). */
+    // L152: the ROW COHORT. For a steady native item the batch row it
+    // occupied last tick is still byte-exact this tick (the walk order is
+    // stable absent add/remove; the entity id, the entity ref and the
+    // verdict state persist), so a dispatch hit may skip the ten append
+    // stores entirely and refresh ONLY the per-tick variables
+    // (IB_FLAGS' inactive verdict, the fresh pickupDelay read, the
+    // activation-truth stamp — each conditionally). BATCH_POS already
+    // carries the row memory (the hit position equals the stored one —
+    // no separate table); COHORT_ID is ARENA-sized and id-stamped: a
+    // fresh spawn's COHORT_ID is 0 and entity ids are ≥1, a slot-
+    // colliding successor can never inherit a row, and any walk-order
+    // shift makes BATCH_POS[slot] != ibN for the whole shifted tail —
+    // one full re-append tick, self-healing. Positions are a per-tick
+    // bijection over the walked entities, so a hit row can never belong
+    // to a different entity (the interleaved mob rows are re-appended
+    // by their own path every tick and never take a cohort hit).
+    private static final int[] COHORT_ID = new int[ARENA.length];
+
     private static void appendDispatch(ItemEntity e, boolean active, int eid) {
         int i = ibN;
         ibN = i + 1;
