@@ -723,8 +723,7 @@ public final class CeHooks {
                     + net.minecraft.server.MinecraftServer.currentTick
                     + " path=" + path + " active=" + active
                     + " tc=" + e.tickCount + " at=" + e.activatedTick
-                    + " mode=" + (slotOf(entId(e)) >= 0
-                            ? MODE_VAL_S[slotOf(entId(e))] : -1)
+                    + " mode=" + MODE_VAL[entId(e) & MAMASK]
                     + " onG=" + e.onGround()
                     + " dx=" + e.getDeltaMovement().x
                     + " dy=" + e.getDeltaMovement().y
@@ -1766,9 +1765,6 @@ public final class CeHooks {
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
                 RM_BIT[paSlot] = 0; // L115: fresh slot — alive
-                if (slotOf(paId) < 0) {
-                    slotRegister(paId); // L150c: the registry hosts EVERY entity now (the tracker's TT twins share the slot space)
-                }
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
                 batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
             }
@@ -1791,24 +1787,16 @@ public final class CeHooks {
                 ARENA_ID[prSlot] = 0;
                 REST_GEN[prSlot] = 0; // gone: drop the rest state
                 RM_BIT[prSlot] = 1;   // L115: the removed-bit mirror
-                slotMarkDead(slotOf(prId)); // L150c: the registry dead mark
                 batchRemove(prId);
-                // L150c: with the module disarmed no batch can be in flight
-                // (the walk never dispatches) — the dead slots are safe to
-                // reclaim here, otherwise a long vanilla period would leak
-                // one slot per removal.
-                if (!ACTIVE && slotDeadN >= 1024) {
-                    slotReclaimDead();
-                }
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
             // the entity — the identity check tolerates stale slots, but a
             // removed entity's TrackedEntity must be collectable). L65: the
             // se/sit/steps refs ride the same slot lifecycle.
             if (e != null) {
-                int sm = slotOf(entId(e)); // L150d: the registry slot
+                int sm = entId(e) & AMASK;
                 Object[] rf0 = TT_REF;
-                if (rf0 != null && sm >= 0) {
+                if (rf0 != null) {
                     int ob = sm * 5;
                     rf0[ob] = null;
                     rf0[ob + 1] = null;
@@ -1817,11 +1805,10 @@ public final class CeHooks {
                     rf0[ob + 4] = null;
                 }
                 long[] fl0 = TT_FLAT;
-                if (fl0 != null && sm >= 0) fl0[sm * 2] = 0;
-                int smid = entId(e) & AMASK; // the id-masked AI-floor tables stay
+                if (fl0 != null) fl0[sm * 2] = 0;
                 Entity[] fe = FROZ_E;
-                if (fe != null) fe[smid] = null;
-                AT_E[smid & (AT_CAP - 1)] = null;
+                if (fe != null) fe[sm] = null;
+                AT_E[sm & (AT_CAP - 1)] = null;
                 // L73: the AI floor's shadow keys are STRONG — the removed
                 // mob's selector must be dropped explicitly (its goalSelector
                 // rides O_MOB_GOALSEL). A missed drop leaks one bounded
@@ -1924,9 +1911,8 @@ public final class CeHooks {
                 // L119 POSITIONAL DRAIN: a box change from THIS flush's batch
                 // member carries its dispatch-loop position — flushUpTo at the
                 // merge scans holds it until vanilla's loop reaches the owner.
-                int posSlot = slotOf(entId(e));
-                int pos = posSlot >= 0 && BATCH_GEN_S[posSlot] == batchGenCur
-                        ? BATCH_POS_S[posSlot] : -1;
+                int posSlot = entId(e) & AMASK;
+                int pos = BATCH_GEN[posSlot] == batchGenCur ? BATCH_POS[posSlot] : -1;
                 batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral, pos);
             }
         } catch (Throwable t) {
@@ -2438,23 +2424,14 @@ public final class CeHooks {
     // exactly what vanilla's fresh instance would carry. CE_VEC_CACHE=0
     // restores the fresh-allocation shape for A/B bisects.
     private static final Object[] VEC_CACHE = new Object[2 * (AMASK + 1)];
-    // L150c: the slot-indexed twin — the flush passes the registry slot
-    // (sequential-ish, population-sized) instead of the full id (random
-    // across 64 MB); same 2-way value-equality contract, same exactness.
-    private static Object[] VEC_CACHE_S = new Object[2 * (1 << 18)];
     private static final boolean VEC_CACHE_ON =
             !"0".equals(System.getenv("CE_VEC_CACHE"));
 
     /** The delta Vec3 for a writeback — reused from the 2-way per-slot
-     *  cache when a cached instance carries the exact value. The registry
-     *  slot (>= 0, < SLOT_CAP) indexes VEC_CACHE_S; the full-id path stays
-     *  for any legacy caller. */
+     *  cache when a cached instance carries the exact value. */
     private static Vec3 vec3Cached(int idSlot, double x, double y, double z) {
         if (!VEC_CACHE_ON) {
             return new Vec3(x, y, z);
-        }
-        if (idSlot >= 0 && idSlot < SLOT_CAP) {
-            return vec3CachedS(idSlot, x, y, z);
         }
         int base = (idSlot & AMASK) * 2;
         Object a = VEC_CACHE[base];
@@ -2470,27 +2447,6 @@ public final class CeHooks {
         Vec3 fresh = new Vec3(x, y, z);
         VEC_CACHE[base + 1] = a;
         VEC_CACHE[base] = fresh;
-        return fresh;
-    }
-
-    private static Vec3 vec3CachedS(int slot, double x, double y, double z) {
-        int base = slot * 2;
-        if (base + 1 >= VEC_CACHE_S.length) {
-            VEC_CACHE_S = new Object[2 * SLOT_CAP];
-        }
-        Object a = VEC_CACHE_S[base];
-        if (a instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
-            return v;
-        }
-        Object b = VEC_CACHE_S[base + 1];
-        if (b instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
-            VEC_CACHE_S[base] = b;
-            VEC_CACHE_S[base + 1] = a;
-            return v;
-        }
-        Vec3 fresh = new Vec3(x, y, z);
-        VEC_CACHE_S[base + 1] = a;
-        VEC_CACHE_S[base] = fresh;
         return fresh;
     }
 
@@ -2513,199 +2469,6 @@ public final class CeHooks {
     // scans hold the box changes of the entities vanilla's mid-loop scan
     // would still see PRE-move.
     private static final int[] BATCH_POS = new int[ARENA.length];
-    // L150c COMPACT SLOT REGISTRY. The dispatch/flush verdict tables were
-    // id-masked over 1<<22 slots (~180 MB across MODE_* / DISP_* / RM_BIT /
-    // BATCH_*): every item every tick paid ~6 random accesses spread across
-    // that address space — TLB walks + L3 misses the microbench puts at
-    // ~30 ns each (~11 ms/tick at the 63k scale). The registry gives every
-    // LIVE ItemEntity a dense slot; the hot tables are slot-indexed
-    // (population-sized, L2-resident) and the id → slot resolve is ONE
-    // multiplicative-hash probe with an exact id verify.
-    //
-    // Lifecycle: probeAdd registers (dispatch registers as the safety net),
-    // probeRemove marks the slot DEAD (RM_BIT_S=1, the id negated) — dead
-    // slots are reclaimed ONLY at the flush boundary (after loop B), so a
-    // slot is never reused inside one tick and the batch's IB_SLOT stamps
-    // stay valid; slotAlloc CLEARS the verdict tables, a reused slot can
-    // never inherit the previous owner's fast-path verdict.
-    private static int IDMAP_CAP = 1 << 19;
-    private static int IDMAP_MASK = IDMAP_CAP - 1;
-    private static int[] ID2SLOT = new int[IDMAP_CAP]; // slot+1, 0 = empty
-    private static long[] SLOT2ID = new long[1 << 18];       // 0 = free, <0 = dead
-    private static int[] MODE_GEN_S = new int[1 << 18];
-    private static int[] MODE_VAL_S = new int[1 << 18];
-    private static int[] MODE_REV_S = new int[1 << 18];
-    private static long[] DISP_ID_S = new long[1 << 18];
-    private static int[] DISP_VAL_S = new int[1 << 18];
-    private static int[] RM_BIT_S = new int[1 << 18];
-    private static int[] BATCH_POS_S = new int[1 << 18];
-    private static int[] BATCH_GEN_S = new int[1 << 18];
-    private static int SLOT_CAP = 1 << 18;
-    private static int slotBump = 0;
-    private static int[] slotFree = new int[256];
-    private static int slotFreeN = 0;
-    private static int[] slotDead = new int[256];
-    private static int slotDeadN = 0;
-    private static int slotStale = 0; // dead map entries awaiting rehash
-
-    /** The exact id → slot resolve: ONE hash probe (linear walk over the
-     *  stale entries), verified against SLOT2ID — dead or reused slots
-     *  mismatch and the walk continues. Returns -1 for unregistered ids. */
-    /** The batch-entry removal check: the registry slot when valid, the
-     *  id-masked fallback for the pathological unregistered append. */
-    private static boolean rmDead(int s, long eid) {
-        return s >= 0 ? RM_BIT_S[s] == 1
-                : RM_BIT[(int) (eid & 0xFFFF_FFFFL) & AMASK] == 1;
-    }
-
-    private static int slotOf(long eid) {
-        // L150c-2: the DIRECT id mask — entity ids are monotonic per run, so
-        // the walk order STREAMS the low id range; the multiplicative hash
-        // turned that into a random probe and cost 7.3% self (the 51dac4f
-        // items leg). The exact id verify handles the id>=IDMAP_CAP wrap.
-        int p = (int) eid & IDMAP_MASK;
-        while (true) {
-            int s1 = ID2SLOT[p];
-            if (s1 == 0) return -1;
-            long sid = SLOT2ID[s1 - 1];
-            if (sid == eid) return s1 - 1;
-            p = (p + 1) & IDMAP_MASK;
-        }
-    }
-
-    /** Registration (the walk owns it — single server thread). Clears the
-     *  verdict tables so a reused slot cannot inherit a fast-path verdict. */
-    private static int slotRegister(long eid) {
-        int s = slotAlloc(eid);
-        if (s < 0) return -1;
-        SLOT2ID[s] = eid;
-        int p = (int) eid & IDMAP_MASK; // the direct mask — see slotOf
-        while (ID2SLOT[p] != 0) {
-            p = (p + 1) & IDMAP_MASK;
-        }
-        ID2SLOT[p] = s + 1;
-        return s;
-    }
-
-    private static int slotAlloc(long eid) {
-        if (slotFreeN > 0) {
-            int s = slotFree[--slotFreeN];
-            MODE_GEN_S[s] = 0;
-            MODE_VAL_S[s] = 0;
-            MODE_REV_S[s] = 0;
-            DISP_ID_S[s] = 0L;
-            DISP_VAL_S[s] = 0;
-            RM_BIT_S[s] = 0;
-            BATCH_POS_S[s] = 0;
-            BATCH_GEN_S[s] = 0;
-            return s;
-        }
-        if (slotBump >= SLOT_CAP) {
-            if (!growRegistry()) {
-                return -1;
-            }
-        }
-        int s = slotBump++;
-        MODE_GEN_S[s] = 0;
-        MODE_VAL_S[s] = 0;
-        MODE_REV_S[s] = 0;
-        DISP_ID_S[s] = 0L;
-        DISP_VAL_S[s] = 0;
-        RM_BIT_S[s] = 0;
-        BATCH_POS_S[s] = 0;
-        BATCH_GEN_S[s] = 0;
-        return s;
-    }
-
-    /** probeRemove: the slot goes DEAD (never reused inside the tick that
-     *  could still hold a batch stamp for it); reclaimed at flush end. */
-    private static void slotMarkDead(int s) {
-        if (s < 0) return;
-        RM_BIT_S[s] = 1;
-        SLOT2ID[s] = -SLOT2ID[s];
-        if (slotDeadN == slotDead.length) {
-            slotDead = java.util.Arrays.copyOf(slotDead, slotDeadN * 2);
-        }
-        slotDead[slotDeadN++] = s;
-        slotStale++;
-    }
-
-    /** The flush boundary: dead slots become reusable — the batch that
-     *  could reference them is fully consumed by now. */
-    private static void slotReclaimDead() {
-        for (int i = 0; i < slotDeadN; i++) {
-            int s = slotDead[i];
-            SLOT2ID[s] = 0;
-            if (slotFreeN == slotFree.length) {
-                slotFree = java.util.Arrays.copyOf(slotFree, slotFreeN * 2);
-            }
-            slotFree[slotFreeN++] = s;
-        }
-        slotDeadN = 0;
-        // stale map entries are verified away on lookup; rehash only when
-        // they approach the live population (amortized O(cap))
-        if (slotStale > (SLOT_CAP >>> 1)) {
-            java.util.Arrays.fill(ID2SLOT, 0);
-            for (int s = 0; s < SLOT_CAP; s++) {
-                long sid = SLOT2ID[s];
-                if (sid <= 0) continue;
-                int p = (int) sid & IDMAP_MASK;
-                while (ID2SLOT[p] != 0) {
-                    p = (p + 1) & IDMAP_MASK;
-                }
-                ID2SLOT[p] = s + 1;
-            }
-            slotStale = 0;
-        }
-    }
-
-    private static boolean growRegistry() {
-        int nc = SLOT_CAP << 1;
-        try {
-            // the id map grows in lockstep (the invariant: the probe map is
-            // 2x the slot capacity — a full map would spin slotOf forever)
-            int nmc = IDMAP_CAP << 1;
-            int[] nim = new int[nmc];
-            for (int s = 0; s < SLOT_CAP; s++) {
-                long sid = SLOT2ID[s];
-                if (sid <= 0) continue;
-                int pp = (int) sid & (nmc - 1);
-                while (nim[pp] != 0) {
-                    pp = (pp + 1) & (nmc - 1);
-                }
-                nim[pp] = s + 1;
-            }
-            ID2SLOT = nim;
-            IDMAP_CAP = nmc;
-            IDMAP_MASK = nmc - 1;
-            SLOT2ID = java.util.Arrays.copyOf(SLOT2ID, nc);
-            MODE_GEN_S = java.util.Arrays.copyOf(MODE_GEN_S, nc);
-            MODE_VAL_S = java.util.Arrays.copyOf(MODE_VAL_S, nc);
-            MODE_REV_S = java.util.Arrays.copyOf(MODE_REV_S, nc);
-            DISP_ID_S = java.util.Arrays.copyOf(DISP_ID_S, nc);
-            DISP_VAL_S = java.util.Arrays.copyOf(DISP_VAL_S, nc);
-            RM_BIT_S = java.util.Arrays.copyOf(RM_BIT_S, nc);
-            BATCH_POS_S = java.util.Arrays.copyOf(BATCH_POS_S, nc);
-            BATCH_GEN_S = java.util.Arrays.copyOf(BATCH_GEN_S, nc);
-        } catch (OutOfMemoryError oom) {
-            lastError = System.nanoTime();
-            lastErrorText = "registry grow: " + oom;
-            return false;
-        }
-        SLOT_CAP = nc;
-        // L150d: the tracker twins ride the same slot space
-        Object[] ntr = new Object[nc * 5];
-        if (TT_REF != null) System.arraycopy(TT_REF, 0, ntr, 0, Math.min(TT_REF.length, ntr.length));
-        long[] ntf = new long[nc * 2];
-        if (TT_FLAT != null) System.arraycopy(TT_FLAT, 0, ntf, 0, Math.min(TT_FLAT.length, ntf.length));
-        long[] ntq = new long[(nc + 63) >> 6];
-        if (TT_QUIET != null) System.arraycopy(TT_QUIET, 0, ntq, 0, Math.min(TT_QUIET.length, ntq.length));
-        TT_REF = ntr;
-        TT_FLAT = ntf;
-        TT_QUIET = ntq;
-        return true;
-    }
-
     // L150b: the dispatch's cached level reference + its isClientSide bit —
     // the walk is contiguous per level, so the per-item cost drops to ONE
     // L1 reference compare; the Unsafe boolean read fires only when the
@@ -4436,12 +4199,6 @@ public final class CeHooks {
     private static final int[] IB_ATI = new int[IB_CAP * 3];
     private static final long[] MS_CAND_IDS = new long[256];
     private static final long[] IB_IDS = new long[IB_CAP];
-    // L150c: the registry slot per batch entry — the flush's verdict writes
-    // and RM_BIT reads index THIS (sequential) instead of re-hashing the id
-    // through the 4M-slot id-masked tables. appendDispatch/appendItem stamp
-    // it; a slot is never reused inside one tick (dead slots reclaim at the
-    // flush boundary), so the stamps stay valid for the whole flush.
-    private static final int[] IB_SLOT = new int[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
     // this (one array read) instead of arenaRef(id) (an ARENA read + the
@@ -5109,7 +4866,7 @@ public final class CeHooks {
      *  sync), so the tracker pass for the slot reduces to the mirror bump. */
     private static void standQuietStamp(
             net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
-        if (!TTL_QUIET_ON || !TT_MIRROR || sid < 0) return;
+        if (!TTL_QUIET_ON || !TT_MIRROR) return;
         Object[] rq = TT_REF;
         long[] fq = TT_FLAT;
         if (rq == null || fq == null) return;
@@ -5125,7 +4882,7 @@ public final class CeHooks {
      *  may change tracker-visible state; the slot must go full-path again. */
     private static void standQuietClear(
             net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
-        if (!TTL_QUIET_ON || !TT_MIRROR || sid < 0) return;
+        if (!TTL_QUIET_ON || !TT_MIRROR) return;
         Object[] rq = TT_REF;
         if (rq == null || rq[sid * 5 + 2] != as) return;
         TT_QUIET[sid >> 6] &= ~(1L << (sid & 63));
@@ -5139,12 +4896,12 @@ public final class CeHooks {
             net.minecraft.world.entity.decoration.ArmorStand as) {
         if (!STAND_MIRROR_ON) return false;
         try {
-            int sid = slotOf(entId(as)); // L150d: the registry slot
+            int sid = entId(as) & AMASK;
             // the stateless static classification — every read is live;
             // any miss routes the exact vanilla body for this tick.
             // (noTickEquipmentDirty is private and only ever set for
             // !canTick stands — the !as.canTick gate already routes those.)
-            if ((sid >= 0 && RM_BIT_S[sid] == 1) || !as.canTick
+            if (RM_BIT[sid] == 1 || !as.canTick
                     || !as.isMarker() || !as.isNoGravity()
                     || !as.getPassengers().isEmpty() || as.isPassenger()
                     || !as.isAlive()) {
@@ -5264,16 +5021,13 @@ public final class CeHooks {
         // stamps its loop position — including the fresh-belt items that
         // route vanilla WITHOUT a batch row (their bodies move them and the
         // probeBox must hold that box until vanilla's loop reaches them).
-        // L150b/c: ONE entity-id read + ONE registry-slot probe per item per
-        // tick (the previous shape called entId(e) four times and read four
-        // id-masked 4M-slot tables — entId 2.1% self, the table walk ~11 ms
-        // of TLB/L3 traffic at the 63k scale).
+        // L150b: ONE entity-id read per item per tick — the previous shape
+        // called entId(e) three times (BATCH_POS, the slot, the fast-path
+        // stamp) and appendDispatch re-read it a fourth; entId was 2.1%
+        // self in items-100k.
         final int eid = entId(e);
-        int sreg = slotOf(eid);
-        if (sreg < 0) sreg = slotRegister(eid);
-        if (sreg < 0) { dispDiag(e, "slot"); return false; }
-        BATCH_POS_S[sreg] = ibN;
-        BATCH_GEN_S[sreg] = batchGenCur;
+        BATCH_POS[eid & AMASK] = ibN;
+        BATCH_GEN[eid & AMASK] = batchGenCur;
         try {
             // L150b: the direct client check, level-reference cached. The
             // walk is contiguous per level (one EntityTickList per Level),
@@ -5299,7 +5053,7 @@ public final class CeHooks {
                 dispDiag(e, "client");
                 return false;
             }
-            int slot = sreg;
+            int slot = eid & MAMASK;
             // i0-a STAY fast path (doc 62): the core pre-approved this
             // item's next dispatch — native-mode (MODE_VAL==1), revision
             // fresh (MODE_REV==WORLD_REV), and the %4 rotation clause
@@ -5312,67 +5066,54 @@ public final class CeHooks {
             // %4-hit item and none of them can flip for a native item
             // without a probe wake (which clears MODE synchronously) or
             // a section change (which stales MODE_REV). isRemoved stays:
-            // the removal driver may lag one boundary. L150c: the verdict
-            // tables are slot-indexed; the DISP_ID_S stamp compare STAYS —
-            // the first parity run (3aac126) dropped it and the fast path
-            // then fired for NATIVE_OK entries WITHOUT the bit-18/20
-            // verdict (DISP_ID_S==0 — the slow path's itemCheckActive owns
-            // those): items dispatched INACTIVE that vanilla keeps active —
-            // the vx/vz 1/0.588-per-step drift and the merge-survivor
-            // shifts across every items leg. The slot ownership verify
-            // (slotOf's exact id compare) still replaces the ALIASING role
-            // of the old id-masked stamp; the stamp's verdict-presence
-            // role is value semantics and must not be dropped.
-            if (DISP_ID_S[slot] == eid
-                    && MODE_GEN_S[slot] == MODE_EPOCH && MODE_VAL_S[slot] == 1
-                    && MODE_REV_S[slot] == WORLD_REV
+            // the removal driver may lag one boundary.
+            if (DISP_ID[slot] == (long) eid
+                    && MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 1
+                    && MODE_REV[slot] == WORLD_REV
                     && !e.isRemoved()) {
                 // i0-a2: the core's verdict IS the port's decision (the same
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
                 // by the last flush's writeback.
-                if (!appendDispatch(e, DISP_VAL_S[slot] == 1, eid, slot)) {
-                    dispDiag(e, "slot");
-                    return false; // registry refused: vanilla this tick
-                }
+                appendDispatch(e, DISP_VAL[slot] == 1, eid);
                 dispFast++;
-                dispDiag(e, DISP_VAL_S[slot] == 1 ? "fast-native" : "fast-inactive");
+                dispDiag(e, DISP_VAL[slot] == 1 ? "fast-native" : "fast-inactive");
                 return true;
             }
-            if (MODE_VAL_S[slot] == 2) { // L21 REST: the dispatch-owned fixed point
+            if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
                 if (REST_ID[slot] != entId(e)) {
                     // slot turnover: entity ids are monotonic per run, so a
                     // mismatched stamp belongs to a dead predecessor
-                    MODE_VAL_S[slot] = 0;
+                    MODE_VAL[slot] = 0;
                 } else {
                     // cheap gates (the same set the native path runs): any
                     // hit leaves rest — vanilla computes the tick exactly
                     // and the resync re-arms the mode (the L6 protocol)
-                    if (RM_BIT_S[slot] == 1 || e.noPhysics
+                    if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
                             || e.portalProcess != null || e.isOnPortalCooldown()
                             || stackEmptyDispatch(e)
                             || !e.getPassengers().isEmpty()
-                            || ARENA[eid & AMASK] != e) {
-                        MODE_VAL_S[slot] = 0;
+                            || ARENA[entId(e) & AMASK] != e) {
+                        MODE_VAL[slot] = 0;
                         restExits++;
                         dispPass++;
                         dispDiag(e, "rest-exit");
                         return false;
                     }
-                    if (MODE_REV_S[slot] != WORLD_REV) {
+                    if (MODE_REV[slot] != WORLD_REV) {
                         dispGate++;
                         // the global revision moved: exit only when THIS
                         // item's environment was touched (a block change
                         // anywhere must not herd the whole rest set)
                         if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
                                 || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
-                            MODE_VAL_S[slot] = 0;
+                            MODE_VAL[slot] = 0;
                             restExits++;
                             dispPass++;
                             dispDiag(e, "rest-exit-rev");
                             return false;
                         }
-                        MODE_REV_S[slot] = WORLD_REV; // stale-but-boring
+                        MODE_REV[slot] = WORLD_REV; // stale-but-boring
                         restSectKeeps++;
                     }
                     // itemCheckActive runs ONLY at merge-cadence ticks (its
@@ -5407,7 +5148,7 @@ public final class CeHooks {
                             // index unsure: UNDO the mirror and let the
                             // vanilla body compute the whole tick (counters
                             // included) exactly — the resync re-arms rest
-                            MODE_VAL_S[slot] = 0;
+                            MODE_VAL[slot] = 0;
                             e.tickCount = e.tickCount - 1;
                             e.totalEntityAge = e.totalEntityAge - 1;
                             if (pdDec) {
@@ -5426,13 +5167,13 @@ public final class CeHooks {
                     if (e.age >= rate) {
                         despawnTail(e);
                     }
-                    MODE_GEN_S[slot] = MODE_EPOCH; // keep the recency stamp alive
+                    MODE_GEN[slot] = MODE_EPOCH; // keep the recency stamp alive
                     dispRest++;
                     dispDiag(e, "rest-tick");
                     return true;
                 }
             }
-            if (MODE_GEN_S[slot] != MODE_EPOCH || MODE_VAL_S[slot] == 0) {
+            if (MODE_GEN[slot] != MODE_EPOCH || MODE_VAL[slot] == 0) {
                 dispPass++;
                 dispDiag(e, "pass-gen");
                 return false;
@@ -5440,7 +5181,7 @@ public final class CeHooks {
             // cheap fresh-flag gates: always plain field reads
             // (stackEmptyDispatch: the cached empty bit replaces the
             // SynchedEntityData read — 6.55% MSPT on items-100k)
-            if (RM_BIT_S[slot] == 1 || e.noPhysics
+            if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
                     || e.portalProcess != null || e.isOnPortalCooldown()
                     || stackEmptyDispatch(e)) {
                 dispPass++;
@@ -5454,7 +5195,7 @@ public final class CeHooks {
             }
             // the world's block set changed since this item's last native
             // tick: the expensive gates decide (their L6 pre-tick role)
-            if (MODE_REV_S[slot] != WORLD_REV) {
+            if (MODE_REV[slot] != WORLD_REV) {
                 dispGate++;
                 if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
                         || despawnTimeOf(e) >= 0) {
@@ -5476,10 +5217,7 @@ public final class CeHooks {
             // way.
             boolean active = itemCheckActive(e, true);
             dtrace(e, "dispatch", active);
-            if (!appendDispatch(e, active, eid, slot)) {
-                dispDiag(e, "slot");
-                return false; // registry refused: vanilla this tick
-            }
+            appendDispatch(e, active, eid);
             dispDiag(e, active ? "native" : "inactive");
             if (active) {
                 dispNative++;
@@ -5573,17 +5311,13 @@ public final class CeHooks {
      *  fills its own quads) or behind the (f & IF_NATIVE) != 0
      *  short-circuit (the rateOk arms). Three stores per item per tick
      *  off the dispatch append (the #2 items leaf). */
-    /** @return false = the append FAILED (registry allocation refused) — the
-     *  caller must route the item VANILLA this tick (a dropped batch entry
-     *  must never skip the tick). The slot is pre-resolved by the caller. */
-    private static boolean appendDispatch(ItemEntity e, boolean active, int eid, int slot) {
+    private static void appendDispatch(ItemEntity e, boolean active, int eid) {
         int i = ibN;
         ibN = i + 1;
         IB_IDS[i] = eid;
         IB_FLAGS[i] = IF_NATIVE | (active ? 0 : IF_INACTIVE); // cd slot 0
         IB_ITEM[i] = e;
         IB_I[i * 4 + 2] = e.pickupDelay;
-        IB_SLOT[i] = slot;
         // L150b: the activation truth stamped AT APPEND. No vanilla body
         // runs between the append and the flush for a native-routed entry
         // (the walk route skips it, the tick guard suppresses the body),
@@ -5597,7 +5331,6 @@ public final class CeHooks {
         IB_ATI[i * 3 + 1] = (int) (at >> 32);
         IB_ATI[i * 3 + 2] = (e.isTemporarilyActive ? 1 : 0)
                 | (e.defaultActivationState ? 2 : 0);
-        return true;
     }
 
     /** L7: an external mutation of this item (box or velocity change
@@ -5607,9 +5340,9 @@ public final class CeHooks {
      *  gates (it must fire even when the query index is suspended). */
     private static void l7ExternalMutation(Entity e) {
         if (ITEM_TICK_ON && !IN_ITEM_APPLY && e instanceof ItemEntity) {
-            int slot = slotOf(entId(e));
-            if (slot >= 0 && MODE_GEN_S[slot] == MODE_EPOCH) {
-                MODE_VAL_S[slot] = 0;
+            int slot = entId(e) & MAMASK;
+            if (MODE_GEN[slot] == MODE_EPOCH) {
+                MODE_VAL[slot] = 0;
             }
         }
     }
@@ -6743,9 +6476,8 @@ public final class CeHooks {
             // L150b: one entId read for the whole guard chain (was: three —
             // the nativeMode pair plus the RM_BIT gate each re-read it)
             int eid = entId(e);
-            int sks = slotOf(eid);
-            boolean nativeMode = sks >= 0
-                    && MODE_GEN_S[sks] == MODE_EPOCH && MODE_VAL_S[sks] != 0;
+            boolean nativeMode = MODE_GEN[eid & MAMASK] == MODE_EPOCH
+                    && MODE_VAL[eid & MAMASK] != 0;
             // fresh-flag gates: anything the core cannot compute exactly runs
             // vanilla THIS tick (the flush re-evaluates the mode afterwards).
             // L55: the onGround flag MUST ride every RESYNC-flavored batch
@@ -6756,9 +6488,7 @@ public final class CeHooks {
             // wakeup's active body read !st.on_ground and ran a SPURIOUS
             // move+friction vanilla's gate skipped — 53 items at t=413, one
             // 0.588 vx/vz step each, 1214 by T639).
-            if ((sks >= 0 && RM_BIT_S[sks] == 1)
-                    || RM_BIT[eid & AMASK] == 1
-                    || e.noPhysics || e.isInWater() || e.isInLava()
+            if (RM_BIT[eid & AMASK] == 1 || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
                     || e.getItem().isEmpty()) {
                 appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
@@ -6802,8 +6532,8 @@ public final class CeHooks {
         if (ACTIVE && ITEM_TICK_ON && cplugReady && ibN < IB_CAP
                 && !e.level().isClientSide()) {
             try {
-                int slot = slotOf(entId(e));
-                if (slot >= 0 && MODE_GEN_S[slot] == MODE_EPOCH && MODE_VAL_S[slot] == 0) {
+                int slot = entId(e) & MAMASK;
+                if (MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 0) {
                     // L55: the onGround flag rides the RESYNC ingest too (the
                     // vanilla body ran; its PRE-tick onGround is the freshest
                     // store-side truth — an inactive body never moves).
@@ -6824,19 +6554,6 @@ public final class CeHooks {
         int id = entId(e);
         IB_IDS[i] = id;
         IB_FLAGS[i] = flags;
-        // L150c: register-on-append (the safety net for probeAdd misses);
-        // a refused registration means the caller routed vanilla — appendItem
-        // only runs after itemSkip's gates, and a missing slot here degrades
-        // to the id-masked fallback in the flush's IB_SLOT<0 guards.
-        int as = slotOf(id);
-        if (as < 0) as = slotRegister(id);
-        if (as < 0) {
-            // registry exhausted (grow OOM): a -1 slot would corrupt the
-            // flush's table indexing — disarm instead (the caller's catch
-            // routes every item vanilla from the next tick)
-            throw new IllegalStateException("item registry exhausted");
-        }
-        IB_SLOT[i] = as;
         // L64c: the flush's two full-batch scans (pass-1 re-read + the L44
         // view build) skip entirely when this count is zero.
         if ((flags & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
@@ -6979,7 +6696,7 @@ public final class CeHooks {
                     // path — the cold e.isRemoved() field load at this
                     // volume was 16.6% of the items-100k-mod leg; the RM_BIT
                     // slot is L1-resident next to IB_IDS/IB_ITEM).
-                    if (e == null || rmDead(IB_SLOT[i], IB_IDS[i])) continue;
+                    if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue;
                     int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
                     IB_CD[o] = e.getX();
                     IB_CD[o + 1] = e.getY();
@@ -7117,7 +6834,7 @@ public final class CeHooks {
                         || (f & IF_INACTIVE) != 0) continue;
                 if (viewN >= VIEW_IDS.length) break;
                 ItemEntity ei = IB_ITEM[i];
-                if (ei == null || rmDead(IB_SLOT[i], IB_IDS[i])) continue; // L115b
+                if (ei == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                 int cdSlot = (IB_FLAGS[i] >>> IF_CDSHIFT) - 1;
                 if (cdSlot < 0) continue;
                 VIEW_IDS[viewN] = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
@@ -7180,12 +6897,12 @@ public final class CeHooks {
                 drainCursor = i;
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
-                int mSlot = IB_SLOT[i]; // L150c: the registry slot (sequential read)
-                MODE_GEN_S[mSlot] = epoch;
+                int mSlot = (int) (IB_IDS[i] & MAMASK);
+                MODE_GEN[mSlot] = epoch;
                 if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
-                    MODE_REV_S[mSlot] = revBefore;
-                    MODE_VAL_S[mSlot] = 0;
-                    DISP_ID_S[mSlot] = 0L; // i0-a: no verdict for a vanilla-routed plan
+                    MODE_REV[mSlot] = revBefore;
+                    MODE_VAL[mSlot] = 0;
+                    DISP_ID[mSlot] = 0L; // i0-a: no verdict for a vanilla-routed plan
                     itemVanillaNext++;
                 } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
                     // L21 REST: a value-fixed-point tick — the dispatch guard
@@ -7212,20 +6929,20 @@ public final class CeHooks {
                             && (bits & (1 << 15)) != 0
                             && r0 != null
                             && !restSectionTouched(r0)) {
-                        MODE_VAL_S[mSlot] = 2;
-                        REST_ID[mSlot] = IB_IDS[i]; // L150c: dead code (rest disabled), id-masked is fine
-                        MODE_REV_S[mSlot] = WORLD_REV;
+                        MODE_VAL[mSlot] = 2;
+                        REST_ID[mSlot] = IB_IDS[i];
+                        MODE_REV[mSlot] = WORLD_REV;
                     } else {
-                        MODE_REV_S[mSlot] = revBefore;
-                        MODE_VAL_S[mSlot] = 1;
+                        MODE_REV[mSlot] = revBefore;
+                        MODE_VAL[mSlot] = 1;
                     }
                     // i0-a2: the verdict rides the core's bit 18 — the fast
                     // path fires for every native entry whose decision the
                     // core computed; DISP_VAL carries active(1)/inactive(2).
                     // The verdict dies with the item's plan (cleared on any
                     // non-native next tick).
-                    DISP_ID_S[mSlot] = (bits & ((1 << 18) | (1 << 20))) != 0 ? IB_IDS[i] : 0L;
-                    DISP_VAL_S[mSlot] = (bits & (1 << 18)) != 0 ? 1
+                    DISP_ID[mSlot] = (bits & ((1 << 18) | (1 << 20))) != 0 ? IB_IDS[i] : 0L;
+                    DISP_VAL[mSlot] = (bits & (1 << 18)) != 0 ? 1
                             : ((bits & (1 << 20)) != 0 ? 2 : 0);
                     // i0-a2: the verdict's side effects — the writeback keeps
                     // the Java fields value-exact without running the port
@@ -7246,10 +6963,10 @@ public final class CeHooks {
                         }
                     }
                 } else {
-                    MODE_REV_S[mSlot] = revBefore;
-                    MODE_VAL_S[mSlot] = 0; // resync/vanilla-ran re-enters via
-                                           // want_native next flush
-                    DISP_ID_S[mSlot] = 0L;
+                    MODE_REV[mSlot] = revBefore;
+                    MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
+                                         // want_native next flush
+                    DISP_ID[mSlot] = 0L;
                 }
                 if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
                     // aborted (bit 13): the core did not compute — nothing to
@@ -7261,7 +6978,7 @@ public final class CeHooks {
                 // L115b (the loop-A head): the mirror read replaces the cold
                 // removal-reason load — the entity object is only touched
                 // for the counter writes now (one cache line, not two).
-                if (e == null || rmDead(IB_SLOT[i], IB_IDS[i])) continue;
+                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
                 // skipped for dispatch-owned entries). L78: the age write
@@ -7297,7 +7014,7 @@ public final class CeHooks {
                         Object[] rq = TT_REF;
                         long[] fq = TT_FLAT;
                         if (rq != null && fq != null) {
-                            int mq = IB_SLOT[i]; // L150d: the registry slot
+                            int mq = (int) (IB_IDS[i] & AMASK);
                             int obq = mq * 5;
                             if (rq[obq + 2] == e) {
                                 long shq = fq[mq * 2];
@@ -7319,7 +7036,7 @@ public final class CeHooks {
                         Object[] rq2 = TT_REF;
                         long[] fq2 = TT_FLAT;
                         if (rq2 != null && fq2 != null) {
-                            int mq2 = IB_SLOT[i]; // L150d: the registry slot
+                            int mq2 = (int) (IB_IDS[i] & AMASK);
                             int obq2 = mq2 * 5;
                             if (rq2[obq2 + 2] == e) {
                                 TT_QUIET[mq2 >> 6] &= ~(1L << (mq2 & 63));
@@ -7343,7 +7060,7 @@ public final class CeHooks {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 ItemEntity e = IB_ITEM[i];
-                if (e == null || rmDead(IB_SLOT[i], IB_IDS[i])) continue; // L115b
+                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                 if ((bits & (1 << 16)) != 0) continue; // belt: the core excludes these
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
@@ -7413,7 +7130,7 @@ public final class CeHooks {
                             // fresh-allocation identity term is served by
                             // the cache only when x/y/z compare equal, so
                             // the field's observable value is exact.
-                            Object dv = vec3Cached(IB_SLOT[i], outD[o], outD[o + 1], outD[o + 2]);
+                            Object dv = vec3Cached(idSlot, outD[o], outD[o + 1], outD[o + 2]);
                             if (DELTA_VOL) {
                                 U.putObjectVolatile(e, O_ENT_DELTA, dv);
                             } else {
@@ -7536,9 +7253,9 @@ public final class CeHooks {
                                 continue;
                             }
                             MH_TRY_MERGE.invokeExact(e, other);
-                            if (rmDead(IB_SLOT[i], IB_IDS[i])
+                            if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1
                                     | RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) mergeOps++; // L115b
-                            if (rmDead(IB_SLOT[i], IB_IDS[i])) break;
+                            if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) break;
                         }
                     }
                     if (!fast) {
@@ -7571,13 +7288,13 @@ public final class CeHooks {
                     // lives entirely in the (!fast) branch above: a v3 refusal
                     // crosses the legacy scanner once, and ITS refusal routes
                     // runVanillaMerge. Nothing else runs after the scan.
-                    if (rmDead(IB_SLOT[i], IB_IDS[i])) continue; // L115b
+                    if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                     } else if (!initMergeMhs(e)) {
                         // the reflective init failed: the exact vanilla body
                         // (a dropped merge is the one red line)
                         runVanillaMerge(e);
                         itemMerge++;
-                        if (rmDead(IB_SLOT[i], IB_IDS[i])) continue; // L115b
+                        if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                     }
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
@@ -7623,7 +7340,7 @@ public final class CeHooks {
                     Object[] rq3 = TT_REF;
                     long[] fq3 = TT_FLAT;
                     if (rq3 != null && fq3 != null) {
-                        int mq3 = IB_SLOT[i]; // L150d: the registry slot
+                        int mq3 = (int) (IB_IDS[i] & AMASK);
                         int obq3 = mq3 * 5;
                         if (rq3[obq3 + 2] == e) {
                             if ((bits & ((1) | (1 << 2) | (1 << 5) | (1 << 7)
@@ -7649,7 +7366,6 @@ public final class CeHooks {
             flush();
             batchGenCur++; // the next tick's dispatch stamps are fresh
             drainCursor = -1; // the next flush's arena starts behind every entry
-            slotReclaimDead(); // L150c: dead registry slots reusable again
             } finally {
                 IN_ITEM_APPLY = false;
             }
@@ -12494,13 +12210,6 @@ public final class CeHooks {
     // shared by 4 slots) — 2 misses per entity instead of 5-6 (the
     // items-100k-mod JFR pinned 9.9% across the array-ref loads — pure
     // cache-miss traffic). Slot base ob = slot*5, long base lb = slot*2.
-    // L150d: the TT layer moved to the registry slot space — the old
-    // id-masked tables were ARENA-sized (20M Object refs = 160 MB heap, and
-    // every per-entity tracker read was a random access across it). The _S
-    // twins are population-sized (SLOT_CAP*5 refs = ~10 MB at 262k slots,
-    // ~6 MB of live working set at 150k entities) and grow with the
-    // registry. Slot < 0 (added while the module was disarmed) = the
-    // conservative full vanilla tracker path.
     private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
     private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
     private static final long TT_OK = 1L, TT_SIT = 2L;
@@ -12579,9 +12288,9 @@ public final class CeHooks {
             // allocated once — the identity check tolerates stale entries,
             // probeRemove clears the slot to release the te ref).
             if (TT_REF == null) {
-                TT_REF = new Object[SLOT_CAP * 5];
-                TT_FLAT = new long[SLOT_CAP * 2];
-                TT_QUIET = new long[(SLOT_CAP + 63) >> 6];
+                TT_REF = new Object[ARENA.length * 5];
+                TT_FLAT = new long[ARENA.length * 2];
+                TT_QUIET = new long[(ARENA.length + 63) >> 6];
                 TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
@@ -12772,9 +12481,8 @@ public final class CeHooks {
      *  per-tick work for such an entity (the ServerEntity.tickCount mirror
      *  bump) already ran inline in the flush. */
     private static boolean ttlQuietSkip(Entity ent, int m) {
-        if (m < 0) return false; // L150d: unregistered = conservative
         long[] tq = TT_QUIET;
-        if (tq == null || (m >> 6) >= tq.length) return false;
+        if (tq == null) return false;
         int q = m & 63;
         int w = m >> 6;
         if ((tq[w] & (1L << q)) == 0) return false;
@@ -12788,13 +12496,12 @@ public final class CeHooks {
         // probeRemove clears the slot unconditionally, so a removed
         // entity can never pass; a re-tracked entity (fresh te for a
         // fresh add) re-fills.
-        if (m < 0) return false; // L150d: unregistered = conservative
         Object[] rf = TT_REF;
-        if (rf == null || m * 5 + 4 >= rf.length) return false;
+        if (rf == null) return false;
         int ob = m * 5;
         if (rf[ob + 2] != ent) return false;
         long[] fl = TT_FLAT;
-        if (fl == null || m * 2 + 1 >= fl.length) return false;
+        if (fl == null) return false;
         int lb = m * 2;
         long sh = fl[lb];
         if ((sh & TT_OK) == 0) return false;
@@ -12970,8 +12677,7 @@ public final class CeHooks {
                             long[] flr = TT_FLAT;
                             for (int i = 0; i < size; i++) {
                                 Entity ent = raw[i];
-                                int m = slotOf(entId(ent)); // L150d
-                                if (m < 0) continue;
+                                int m = entId(ent) & AMASK;
                                 int ob2 = m * 5;
                                 Object te2 = trackedEntityOf(ent);
                                 if (te2 == null || rfr[ob2] != te2) continue;
@@ -13008,15 +12714,12 @@ public final class CeHooks {
                 // the chunk read are both deferred behind the cache check,
                 // the fill probe on any doubt.
                 if (cacheArm) {
-                    int m0 = slotOf(entId(ent)); // L150d: the registry slot
+                    int m0 = entId(ent) & AMASK;
                     // L92: the applier-stamped quiet cohort — the mirror bump
                     // already ran inline in the item-tick flush; skip the
                     // whole probe chain (the cached path's remaining work for
-                    // such an entity was exactly that bump). A slot < 0
-                    // (added while the module was disarmed) is conservative:
-                    // the full vanilla tracker serves it, and the fill below
-                    // never stamps it — no table entry, no quiet bit.
-                if (quietArm && m0 >= 0 && ttlQuietSkip(ent, m0)) {
+                    // such an entity was exactly that bump).
+                if (quietArm && ttlQuietSkip(ent, m0)) {
                     ttlQuiet++;
                     // L99: the mirror bump lives HERE (was in the applier
                     // stamp) - a persistent-quiet slot owes exactly one
@@ -13029,7 +12732,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
-                    if (m0 >= 0 && ttlCachedPath(ent, m0)) {
+                    if (ttlCachedPath(ent, m0)) {
                         ttlFuse++;
                         continue;
                     }
@@ -13040,10 +12743,10 @@ public final class CeHooks {
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
                 if (cacheArm) {
-                    int m = slotOf(entId(ent)); // L150d: the registry slot
+                    int m = entId(ent) & AMASK;
                     Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                             .moonrise$getChunkData().nearbyPlayers;
-                    if (m >= 0 && ttlFastPath(ent, te, chunk)) {
+                    if (ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
                         try { // fill: cache the structural verdicts + refs
                             net.minecraft.server.level.ServerEntity se0 =
