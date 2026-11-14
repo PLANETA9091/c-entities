@@ -107,10 +107,19 @@ impl SectionData {
 
 /// Pack a section key: (cx:24 | cz:24 | cy:16) — cy is small (world height),
 /// cx/cz 24 bits suffice for ±8.3M sections.
+///
+/// L150f: cy is XOR-BIASED with 0x8000. The raw mask let sec_key(-1, -1, -1)
+/// produce EXACTLY u64::MAX — the SectionCache's SC_EMPTY sentinel — so a
+/// REAL section at chunk (-1, -1), section Y -1 matched the fresh-cache
+/// "empty" way on the hit path and served a None unwrap (the mixed-150k
+/// abort, sections.rs data(): the placement-dependent core dump). With the
+/// bias the low 16 bits of a real key never reach 0xFFFF, so no key can
+/// ever alias the sentinel again.
 #[inline]
 pub fn sec_key(cx: i32, cy: i32, cz: i32) -> u64 {
-    ((((cx as i64) & 0xFF_FFFF) << 40) | (((cz as i64) & 0xFF_FFFF) << 16) | ((cy as i64) & 0xFFFF))
-        as u64
+    ((((cx as i64) & 0xFF_FFFF) << 40)
+        | (((cz as i64) & 0xFF_FFFF) << 16)
+        | (((cy as i64) & 0xFFFF) ^ 0x8000)) as u64
 }
 
 /// Provider result: Ok(data) — populated; Err(()) — chunk absent.
@@ -800,5 +809,34 @@ impl<'a> SectionCache<'a> {
             }
             Err(()) => (None, true),
         }
+    }
+}
+
+#[cfg(test)]
+mod sec_key_tests {
+    use super::*;
+
+    /// L150f: sec_key(-1, -1, -1) used to fold EXACTLY onto u64::MAX — the
+    /// SectionCache's SC_EMPTY sentinel — so the REAL section at chunk
+    /// (-1, -1) / section Y -1 matched the fresh-cache empty way and the
+    /// hit path served a None unwrap (the mixed-150k abort). The cy bias
+    /// must keep every real key away from the sentinel.
+    #[test]
+    fn sec_key_never_aliases_the_cache_sentinel() {
+        assert_ne!(sec_key(-1, -1, -1), u64::MAX);
+        assert_ne!(sec_key(0, 0, 0), u64::MAX);
+        // the whole practical world range
+        for cx in -4096..=4096 {
+            for cz in -4096..=4096 {
+                for cy in -24..=32 {
+                    assert_ne!(sec_key(cx, cy, cz), u64::MAX, "cx={cx} cy={cy} cz={cz}");
+                }
+            }
+        }
+        // sec_key stays injective over a sanity window (the bias must not
+        // fold distinct sections together)
+        assert_ne!(sec_key(-1, -1, -1), sec_key(-1, 0, -1));
+        assert_ne!(sec_key(-1, -1, -1), sec_key(0, -1, -1));
+        assert_eq!(sec_key(-1, -1, -1), sec_key(-1, -1, -1));
     }
 }
