@@ -2406,6 +2406,50 @@ public final class CeHooks {
     private static final Entity[] ARENA = new Entity[1 << 22];
     private static final int AMASK = ARENA.length - 1;
 
+    // L122 WRITEBACK VEC3 CACHE: the flush apply writes the item's delta
+    // EVERY tick (the %4 cycle: gravity on closed ticks, friction+landing
+    // on open ticks — the ds=0/38M verdict says the value never repeats
+    // the PRE-tick input), and the write allocates a fresh Vec3 per item
+    // per tick: ~63k allocations/tick on items-100k, ~6 MB/tick of young-
+    // gen garbage — the GC sawtooth behind the periodic 90 ms tick bursts
+    // (12-14 slow ticks every ~65 ticks, JFR GC pauses... in the young
+    // cycles). A settled item's delta CONVERGES to an exact f64 2-cycle:
+    // a_closed = -0.49*(a_closed - 0.04) with dx/dz contracted to 0.0 by
+    // the ground friction — so a 2-way per-slot cache turns every steady
+    // write into a value-equality hit and the allocation disappears.
+    // EXACTNESS: the reuse is value-identical (the cached instance is
+    // served only when x/y/z compare equal); Vec3 is an immutable value
+    // type, the field's observable value is unchanged, and a stale slot
+    // (entity turnover) can only be served for an equal VALUE — which is
+    // exactly what vanilla's fresh instance would carry. CE_VEC_CACHE=0
+    // restores the fresh-allocation shape for A/B bisects.
+    private static final Object[] VEC_CACHE = new Object[2 * (AMASK + 1)];
+    private static final boolean VEC_CACHE_ON =
+            !"0".equals(System.getenv("CE_VEC_CACHE"));
+
+    /** The delta Vec3 for a writeback — reused from the 2-way per-slot
+     *  cache when a cached instance carries the exact value. */
+    private static Vec3 vec3Cached(int idSlot, double x, double y, double z) {
+        if (!VEC_CACHE_ON) {
+            return new Vec3(x, y, z);
+        }
+        int base = (idSlot & AMASK) * 2;
+        Object a = VEC_CACHE[base];
+        if (a instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
+            return v;
+        }
+        Object b = VEC_CACHE[base + 1];
+        if (b instanceof Vec3 v && v.x == x && v.y == y && v.z == z) {
+            VEC_CACHE[base] = b;
+            VEC_CACHE[base + 1] = a;
+            return v;
+        }
+        Vec3 fresh = new Vec3(x, y, z);
+        VEC_CACHE[base + 1] = a;
+        VEC_CACHE[base] = fresh;
+        return fresh;
+    }
+
     // L115 REMOVED-BIT MIRROR: the hot guards (itemSkip / itemInactiveCollect /
     // the dispatch rest gates) read e.isRemoved() on every entity every tick
     // (13.76% of the items-100k-mod profile — the removal-reason field load
@@ -6485,7 +6529,12 @@ public final class CeHooks {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
                     ItemEntity e = IB_ITEM[i];
-                    if (e == null || e.isRemoved()) continue;
+                    // L115b: the removed-bit mirror (the remove probe at
+                    // EntityLookup's choke point fires for EVERY removal
+                    // path — the cold e.isRemoved() field load at this
+                    // volume was 16.6% of the items-100k-mod leg; the RM_BIT
+                    // slot is L1-resident next to IB_IDS/IB_ITEM).
+                    if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue;
                     int o = ((IB_FLAGS[i] >>> IF_CDSHIFT) - 1) * 14; // cd slot
                     IB_CD[o] = e.getX();
                     IB_CD[o + 1] = e.getY();
@@ -6614,7 +6663,7 @@ public final class CeHooks {
                         || (f & IF_INACTIVE) != 0) continue;
                 if (viewN >= VIEW_IDS.length) break;
                 ItemEntity ei = IB_ITEM[i];
-                if (ei == null || ei.isRemoved()) continue;
+                if (ei == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                 int cdSlot = (IB_FLAGS[i] >>> IF_CDSHIFT) - 1;
                 if (cdSlot < 0) continue;
                 VIEW_IDS[viewN] = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
@@ -6755,7 +6804,10 @@ public final class CeHooks {
                     continue;
                 }
                 ItemEntity e = IB_ITEM[i];
-                if (e == null || e.isRemoved()) continue;
+                // L115b (the loop-A head): the mirror read replaces the cold
+                // removal-reason load — the entity object is only touched
+                // for the counter writes now (one cache line, not two).
+                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
                 // skipped for dispatch-owned entries). L78: the age write
@@ -6837,7 +6889,7 @@ public final class CeHooks {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 ItemEntity e = IB_ITEM[i];
-                if (e == null || e.isRemoved()) continue;
+                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                 if ((bits & (1 << 16)) != 0) continue; // belt: the core excludes these
                 if ((f & IF_INACTIVE) != 0) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
@@ -6894,8 +6946,12 @@ public final class CeHooks {
                             && REST_GEN[idSlot & AMASK] == 0) {
                         if (Double.isFinite(outD[o]) && Double.isFinite(outD[o + 1])
                                 && Double.isFinite(outD[o + 2])) {
+                            // L122: the value-identical Vec3 cache — the
+                            // fresh-allocation identity term is served by
+                            // the cache only when x/y/z compare equal, so
+                            // the field's observable value is exact.
                             U.putObjectVolatile(e, O_ENT_DELTA,
-                                    new Vec3(outD[o], outD[o + 1], outD[o + 2]));
+                                    vec3Cached(idSlot, outD[o], outD[o + 1], outD[o + 2]));
                         }
                     } else {
                         e.setDeltaMovement(new Vec3(outD[o], outD[o + 1], outD[o + 2]));
@@ -6997,7 +7053,7 @@ public final class CeHooks {
                         // stored boxes = the scan-time view — see n_merge_scan).
                         for (int k2 = 0; k2 < cands; k2++) {
                             ItemEntity other = (ItemEntity) arenaRef(MS_CAND_IDS[k2]);
-                            if (other == null || other.isRemoved()) continue;
+                            if (other == null || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                             if (!isMergableFast(other)) continue;
                             if (walls
                                     && level.clipDirect(e.position(), other.position(),
@@ -7006,8 +7062,9 @@ public final class CeHooks {
                                 continue;
                             }
                             MH_TRY_MERGE.invokeExact(e, other);
-                            if (e.isRemoved() | other.isRemoved()) mergeOps++;
-                            if (e.isRemoved()) break;
+                            if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1
+                                    | RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) mergeOps++; // L115b
+                            if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) break;
                         }
                     }
                     if (!fast) {
@@ -7040,13 +7097,13 @@ public final class CeHooks {
                     // lives entirely in the (!fast) branch above: a v3 refusal
                     // crosses the legacy scanner once, and ITS refusal routes
                     // runVanillaMerge. Nothing else runs after the scan.
-                    if (e.isRemoved()) continue;
+                    if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                     } else if (!initMergeMhs(e)) {
                         // the reflective init failed: the exact vanilla body
                         // (a dropped merge is the one red line)
                         runVanillaMerge(e);
                         itemMerge++;
-                        if (e.isRemoved()) continue;
+                        if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
                     }
                 }
                 if ((bits & (1 << 7)) != 0) { // DESPAWN: exact vanilla snippet
