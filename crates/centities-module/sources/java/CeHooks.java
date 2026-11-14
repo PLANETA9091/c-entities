@@ -7089,7 +7089,6 @@ public final class CeHooks {
                     if (MODE_VAL[mSlot] != 0) {
                         MODE_VAL[mSlot] = 0;
                     }
-                    DISP_ID[mSlot] = 0L; // i0-a: no verdict for a vanilla-routed plan
                     FAST_STAMP[mSlot] = 0L;
                     itemVanillaNext++;
                 } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
@@ -7148,12 +7147,8 @@ public final class CeHooks {
                                 << 32 | (IB_IDS[i] & 0xFFFF_FFFFL))
                                 | ((bits & (1 << 18)) != 0
                                         ? 0L : Long.MIN_VALUE);
-                        DISP_ID[mSlot] = IB_IDS[i];
-                        DISP_VAL[mSlot] = (bits & (1 << 18)) != 0 ? 1 : 2;
                     } else {
                         FAST_STAMP[mSlot] = 0L;
-                        DISP_ID[mSlot] = 0L;
-                        DISP_VAL[mSlot] = 0;
                     }
                     // i0-a2: the verdict's side effects — the writeback keeps
                     // the Java fields value-exact without running the port
@@ -7181,7 +7176,6 @@ public final class CeHooks {
                         MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
                                              // want_native next flush
                     }
-                    DISP_ID[mSlot] = 0L;
                     FAST_STAMP[mSlot] = 0L;
                 }
                 if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
