@@ -5174,14 +5174,22 @@ public final class CeHooks {
                 // by the last flush's writeback. L151: the inactive verdict
                 // rides the stamp's top bit.
                 boolean act = st >= 0L;
-                // L152: the row-cohort hit — the row at ibN is this item's
-                // own row from last tick, byte-exact except for the three
-                // per-tick variables, which are refreshed conditionally.
-                // Anything else (a fresh row, an order shift, a slot
-                // successor) falls to the full append (appendDispatch bumps
-                // ibN itself) and re-stamps.
-                int aslot = eid & AMASK;
-                if (COHORT_ID[aslot] == eid && BATCH_POS[aslot] == ibN) {
+                // L152: the row-cohort hit. The hit validates THE ROW ITSELF
+                // (IB_IDS[ibN] carries this entity's full id) — NOT the
+                // remembered position: entity ids are unique per run, so a
+                // row that passes the id check IS this item's row, whatever
+                // wrote it last. The naive "BATCH_POS[slot] == ibN" memory
+                // was WRONG — vanilla's mid-walk removal compaction skips/
+                // shifts entities inside the raw iterator, so a stale
+                // BATCH_POS can name a row another entity rewrote since
+                // (the parity items leg: a global one-tick tc lag + ~900
+                // merge-survivor differences). The per-tick variables (the
+                // inactive verdict in the flags, the fresh pickupDelay, the
+                // activation-truth stamp) are refreshed conditionally; the
+                // tick/age/rate quad slots stay stale exactly as before
+                // (the kernel's native path reads only iv[k*4+2] and the
+                // store owns the counters).
+                if (IB_IDS[ibN] == (long) eid) {
                     int k = ibN;
                     ibN = k + 1;
                     int wantF = IF_NATIVE | (act ? 0 : IF_INACTIVE);
@@ -5204,7 +5212,6 @@ public final class CeHooks {
                     }
                 } else {
                     appendDispatch(e, act, eid);
-                    COHORT_ID[aslot] = eid;
                 }
                 dispFast++;
                 dispDiag(e, act ? "fast-native" : "fast-inactive");
@@ -5451,17 +5458,15 @@ public final class CeHooks {
     // verdict state persist), so a dispatch hit may skip the ten append
     // stores entirely and refresh ONLY the per-tick variables
     // (IB_FLAGS' inactive verdict, the fresh pickupDelay read, the
-    // activation-truth stamp — each conditionally). BATCH_POS already
-    // carries the row memory (the hit position equals the stored one —
-    // no separate table); COHORT_ID is ARENA-sized and id-stamped: a
-    // fresh spawn's COHORT_ID is 0 and entity ids are ≥1, a slot-
-    // colliding successor can never inherit a row, and any walk-order
-    // shift makes BATCH_POS[slot] != ibN for the whole shifted tail —
-    // one full re-append tick, self-healing. Positions are a per-tick
-    // bijection over the walked entities, so a hit row can never belong
-    // to a different entity (the interleaved mob rows are re-appended
-    // by their own path every tick and never take a cohort hit).
-    private static final int[] COHORT_ID = new int[ARENA.length];
+    // activation-truth stamp — each conditionally). THE HIT VALIDATES THE
+    // ROW ITSELF (IB_IDS[ibN] == the full entity id) — never a remembered
+    // position: vanilla's mid-walk removal compaction shifts the raw
+    // iterator's tail, so a remembered BATCH_POS can name a row another
+    // entity has rewritten since (the first cohort draft hit exactly that —
+    // the parity items leg read a global one-tick tc lag + ~900 divergent
+    // merge survivors). Positions stay a per-tick bijection for the BATCH_POS
+    // probe bookkeeping, which is written unconditionally by the dispatch
+    // prologue and validated by BATCH_GEN like before.
 
     private static void appendDispatch(ItemEntity e, boolean active, int eid) {
         int i = ibN;
