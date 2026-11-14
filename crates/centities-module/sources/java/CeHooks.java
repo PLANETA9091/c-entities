@@ -1766,8 +1766,8 @@ public final class CeHooks {
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
                 RM_BIT[paSlot] = 0; // L115: fresh slot — alive
-                if (e instanceof ItemEntity && slotOf(paId) < 0) {
-                    slotRegister(paId); // L150c: the dispatch registry
+                if (slotOf(paId) < 0) {
+                    slotRegister(paId); // L150c: the registry hosts EVERY entity now (the tracker's TT twins share the slot space)
                 }
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
                 batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
@@ -1806,9 +1806,9 @@ public final class CeHooks {
             // removed entity's TrackedEntity must be collectable). L65: the
             // se/sit/steps refs ride the same slot lifecycle.
             if (e != null) {
-                int sm = entId(e) & AMASK;
+                int sm = slotOf(entId(e)); // L150d: the registry slot
                 Object[] rf0 = TT_REF;
-                if (rf0 != null) {
+                if (rf0 != null && sm >= 0) {
                     int ob = sm * 5;
                     rf0[ob] = null;
                     rf0[ob + 1] = null;
@@ -1817,10 +1817,11 @@ public final class CeHooks {
                     rf0[ob + 4] = null;
                 }
                 long[] fl0 = TT_FLAT;
-                if (fl0 != null) fl0[sm * 2] = 0;
+                if (fl0 != null && sm >= 0) fl0[sm * 2] = 0;
+                int smid = entId(e) & AMASK; // the id-masked AI-floor tables stay
                 Entity[] fe = FROZ_E;
-                if (fe != null) fe[sm] = null;
-                AT_E[sm & (AT_CAP - 1)] = null;
+                if (fe != null) fe[smid] = null;
+                AT_E[smid & (AT_CAP - 1)] = null;
                 // L73: the AI floor's shadow keys are STRONG — the removed
                 // mob's selector must be dropped explicitly (its goalSelector
                 // rides O_MOB_GOALSEL). A missed drop leaks one bounded
@@ -2688,6 +2689,16 @@ public final class CeHooks {
             return false;
         }
         SLOT_CAP = nc;
+        // L150d: the tracker twins ride the same slot space
+        Object[] ntr = new Object[nc * 5];
+        if (TT_REF != null) System.arraycopy(TT_REF, 0, ntr, 0, Math.min(TT_REF.length, ntr.length));
+        long[] ntf = new long[nc * 2];
+        if (TT_FLAT != null) System.arraycopy(TT_FLAT, 0, ntf, 0, Math.min(TT_FLAT.length, ntf.length));
+        long[] ntq = new long[(nc + 63) >> 6];
+        if (TT_QUIET != null) System.arraycopy(TT_QUIET, 0, ntq, 0, Math.min(TT_QUIET.length, ntq.length));
+        TT_REF = ntr;
+        TT_FLAT = ntf;
+        TT_QUIET = ntq;
         return true;
     }
 
@@ -5094,7 +5105,7 @@ public final class CeHooks {
      *  sync), so the tracker pass for the slot reduces to the mirror bump. */
     private static void standQuietStamp(
             net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
-        if (!TTL_QUIET_ON || !TT_MIRROR) return;
+        if (!TTL_QUIET_ON || !TT_MIRROR || sid < 0) return;
         Object[] rq = TT_REF;
         long[] fq = TT_FLAT;
         if (rq == null || fq == null) return;
@@ -5110,7 +5121,7 @@ public final class CeHooks {
      *  may change tracker-visible state; the slot must go full-path again. */
     private static void standQuietClear(
             net.minecraft.world.entity.decoration.ArmorStand as, int sid) {
-        if (!TTL_QUIET_ON || !TT_MIRROR) return;
+        if (!TTL_QUIET_ON || !TT_MIRROR || sid < 0) return;
         Object[] rq = TT_REF;
         if (rq == null || rq[sid * 5 + 2] != as) return;
         TT_QUIET[sid >> 6] &= ~(1L << (sid & 63));
@@ -5124,12 +5135,12 @@ public final class CeHooks {
             net.minecraft.world.entity.decoration.ArmorStand as) {
         if (!STAND_MIRROR_ON) return false;
         try {
-            int sid = entId(as) & AMASK;
+            int sid = slotOf(entId(as)); // L150d: the registry slot
             // the stateless static classification — every read is live;
             // any miss routes the exact vanilla body for this tick.
             // (noTickEquipmentDirty is private and only ever set for
             // !canTick stands — the !as.canTick gate already routes those.)
-            if (RM_BIT[sid] == 1 || !as.canTick
+            if ((sid >= 0 && RM_BIT_S[sid] == 1) || !as.canTick
                     || !as.isMarker() || !as.isNoGravity()
                     || !as.getPassengers().isEmpty() || as.isPassenger()
                     || !as.isAlive()) {
@@ -5297,10 +5308,19 @@ public final class CeHooks {
             // %4-hit item and none of them can flip for a native item
             // without a probe wake (which clears MODE synchronously) or
             // a section change (which stales MODE_REV). isRemoved stays:
-            // the removal driver may lag one boundary. L150c: the slot
-            // ownership (slotOf's exact id verify) replaces the DISP_ID
-            // stamp compare.
-            if (MODE_GEN_S[slot] == MODE_EPOCH && MODE_VAL_S[slot] == 1
+            // the removal driver may lag one boundary. L150c: the verdict
+            // tables are slot-indexed; the DISP_ID_S stamp compare STAYS —
+            // the first parity run (3aac126) dropped it and the fast path
+            // then fired for NATIVE_OK entries WITHOUT the bit-18/20
+            // verdict (DISP_ID_S==0 — the slow path's itemCheckActive owns
+            // those): items dispatched INACTIVE that vanilla keeps active —
+            // the vx/vz 1/0.588-per-step drift and the merge-survivor
+            // shifts across every items leg. The slot ownership verify
+            // (slotOf's exact id compare) still replaces the ALIASING role
+            // of the old id-masked stamp; the stamp's verdict-presence
+            // role is value semantics and must not be dropped.
+            if (DISP_ID_S[slot] == eid
+                    && MODE_GEN_S[slot] == MODE_EPOCH && MODE_VAL_S[slot] == 1
                     && MODE_REV_S[slot] == WORLD_REV
                     && !e.isRemoved()) {
                 // i0-a2: the core's verdict IS the port's decision (the same
@@ -7273,7 +7293,7 @@ public final class CeHooks {
                         Object[] rq = TT_REF;
                         long[] fq = TT_FLAT;
                         if (rq != null && fq != null) {
-                            int mq = (int) (IB_IDS[i] & AMASK);
+                            int mq = IB_SLOT[i]; // L150d: the registry slot
                             int obq = mq * 5;
                             if (rq[obq + 2] == e) {
                                 long shq = fq[mq * 2];
@@ -7295,7 +7315,7 @@ public final class CeHooks {
                         Object[] rq2 = TT_REF;
                         long[] fq2 = TT_FLAT;
                         if (rq2 != null && fq2 != null) {
-                            int mq2 = (int) (IB_IDS[i] & AMASK);
+                            int mq2 = IB_SLOT[i]; // L150d: the registry slot
                             int obq2 = mq2 * 5;
                             if (rq2[obq2 + 2] == e) {
                                 TT_QUIET[mq2 >> 6] &= ~(1L << (mq2 & 63));
@@ -7599,7 +7619,7 @@ public final class CeHooks {
                     Object[] rq3 = TT_REF;
                     long[] fq3 = TT_FLAT;
                     if (rq3 != null && fq3 != null) {
-                        int mq3 = (int) (IB_IDS[i] & AMASK);
+                        int mq3 = IB_SLOT[i]; // L150d: the registry slot
                         int obq3 = mq3 * 5;
                         if (rq3[obq3 + 2] == e) {
                             if ((bits & ((1) | (1 << 2) | (1 << 5) | (1 << 7)
@@ -12470,6 +12490,13 @@ public final class CeHooks {
     // shared by 4 slots) — 2 misses per entity instead of 5-6 (the
     // items-100k-mod JFR pinned 9.9% across the array-ref loads — pure
     // cache-miss traffic). Slot base ob = slot*5, long base lb = slot*2.
+    // L150d: the TT layer moved to the registry slot space — the old
+    // id-masked tables were ARENA-sized (20M Object refs = 160 MB heap, and
+    // every per-entity tracker read was a random access across it). The _S
+    // twins are population-sized (SLOT_CAP*5 refs = ~10 MB at 262k slots,
+    // ~6 MB of live working set at 150k entities) and grow with the
+    // registry. Slot < 0 (added while the module was disarmed) = the
+    // conservative full vanilla tracker path.
     private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
     private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
     private static final long TT_OK = 1L, TT_SIT = 2L;
@@ -12548,9 +12575,9 @@ public final class CeHooks {
             // allocated once — the identity check tolerates stale entries,
             // probeRemove clears the slot to release the te ref).
             if (TT_REF == null) {
-                TT_REF = new Object[ARENA.length * 5];
-                TT_FLAT = new long[ARENA.length * 2];
-                TT_QUIET = new long[(ARENA.length + 63) >> 6];
+                TT_REF = new Object[SLOT_CAP * 5];
+                TT_FLAT = new long[SLOT_CAP * 2];
+                TT_QUIET = new long[(SLOT_CAP + 63) >> 6];
                 TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0
@@ -12741,8 +12768,9 @@ public final class CeHooks {
      *  per-tick work for such an entity (the ServerEntity.tickCount mirror
      *  bump) already ran inline in the flush. */
     private static boolean ttlQuietSkip(Entity ent, int m) {
+        if (m < 0) return false; // L150d: unregistered = conservative
         long[] tq = TT_QUIET;
-        if (tq == null) return false;
+        if (tq == null || (m >> 6) >= tq.length) return false;
         int q = m & 63;
         int w = m >> 6;
         if ((tq[w] & (1L << q)) == 0) return false;
@@ -12756,12 +12784,13 @@ public final class CeHooks {
         // probeRemove clears the slot unconditionally, so a removed
         // entity can never pass; a re-tracked entity (fresh te for a
         // fresh add) re-fills.
+        if (m < 0) return false; // L150d: unregistered = conservative
         Object[] rf = TT_REF;
-        if (rf == null) return false;
+        if (rf == null || m * 5 + 4 >= rf.length) return false;
         int ob = m * 5;
         if (rf[ob + 2] != ent) return false;
         long[] fl = TT_FLAT;
-        if (fl == null) return false;
+        if (fl == null || m * 2 + 1 >= fl.length) return false;
         int lb = m * 2;
         long sh = fl[lb];
         if ((sh & TT_OK) == 0) return false;
@@ -12937,7 +12966,8 @@ public final class CeHooks {
                             long[] flr = TT_FLAT;
                             for (int i = 0; i < size; i++) {
                                 Entity ent = raw[i];
-                                int m = entId(ent) & AMASK;
+                                int m = slotOf(entId(ent)); // L150d
+                                if (m < 0) continue;
                                 int ob2 = m * 5;
                                 Object te2 = trackedEntityOf(ent);
                                 if (te2 == null || rfr[ob2] != te2) continue;
@@ -12974,12 +13004,15 @@ public final class CeHooks {
                 // the chunk read are both deferred behind the cache check,
                 // the fill probe on any doubt.
                 if (cacheArm) {
-                    int m0 = entId(ent) & AMASK;
+                    int m0 = slotOf(entId(ent)); // L150d: the registry slot
                     // L92: the applier-stamped quiet cohort — the mirror bump
                     // already ran inline in the item-tick flush; skip the
                     // whole probe chain (the cached path's remaining work for
-                    // such an entity was exactly that bump).
-                if (quietArm && ttlQuietSkip(ent, m0)) {
+                    // such an entity was exactly that bump). A slot < 0
+                    // (added while the module was disarmed) is conservative:
+                    // the full vanilla tracker serves it, and the fill below
+                    // never stamps it — no table entry, no quiet bit.
+                if (quietArm && m0 >= 0 && ttlQuietSkip(ent, m0)) {
                     ttlQuiet++;
                     // L99: the mirror bump lives HERE (was in the applier
                     // stamp) - a persistent-quiet slot owes exactly one
@@ -12992,7 +13025,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
-                    if (ttlCachedPath(ent, m0)) {
+                    if (m0 >= 0 && ttlCachedPath(ent, m0)) {
                         ttlFuse++;
                         continue;
                     }
@@ -13003,10 +13036,10 @@ public final class CeHooks {
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
                 if (cacheArm) {
-                    int m = entId(ent) & AMASK;
+                    int m = slotOf(entId(ent)); // L150d: the registry slot
                     Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                             .moonrise$getChunkData().nearbyPlayers;
-                    if (ttlFastPath(ent, te, chunk)) {
+                    if (m >= 0 && ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
                         try { // fill: cache the structural verdicts + refs
                             net.minecraft.server.level.ServerEntity se0 =
