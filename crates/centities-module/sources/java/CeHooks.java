@@ -4888,6 +4888,83 @@ public final class CeHooks {
         TT_QUIET[sid >> 6] &= ~(1L << (sid & 63));
     }
 
+    /** L151: the javap-anchored checkIfActive slice for an ArmorStand.
+     *  activationTypeFor(javap): stands match none of {WaterAnimal,
+     *  Villager, Ghast/Phantom, Raider, Enemy, PathfinderMob,
+     *  AmbientCreature} → MISC, exactly the ItemEntity type. The 26.3
+     *  bytecode for a stand reduces to:
+     *    - the Firework/ItemEntity %4 clause: dead (not an ItemEntity);
+     *    - defaultActivationState → true;
+     *    - tickCount < 200 → true (the POST-bump counter — the caller
+     *      owns the dispatcher and mirrors the ++ BEFORE this port);
+     *    - the isAlive gate: the classification proved alive THIS dispatch
+     *      and nothing ran between (the mirror owns the whole body);
+     *    - the portal clause: LIVE (nothing in the classification gates a
+     *      stand's portal state — a command/plugin could move one);
+     *    - the Mob-leash clause: dead (stands are not Mob);
+     *    - the wake window with the stand's checkEntityImmunities slice
+     *      (standImmunities below) — the isTemporarilyActive=false write
+     *      and the activatedTick stamps are byte-exact. */
+    private static boolean standCheckActive(
+            net.minecraft.world.entity.decoration.ArmorStand as) {
+        if (as.defaultActivationState) return true;
+        if (as.tickCount < 200) return true;
+        if (as.portalProcess != null) {
+            if (!as.portalProcess.hasExpired()) return true;
+            if (as.getPortalCooldown() > 0) return true;
+        }
+        long cur = net.minecraft.server.MinecraftServer.currentTick;
+        boolean isActive = as.activatedTick >= cur;
+        as.isTemporarilyActive = false;
+        if (!isActive && (cur - as.activatedTick - 1L) % 20L == 0L) {
+            int i = standImmunities(as);
+            if (i >= 0) {
+                as.activatedTick = cur + i;
+            } else {
+                as.isTemporarilyActive = true;
+            }
+            isActive = true;
+        }
+        return isActive;
+    }
+
+    /** L151: the checkEntityImmunities slice for an ArmorStand (javap
+     *  26.3): checkInactiveWakeup returns -1 for MISC; the water branch is
+     *  NOT type-gated; the arrow branch is dead; !onGround && !flies → 10
+     *  (stands are absent from ENTITIES_THAT_FLY — a ctor-fixed set); the
+     *  LivingEntity slice is LIVE (a stand can hold effects/climb state);
+     *  the tail's {Mob(→0), Bee, Villager, Llama, Animal, Sheep, Creeper,
+     *  Pillager, ExperienceOrb} branches are all instanceof-gated and
+     *  stands match none → -1. */
+    private static int standImmunities(
+            net.minecraft.world.entity.decoration.ArmorStand as) {
+        if (as.getRemainingFireTicks() > 0) return 2;
+        long cur = net.minecraft.server.MinecraftServer.currentTick;
+        if (as.activatedImmunityTick >= cur) return 1;
+        if (as.isInWater() && as.isPushedByFluid()) return 100;
+        if (as.onGround()) {
+            if (as.getDeltaMovement().horizontalDistanceSqr()
+                    > 9.999999747378752E-6) {
+                return 100;
+            }
+        } else {
+            // javap bc 120-136: !onGround and not an ENTITIES_THAT_FLY
+            // member → 10 (a floating stand is immune-stamped for 10 ticks)
+            return 10;
+        }
+        // the LivingEntity slice (javap bc 147-218)
+        java.util.Optional<net.minecraft.core.BlockPos> cl =
+                as.getLastClimbablePos();
+        if (cl.isPresent() && cl.get().equals(as.blockPosition())) {
+            return 1;
+        }
+        if (as.isJumping() || as.hurtTime > 0
+                || !as.getActiveEffectsMap().isEmpty() || as.isFreezing()) {
+            return 1;
+        }
+        return -1;
+    }
+
     /** L123 STAND MIRROR — the static marker ArmorStand dispatch (see the
      *  L123 design comment at the weave point). true = the vanilla body is
      *  suppressed; the mirror ran the dispatcher prologue + the exact
@@ -4916,10 +4993,12 @@ public final class CeHooks {
             // transition tick active and lost exactly one noActionTime++),
             as.tickCount = as.tickCount + 1;
             as.totalEntityAge = as.totalEntityAge + 1;
-            // the dispatcher branch — the REAL checkIfActive (the byte-exact
-            // isTemporarilyActive=false side effect + the wake/portal clauses)
-            boolean active = io.papermc.paper.entity.activation.ActivationRange
-                    .checkIfActive(as);
+            // the dispatcher branch — L151: the javap-anchored MISC port
+            // (the REAL checkIfActive call cost the instanceof chain, the
+            // portal reads and the Mob-leash probe per stand per tick; the
+            // port encodes the exact ArmorStand slice — the side effects
+            // isTemporarilyActive=false / the wake stamps are byte-exact)
+            boolean active = standCheckActive(as);
             if (!active) {
                 // the exact inactiveTick body — javap: Entity.inactiveTick is
                 // EMPTY and LivingEntity adds only `noActionTime++` (the
@@ -5067,17 +5146,27 @@ public final class CeHooks {
             // without a probe wake (which clears MODE synchronously) or
             // a section change (which stales MODE_REV). isRemoved stays:
             // the removal driver may lag one boundary.
-            if (DISP_ID[slot] == (long) eid
-                    && MODE_GEN[slot] == MODE_EPOCH && MODE_VAL[slot] == 1
-                    && MODE_REV[slot] == WORLD_REV
-                    && !e.isRemoved()) {
+            // L151: the five-table tuple {DISP_ID==eid, MODE_GEN==epoch,
+            // MODE_VAL==1, MODE_REV==WORLD_REV, DISP_VAL} collapses into ONE
+            // 64-bit stamp read (FAST_STAMP — see the declaration); RM_BIT
+            // replaces the cold isRemoved() field load (the remove probe at
+            // EntityLookup's choke point fires for EVERY removal path, so
+            // the mirror is set before the next dispatch can see the item).
+            long st = FAST_STAMP[slot];
+            if (st != 0L
+                    && (st & 0x7FFF_FFFF_FFFF_FFFFL)
+                            == ((long) ((WORLD_REV ^ MODE_EPOCH) & 0x7FFF_FFFF)
+                                    << 32 | (eid & 0xFFFF_FFFFL))
+                    && RM_BIT[eid & AMASK] != 1) {
                 // i0-a2: the core's verdict IS the port's decision (the same
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
-                // by the last flush's writeback.
-                appendDispatch(e, DISP_VAL[slot] == 1, eid);
+                // by the last flush's writeback. L151: the inactive verdict
+                // rides the stamp's top bit.
+                boolean act = st >= 0L;
+                appendDispatch(e, act, eid);
                 dispFast++;
-                dispDiag(e, DISP_VAL[slot] == 1 ? "fast-native" : "fast-inactive");
+                dispDiag(e, act ? "fast-native" : "fast-inactive");
                 return true;
             }
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
@@ -5085,6 +5174,7 @@ public final class CeHooks {
                     // slot turnover: entity ids are monotonic per run, so a
                     // mismatched stamp belongs to a dead predecessor
                     MODE_VAL[slot] = 0;
+                    FAST_STAMP[slot] = 0L;
                 } else {
                     // cheap gates (the same set the native path runs): any
                     // hit leaves rest — vanilla computes the tick exactly
@@ -5095,6 +5185,7 @@ public final class CeHooks {
                             || !e.getPassengers().isEmpty()
                             || ARENA[entId(e) & AMASK] != e) {
                         MODE_VAL[slot] = 0;
+                        FAST_STAMP[slot] = 0L;
                         restExits++;
                         dispPass++;
                         dispDiag(e, "rest-exit");
@@ -5108,6 +5199,7 @@ public final class CeHooks {
                         if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
                                 || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
                             MODE_VAL[slot] = 0;
+                            FAST_STAMP[slot] = 0L;
                             restExits++;
                             dispPass++;
                             dispDiag(e, "rest-exit-rev");
@@ -5149,6 +5241,7 @@ public final class CeHooks {
                             // vanilla body compute the whole tick (counters
                             // included) exactly — the resync re-arms rest
                             MODE_VAL[slot] = 0;
+                            FAST_STAMP[slot] = 0L;
                             e.tickCount = e.tickCount - 1;
                             e.totalEntityAge = e.totalEntityAge - 1;
                             if (pdDec) {
@@ -5343,6 +5436,7 @@ public final class CeHooks {
             int slot = entId(e) & MAMASK;
             if (MODE_GEN[slot] == MODE_EPOCH) {
                 MODE_VAL[slot] = 0;
+                FAST_STAMP[slot] = 0L; // L151: the stamp dies with the mode
             }
         }
     }
@@ -5408,6 +5502,19 @@ public final class CeHooks {
     // (the slot was cleared), 1 = active, 2 = inactive. The fast path
     // appends with this flag instead of running the port.
     private static final int[] DISP_VAL = new int[1 << 22];
+    // L151: the ONE-READ fast-path stamp — folds the five-table verdict
+    // tuple {DISP_ID==eid, MODE_GEN==epoch, MODE_VAL==1, MODE_REV==WORLD_REV,
+    // DISP_VAL} into one 64-bit word per slot: low 32 bits = the FULL entity
+    // id, bit 63 = the inactive verdict, bits 32-62 = (WORLD_REV ^ MODE_EPOCH)
+    // masked to 31 bits (the run's revision count never reaches 2^31 — a
+    // wrap would only ever route conservative). The stamp is written ONLY by
+    // the flush applier's NATIVE_OK verdict arm and cleared by every mode
+    // invalidation site; a slot-colliding successor can never inherit it
+    // (the full id rides the word) and an epoch/reload bump re-words every
+    // stamp at once (stale words miss the equality and route the slow chain).
+    // DISP_ID/DISP_VAL stay for the diagnostic/REST readers; the fast path
+    // no longer touches them.
+    private static final long[] FAST_STAMP = new long[1 << 22];
     // Per-section revision stamps: the flush drain stamps every invalidated
     // section with the post-bump WORLD_REV. A rest item whose environment
     // sections were not touched by the current revision keeps resting even
@@ -6759,7 +6866,10 @@ public final class CeHooks {
             // body RAN vanilla (resync / force-vanilla / the inactive
             // collect) or missing items re-read here. 3 reads + 2 writes per
             // native item per tick off the 100k scale.
-            for (int i = 0; i < n; i++) {
+            // L151: the pass is gated on rsN — a pure-native batch (the
+            // steady state) has no RESYNC/FORCE_VANILLA entries, so the
+            // loop would read IB_ITEM+IB_FLAGS per entry for nothing.
+            for (int i = 0; rsN != 0 && i < n; i++) {
                 ItemEntity ie = IB_ITEM[i];
                 if (ie == null) {
                     IB_ATI[i * 3] = 0;
@@ -6898,11 +7008,25 @@ public final class CeHooks {
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
                 int mSlot = (int) (IB_IDS[i] & MAMASK);
-                MODE_GEN[mSlot] = epoch;
+                // L151: the verdict tables are written ONCE at the arm and on
+                // transitions — a steady NATIVE_OK item re-writes nothing
+                // (the conditional reads are L1-hot next to the batch rows).
+                // The FAST_STAMP carries the fast-path tuple: word | eid, the
+                // inactive verdict on bit 63, ZERO when no verdict rides this
+                // plan (bit 18|20 both clear) — the exact shape the old
+                // DISP_ID==eid gate enforced.
+                if (MODE_GEN[mSlot] != epoch) {
+                    MODE_GEN[mSlot] = epoch;
+                }
                 if ((bits & (1 << 11)) != 0) { // VANILLA_NEXT
-                    MODE_REV[mSlot] = revBefore;
-                    MODE_VAL[mSlot] = 0;
+                    if (MODE_REV[mSlot] != revBefore) {
+                        MODE_REV[mSlot] = revBefore;
+                    }
+                    if (MODE_VAL[mSlot] != 0) {
+                        MODE_VAL[mSlot] = 0;
+                    }
                     DISP_ID[mSlot] = 0L; // i0-a: no verdict for a vanilla-routed plan
+                    FAST_STAMP[mSlot] = 0L;
                     itemVanillaNext++;
                 } else if ((bits & (1 << 12)) != 0) { // NATIVE_OK
                     // L21 REST: a value-fixed-point tick — the dispatch guard
@@ -6932,18 +7056,41 @@ public final class CeHooks {
                         MODE_VAL[mSlot] = 2;
                         REST_ID[mSlot] = IB_IDS[i];
                         MODE_REV[mSlot] = WORLD_REV;
+                        FAST_STAMP[mSlot] = 0L; // the rest guard owns this slot
                     } else {
-                        MODE_REV[mSlot] = revBefore;
-                        MODE_VAL[mSlot] = 1;
+                        if (MODE_REV[mSlot] != revBefore) {
+                            MODE_REV[mSlot] = revBefore;
+                        }
+                        if (MODE_VAL[mSlot] != 1) {
+                            MODE_VAL[mSlot] = 1;
+                        }
                     }
                     // i0-a2: the verdict rides the core's bit 18 — the fast
                     // path fires for every native entry whose decision the
-                    // core computed; DISP_VAL carries active(1)/inactive(2).
-                    // The verdict dies with the item's plan (cleared on any
-                    // non-native next tick).
-                    DISP_ID[mSlot] = (bits & ((1 << 18) | (1 << 20))) != 0 ? IB_IDS[i] : 0L;
-                    DISP_VAL[mSlot] = (bits & (1 << 18)) != 0 ? 1
-                            : ((bits & (1 << 20)) != 0 ? 2 : 0);
+                    // core computed; the inactive decision rides the stamp's
+                    // top bit (active(1)/inactive(2) → the exact DISP_VAL
+                    // mapping). The verdict dies with the item's plan (zeroed
+                    // on any non-native next tick / a verdict-less plan).
+                    // The WORD carries revBefore — the pre-drain revision —
+                    // exactly like the MODE_REV stamp: a post-drain
+                    // invalidation bump must stale the stamp (the fresh-flag
+                    // belt re-approves the item on the next dispatch). The
+                    // EPOCH side carries the LOCAL `epoch` — MODE_EPOCH is
+                    // still the OLD value until the flush tail bumps it, and
+                    // the next dispatch compares against the BUMPED field
+                    // (the exact MODE_GEN==MODE_EPOCH contract).
+                    if ((bits & ((1 << 18) | (1 << 20))) != 0) {
+                        FAST_STAMP[mSlot] = ((long) ((revBefore ^ epoch) & 0x7FFF_FFFF)
+                                << 32 | (IB_IDS[i] & 0xFFFF_FFFFL))
+                                | ((bits & (1 << 18)) != 0
+                                        ? 0L : Long.MIN_VALUE);
+                        DISP_ID[mSlot] = IB_IDS[i];
+                        DISP_VAL[mSlot] = (bits & (1 << 18)) != 0 ? 1 : 2;
+                    } else {
+                        FAST_STAMP[mSlot] = 0L;
+                        DISP_ID[mSlot] = 0L;
+                        DISP_VAL[mSlot] = 0;
+                    }
                     // i0-a2: the verdict's side effects — the writeback keeps
                     // the Java fields value-exact without running the port
                     // (the od slot 8 carries activatedTick; bit 19 isTemp).
@@ -6963,10 +7110,15 @@ public final class CeHooks {
                         }
                     }
                 } else {
-                    MODE_REV[mSlot] = revBefore;
-                    MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
-                                         // want_native next flush
+                    if (MODE_REV[mSlot] != revBefore) {
+                        MODE_REV[mSlot] = revBefore;
+                    }
+                    if (MODE_VAL[mSlot] != 0) {
+                        MODE_VAL[mSlot] = 0; // resync/vanilla-ran re-enters via
+                                             // want_native next flush
+                    }
                     DISP_ID[mSlot] = 0L;
+                    FAST_STAMP[mSlot] = 0L;
                 }
                 if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
                     // aborted (bit 13): the core did not compute — nothing to
@@ -12177,6 +12329,16 @@ public final class CeHooks {
     private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
     private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
     private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
+    // L151: the exact sendChanges fast-exit shape's offsets (see
+    // initTrackerLoopHandles) — all resolved-or-(-1), gated by the flag.
+    private static long O_ENT_POSITION = -1;          // Entity.position (Vec3)
+    private static long O_SE_RESYNC = -1;             // ServerEntity.forceStateResync
+    private static long O_SE_LASTPASSENGERS = -1;     // ServerEntity.lastPassengers
+    private static long O_SE_INTERVAL = -1;           // ServerEntity.updateInterval
+    private static long O_SE_CODEC = -1;              // ServerEntity.positionCodec
+    private static long O_CODEC_BASE = -1;            // VecDeltaCodec.base (Vec3)
+    private static long O_SED_ISDIRTY = -1;           // SynchedEntityData.isDirty (boolean)
+    private static volatile boolean TRACKER_EXIT_OK;
     // L63a: Entity.deltaMovement (private Vec3) — the flush apply loop's
     // direct delta write (javap 26.3: setDeltaMovement's whole body is the
     // isFinite gate + the posLock-guarded field store; no flag writes).
@@ -12258,6 +12420,7 @@ public final class CeHooks {
             new java.util.WeakHashMap<>();
     private static final boolean[] TT_ARM_VAL = new boolean[8];
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
+    public static long ttlExit = 0; // L151: the exact fast-exit skips
 
 
     public static void initTrackerLoopHandles() {
@@ -12277,6 +12440,33 @@ public final class CeHooks {
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
+            // L151: the exact sendChanges fast-exit shape. needsSync is a
+            // PUBLIC Entity field (direct read); the rest are ServerEntity /
+            // codec / data privates read through offsets.
+            O_ENT_POSITION = offOf(Entity.class, "position");
+            O_SE_RESYNC = offOf(
+                    net.minecraft.server.level.ServerEntity.class,
+                    "forceStateResync");
+            O_SE_LASTPASSENGERS = offOf(
+                    net.minecraft.server.level.ServerEntity.class,
+                    "lastPassengers");
+            O_SE_INTERVAL = offOf(
+                    net.minecraft.server.level.ServerEntity.class,
+                    "updateInterval");
+            O_SE_CODEC = offOf(
+                    net.minecraft.server.level.ServerEntity.class,
+                    "positionCodec");
+            O_CODEC_BASE = offOf(
+                    net.minecraft.network.protocol.game.VecDeltaCodec.class,
+                    "base");
+            O_SED_ISDIRTY = offOf(
+                    net.minecraft.network.syncher.SynchedEntityData.class,
+                    "isDirty");
+            TRACKER_EXIT_OK = O_ENT_POSITION >= 0 && O_SE_RESYNC >= 0
+                    && O_SE_LASTPASSENGERS >= 0 && O_SE_INTERVAL >= 0
+                    && O_SE_CODEC >= 0 && O_CODEC_BASE >= 0
+                    && O_SED_ISDIRTY >= 0 && O_SE_TICKCOUNT >= 0
+                    && O_SE_INTERP >= 0 && O_ENT_SYNC_POS >= 0;
             // L63a: the delta field offset (the flush apply loop's direct
             // write; a miss keeps every writeback on the woven call).
             O_ENT_DELTA = offOf(Entity.class, "deltaMovement");
@@ -12490,6 +12680,133 @@ public final class CeHooks {
         return rq != null && rq[m * 5 + 2] == ent;
     }
 
+    /** L151: the EXACT sendChanges fast-exit replica (javap 26.3
+     *  ServerEntity.sendChanges bc 0-1106). When every gate below holds,
+     *  the vanilla body provably reduces to
+     *    { updateDataBeforeSync (an EMPTY stub), the SIT 2-write shape,
+     *      se.tickCount++ } — everything else it touches on that path is a
+     *  pure read: moonrise$isHardColliding, the passengers-equality
+     *  compare, the trackedPlayers/ItemFrame block (stands/items fail the
+     *  instanceof), trackingPosition() (a Vec3 allocation — GC-visible
+     *  only), syncPosition, forceStateResync, needsSync, the interval
+     *  test, isDirty.
+     *  Gates (in the vanilla read order, ALL pure):
+     *    1. !moonrise$isHardColliding()      (bc 0-16 writes teleportDelay)
+     *    2. seenBy non-empty                  (bc 107; empty = the FUSED
+     *      path's population — the fill probe owns it)
+     *    3. !syncVelocity                     (bc 1116+ would emit the
+     *      motion packet over a non-empty tracked set)
+     *    4. syncPosition == 0                 (bc 312-347 writes tickCount)
+     *    5. !forceStateResync && !needsSync   (bc 347-361)
+     *    6. !updateInterval.test(se.tickCount) (bc 364-377)
+     *    7. !entityData.isDirty()             (bc 380-390)
+     *    8. passengers.equals(lastPassengers) (bc 26-44 writes lastPassengers)
+     *    9. position == codec.base (IDENTITY) — the license for the
+     *      moonrise$tick skip: updatePlayer's decision is a pure function
+     *      of the player/entity positions and the view distance; the
+     *      stable-geometry hash (cacheArm) pins the player side, this gate
+     *      pins the entity side, and the seenBy invariant holds from the
+     *      last full vanilla pass (the hash moved → cacheArm false →
+     *      vanilla re-served). Fresh spawns decline at gate 2 (seenBy
+     *      empty → updatePlayer must add them).
+     *    10. the interp tracker is NO_OP or the proven empty-steps SIT
+     *      shape (bc 294-307 runs unconditionally — its 2 writes are
+     *      replicated LAST, after every decline check, so a decline never
+     *      double-increments ticksSinceLastStep with the vanilla body).
+     *  The moonrise$tick skip is implied by the caller's continue: the
+     *  te's own update-count gate would skip its seenBy walk, and the
+     *  per-player updatePlayer loop is the no-op proven above. */
+    private static boolean trackerFastExit(Entity ent, Object te) {
+        if (!TRACKER_EXIT_OK) return false;
+        // a mirror-owned slot (the fill's TT_OK identity) owes its tickCount
+        // increments to the TT_FLAT mirror — the quiet/cached pair owns it;
+        // bumping the REAL field here would fork the counter (the L70
+        // contract). Such slots declined the cached path for a reason —
+        // route the exact vanilla pair.
+        Object[] rq = TT_REF;
+        if (rq != null && rq[(entId(ent) & AMASK) * 5 + 2] == ent) {
+            return false;
+        }
+        try {
+            Object se = U.getObject(te, O_TE_SE);
+            if (!(se instanceof net.minecraft.server.level.ServerEntity sev)) {
+                return false;
+            }
+            if (ent.moonrise$isHardColliding()) {
+                return false;
+            }
+            Object seen = U.getObject(te, O_TE_SEEN);
+            if (!(seen instanceof java.util.Set<?> ss) || ss.isEmpty()) {
+                return false;
+            }
+            if (ent.syncVelocity || U.getByte(ent, O_ENT_SYNC_POS) != 0
+                    || ent.needsSync) {
+                return false;
+            }
+            if (U.getBoolean(sev, O_SE_RESYNC)) {
+                return false;
+            }
+            Object ui = U.getObject(sev, O_SE_INTERVAL);
+            int tc = U.getInt(sev, O_SE_TICKCOUNT);
+            if (!(ui instanceof net.minecraft.world.entity.UpdateInterval updt)
+                    || updt.test(tc)) {
+                return false;
+            }
+            Object ed = ent.getEntityData();
+            if (ed == null
+                    || U.getBoolean(ed, O_SED_ISDIRTY)) {
+                return false;
+            }
+            Object pss = ent.getPassengers();
+            Object lp = U.getObject(sev, O_SE_LASTPASSENGERS);
+            if (pss != lp && !pss.equals(lp)) {
+                return false;
+            }
+            // the moonrise$tick license: the entity is at its last-sent
+            // position (the codec's base is reassigned ONLY to the current
+            // position object at a sync — identity holds exactly while the
+            // entity has not moved since).
+            Object codec = U.getObject(sev, O_SE_CODEC);
+            if (!(codec instanceof net.minecraft.network.protocol.game.VecDeltaCodec vc)) {
+                return false;
+            }
+            Object base = U.getObject(vc, O_CODEC_BASE);
+            if (base != U.getObject(ent, O_ENT_POSITION)) {
+                return false;
+            }
+            // the interp shape (bc 294-307): NO_OP is a pure skip; the
+            // SteppedInterpolationTracker's empty-steps + !syncPosition
+            // shape reduces to the 2 writes — replicated AFTER every
+            // decline check (a decline must leave the state vanilla).
+            Object it = U.getObject(sev, O_SE_INTERP);
+            boolean sit = false;
+            if (it != net.minecraft.world.entity.InterpolationTracker.NO_OP) {
+                if (O_SIT_STEPS < 0 || O_SIT_DELTA < 0 || O_SIT_TICKS < 0
+                        || !(it instanceof net.minecraft.world.entity
+                                .SteppedInterpolationTracker)) {
+                    return false;
+                }
+                Object steps = U.getObject(it, O_SIT_STEPS);
+                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                    return false;
+                }
+                sit = true;
+            }
+            // THE EXACT VANILLA FAST-EXIT TAIL:
+            ent.updateDataBeforeSync();               // bc 19-23 (EMPTY stub)
+            if (sit) {
+                U.putObject(it, O_SIT_DELTA,
+                        net.minecraft.world.phys.Vec3.ZERO);
+                U.putInt(it, O_SIT_TICKS,
+                        U.getInt(it, O_SIT_TICKS) + 1);
+            }
+            U.putInt(sev, O_SE_TICKCOUNT, tc + 1);    // bc 1106-1113
+            return true;
+        } catch (Throwable exitFail) {
+            return false; // route the exact vanilla pair — never break tracking
+        }
+    }
+
     private static boolean ttlCachedPath(Entity ent, int m) {
         // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
         // read — the te Unsafe hop existed only to prove the slot).
@@ -12634,14 +12951,32 @@ public final class CeHooks {
                             h = h * 31 + Double.doubleToLongBits(pz);
                             h = h * 31 + Float.floatToIntBits(pyr);
                             h = h * 31 + Float.floatToIntBits(ppi);
+                            // L151: the per-player view distance feeds
+                            // updatePlayer's range decision (getPlayerView-
+                            // Distance is private; PlatformHooks' public
+                            // getSendViewDistance IS its body) — fold it
+                            // into the geometry hash so a mid-run
+                            // view-distance change disarms like a move.
+                            h = h * 31 + ca.spottedleaf.moonrise.common
+                                    .PlatformHooks.get().getSendViewDistance(
+                                            (net.minecraft.server.level.ServerPlayer) pe);
                         }
                         Long prev = TT_PQ_HASH.get(cmObj);
                         if (prev == null || prev != h) {
                             TT_PQ_HASH.put(cmObj, h);
                             cacheArm = pn == 0; // first sight: arm only if playerless
+                        } else {
+                            // L151: the geometry hash is UNCHANGED since the
+                            // previous pass — the last full vanilla pass ran
+                            // at exactly this player set and these positions
+                            // (pass N-1 always served vanilla whenever the
+                            // hash moved, so subscriptions are correct at h),
+                            // and a static geometry cannot invalidate them.
+                            // This re-arms the quiet/cached cohort under a
+                            // STATIC player — the old shape kept cacheArm
+                            // false forever for every player-present world.
+                            cacheArm = true;
                         }
-                        // unchanged player set AND unchanged positions: arm
-                        // (the static geometry keeps every skip exact)
                     } catch (Throwable pqFail) {
                         cacheArm = false;
                     }
@@ -12743,6 +13078,16 @@ public final class CeHooks {
                                 .moonrise$getTrackedEntity();
                 if (te == null) continue;                     // vanilla bc 46-51
                 if (cacheArm) {
+                    // L151: the exact sendChanges fast-exit — the seen,
+                    // static, non-dirty, off-interval population (stands,
+                    // resting items near the bot) provably emits nothing:
+                    // skip moonrise$tick (the stable-geometry + pos==base
+                    // license proves updatePlayer a no-op) AND sendChanges,
+                    // replicating the vanilla fast-exit tail exactly.
+                    if (trackerFastExit(ent, te)) {
+                        ttlExit++;
+                        continue;
+                    }
                     int m = entId(ent) & AMASK;
                     Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
                             .moonrise$getChunkData().nearbyPlayers;
