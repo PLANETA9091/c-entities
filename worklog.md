@@ -1327,3 +1327,48 @@ Task ID: 20 (the L163/L164/L165 storm pass + the sandbox rebuild)
   vanilla tick floor (chunk system, GC, the tracker residual, the bench
   bot's network stack) — the same conclusion as Task 19, now with the
   three hottest self-time lines of the CI profile rewritten.
+
+Task ID: 21 (the L166/L167/L168 storm — the vanilla merge-walk kill)
+- The d43f26f CI profile exposed a DEAD wire: the L163 increment never
+  armed on CI because the bench plugin registered an ItemMergeEvent
+  listener unconditionally (the L119 parity stream) —
+  getRegisteredListeners() read 1 on EVERY leg and the post-merge
+  refresh stayed the full Unsafe chain (16.54% self at items-100k-mod,
+  run 43759408035).
+- L166 (4b0499e; parity/e2e/module SUCCESS): (a) the plugin's
+  ItemMergeEvent stream registers ONLY on parity legs — the perf legs
+  keep the listener set EMPTY so the one-iadd increment stays armed;
+  (b) the full-refresh fallback drops the dead gSelfTg re-load (the
+  javap'd merge body never touches the target); (c) the flush's three
+  resync-gated scans ride the RS_IDX index list (rsN ~25 entries)
+  instead of walking all n batch entries three times per flush (2.39%).
+- L167 (8259a3f; parity SUCCESS): the mergeMaxStack prototype cache
+  gained a second slot (the alternating A,B stack pair kept resident).
+  The verdict-neutral constant answers; the CI delta was ~zero because
+  the getMaxStackSize leaf in the mixed profile turned out to be the
+  VANILLA isMergable() walk (not the module cache) — see L168.
+- L168 (68bb299; parity/e2e/module SUCCESS): mergeScanNative rides the
+  native scan route (n_merge_scan) instead of fastQuery: the EMA router
+  (wantFast / bigbox / view) REFUSED most merge scans in the dense
+  piles (2217 over the mixed run, ~100 ms vanilla body each —
+  intersects 7.5% + indexOf 5.84% + getMaxStackSize 15.99% of the
+  mixed-150k-mod profile), and the refusals were the single largest
+  mod-side cost on mixed/items. The native route answers OUTSIDE the
+  router with the L160a trusted pre-filter Rust-side; the consume loop
+  keeps isMergableFast + the walls clip + RM_BIT + the absorbed-stop
+  (the pre-filter's rejects are a subset of isMergable — the verdict is
+  exact). The local items-50k merge fingerprint is bit-identical to the
+  unpatched control (61/60 only-off/only-on, common 25346) and the mod
+  p50 fell 19.0 -> 14.1 ms (-26% local; mergeMirror=0 — every scan
+  answered native).
+- The paired CI verdicts so far (baseline p50s, off -> on):
+  - 9c623b2: items 68.8->30.0 (-56.4), spread 353->58.3 (-83.5), mixed
+    475->87.5 (-81.6), mobs-native 406.7->25.3 (-93.7)
+  - d43f26f (L163/L164): items 73.5->35.2 (-52.0), spread 518->62.5
+    (-87.9), mixed 555->93.2 (-83.2), mobs-native 538->26.5 (-95.1)
+  - 4b0499e/8259a3f (L165/L166/L167): items 68.4->33.4 (-51.2), spread
+    379->52.7 (-86.1), mixed 556->84.2 (-84.8), mobs-native 419->27.0
+    (-93.6). The off-side medians swing +-25% run to run (379..518 for
+    spread); the mod side is the stable, controlled metric.
+- CI in flight: the L168 baseline + the three fresh profiles (items/
+  mixed/spread) on 68bb299.
