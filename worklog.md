@@ -1159,3 +1159,89 @@ Stage Summary:
   twice), items PASS (bit-identical, 20000 items), mobs PASS (bit-identical,
   2509 zombies), core suite 71/71 green. NEXT: push → CI parity (all four
   scenarios incl. spread), then the speed target -90%.
+
+Task ID: 19
+Agent: main (Z.ai)
+Task: java-wires storm pass — L162 (merge-candidate levers + the
+NaturalSpawner.createState filtered walk) + L161a (dispatch-quiet
+protocol) toward the -90% target on the integration wires
+
+Work Log:
+- The CI verdict on L160a (d561f13, paired A/B on one runner): mobs-25k
+  -95.3% (531.8 -> 25.2), spread-100k -88.0% (508.5 -> 61.1),
+  mixed-150k -81.5% (474.7 -> 87.8), items-100k -54.1% (69.3 -> 31.8).
+  Native-mobs is past the target; the three entity legs are not.
+- The fresh items-100k-mod JFR pinned the wires: itemTickFlush 17.5%
+  (line 7583 = the post-merge Unsafe snapshot refresh — NOT the
+  invokeExact), tickListForEach walk 7.3%, the Unsafe mirrors 10.7%,
+  itemDispatch 4.7%, the tracker 2.9%, NaturalSpawner.createState 4.3%
+  (UNHOOKED — the vanilla spawn-state walk ran getType().getCategory()
+  per 100k items per tick and items always die at the MISC compare).
+- L162 (6030e38): the merge candidate loop — the redundant second
+  isMergable MH call per surviving candidate dropped (the gate above it
+  already ran the identical predicate; CE_MERGE_DBLCHECK restores), the
+  FULL-SELF break (a capacity-reached scanner's whole candidate walk
+  provably no-ops: every same-item candidate fails areMergable's sum,
+  every other stack fails isSameItemSameComponents, tryToMerge is
+  side-effect-free until merge(); CE_MERGE_FULLBREAK restores), the
+  per-scanner synchronized monitor replaced by a volatile read. AND the
+  NaturalSpawner.createState floor: a replace_body bridge that is the
+  byte-exact transcription of the javap'd 26.3 5-arg body + ONE
+  pre-gate (instanceof ItemEntity -> skip; vanilla itself continues at
+  the MISC compare and EntityType.ITEM's category is ctor-fixed) — the
+  mob path runs the REAL lambda$createState$0 handle through the REAL
+  ChunkGetter.query and the REAL SpawnState ctor; the 4-arg overload
+  delegates into the patched 5-arg. Vanilla 4.3% self -> the bridge
+  floor 1.2% (measured locally). CE_SPAWNER_FILTER=0 refuses the weave.
+  CI: e2e/parity/module all SUCCESS (bit-in-bit on all four scenarios,
+  the spawner bridge's mob path included); baseline in flight.
+- L161a (9c623b2): the dispatch-quiet protocol. A native item whose
+  flush verdict certified TAIL_NONE AND whose out-delta is the EXACT
+  zero fixed point AND that is not merge-cadence-eligible (the SAME
+  isMergable predicate the scan gate runs) leaves the dispatch/row/
+  flush cycle: itemDispatch returns on one bitset read, no batch row,
+  the core never sees it; a Java quiet pass owns the counters (+ the
+  exact despawn tail + the 256-tick belt). Wakes: l7ExternalMutation,
+  the section-revision gate (QUIET_REV vs WORLD_REV + the L21-rest
+  touched check), registration/box/regrow probes, removal, despawn,
+  the belt. The itemcore pre-filter widened to sync_gen != 0
+  (ever-ingested) so the quiet cohort's frozen rows keep the L160
+  candidate economics (the three rejects are monotone-safe on a frozen
+  row: store age <= live age; pd/age-marker immutable). TWO par5-caught
+  bugs fixed with lessons in the comments: (1) the pass gate must ride
+  the level's gameTime, NOT CUR_TICK — CUR_TICK counts flush CALLS and
+  the flush fires ~8x per tick (29522 calls / ~3600 ticks), which
+  multiplied the cohort's counters (tc off=449 on=935); (2) a one-tick
+  TAIL_NONE verdict must NOT be extrapolated to a decaying item — the
+  velocity-dust item froze at 1.1e-14 while vanilla decayed to
+  2.7e-28; the denormal-stuck tail NEVER underflows to exact 0.0
+  (4.9e-324 * 0.98 rounds back to itself), so only exact-zero items are
+  provably self-sustaining. The consequence for the bench shapes: the
+  fill spawns items with the ctor's random velocity, the decay lands in
+  denormal dust within ~1400 ticks and stays there forever -> the quiet
+  cohort is EMPTY in the bench (qui stamps 0), the protocol is dormant
+  but parity-proven; production worlds with exact-rest items quiet them.
+  CE_QUIET=0 refuses the arm. CI in flight.
+- The honest floor accounting (items-100k, CI scale): the wires are
+  ~12-15ms of the 31.8ms leg (walk 7% + mirrors 11% + flush-A 9% +
+  dispatch 1.2% + tracker 2% + spawner now 1.2% of the PROFILED window,
+  ~1.5-1.8x within tick-time); the Rust core is 1.3ms; the REST
+  (~10ms) is vanilla's non-entity tick work + tracker residual + GC +
+  the bench bot. Killing the wires entirely lands ~-75..-80%; the
+  exact-zero quiet cohort adds nothing in 3600-tick bench runs. The
+  -90% items target requires the vanilla floor itself (chunk ticking,
+  the tracker's per-entity walk, GC pressure) — a DIFFERENT campaign
+  than the entity wires. The spread/mixed legs get the spawner win
+  (~1.4ms) + the quiet dormancy; their remaining gap is the same wall.
+- The local harness reality (4 GB sandbox): the 100k A/B legs OOM at
+  ~38k entities (XMX 8G default on a 4041 MB box, java RSS 2.5 GB at
+  38k, the fill freezes, the mineflayer bot dies, baseline.json never
+  lands) — the local pairs run at SCALE=50000 with XMS=512M XMX=2300M.
+  The parity legs: PARITY=1 skips the bot entirely (deterministic).
+  The local pairs: items-50k 42.87 -> 20.47 (-52.2%) pre-L161a, 22.62
+  after (local noise +-2 ms; the CI pair is the arbiter).
+NEXT: the CI baseline verdict on 6030e38 (the paired speed table with
+the spawner filter), then the 9c623b2 parity + baseline verdicts; if
+parity stays green, the next wire lever is the tracker's per-entity
+walk (the AABB.intersects 1.6-5% + the ttl residual) and the GC/chunk
+floor — the -90% wall is the vanilla tick itself, not the wires.
