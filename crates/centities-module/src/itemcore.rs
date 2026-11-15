@@ -83,6 +83,12 @@ struct ItemEntry {
     np_stuck: bool,
     np_flags: u8,
     np_box: [f64; 6],
+    /// L155: the rest fast-path memo (persists across flushes; cleared by
+    /// every resync/vanilla ingest — the full body re-proves before
+    /// re-arming).
+    rest_valid: bool,
+    rest_rev: u64,
+    rest_dy: f64,
 }
 
 impl ItemEntry {
@@ -118,6 +124,9 @@ impl ItemEntry {
             np_stuck: false,
             np_flags: 0,
             np_box: [0.0; 6],
+            rest_valid: false,
+            rest_rev: 0,
+            rest_dy: 0.0,
         }
     }
 }
@@ -159,6 +168,10 @@ struct L6Rec {
     np_stuck: bool,
     np_flags: u8,
     np_box: [f64; 6],
+    /// L155: the rest fast-path memo
+    rest_valid: bool,
+    rest_rev: u64,
+    rest_dy: f64,
 }
 
 /// The full per-entry state snapshot used by the L7 dispatch protocol.
@@ -901,6 +914,9 @@ unsafe fn n_item_tick_impl(
                                     friction_disabled: (f & F_FRIC_OFF) != 0,
                                     land_fall: 0.0,
                                     default_activation: false,
+                                    rest_valid: false,
+                                    rest_rev: 0,
+                                    rest_dy: 0.0,
                                 };
                                 if (f & (F_RESYNC | F_FORCE_VANILLA)) != 0 {
                                     // vanilla body ran this tick: ingest the fresh
@@ -931,6 +947,11 @@ unsafe fn n_item_tick_impl(
                                     entry.fall_dist = st.fall_dist;
                                     entry.on_ground = (f & F_ON_GROUND) != 0;
                                     entry.aborts = 0;
+                                    // L155: a vanilla body re-proved nothing about the
+                                    // rest identity — clear the memo; the next native
+                                    // identity tick re-arms.
+                                    entry.rest_valid = false;
+                                    entry.rest_rev = 0;
                                     st.stuck = entry.stuck;
                                     st.sup_x = entry.sup.0;
                                     st.sup_y = entry.sup.1;
@@ -994,6 +1015,10 @@ unsafe fn n_item_tick_impl(
                                         entry.np_box[4],
                                         entry.np_box[5],
                                     );
+                                    // L155: the rest memo rides the store too
+                                    st.rest_valid = entry.rest_valid;
+                                    st.rest_rev = entry.rest_rev;
+                                    st.rest_dy = entry.rest_dy;
                                 }
                                 // L7 dispatch-owned entries: the STORE is the state
                                 // source (the vanilla dispatcher was suppressed, the
@@ -1274,6 +1299,9 @@ unsafe fn n_item_tick_impl(
                                                         st.np_box.y1,
                                                         st.np_box.z1,
                                                     ],
+                                                    rest_valid: st.rest_valid,
+                                                    rest_rev: st.rest_rev,
+                                                    rest_dy: st.rest_dy,
                                                 };
                                             }
                                             // one shared-counter bump per chunk (not per
@@ -1333,6 +1361,10 @@ unsafe fn n_item_tick_impl(
                                     entry.np_stuck = rec.np_stuck;
                                     entry.np_flags = rec.np_flags;
                                     entry.np_box = rec.np_box;
+                                    // L155: the rest memo persists
+                                    entry.rest_valid = rec.rest_valid;
+                                    entry.rest_rev = rec.rest_rev;
+                                    entry.rest_dy = rec.rest_dy;
                                     // L7: mirror the full state back (dispatch-owned)
                                     entry.x = od[k * 9 + 3];
                                     entry.y = od[k * 9 + 4];

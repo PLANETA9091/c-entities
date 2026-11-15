@@ -109,6 +109,14 @@ pub struct ItemState {
     /// ingested once (the batch's flags2 bit carries it per tick too; the
     /// store copy covers the pre-first-batch verdicts).
     pub default_activation: bool,
+    /// L155: the rest fast-path memo (persists across flushes via the
+    /// store, like the np memo). Validity = (grid rev unchanged since the
+    /// armed identity tick) AND (the phase-stable pre-tick dy) AND (the
+    /// zero-delta grounded state). Any resync/vanilla tick clears it —
+    /// the full body re-proves before re-arming.
+    pub rest_valid: bool,
+    pub rest_rev: u64,
+    pub rest_dy: f64,
 }
 
 impl ItemState {
@@ -148,6 +156,9 @@ impl ItemState {
             np_stuck: false,
             np_flags: 0,
             np_box: Aabb6::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            rest_valid: false,
+            rest_rev: 0,
+            rest_dy: 0.0,
         }
     }
 }
@@ -300,6 +311,7 @@ pub fn tick_item(
     // cadence below must therefore read the PRE value: tc_pre = tc - 1.
 
     // ===== read-only phase =====
+    let pre_pos = (st.x, st.y, st.z); // L155: the arm's identity witness
     let box_now = Aabb6::item_box(st.x, st.y, st.z);
 
     // Entity.baseTick -> checkBelowWorld (void damage)
@@ -364,6 +376,67 @@ pub fn tick_item(
         // reachable right after a block change, which routes vanilla at
         // the probe anyway).
         out.set(TickOutcome::ABORTED | TickOutcome::VANILLA_NEXT);
+        return out;
+    }
+
+    // L155 REST FAST-PATH (the trace-proven fixed point, the L119 cycle).
+    // A grounded item whose state sits on the %4 cycle's identity point
+    // (dx/dz EXACT zero, dy == the phase-stable accumulated gravity the
+    // cycle re-zeroes) computes an IDENTITY physics body on the open
+    // tick: the swept move (-|dy_g| y) collides at the exact resting
+    // plane (collided == (0, 0, 0), MOVED unset — run tr29 ground trace:
+    // dy 0.0 -> 0.0; the position is bit-stable), the vertical collision
+    // zeroes dy, the friction multiplies exact zeros, fallDistance stays
+    // 0.0, onGround stays true. The skip therefore replaces the whole
+    // physics block (swept gather, perform_collisions, friction/step
+    // reads, inside-blocks scan) with the identity verdict while running
+    // the SAME commit (pd--, old-pos, the delta zeroing the collision
+    // would apply) and the SAME tail (merge cadence, age++, despawn).
+    // Arming: only a COMPLETED identity body may arm (no aborts, no
+    // vanilla routes, no cobweb/stuck) — see the arm below. Disarming:
+    // any grid edit bumps grid_rev (conservative: one full body per
+    // edit tick re-proves), any state change fails the guards, any
+    // resync clears the memo at the ingest.
+    let grid_rev = sc.grid_rev();
+    let rest_gate_open = !st.on_ground
+        || (st.dx * st.dx + st.dz * st.dz) > GATE_HORZ_SQR
+        || (st.tick_count.wrapping_add(id as i32)) % 4 == 0;
+    if st.rest_valid
+        && st.rest_rev == grid_rev
+        && st.on_ground
+        && st.dx == 0.0
+        && st.dz == 0.0
+        && st.dy == st.rest_dy
+        && st.stuck.0 == 0.0
+        && st.stuck.1 == 0.0
+        && st.stuck.2 == 0.0
+        && !flags_np.complex
+        && !flags_np.any_fluid
+        && !flags_np.unloaded
+        && rest_gate_open
+    {
+        // identity commit: the pickupDelay decrement and the old-pos
+        // store run exactly as the full body's commit does; the delta
+        // ends EXACTLY zero (the vertical collision zeroes the
+        // accumulated gravity, friction multiplies zeros — the full
+        // body's final state for this input).
+        // delta_pre_rest = the ENTRY delta (pre-gravity) — the tail's
+        // hasImpulse verdict compares the FINAL delta against it, and
+        // the full body's verdict for this input is dd = (0, |rest_dy|,
+        // 0) — the collision-cancelled gravity counts as impulse
+        // (0.12^2 > 0.01) — bit-identical here.
+        let delta_pre_rest = (st.dx, st.dy, st.dz);
+        if st.pickup_delay > 0 && st.pickup_delay != 32767 {
+            st.pickup_delay -= 1;
+        }
+        st.xo = st.x;
+        st.yo = st.y;
+        st.zo = st.z;
+        st.dx = 0.0;
+        st.dy = 0.0;
+        st.dz = 0.0;
+        out.set(TickOutcome::V_COLL); // the vertical collision verdict
+        item_tail(st, &mut out, delta_pre_rest);
         return out;
     }
 
@@ -676,6 +749,41 @@ pub fn tick_item(
         }
     }
 
+    // L155 REST ARM: only a COMPLETED identity body may arm the memo —
+    // the open-gate tick ran, no vanilla route / abort fired, the state
+    // ended at the exact fixed point (zero delta, grounded, position
+    // bit-identical to the entry). rest_dy records the phase-stable
+    // accumulated gravity the next open tick starts with (the cycle:
+    // open zeroed -> closed -0.04 -> -0.08 -> -0.12 -> open, so the
+    // pre-dy of every open tick repeats); the rest guard revalidates it.
+    if gate
+        && !out.has(TickOutcome::VANILLA_NEXT)
+        && !out.has(TickOutcome::ABORTED)
+        && st.on_ground
+        && st.dx == 0.0
+        && st.dy == 0.0
+        && st.dz == 0.0
+        && st.x == pre_pos.0
+        && st.y == pre_pos.1
+        && st.z == pre_pos.2
+        && !stuck_applied
+        && !cobweb_hit
+        && !inside_special
+    {
+        st.rest_valid = true;
+        st.rest_rev = sc.grid_rev();
+        st.rest_dy = delta_pre_gravity.1;
+    }
+    item_tail(st, &mut out, delta_pre_gravity);
+    out
+}
+
+/// L155: the tick tail shared by the full body and the rest fast-path
+/// (merge cadence, age++, hasImpulse, despawn, the ON_GROUND absolute
+/// bit). MUST stay bit-identical for both paths — the tail is the
+/// parity-visible part of the tick.
+#[inline]
+fn item_tail(st: &mut ItemState, out: &mut TickOutcome, delta_pre_gravity: (f64, f64, f64)) {
     // merge cadence — EMPIRICAL (runs 40723397672 vs 40733281619): the
     // all-post convention held the items splits at 23/23, all-pre exploded
     // them to 574/574 — the merge cadence reads the POST-increment value
@@ -716,8 +824,6 @@ pub fn tick_item(
     if st.on_ground {
         out.set(TickOutcome::ON_GROUND);
     }
-
-    out
 }
 
 /// The inactive tick body (vanilla inactiveTick: pickupDelay--, age++,
