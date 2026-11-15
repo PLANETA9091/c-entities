@@ -4921,6 +4921,25 @@ public final class CeHooks {
     // the wire (the bisect knob, same shape as CE_VEC_CACHE).
     public static final boolean STAND_MIRROR_ON =
             !"0".equals(System.getenv("CE_STAND_MIRROR"));
+    // L165: the stand-classification data port. The stateless per-tick
+    // classification keeps its LIVE reads, but the two SynchedEntityData.get()
+    // chains (edata getfield + static accessor + itemsById getfield +
+    // arrayload + value getfield + cast + byteValue, per accessor, per
+    // stand, per tick) were 8.47% of the spread-100k-mod profile (run
+    // 43736024359): 20k stands x 2 accessors. The port reads the same
+    // value slots through the Unsafe offsets (entityData -> itemsById[] ->
+    // DataItem.value): the itemsById array is final and its entries are
+    // created in defineSynchedData — never mutated afterwards — and the
+    // value references are the SAME boxed objects the vanilla chain
+    // unpacks, so the verdicts are byte-identical. A non-Byte/Boolean
+    // slot (impossible for these two accessors) or any negative offset
+    // routes the vanilla accessor chain. CE_STAND_PORT=0 restores it.
+    public static final boolean STAND_PORT =
+            !"0".equals(System.getenv("CE_STAND_PORT"));
+    public static volatile long O_EDATA = -1, O_SD_ITEMS_BY_ID = -1,
+            O_SDI_VALUE = -1;
+    public static volatile int O_ACC_FLAGS_ID = -1, O_ACC_NG_ID = -1;
+    public static long standPortHit = 0, standPortMiss = 0;
     // L124: the delta writeback store shape. Default PLAIN (every reader
     // runs on the server thread; the reference store is atomic);
     // CE_DELTA_VOL=1 restores the volatile store for the bisect.
@@ -5047,12 +5066,45 @@ public final class CeHooks {
         if (!STAND_MIRROR_ON) return false;
         try {
             int sid = entId(as) & AMASK;
+            // L165: the two data-classification reads through the Unsafe
+            // port (same value slots, fewer loads); the rest of the
+            // classification stays the vanilla accessor calls.
+            boolean marker = false;
+            boolean noGravity = false;
+            boolean ported = false;
+            if (STAND_PORT && O_EDATA >= 0 && O_SD_ITEMS_BY_ID >= 0
+                    && O_SDI_VALUE >= 0 && O_ACC_FLAGS_ID >= 0
+                    && O_ACC_NG_ID >= 0 && U != null) {
+                Object ed = U.getObject(as, O_EDATA);
+                Object arr = ed != null ? U.getObject(ed, O_SD_ITEMS_BY_ID) : null;
+                if (arr != null) {
+                    long ab = U.ARRAY_OBJECT_BASE_OFFSET;
+                    long sc = U.ARRAY_OBJECT_INDEX_SCALE;
+                    Object fItem = U.getObject(arr, ab + (long) O_ACC_FLAGS_ID * sc);
+                    Object nItem = U.getObject(arr, ab + (long) O_ACC_NG_ID * sc);
+                    if (fItem != null && nItem != null) {
+                        Object fv = U.getObject(fItem, O_SDI_VALUE);
+                        Object nv = U.getObject(nItem, O_SDI_VALUE);
+                        if (fv instanceof Byte fb && nv instanceof Boolean nb) {
+                            marker = (fb.byteValue() & 0x10) != 0;
+                            noGravity = nb;
+                            ported = true;
+                            standPortHit++;
+                        }
+                    }
+                }
+            }
+            if (!ported) {
+                marker = as.isMarker();
+                noGravity = as.isNoGravity();
+                standPortMiss++;
+            }
             // the stateless static classification — every read is live;
             // any miss routes the exact vanilla body for this tick.
             // (noTickEquipmentDirty is private and only ever set for
             // !canTick stands — the !as.canTick gate already routes those.)
             if (RM_BIT[sid] == 1 || !as.canTick
-                    || !as.isMarker() || !as.isNoGravity()
+                    || !marker || !noGravity
                     || !as.getPassengers().isEmpty() || as.isPassenger()
                     || !as.isAlive()) {
                 dispStandMiss++;
@@ -13170,6 +13222,34 @@ public final class CeHooks {
             O_ENT_LEVEL = offOf(Entity.class, "level");
             O_LEVEL_CLIENT = offOf(net.minecraft.world.level.Level.class,
                     "isClientSide");
+            // L165: the stand-data port offsets + the two accessor ids.
+            // DATA_CLIENT_FLAGS is public static; DATA_NO_GRAVITY is
+            // private static — resolved reflectively once at arm.
+            O_EDATA = offOf(Entity.class, "entityData");
+            O_SD_ITEMS_BY_ID = offOf(
+                    net.minecraft.network.syncher.SynchedEntityData.class,
+                    "itemsById");
+            O_DI_VALUE = offOf(
+                    net.minecraft.network.syncher.SynchedEntityData.DataItem.class,
+                    "value");
+            try {
+                java.lang.reflect.Field ff = net.minecraft.world.entity.decoration.ArmorStand.class
+                        .getDeclaredField("DATA_CLIENT_FLAGS");
+                ff.setAccessible(true);
+                O_ACC_FLAGS_ID = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
+                        ff.get(null)).id();
+            } catch (Throwable accFail) {
+                O_ACC_FLAGS_ID = -1;
+            }
+            try {
+                java.lang.reflect.Field gf = Entity.class
+                        .getDeclaredField("DATA_NO_GRAVITY");
+                gf.setAccessible(true);
+                O_ACC_NG_ID = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
+                        gf.get(null)).id();
+            } catch (Throwable ngFail) {
+                O_ACC_NG_ID = -1;
+            }
             // L63b: the shape-cache arrays (slot-indexed like the ARENA;
             // allocated once — the identity check tolerates stale entries,
             // probeRemove clears the slot to release the te ref).
