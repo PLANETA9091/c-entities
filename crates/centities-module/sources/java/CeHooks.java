@@ -5084,12 +5084,30 @@ public final class CeHooks {
         // tick route (the t=157 byte-exactness lesson) — an unclassified mob
         // returns false here and takes the vanilla dispatch, whose tick()
         // fires the sight.
-        if (NATIVE_MOB_ON && ent instanceof net.minecraft.world.entity.Mob m) {
-            if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
-                dispMobNative++;
-                return true;
+        // L156 TYPE-ORDER: the instanceof chain runs per entity per tick —
+        // the per-type branch order now matches the population: ItemEntity
+        // first (items pay ONE check — every entity is an item in the items
+        // legs), ArmorStand second, Mob last (mobs are 10-20% of mixed and
+        // pay three). Routing semantics unchanged: an entity is exactly one
+        // of the three types; the mob branch still declines non-native mobs
+        // with false and never lets a Mob reach the item path (the item
+        // branch is unreachable for non-items by construction).
+        ItemEntity e = null;
+        if (ent instanceof ItemEntity ie) {
+            e = ie;
+            if (!ITEM_TICK_ON) { dispDiag(e, "off"); return false; }
+        } else {
+            if (ent instanceof net.minecraft.world.entity.decoration.ArmorStand as) {
+                return standMirror(as);
             }
-            return false; // a non-native mob NEVER takes the item path
+            if (NATIVE_MOB_ON && ent instanceof net.minecraft.world.entity.Mob m) {
+                if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                    dispMobNative++;
+                    return true;
+                }
+                return false; // a non-native mob NEVER takes the item path
+            }
+            return false;
         }
         // L123 STAND MIRROR: a static marker ArmorStand's dispatch is
         // observably a no-op — the javap-anchored reduction (26.3-249):
@@ -5112,11 +5130,7 @@ public final class CeHooks {
         // gravity, death) misses the classification that tick and routes
         // the exact vanilla body; the quiet bit is cleared on the miss
         // (the L99 reset contract). CE_STAND_MIRROR=0 kills the wire.
-        if (ent instanceof net.minecraft.world.entity.decoration.ArmorStand as) {
-            return standMirror(as);
-        }
-        if (!ITEM_TICK_ON) { if (ent instanceof ItemEntity ie) dispDiag(ie, "off"); return false; }
-        if (!(ent instanceof ItemEntity e)) return false;
+        // (L156: the stand/mob branches live in the type dispatch above.)
         if (ibN >= IB_CAP) { dispDiag(e, "cap"); return false; }
         // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
         // stamps its loop position — including the fresh-belt items that
