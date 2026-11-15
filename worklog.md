@@ -1270,3 +1270,60 @@ Task ID: 19 (verdict addendum)
   TAIL_NONE verdict onto a still-decaying item). The remaining gap to
   -90% on items/mixed is the vanilla tick floor itself (chunk system,
   GC, the active-item tracker work, the bench bot's network stack).
+
+Task ID: 20 (the L163/L164/L165 storm pass + the sandbox rebuild)
+- The sandbox was recycled: rustup, Maven 3.9.9, the paperclip-26.3 (build
+  253) boot cache, the mapped jar, the ViaVersion/ViaBackwards plugin
+  staging, the mineflayer node_modules and the ce-baseline plugin were all
+  rebuilt from scratch; the work tree carried the half-written doc-36b
+  parity-order edit which cargo-checks green (the "cell_keysome" glyphs in
+  the terminal diff output were a display artifact — the file bytes are
+  intact) and its tests pass; it was already merged upstream by the pull
+  (the upsert_ord/ensure_cell_order shape lives in HEAD).
+- The LOCAL parity gate is only HALF-valid on this 4-core box:
+  items-50k pairs run bit-exact apart from the KNOWN 61/60 only-off/
+  only-on merge fingerprint (proven UNPATCHED: the control pair without
+  L163/L164 produces the identical fingerprint — the CI parity gate is
+  bit-in-bit SUCCESS over the same code), but the spread/mixed pairs are
+  NOT valid: chunk-gen chickens interleave the entity-id sequence at
+  wallclock-dependent timing (17/19 chickens on the UNPATCHED control
+  spread pair, 13079 type mismatches — the run-baseline.sh the_void
+  no-chunk-gen-spawn contract does not hold for the lazy AREA-300
+  generation here). CI is the arbiter for spread/mixed parity.
+- L163 (d43f26f, CE_MERGE_INCR=0 restores): the post-merge snapshot
+  refresh rides the pre-gate's already-loaded candidate count — one iadd.
+  Proven exact: the javap'd 4-arg merge body touches only
+  pickupDelay/age/discard (target survives; the pre-gate proved the
+  equality), the merge() result is built from the self stack via
+  copyWithCount (the SAME components — maxStackSize and
+  isSameItemSameComponents are reference-independent), and the ONLY
+  event-no-mutation path (a canceled ItemMergeEvent) is excluded because
+  the increment runs only when the handler cache reads 0 listeners
+  (re-counted every 512 merges). The full Unsafe refresh stays behind a
+  listener. Target: the 16.05% self-time line (items-100k-mod,
+  run 43736024359) / 8.54% (spread-100k-mod).
+- L164 (d43f26f): the dispatch fast gate drops the RM_BIT belt (the
+  EntityLookup choke-point probe zeroes the stamp on every removal path
+  BEFORE the next dispatch — the documented invariant; CE_DISP_NORB=1
+  restores; 1.34% self), the tracker's per-ChunkMap player-geometry hash
+  moved from the boxed WeakHashMap get/put to a raw-long parallel array
+  with the identity-slot resolve hoisted (2.68% self), and the createState
+  walk checks ItemEntity FIRST (one instanceof instead of two for the
+  dominant population; 3.72% self).
+- L165 (c1b1cb8, CE_STAND_PORT=0 restores): the stand classification's
+  two SynchedEntityData.get chains (8.47% of the spread-100k-mod profile)
+  route through the Unsafe offsets entityData -> itemsById[accessorId] ->
+  DataItem.value — the SAME boxed objects, byte-identical verdicts
+  (itemsById is final; entries created in defineSynchedData only). The
+  accessor ids resolve reflectively at arm (DATA_CLIENT_FLAGS public,
+  DATA_NO_GRAVITY private static; the record's accessor method is id(),
+  NOT getId() — the first javac fail caught it).
+- CI on d43f26f: parity SUCCESS, module SUCCESS, e2e SUCCESS (bit-in-bit
+  over L163+L164); baseline in flight. CI on c1b1cb8 (L165): in flight.
+- The local items-50k pair: mod p50 21.1 -> 19.0 ms after L164 (-2.1 ms;
+  the RM_BIT load + the hash put + the spawner double-check off the
+  per-tick wire). The -90% wall statement stands: the wires are now at
+  their provable minimum for the bench shapes; the remaining gap is the
+  vanilla tick floor (chunk system, GC, the tracker residual, the bench
+  bot's network stack) — the same conclusion as Task 19, now with the
+  three hottest self-time lines of the CI profile rewritten.
