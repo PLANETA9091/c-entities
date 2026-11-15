@@ -89,6 +89,11 @@ struct ItemEntry {
     rest_valid: bool,
     rest_rev: u64,
     rest_dy: f64,
+    /// L160: the flush generation this entry last participated in. The
+    /// merge-scan pre-filter trusts pd/age/rate ONLY when the row was in
+    /// the current flush's batch (the mirror is dispatch-fresh and
+    /// natively modeled); 0 = never batched.
+    sync_gen: u64,
 }
 
 impl ItemEntry {
@@ -127,6 +132,7 @@ impl ItemEntry {
             rest_valid: false,
             rest_rev: 0,
             rest_dy: 0.0,
+            sync_gen: 0,
         }
     }
 }
@@ -137,6 +143,9 @@ impl ItemEntry {
 /// touched memory per tick at 100k items, page-faulting it in every time).
 pub struct ItemWorld {
     entries: Vec<ItemEntry>,
+    /// L160: bumped once per n_item_tick flush of THIS world; entries
+    /// stamped with the current value carry tick-fresh pd/age/rate.
+    flush_gen: u64,
     pub grid: SectionGrid,
     // ---- flush scratch (sized to n; only grows) ----
     /// Phase-1 hydrated states, mutated in place by phase 2.
@@ -194,6 +203,7 @@ impl ItemWorld {
     fn new() -> ItemWorld {
         ItemWorld {
             entries: (0..STORE_CAP).map(|_| ItemEntry::fresh(u64::MAX)).collect(),
+            flush_gen: 1,
             grid: SectionGrid::new(),
             sts: Vec::new(),
             tickable: Vec::new(),
@@ -809,6 +819,10 @@ unsafe fn n_item_tick_impl(
                             let items_native = envv_i[3] != 0;
                             let t0 = std::time::Instant::now();
                             let world = core.world(wid as usize);
+                            // L160: a new generation for this flush — every batch
+                            // row is stamped with it in phase 1 (the trusted-set
+                            // marker for the merge-scan pre-filter).
+                            world.flush_gen = world.flush_gen.wrapping_add(1);
 
                             // ------------------------------------------------
                             // L8 PARALLEL FLUSH — three phases.
@@ -1068,6 +1082,12 @@ unsafe fn n_item_tick_impl(
                                     }
                                 }
                                 world.aborts_in[k] = world.entry(id).aborts;
+                                // L160: stamp THIS flush's generation — the row's
+                                // pd/age/rate mirror is now dispatch-fresh (the
+                                // resync branch re-ingested; the native branch's
+                                // batch guard re-read pickupDelay) and the tick
+                                // model owns the post-tick outcome.
+                                world.entry(id).sync_gen = world.flush_gen;
                                 world.tickable[k] = true;
                                 world.sts[k] = st;
                             }
@@ -1632,11 +1652,23 @@ pub extern "system" fn n_merge_scan(
         std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
     ];
+    /// L160: candidates dropped by the trusted pre-filter (telemetry only).
+    static MS_PREFLT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let refused = |which: usize| -> i32 {
         MS_STATS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         MS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         -1
     };
+    // L160 kill-switch: CE_MS_PREFILTER=0 routes every candidate to Java's
+    // exact chain (the pre-L160 shape).
+    fn ms_prefilter_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("CE_MS_PREFILTER")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    }
     if wid < 0 || wid >= 8 || r.is_nan() {
         return refused(1);
     }
@@ -1733,6 +1765,35 @@ pub extern "system" fn n_merge_scan(
                 MS_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
+            // L160 THE TRUSTED PRE-FILTER: a candidate whose entry
+            // participated in THIS flush (sync_gen == flush_gen) carries a
+            // tick-exact pd/age/rate mirror (dispatch-fresh at hydrate,
+            // natively modeled post-tick). The three isMergable
+            // single-side rejects are PROVABLE for the live field here:
+            //   pd == 32767 — the decay never touches 32767 and no tick
+            //     path raises it; exact for a trusted row.
+            //   age >= rate + 1 — the store age is POST-tick; a not-yet-
+            //     flushed row's live age is one behind (a_pre = a_post-1),
+            //     so a_post >= rate+1 ⟺ live a_pre >= rate — exact; an
+            //     already-flushed row rejects one tick conservatively
+            //     (the safe direction).
+            //   age == -32768 — the spawn-time marker is immutable.
+            // Untrusted rows (no batch row this tick — fresh belt / probe
+            // wake) pass through: Java's exact chain decides. A false pass
+            // costs the Java loop a candidate; a false reject would be the
+            // dropped-merge red line — only these three provable terms.
+            // CE_MS_PREFILTER=0 kills the wire for the bisect.
+            if ms_prefilter_on() {
+                let e2 = &world.entries[(cid as u64 & STORE_MASK) as usize];
+                if e2.sync_gen == world.flush_gen
+                    && (e2.pickup_delay == 32767
+                        || e2.age == -32768
+                        || e2.age >= e2.despawn_rate.saturating_add(1))
+                {
+                    MS_PREFLT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+            }
             if n >= out_len {
                 return refused(5);
             }
@@ -1745,10 +1806,11 @@ pub extern "system" fn n_merge_scan(
         let z = MS_ZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if z % 2000 == 0 {
             eprintln!(
-                "[ms] calls={} raw={} stale={} zero={} refused={{1:{},2:{},3:{},4:{},5:{}}}",
+                "[ms] calls={} raw={} stale={} preflt={} zero={} refused={{1:{},2:{},3:{},4:{},5:{}}}",
                 MS_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 MS_RAW.load(std::sync::atomic::Ordering::Relaxed),
                 MS_STALE.load(std::sync::atomic::Ordering::Relaxed),
+                MS_PREFLT.load(std::sync::atomic::Ordering::Relaxed),
                 z,
                 MS_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
                 MS_STATS[2].load(std::sync::atomic::Ordering::Relaxed),
@@ -1763,6 +1825,7 @@ pub extern "system" fn n_merge_scan(
     MS_STATS[2].store(MS_STALE.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     MS_STATS[3].store(MS_ZERO.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     MS_STATS[4].store(MS_REFUSED.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[5].store(MS_PREFLT.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     n as i32
 }
 
