@@ -665,6 +665,23 @@ public final class CeHooks {
         return count < mergeMaxStack(st);
     }
 
+    /** L154: the L29 3-hop synched-data stack walk (entityData.items
+     *  [IDX_ITEM].value) — the same chain isMergableMirror uses, minus the
+     *  isMergable verdict. Returns null when the data is not ready or the
+     *  offsets are unresolved; a null means "skip the pre-gate, pay the
+     *  exact vanilla chain" (belt parity, never a wrong verdict). */
+    private static net.minecraft.world.item.ItemStack stackFast(ItemEntity e) {
+        if (IDX_ITEM < 0 || O_ED < 0) return null;
+        Object ed = U.getObject(e, O_ED);
+        if (ed == null) return null;
+        Object[] items = (Object[]) U.getObject(ed, O_ED_ITEMS);
+        if (items == null || IDX_ITEM >= items.length) return null;
+        Object di = items[IDX_ITEM];
+        if (di == null) return null;
+        Object st = U.getObject(di, O_DI_VALUE);
+        return st instanceof net.minecraft.world.item.ItemStack s ? s : null;
+    }
+
     private static final Predicate<Entity> MERGE_PRED = CeHooks::mergePredTest;
 
     // MSQ — the merge-scan query telemetry at PH_DUMP ticks (CUR_TICK
@@ -7445,6 +7462,15 @@ public final class CeHooks {
                     if (fast) {
                         // L119: the exact view trim happens RUST-SIDE now (the
                         // stored boxes = the scan-time view — see n_merge_scan).
+                        // L154 PER-SCAN SNAPSHOT: tryToMerge re-reads both stacks
+                        // per pair; the scanner's stack is loop-invariant UNTIL a
+                        // merge fires (then the winner's stack grows — refreshed
+                        // after every invokeExact below).
+                        net.minecraft.world.item.ItemStack gSelfSt = stackFast(e);
+                        int gSelfCnt = gSelfSt == null || O_STACK_COUNT < 0
+                                ? 0 : U.getInt(gSelfSt, O_STACK_COUNT);
+                        java.util.UUID gSelfTg = e.target;
+                        boolean gGate = gSelfSt != null && O_STACK_COUNT >= 0;
                         for (int k2 = 0; k2 < cands; k2++) {
                             // L150a: vanilla's merge query predicate accepts
                             // ONLY ItemEntity — a non-item leaking through
@@ -7455,6 +7481,36 @@ public final class CeHooks {
                             Object candObj = arenaRef(MS_CAND_IDS[k2]);
                             if (!(candObj instanceof ItemEntity other)
                                     || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
+                            // L154 MERGE PRE-GATE: tryToMerge is void and
+                            // side-effect-free until merge() runs, so a candidate
+                            // whose OWN gates provably fail is bit-identical to a
+                            // skipped one. The items-100k storm (63027 -> 63026
+                            // merges in 1200 ticks; 17.4% of the profile inside
+                            // MH_TRY_MERGE) is exactly full-stack pairs failing
+                            // areMergable's count sum. The gates mirror
+                            // tryToMerge's body (filters only — order-irrelevant):
+                            //   areMergable(sa, sb): sb.count + sa.count >
+                            //     sb.getMaxStackSize() (bytecode: the max is
+                            //     arg2's = the OTHER's stack; count==0 -> max 1,
+                            //     the EMPTY-map semantics)
+                            //   Objects.equals(target, other.target) (public
+                            //     field; null-safe reference fast path)
+                            //   isSameItemSameComponents(sa, sb)
+                            // Only survivors reach the vanilla per-candidate
+                            // chain below: isMergableFast + walls clip +
+                            // tryToMerge — unchanged, bit-exact.
+                            if (gGate) {
+                                net.minecraft.world.item.ItemStack gOtherSt = stackFast(other);
+                                if (gOtherSt != null) {
+                                    int oc = U.getInt(gOtherSt, O_STACK_COUNT);
+                                    if (gSelfCnt + oc > (oc == 0 ? 1 : mergeMaxStack(gOtherSt))) continue;
+                                    java.util.UUID tg = other.target;
+                                    if (gSelfTg != tg && (gSelfTg == null || tg == null
+                                            || !gSelfTg.equals(tg))) continue;
+                                    if (!net.minecraft.world.item.ItemStack
+                                            .isSameItemSameComponents(gSelfSt, gOtherSt)) continue;
+                                }
+                            }
                             if (!isMergableFast(other)) continue;
                             if (walls
                                     && level.clipDirect(e.position(), other.position(),
@@ -7466,6 +7522,17 @@ public final class CeHooks {
                             if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1
                                     | RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) mergeOps++; // L115b
                             if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) break;
+                            // L154: a fired merge mutates the scanner's stack
+                            // (the winner absorbs; partial merges for max>64
+                            // stacks touch the loser too) — refresh the
+                            // snapshot for the remaining candidates.
+                            gSelfSt = stackFast(e);
+                            if (gSelfSt == null || O_STACK_COUNT < 0) {
+                                gGate = false;
+                            } else {
+                                gSelfCnt = U.getInt(gSelfSt, O_STACK_COUNT);
+                                gSelfTg = e.target;
+                            }
                         }
                     }
                     if (!fast) {
