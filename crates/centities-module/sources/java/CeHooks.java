@@ -7433,7 +7433,11 @@ public final class CeHooks {
                     // the handles first; an init failure routes the exact
                     // vanilla body (a dropped merge is the one red line —
                     // the 104,383-lesson).
-                    if (initMergeMhs(e) && isMergableFast(e)) {
+                    // L157: the scanner gate rides the mirror too (one MH
+                    // roundtrip per merge-verdict item per tick was ~0.5ms
+                    // at items-100k scale); initMergeMhs stays — the handles
+                    // arm the tryToMerge chain below.
+                    if (initMergeMhs(e) && (MERGP_ON ? isMergableMirror(e) : isMergableFast(e))) {
                     // i0-b v3 (doc 62): the scan crosses ONE in-process JNI
                     // call (nativeMergeScan) at the loop B's per-row timing —
                     // the index sees the post-absorption state of the earlier
@@ -7454,7 +7458,12 @@ public final class CeHooks {
                             ? 0.0 : mr - 0.5;
                     int cands = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
                             mr, myinf, e.getId(), MS_CAND_IDS);
-                    dispDiag(e, "merge-scan cands=" + cands + " i=" + i + " n=" + n);
+                    // L157: the route string is built at the CALL SITE — without
+                    // the guard 1575 merge scanners allocate + concat a string
+                    // every tick just to hand it to a early-returning diag.
+                    if (DISP_TRACE_ON) {
+                        dispDiag(e, "merge-scan cands=" + cands + " i=" + i + " n=" + n);
+                    }
                     // L119-DIAG: the fast-path scan's candidate list at PH_DUMP
                     // ticks (the merge pairing hunt: the t=159 direction flip
                     // needs the exact order the native scan handed over).
@@ -7495,6 +7504,20 @@ public final class CeHooks {
                             Object candObj = arenaRef(MS_CAND_IDS[k2]);
                             if (!(candObj instanceof ItemEntity other)
                                     || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
+                            // L157 THE MIRROR-FIRST FILTER: the vanilla loop's own
+                            // candidate gate is other.isMergable() (bc 98). The
+                            // items-100k equilibrium is dominated by candidates the
+                            // gate rejects: the inert pool (pd=32767) sits at its
+                            // spawn positions (it never merged away) and full-stack
+                            // pairs fail areMergable's sum — yet the old path paid a
+                            // full MH invokeExact (~400ns) per candidate to say no
+                            // (the 17.6% self-time back-edge at the loop tail, run
+                            // 43701727207 items-100k-mod). isMergableMirror is the
+                            // L39 byte-exact Unsafe port (~40ns); the L154 pre-gate
+                            // then rejects count-overflow pairs before the walls
+                            // clip + tryToMerge. Same verdicts, same filter order
+                            // semantics (pure filters, order-irrelevant).
+                            if (MERGP_ON ? !isMergableMirror(other) : !isMergableFast(other)) continue;
                             // L154 MERGE PRE-GATE: tryToMerge is void and
                             // side-effect-free until merge() runs, so a candidate
                             // whose OWN gates provably fail is bit-identical to a
@@ -7525,8 +7548,7 @@ public final class CeHooks {
                                             .isSameItemSameComponents(gSelfSt, gOtherSt)) continue;
                                 }
                             }
-                            if (!isMergableFast(other)) continue;
-                            if (walls
+                            if (!isMergableFast(other)) continue;                            if (walls
                                     && level.clipDirect(e.position(), other.position(),
                                            net.minecraft.world.phys.shapes.CollisionContext.of(e))
                                     == net.minecraft.world.phys.HitResult.Type.BLOCK) {
