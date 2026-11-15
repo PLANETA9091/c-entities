@@ -1245,3 +1245,28 @@ the spawner filter), then the 9c623b2 parity + baseline verdicts; if
 parity stays green, the next wire lever is the tracker's per-entity
 walk (the AABB.intersects 1.6-5% + the ttl residual) and the GC/chunk
 floor — the -90% wall is the vanilla tick itself, not the wires.
+
+Task ID: 19 (verdict addendum)
+- The CI verdict on 9c623b2 (L162 + L161a, paired A/B, parity SUCCESS
+  bit-in-bit on all four scenarios, e2e/module SUCCESS): mobs-25k-native
+  406.7 -> 25.3 (-93.7%, PASS; the mod side flat 25.2->25.3), items-100k
+  68.8 -> 30.0 (-56.4%; the mod side 31.8 -> 30.0, the spawner filter +
+  the merge levers = -1.8 ms), spread-100k 353.3 -> 58.3 (-83.5%; the
+  mod side 61.1 -> 58.3, -2.8 ms), mixed-150k 475.4 -> 87.5 (-81.6%; the
+  mod side flat 87.8 -> 87.5). The vanilla-side p50s swung HARD this run
+  (spread 508 -> 353, mobs-native 532 -> 407 — the runner noise +-20%)
+  while the MOD side improved or held — the mod p50 is the stable,
+  controlled metric; the ratio is hostage to the vanilla draw.
+- The 6030e38 baseline matrix failed ONCE on spread-100k with Maven
+  Central 429 (Too Many Requests) at the leg's plugin build — infra
+  flake, not code (the rerun leg passed; the 9c623b2 matrix went green
+  with a spread rerun path as well — the 429 pattern hit twice).
+- The floor statement stands: the wires are exhausted (the walk, the
+  mirrors, flush-A, dispatch, tracker, spawner all at their provable
+  minimum for the bench shapes; the exact-zero quiet cohort is empty in
+  3600-tick fills because the ctor-spawned velocity decays into
+  denormal dust that NEVER underflows to 0.0 — 4.9e-324 * 0.98 rounds
+  back to itself — and bit-exactness forbids extrapolating a one-tick
+  TAIL_NONE verdict onto a still-decaying item). The remaining gap to
+  -90% on items/mixed is the vanilla tick floor itself (chunk system,
+  GC, the active-item tracker work, the bench bot's network stack).
