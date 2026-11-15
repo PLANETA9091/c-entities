@@ -293,6 +293,9 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static final boolean MERGE_ON =
             !"false".equals(System.getProperty("centities.mergeFast", "true"));
+    // L168: the native scan route for mergeScanNative (see the call site).
+    public static final boolean MERGE_NMS =
+            !"0".equals(System.getenv("CE_MERGE_NMS"));
     // L15b: hot-path counters are PLAIN longs — a volatile add per call cost
     // 1-2ms/tick on items-100k (100k merge checks); the JNI verifier and the
     // e2e reader tolerate eventual visibility, and these are write-only from
@@ -873,6 +876,63 @@ public final class CeHooks {
                 MSQ_COLLECT = true;
             }
             List<Entity> cands;
+            // L168: the native scan-route. mergeScanNative's fastQuery goes
+            // through the EMA router (wantFast / bigbox / view), and in a
+            // dense mixed pile that router REFUSES most merge scans (the
+            // per-cell EMAs mix in the push/targeting queries; the bigbox
+            // gate refuses when the predicted resolve looks expensive) —
+            // every refusal then paid the vanilla mergeWithNeighbours body:
+            // the O(section) has()+intersects()+isMergable() walk over the
+            // whole population (intersects 7.5% + indexOf 5.84% +
+            // getMaxStackSize 15.99% of the mixed-150k-mod profile, run
+            // 43762437188 — ~2217 refusals x ~100 ms each over the run).
+            // The native scan route (n_merge_scan — the SAME wire the flush
+            // merge-verdict path uses) answers OUTSIDE the router: the Rust
+            // scan runs the L160a trusted pre-filter Rust-side (the provable
+            // rejects drop before the Java resolve) and the verdicts are the
+            // exact merge-scan contract (intersecting ∩ ¬provable-reject is
+            // a SUPERSET of vanilla's intersecting ∩ isMergable — the
+            // consume loop's own isMergableFast check keeps it exact; the
+            // candidate ORDER is the documented legal difference).
+            // CE_MERGE_NMS=0 restores the fastQuery route.
+            if (MERGE_NMS) {
+                int cn = nativeMergeScan(worldId(sl), e.getX(), e.getY(), e.getZ(),
+                        r, horizOnly ? 0.0 : r - 0.5, entId(e), MS_CAND_IDS);
+                if (cn < 0) {
+                    mergeMirror++;
+                    if (msq) {
+                        msqPath = "nms-refuse";
+                        System.out.println("[ce-baseline] MSQ t=" + CUR_TICK
+                                + " self=" + entId(e) + " path=nms-refuse");
+                    }
+                    return false; // index unsure — vanilla body
+                }
+                mergeFast++;
+                boolean wallsNms = w.paperConfig().fixes.fixItemsMergingThroughWalls;
+                for (int k2 = 0; k2 < cn; k2++) {
+                    Object candObj = arenaRef(MS_CAND_IDS[k2]);
+                    if (!(candObj instanceof ItemEntity other)
+                            || other == e
+                            || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) {
+                        continue;
+                    }
+                    // Vanilla loop re-checks isMergable per candidate; the
+                    // walls fix is a per-candidate ray clip (paper default
+                    // off). The provable rejects never reach the list (the
+                    // Rust pre-filter) — this check keeps the verdict exact.
+                    if (!isMergableFast(other)) continue;
+                    if (wallsNms
+                            && w.clipDirect(e.position(), other.position(),
+                                   net.minecraft.world.phys.shapes.CollisionContext.of(e))
+                            == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                        continue;
+                    }
+                    MH_TRY_MERGE.invokeExact(e, other);
+                    if (e.isRemoved() | other.isRemoved()) mergeOps++;
+                    if (e.isRemoved()) return true; // absorbed — vanilla stops
+                }
+                return true;
+            }
             // L46: the depth guard spans the query AND the consume loop — the
             // scratch answer list must stay stable while mergeScanNative
             // iterates it (a merge body that queries reentrantly lands at
