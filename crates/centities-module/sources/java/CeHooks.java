@@ -7252,16 +7252,30 @@ public final class CeHooks {
                     // EMPTY dirty set (no metadata writer ran — merge is a
                     // TAIL_NONE breaker).
                     if (quietStampArm && !e.syncVelocity) {
-                        Object[] rq = TT_REF;
-                        long[] fq = TT_FLAT;
-                        if (rq != null && fq != null) {
-                            int mq = (int) (IB_IDS[i] & AMASK);
-                            int obq = mq * 5;
-                            if (rq[obq + 2] == e) {
-                                long shq = fq[mq * 2];
-                                if ((shq & TT_OK) != 0 && (shq & TT_SIT) == 0) {
-                                    TT_QUIET[mq >> 6] |= 1L << (mq & 63);
-                                    ttlQuietBumps++;
+                        int mq = (int) (IB_IDS[i] & AMASK);
+                        long[] tq = TT_QUIET;
+                        // L159: the already-quiet short-circuit — the steady-state
+                        // quiet cohort (~30k items/tick at items-100k) paid the
+                        // slot-identity pointer chase (rq[obq+2]) + the shape read
+                        // (fq[mq*2]) every tick to re-set a bit that was already
+                        // set. The bit is SET only by a full verification and is
+                        // cleared by every tail that does work (the L99 reset
+                        // below); syncVelocity stays verified above (a TAIL_NONE
+                        // row cannot have flipped it: markHurt needs a move the
+                        // kernel would have reported, setDeltaMovement is probed).
+                        // A replaced slot entity fails the consumer's own identity
+                        // check (ttlQuietSkip) so a stale bit is inert.
+                        if (tq == null || (tq[mq >> 6] & (1L << (mq & 63))) == 0) {
+                            Object[] rq = TT_REF;
+                            long[] fq = TT_FLAT;
+                            if (rq != null && fq != null) {
+                                int obq = mq * 5;
+                                if (rq[obq + 2] == e) {
+                                    long shq = fq[mq * 2];
+                                    if ((shq & TT_OK) != 0 && (shq & TT_SIT) == 0) {
+                                        tq[mq >> 6] |= 1L << (mq & 63);
+                                        ttlQuietBumps++;
+                                    }
                                 }
                             }
                         }
