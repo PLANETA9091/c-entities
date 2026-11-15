@@ -166,19 +166,27 @@ public class BaselinePlugin extends JavaPlugin implements Listener {
         // same method), so the streams must be IDENTICAL across the A/B:
         // the first mismatching (tick, source, target) triple names the
         // exact diverging absorption — the pairing hunt's decisive probe.
-        getServer().getPluginManager().registerEvent(org.bukkit.event.entity.ItemMergeEvent.class,
-                (org.bukkit.event.Listener) this, org.bukkit.event.EventPriority.NORMAL,
-                (lst, ev) -> {
-                    if (parity) {
-                        org.bukkit.event.entity.ItemMergeEvent m = (org.bukkit.event.entity.ItemMergeEvent) ev;
-                        org.bukkit.entity.Item a = m.getEntity();
-                        org.bukkit.entity.Item b = m.getTarget();
-                        getLogger().info(String.format(Locale.ROOT,
-                                "[ce-baseline] ME t=%d src=%d tc=%d amt=%d y=%.4f tgt=%d tc=%d amt=%d y=%.4f",
-                                tickNo, a.getEntityId(), tickOf(a), a.getItemStack().getAmount(), a.getLocation().getY(),
-                                b.getEntityId(), tickOf(b), b.getItemStack().getAmount(), b.getLocation().getY()));
-                    }
-                }, this);
+        // L166: the listener registers ONLY on parity legs — the perf legs
+        // must keep ItemMergeEvent.getRegisteredListeners() EMPTY so the
+        // module's L163 merge-refresh increment stays armed (a registered
+        // listener is the cancel-risk contract that forces the full Unsafe
+        // refresh per fired merge, 16.54% of the items-100k-mod profile,
+        // run 43759408035). Parity legs need the stream; perf legs don't.
+        if (parity) {
+            getServer().getPluginManager().registerEvent(org.bukkit.event.entity.ItemMergeEvent.class,
+                    (org.bukkit.event.Listener) this, org.bukkit.event.EventPriority.NORMAL,
+                    (lst, ev) -> {
+                        if (parity) {
+                            org.bukkit.event.entity.ItemMergeEvent m = (org.bukkit.event.entity.ItemMergeEvent) ev;
+                            org.bukkit.entity.Item a = m.getEntity();
+                            org.bukkit.entity.Item b = m.getTarget();
+                            getLogger().info(String.format(Locale.ROOT,
+                                    "[ce-baseline] ME t=%d src=%d tc=%d amt=%d y=%.4f tgt=%d tc=%d amt=%d y=%.4f",
+                                    tickNo, a.getEntityId(), tickOf(a), a.getItemStack().getAmount(), a.getLocation().getY(),
+                                    b.getEntityId(), tickOf(b), b.getItemStack().getAmount(), b.getLocation().getY()));
+                        }
+                    }, this);
+        }
 
         // Always-on hook diagnostics: every 100 ticks, any phase.
         Bukkit.getScheduler().runTaskTimer(this,

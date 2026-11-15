@@ -4292,6 +4292,16 @@ public final class CeHooks {
     // find these; on the bench steady state the count is ZERO and both
     // full-batch scans skip on one compare.
     private static int ibResyncN = 0;
+    // L166: the resync batch-index list — appendItem stamps every
+    // RESYNC|FORCE_VANILLA entry's index here, so the flush's three
+    // resync-gated scans (the pass-1 re-read, the pass-2 activation
+    // refresh and the L44 view build) walk rsN ENTRIES instead of the
+    // full n-entity batch three times per flush (2.39% of the
+    // items-100k-mod profile, run 43759408035: 100k IB_FLAGS loads per
+    // scan per flush for ~25 resync entries). Append order is the batch
+    // order, so each walk sees the entries in the same sequence the full
+    // scan produced.
+    private static int[] RS_IDX = new int[IB_CAP > 0 ? IB_CAP : 65536];
 
     // flag bits (must match itemcore.rs)
     public static final int IF_INACTIVE = 1;        // entry came from inactiveTick
@@ -6911,6 +6921,10 @@ public final class CeHooks {
         // L64c: the flush's two full-batch scans (pass-1 re-read + the L44
         // view build) skip entirely when this count is zero.
         if ((flags & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
+            // L166: stamp the index for the flush's resync walks
+            if (ibResyncN < RS_IDX.length) {
+                RS_IDX[ibResyncN] = i;
+            }
             ibResyncN++;
         }
         IB_ITEM[i] = e;
@@ -7148,7 +7162,10 @@ public final class CeHooks {
 
             // pass 1: resync entries re-read state POST vanilla tick
             // (L64c: skipped wholesale when the batch carried none)
-            for (int i = 0; rsN != 0 && i < n; i++) {
+            // L166: the walk rides RS_IDX (the resync entries' batch
+            // indices, stamped at append) — rsN entries instead of n.
+            for (int ri = 0; rsN != 0 && ri < rsN && ri < RS_IDX.length; ri++) {
+                int i = RS_IDX[ri];
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 if ((f & (IF_RESYNC | IF_FORCE_VANILLA)) != 0) {
                     ItemEntity e = IB_ITEM[i];
@@ -7223,7 +7240,9 @@ public final class CeHooks {
             // L151: the pass is gated on rsN — a pure-native batch (the
             // steady state) has no RESYNC/FORCE_VANILLA entries, so the
             // loop would read IB_ITEM+IB_FLAGS per entry for nothing.
-            for (int i = 0; rsN != 0 && i < n; i++) {
+            // L166: the walk rides RS_IDX — rsN entries instead of n.
+            for (int ri = 0; rsN != 0 && ri < rsN && ri < RS_IDX.length; ri++) {
+                int i = RS_IDX[ri];
                 ItemEntity ie = IB_ITEM[i];
                 if (ie == null) {
                     IB_ATI[i * 3] = 0;
@@ -7289,7 +7308,9 @@ public final class CeHooks {
             // L64c: the scan skips wholesale when the batch carried no
             // RESYNC|FORCE_VANILLA entries (viewN stays 0 — the consumers
             // see an empty view exactly as the full scan would produce).
-            for (int i = 0; rsN != 0 && i < n; i++) {
+            // L166: the walk rides RS_IDX — rsN entries instead of n.
+            for (int ri = 0; rsN != 0 && ri < rsN && ri < RS_IDX.length; ri++) {
+                int i = RS_IDX[ri];
                 int f = IB_FLAGS[i] & IF_CDMASK;
                 // RESYNC and FORCE_VANILLA entries both ran their vanilla
                 // bodies DURING the phase (their live boxes are POST-move);
@@ -7933,8 +7954,13 @@ public final class CeHooks {
                             if (gSelfSt == null || O_STACK_COUNT < 0) {
                                 gGate = false;
                             } else {
+                                // L166: the target refresh is DEAD — the
+                                // javap'd merge body touches ONLY
+                                // pickupDelay/age/discard and the pre-gate
+                                // proved the target equality, so gSelfTg
+                                // cannot change across a fired merge (a
+                                // canceled event fires NO mutation either).
                                 gSelfCnt = U.getInt(gSelfSt, O_STACK_COUNT);
-                                gSelfTg = e.target;
                             }
                             // L162 FULL-SELF BREAK (the post-merge arm): the
                             // winner's stack may now be at capacity — every
