@@ -59,6 +59,16 @@ const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 /// L30: the tracker-loop floor target — ChunkMap.newTrackerTick replace_body.
 const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
+/// L163: the spawner-walk floor target — NaturalSpawner.createState replace_body.
+/// The vanilla 5-arg createState walks getAllEntities() and for EVERY entity
+/// runs the Mob-persistence gates + getType().getCategory() + the paperConfig
+/// spawnReason gate; an ItemEntity always dies at the MISC category compare
+/// (EntityType.ITEM's category is ctor-fixed), so the whole per-item body is
+/// dead weight at items scale (4.3% self on items-100k, another few % of
+/// getState/getCategory leaves on spread/mixed). The bridge is the byte-exact
+/// transcription with ONE added pre-gate: `instanceof ItemEntity -> continue`
+/// — value-exact because vanilla itself continues at the MISC compare.
+const NATURALSPAWNER_CLASS: &str = "net/minecraft/world/level/NaturalSpawner";
 // L36: the idle AI-control classes (nav/move/look early-out guards).
 const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNavigation";
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
@@ -508,6 +518,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(CONVERSION_TRACKER_CLASS, |_n, b| patch_conversion(b));
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
     cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
+    cplug_sdk::hooks::register_bytes(NATURALSPAWNER_CLASS, |_n, b| patch_naturalspawner(b));
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
@@ -542,6 +553,8 @@ pub unsafe extern "C" fn cplugin_init(
 // the exact vanilla body. A refusal of one guard keeps the other two.
 // ---------------------------------------------------------------------------
 
+static SP_WOVEN: AtomicBool = AtomicBool::new(false);
+static SP_DECLINED: AtomicBool = AtomicBool::new(false);
 static NAV_WOVEN: AtomicBool = AtomicBool::new(false);
 static NAV_DECLINED: AtomicBool = AtomicBool::new(false);
 static MOVE_WOVEN: AtomicBool = AtomicBool::new(false);
@@ -792,6 +805,7 @@ fn arm_module() {
     precompute_activation(loader);
     precompute_trackedentity(loader);
     precompute_chunkmap(loader);
+    precompute_naturalspawner(loader);
 
     BRIDGE_READY.store(true, Ordering::Release);
 
@@ -810,6 +824,7 @@ fn arm_module() {
         CONVERSION_TRACKER_CLASS,
         TRACKED_ENTITY_CLASS,
         CHUNKMAP_CLASS,
+        NATURALSPAWNER_CLASS,
         SENSING_CLASS,
         NAVIGATION_CLASS,
         MOVE_CONTROL_CLASS,
@@ -1070,6 +1085,25 @@ fn arm_module() {
                         let rc = cplug_sdk::retransform_class(CHUNKMAP_CLASS);
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred tracker-loop floor applied, rc={rc}"
+                        ));
+                    }
+                }
+                // L163 deferred weave: NaturalSpawner usually loads at boot
+                // (bootstrap entity-type registration) — but a post-arm load
+                // order must not strand the floor: same stash/retry protocol
+                // as ChunkMap.
+                if !SP_WOVEN.load(Ordering::Acquire)
+                    && !SP_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(NATURALSPAWNER_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_naturalspawner(loader as jni::jobject);
+                    if SP_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(NATURALSPAWNER_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred NaturalSpawner walk filter applied, rc={rc}"
                         ));
                     }
                 }
@@ -3529,6 +3563,110 @@ fn precompute_chunkmap(loader: jni::jobject) {
                 "[c-entities] FAILED to precompute ChunkMap tracker-loop floor — vanilla kept",
             );
         }
+    }
+}
+
+/// L163: the NaturalSpawner.createState floor — the body becomes
+/// `CeHooks.spawnerCreateState$(I, ServerLevel, ChunkGetter, LocalMobCapCalculator, boolean)`
+/// (the byte-exact vanilla transcription + the ItemEntity pre-filter; the
+/// mob path runs the real lambda$createState$0 handle through the real
+/// ChunkGetter.query).
+fn spawner_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "createState",
+        method_desc: "(ILnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/level/NaturalSpawner$ChunkGetter;Lnet/minecraft/world/level/LocalMobCapCalculator;Z)Lnet/minecraft/world/level/NaturalSpawner$SpawnState;",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "spawnerCreateState$",
+        bridge_desc: "(ILjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Z)Lnet/minecraft/world/level/NaturalSpawner$SpawnState;",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'I' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 2, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 3, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 4, ty: b'Z' },
+        ],
+    }
+}
+
+fn precompute_naturalspawner(loader: jni::jobject) {
+    if read_java_flag("SP_FLAG_ON") != Some(true) {
+        SP_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] spawner walk filter disabled (CE_SPAWNER_FILTER) — vanilla kept",
+        );
+        return;
+    }
+    if prove_handles("initSpawnerHandles", "SP_HANDLES_OK") != Some(true) {
+        SP_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] spawner-walk handle probe failed — vanilla kept (lastErr in stats)",
+        );
+        return;
+    }
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|s| s.get(NATURALSPAWNER_CLASS).cloned())
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] NaturalSpawner not stashed yet — spawner floor deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &spawner_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(NATURALSPAWNER_CLASS, b);
+            }
+            SP_WOVEN.store(true, Ordering::Release);
+            // Telemetry arm only — the bridge body is total and gates on
+            // nothing; a failed weave would keep the vanilla body entirely.
+            let _ = set_java_bool("setSpawnerOn", true);
+            cplug_sdk::log::info("[c-entities] precomputed NaturalSpawner.createState walk filter");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute NaturalSpawner walk filter — vanilla kept",
+            );
+        }
+    }
+}
+
+fn patch_naturalspawner(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_naturalspawner_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_naturalspawner_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load: stash the original bytes, stay vanilla. The floor is
+        // woven at arm time (precompute_naturalspawner).
+        let mut st = STASH.lock().ok()?;
+        st.entry(NATURALSPAWNER_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(NATURALSPAWNER_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched NaturalSpawner.createState walk filter");
+            Some(b)
+        }
+        _ if !SP_WOVEN.load(Ordering::Acquire) && !SP_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(NATURALSPAWNER_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] NaturalSpawner bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
     }
 }
 

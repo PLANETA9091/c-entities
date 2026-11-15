@@ -528,6 +528,21 @@ public final class CeHooks {
     public static volatile boolean MERGP_ON = false;
     private static volatile long O_IE_DESPAWN = -1, O_STACK_COUNT = -1;
     private static volatile int IDX_ITEM = -1;
+    // L162 (the java-wire storm pass): the merge-candidate loop levers.
+    //   MERGE_FULLBREAK — once the scanner's stack is at capacity the whole
+    //     candidate walk provably no-ops (every same-item candidate fails
+    //     areMergable's count sum, every other stack fails
+    //     isSameItemSameComponents; tryToMerge is side-effect-free until
+    //     merge() runs). Skipping the walk is bit-identical.
+    //   MERGE_DBLCHECK — restores the legacy SECOND isMergable MH call per
+    //     surviving candidate; the gate above it already ran the identical
+    //     predicate (the L39 mirror under MERGP_ON, the same MH otherwise)
+    //     and nothing between the two checks mutates an entity.
+    public static final boolean MERGE_FULLBREAK =
+            !"0".equals(System.getenv("CE_MERGE_FULLBREAK"));
+    public static final boolean MERGE_DBLCHECK =
+            "1".equals(System.getenv("CE_MERGE_DBLCHECK"));
+    public static long mergeFullSelf = 0;
 
     /** Resolves the three mirror offsets (ItemEntity.despawnRate,
      *  ItemStack.count, the DATA_ITEM accessor id). Runs once at arm. */
@@ -1195,6 +1210,9 @@ public final class CeHooks {
                 + "/" + restFailFluid + "/" + restFailVel + "/" + restFailChurn
                 + " merge=" + mergeChecks + "/" + mergeSelf + "/" + mergeFast
                 + "/" + mergeMirror + "/" + mergeCand + "/" + mergeOps
+                + "/fb" + mergeFullSelf
+                + " sp=" + spSkipped + "/" + spQueries + "/" + spWalks
+                + "/" + (SP_ON ? 1 : 0)
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
@@ -7451,7 +7469,15 @@ public final class CeHooks {
                     // roundtrip per merge-verdict item per tick was ~0.5ms
                     // at items-100k scale); initMergeMhs stays — the handles
                     // arm the tryToMerge chain below.
-                    if (initMergeMhs(e) && (MERGP_ON ? isMergableMirror(e) : isMergableFast(e))) {
+                    // L162: the volatile read replaces the per-scanner
+                    // monitor entry — initMergeMhs is synchronized and every
+                    // merge-verdict item paid the monitor roundtrip just to
+                    // see the handle was already built (2.4% self at
+                    // items-100k: the scanner gate line). The synchronized
+                    // init runs only on the first-ever scanner; later
+                    // scanners read the volatile handle directly.
+                    if ((MH_TRY_MERGE != null || initMergeMhs(e))
+                            && (MERGP_ON ? isMergableMirror(e) : isMergableFast(e))) {
                     // i0-b v3 (doc 62): the scan crosses ONE in-process JNI
                     // call (nativeMergeScan) at the loop B's per-row timing —
                     // the index sees the post-absorption state of the earlier
@@ -7508,7 +7534,22 @@ public final class CeHooks {
                                 ? 0 : U.getInt(gSelfSt, O_STACK_COUNT);
                         java.util.UUID gSelfTg = e.target;
                         boolean gGate = gSelfSt != null && O_STACK_COUNT >= 0;
-                        for (int k2 = 0; k2 < cands; k2++) {
+                        // L162 FULL-SELF BREAK: once the scanner's stack is at
+                        // capacity, EVERY candidate provably fails — a
+                        // same-components candidate fails areMergable's count
+                        // sum (oc >= 1: selfCnt + oc > max; oc == 0: the
+                        // EMPTY-map max-1 rule keeps it failing) and any other
+                        // stack fails isSameItemSameComponents. tryToMerge is
+                        // side-effect-free until merge() runs (L154), so
+                        // starting the cursor past the end is bit-identical to
+                        // running the walk. CE_MERGE_FULLBREAK=0 restores.
+                        int k2Start = 0;
+                        if (MERGE_FULLBREAK && gGate
+                                && gSelfCnt >= mergeMaxStack(gSelfSt)) {
+                            k2Start = cands;
+                            mergeFullSelf++;
+                        }
+                        for (int k2 = k2Start; k2 < cands; k2++) {
                             // L150a: vanilla's merge query predicate accepts
                             // ONLY ItemEntity — a non-item leaking through
                             // (an index round-trip past the Rust membership
@@ -7562,7 +7603,13 @@ public final class CeHooks {
                                             .isSameItemSameComponents(gSelfSt, gOtherSt)) continue;
                                 }
                             }
-                            if (!isMergableFast(other)) continue;                            if (walls
+                            // L162: the gate ABOVE already ran the identical
+                            // predicate for this candidate (the L39 mirror under
+                            // MERGP_ON, the very same MH under the legacy path)
+                            // and the pre-gate between them is a pure read — the
+                            // re-check was a second ~400ns MH roundtrip per
+                            // surviving candidate. CE_MERGE_DBLCHECK=1 restores.
+                            if (MERGE_DBLCHECK && !isMergableFast(other)) continue;                            if (walls
                                     && level.clipDirect(e.position(), other.position(),
                                            net.minecraft.world.phys.shapes.CollisionContext.of(e))
                                     == net.minecraft.world.phys.HitResult.Type.BLOCK) {
@@ -7582,6 +7629,16 @@ public final class CeHooks {
                             } else {
                                 gSelfCnt = U.getInt(gSelfSt, O_STACK_COUNT);
                                 gSelfTg = e.target;
+                            }
+                            // L162 FULL-SELF BREAK (the post-merge arm): the
+                            // winner's stack may now be at capacity — every
+                            // remaining candidate fails the sum gate, so the
+                            // walk ends here (the Unsafe refresh above was the
+                            // #1 self-time line at items-100k: 12.05%).
+                            if (gGate && MERGE_FULLBREAK
+                                    && gSelfCnt >= mergeMaxStack(gSelfSt)) {
+                                mergeFullSelf++;
+                                break;
                             }
                         }
                     }
@@ -12447,6 +12504,203 @@ public final class CeHooks {
     }
 
     // ==================================================================
+    // L163 — the NaturalSpawner.createState walk filter. The vanilla 5-arg
+    // createState (javap 26.3, transcribed 1:1) iterates
+    // ServerLevel.getAllEntities() and per entity runs:
+    //   instanceof Mob -> isPersistenceRequired/requiresCustomPersistence
+    //     gates (both -> continue)
+    //   getType().getCategory() -> MISC -> continue
+    //   !paperConfig.entities.spawning.countAllMobsForSpawning
+    //     && spawnReason not in {NATURAL, CHUNK_GEN} -> continue
+    //   blockPosition() + ChunkGetter.query(ChunkPos.pack(pos), lambda)
+    // An ItemEntity ALWAYS dies at the MISC compare (EntityType.ITEM's
+    // category is ctor-fixed — no config can change it), so at items scale
+    // the whole per-item chain (getType + paperConfig chain + the compare)
+    // is dead weight (4.3% self on items-100k, plus the per-item share on
+    // spread/mixed). The bridge is the exact transcription with ONE added
+    // pre-gate — `instanceof ItemEntity -> continue` — value-exact because
+    // vanilla itself continues at the MISC compare. Everything else,
+    // INCLUDING the mob path (persistence gates, category, spawnReason,
+    // blockPosition, query, the real lambda$createState$0 handle and the
+    // real SpawnState ctor), runs exactly as vanilla. The lambda captures
+    // ride one reused SpConsumer instead of the invokedynamic capture
+    // allocation: query() consumes it synchronously inside the call on the
+    // single server thread, so the reuse is GC-visible only. The
+    // countAllMobsForSpawning config read is hoisted out of the loop —
+    // the value is startup-immutable (Paper freezes the config after boot;
+    // the spawner never runs during boot).
+    // ==================================================================
+    public static volatile boolean SP_ON = false;
+    public static volatile boolean SP_HANDLES_OK = false;
+    public static final boolean SP_FLAG_ON =
+            !"0".equals(System.getenv("CE_SPAWNER_FILTER"));
+    public static long spSkipped = 0, spMobKept = 0, spQueries = 0, spWalks = 0;
+
+    private static volatile MethodHandle SP_LAMBDA;
+    private static volatile MethodHandle SP_NEW_STATE;
+
+    /** The reused query consumer — the 8 captures of
+     * lambda$createState$0(ServerLevel, BlockPos, Entity, PotentialCalculator,
+     * LocalMobCapCalculator, MobCategory, Object2IntOpenHashMap, boolean,
+     * LevelChunk) written per entity before the query call. */
+    private static final class SpConsumer
+            implements java.util.function.Consumer<net.minecraft.world.level.chunk.LevelChunk> {
+        ServerLevel cLevel;
+        BlockPos cPos;
+        Entity cEnt;
+        net.minecraft.world.level.PotentialCalculator cPot;
+        net.minecraft.world.level.LocalMobCapCalculator cCap;
+        net.minecraft.world.entity.MobCategory cCat;
+        it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap<net.minecraft.world.entity.MobCategory> cMap;
+        boolean cCount;
+
+        @Override
+        public void accept(net.minecraft.world.level.chunk.LevelChunk chunk) {
+            try {
+                SP_LAMBDA.invokeExact(cLevel, cPos, cEnt, cPot, cCap, cCat,
+                        cMap, cCount, chunk);
+            } catch (RuntimeException | Error rethrow) {
+                throw rethrow;
+            } catch (Throwable wrapped) {
+                throw new RuntimeException(wrapped);
+            }
+        }
+    }
+
+    private static final SpConsumer SP_CONS = new SpConsumer();
+
+    public static void initSpawnerHandles() {
+        if (SP_LAMBDA != null && SP_NEW_STATE != null) {
+            SP_HANDLES_OK = true;
+            return;
+        }
+        try {
+            Class<?> ns = Class.forName("net.minecraft.world.level.NaturalSpawner");
+            MethodHandle lm = null;
+            for (java.lang.reflect.Method m : ns.getDeclaredMethods()) {
+                if (!m.isSynthetic() || !java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+                    continue;
+                }
+                if (!m.getName().startsWith("lambda$createState$")
+                        || m.getReturnType() != void.class
+                        || m.getParameterCount() != 9
+                        || m.getParameterTypes()[8] != net.minecraft.world.level.chunk.LevelChunk.class) {
+                    continue;
+                }
+                m.setAccessible(true);
+                lm = MethodHandles.lookup().unreflect(m);
+                break;
+            }
+            if (lm == null) {
+                lastError = System.nanoTime();
+                lastErrorText = "spawnerMhs: lambda$createState$ not found";
+                SP_HANDLES_OK = false;
+                return;
+            }
+            SP_LAMBDA = lm;
+            Class<?> ss = Class.forName(
+                    "net.minecraft.world.level.NaturalSpawner$SpawnState");
+            java.lang.reflect.Constructor<?> ssc = ss.getDeclaredConstructor(
+                    int.class,
+                    it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap.class,
+                    net.minecraft.world.level.PotentialCalculator.class,
+                    net.minecraft.world.level.LocalMobCapCalculator.class);
+            ssc.setAccessible(true);
+            SP_NEW_STATE = MethodHandles.lookup()
+                    .unreflectConstructor(ssc)
+                    .asType(java.lang.invoke.MethodType.methodType(
+                            net.minecraft.world.level.NaturalSpawner.SpawnState.class,
+                            int.class,
+                            it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap.class,
+                            net.minecraft.world.level.PotentialCalculator.class,
+                            net.minecraft.world.level.LocalMobCapCalculator.class));
+            SP_HANDLES_OK = true;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "initSpawnerHandles: " + t;
+            SP_HANDLES_OK = false;
+        }
+    }
+
+    /** The 26.3 5-arg createState, transcribed byte-exact from javap, plus
+     * the ItemEntity pre-filter. The weave arms only after initSpawnerHandles
+     * proved BOTH handles (the lambda and the SpawnState ctor), so the body
+     * below is total — there is no vanilla route left once replace_body runs.
+     * The 4-arg overload delegates to this one in vanilla (iconst_0) and is
+     * NOT patched — delegation reaches the patched 5-arg normally. */
+    public static net.minecraft.world.level.NaturalSpawner.SpawnState spawnerCreateState$(
+            int spawnableChunks, Object levelO, Object getterO, Object capO,
+            boolean countEntities) {
+        ServerLevel level = (ServerLevel) levelO;
+        net.minecraft.world.level.NaturalSpawner.ChunkGetter getter =
+                (net.minecraft.world.level.NaturalSpawner.ChunkGetter) getterO;
+        net.minecraft.world.level.LocalMobCapCalculator cap =
+                (net.minecraft.world.level.LocalMobCapCalculator) capO;
+        java.util.Iterator<?> it = level.getAllEntities().iterator();
+        net.minecraft.world.level.PotentialCalculator pot =
+                new net.minecraft.world.level.PotentialCalculator();
+        it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap<net.minecraft.world.entity.MobCategory> map =
+                new it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap<>();
+        // Hoisted: startup-immutable config (see the section header).
+        final boolean countAll = level.paperConfig().entities.spawning.countAllMobsForSpawning;
+        spWalks++;
+        while (it.hasNext()) {
+            Object o = it.next();
+            if (!(o instanceof Entity ent)) {
+                // vanilla checkcasts unconditionally — unreachable, kept total
+                continue;
+            }
+            // L163 THE FILTER: vanilla kills every ItemEntity at the MISC
+            // category compare — skip before getType()/paperConfig even run.
+            if (ent instanceof ItemEntity) {
+                spSkipped++;
+                continue;
+            }
+            if (ent instanceof net.minecraft.world.entity.Mob mob) {
+                if (mob.isPersistenceRequired()) {
+                    spMobKept++;
+                    continue;
+                }
+                if (mob.requiresCustomPersistence()) {
+                    spMobKept++;
+                    continue;
+                }
+            }
+            net.minecraft.world.entity.MobCategory cat = ent.getType().getCategory();
+            if (cat == net.minecraft.world.entity.MobCategory.MISC) {
+                spMobKept++;
+                continue;
+            }
+            if (!countAll
+                    && ent.spawnReason != org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason.NATURAL
+                    && ent.spawnReason != org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason.CHUNK_GEN) {
+                spMobKept++;
+                continue;
+            }
+            BlockPos pos = ent.blockPosition();
+            SpConsumer c = SP_CONS;
+            c.cLevel = level;
+            c.cPos = pos;
+            c.cEnt = ent;
+            c.cPot = pot;
+            c.cCap = cap;
+            c.cCat = cat;
+            c.cMap = map;
+            c.cCount = countEntities;
+            getter.query(net.minecraft.world.level.ChunkPos.pack(pos), c);
+            spQueries++;
+        }
+        try {
+            return (net.minecraft.world.level.NaturalSpawner.SpawnState)
+                    SP_NEW_STATE.invokeExact(spawnableChunks, map, pot, cap);
+        } catch (RuntimeException | Error rethrow) {
+            throw rethrow;
+        } catch (Throwable wrapped) {
+            throw new RuntimeException(wrapped);
+        }
+    }
+
+    // ==================================================================
     // L30 — the tracker-loop floor. The vanilla ChunkMap.newTrackerTick
     // (javap, 26.3) per entity: moonrise$getTrackedEntity (interface),
     // moonrise$getChunkData().nearbyPlayers, moonrise$tick(chunk), then
@@ -12675,6 +12929,14 @@ public final class CeHooks {
 
     public static void setTrackerLoopOn(boolean on) {
         TTL_ON = on;
+    }
+
+    /** L163 telemetry arm: flipped by the module once the spawner floor is
+     *  woven and retransformed. The bridge body itself is total (the exact
+     *  transcription) and gates on nothing — SP_ON only marks the [ms]
+     *  telemetry line so a weave that silently failed to land is visible. */
+    public static void setSpawnerOn(boolean on) {
+        SP_ON = on;
     }
 
     /** The iteratingTrackerEntities write. The field is a BOOLEAN — a raw
