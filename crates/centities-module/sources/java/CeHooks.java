@@ -622,7 +622,9 @@ public final class CeHooks {
     private static volatile Object EMPTY_PATCH;
     private static volatile Object MSSTYPE;
     private static Object LAST_PROTO;
+    private static Object PREV_PROTO;
     private static int LAST_PROTO_MAX;
+    private static int PREV_PROTO_MAX;
 
     private static void initMergeMaxStack() {
         try {
@@ -654,7 +656,12 @@ public final class CeHooks {
 
     /** The max-stack answer for a NON-EMPTY stack: the prototype constant
      *  when the patch map is the shared empty singleton, the exact walk
-     *  otherwise. */
+     *  otherwise. L167: TWO slots — the mixed-100k population alternates
+     *  stack types (A,B,A,B…), and the single-slot cache missed on EVERY
+     *  alternating candidate (proto.get per candidate, 15.99% of the
+     *  mixed-150k-mod profile, run 43762437188). The second slot keeps the
+     *  alternating pair resident; a miss still walks exactly once per
+     *  proto. */
     private static int mergeMaxStack(Object st) {
         long o1 = O_STACK_COMPONENTS, o2 = O_PCM_PATCH, o3 = O_PCM_PROTO;
         Object mst = MSSTYPE;
@@ -665,10 +672,13 @@ public final class CeHooks {
                 if (patch == EMPTY_PATCH) {
                     Object proto = U.getObject(map, o3);
                     if (proto == LAST_PROTO) return LAST_PROTO_MAX;
+                    if (proto == PREV_PROTO) return PREV_PROTO_MAX;
                     try {
                         Object v = ((net.minecraft.core.component.DataComponentMap) proto)
                                 .get((net.minecraft.core.component.DataComponentType<?>) mst);
                         Integer iv = (Integer) v;
+                        PREV_PROTO = LAST_PROTO;
+                        PREV_PROTO_MAX = LAST_PROTO_MAX;
                         LAST_PROTO_MAX = iv == null ? 1 : iv;
                         LAST_PROTO = proto;
                         return LAST_PROTO_MAX;
