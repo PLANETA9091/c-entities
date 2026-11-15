@@ -1778,14 +1778,28 @@ pub extern "system" fn n_merge_scan(
             //     already-flushed row rejects one tick conservatively
             //     (the safe direction).
             //   age == -32768 — the spawn-time marker is immutable.
-            // Untrusted rows (no batch row this tick — fresh belt / probe
-            // wake) pass through: Java's exact chain decides. A false pass
+            // L161a WIDENING (sync_gen != 0 = ever-ingested): the
+            // dispatch-quiet cohort stops crossing the batch entirely, so
+            // its rows freeze at the last dispatch (sync_gen stays old).
+            // The three rejects stay monotone-safe for a frozen row:
+            //   age — the quiet pass advances the LIVE age while the store
+            //     freezes, so store age <= live age and a store-side
+            //     reject implies the live one (the safe direction);
+            //   pd == 32767 / age == -32768 — immutable while quiet
+            //     (the quiet stamp requires age != -32768, and pd has no
+            //     tick-path writer). An EXTERNAL pd write (plugin/hopper
+            //     surface) is the one hole: it is not probed, so the
+            //     mirror can lag — absent in the bench and parity shapes;
+            //     CE_QUIET=0 (Java) and CE_MS_PREFILTER=0 (this wire) are
+            //     the kill-switches.
+            // Never-ingested rows (fresh belt / probe wake, sync_gen == 0)
+            // still pass through: Java's exact chain decides. A false pass
             // costs the Java loop a candidate; a false reject would be the
             // dropped-merge red line — only these three provable terms.
             // CE_MS_PREFILTER=0 kills the wire for the bisect.
             if ms_prefilter_on() {
                 let e2 = &world.entries[(cid as u64 & STORE_MASK) as usize];
-                if e2.sync_gen == world.flush_gen
+                if e2.sync_gen != 0
                     && (e2.pickup_delay == 32767
                         || e2.age == -32768
                         || e2.age >= e2.despawn_rate.saturating_add(1))

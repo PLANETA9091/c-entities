@@ -1213,6 +1213,9 @@ public final class CeHooks {
                 + "/fb" + mergeFullSelf
                 + " sp=" + spSkipped + "/" + spQueries + "/" + spWalks
                 + "/" + (SP_ON ? 1 : 0)
+                + " qui=" + quietSkips + "/" + quietStamps + "/" + quietExits
+                + "/" + quietBelt + "/" + quietDespawns
+                + "/" + (CE_QUIET_ON ? 1 : 0)
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
@@ -1800,6 +1803,9 @@ public final class CeHooks {
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
                 RM_BIT[paSlot] = 0; // L115: fresh slot — alive
+                // L161a: the fresh slot must not inherit a dead predecessor's
+                // quiet proof (id&AMASK collisions across generations).
+                quietClearSlot(paId);
                 ordStamp(e); // L37: vanilla addEntity appends -> fresh seq
                 batchUpsert(paId, worldId(e.level()), e, e.getBoundingBox(), false);
             }
@@ -1922,6 +1928,8 @@ public final class CeHooks {
                 int pbSlot = pbId & AMASK;
                 ARENA[pbSlot] = e;
                 ARENA_ID[pbSlot] = pbId;
+                // L161a: a box change is a disturbance — exit dispatch-quiet.
+                quietClearSlot(pbId);
                 if (REST_GEN[pbSlot] != 0) {
                     REST_GEN[pbSlot] = 0; // a box change is a disturbance
                     wakesBox++;
@@ -2789,6 +2797,8 @@ public final class CeHooks {
                         int enId = entId(en);
                         ARENA[enId & AMASK] = en;
                         ARENA_ID[enId & AMASK] = enId;
+                        // L161a: refreshed slots drop any inherited quiet proof.
+                        quietClearSlot(enId);
                         ordStamp(en);
                     }
                 }
@@ -5191,6 +5201,39 @@ public final class CeHooks {
                 dispDiag(e, "client");
                 return false;
             }
+            // L161a: the dispatch-quiet skip — one bitset read for the
+            // whole per-tick wire of a TAIL_NONE non-mergable item. The
+            // identity check pins the slot to THIS entity (a slot collision
+            // with a dead quiet item cannot inherit the proof: registration
+            // and box probes clear the bit). The section-revision gate is
+            // the exact L21-rest shape: only when the global revision moved
+            // does the item pay the per-item environment check (water/lava/
+            // fire/despawn-time/its own sections) — a stale-but-boring
+            // revision re-stamps and stays quiet.
+            if (CE_QUIET_ON) {
+                long[] dq = DS_QUIET;
+                if (dq != null) {
+                    int q = eid & AMASK;
+                    if ((dq[q >> 6] & (1L << (q & 63))) != 0
+                            && RM_BIT[q] != 1 && ARENA[q] == e) {
+                        if (QUIET_REV[q] != WORLD_REV) {
+                            if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
+                                    || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
+                                dq[q >> 6] &= ~(1L << (q & 63));
+                                quietExits++;
+                                dispDiag(e, "quiet-exit-rev");
+                            } else {
+                                QUIET_REV[q] = WORLD_REV; // stale-but-boring
+                            }
+                        }
+                        if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
+                            quietSkips++;
+                            dispDiag(e, "quiet");
+                            return true; // the quiet pass owns this item's tick
+                        }
+                    }
+                }
+            }
             int slot = eid & MAMASK;
             // i0-a STAY fast path (doc 62): the core pre-approved this
             // item's next dispatch — native-mode (MODE_VAL==1), revision
@@ -5550,6 +5593,14 @@ public final class CeHooks {
             if (MODE_GEN[slot] == MODE_EPOCH) {
                 MODE_VAL[slot] = 0;
                 FAST_STAMP[slot] = 0L; // L151: the stamp dies with the mode
+            }
+            // L161a: any external kinematic mutation exits dispatch-quiet —
+            // the quiet pass owns the counters, but a moved/pushed item
+            // needs the exact vanilla/flush tail again.
+            long[] dq = DS_QUIET;
+            if (dq != null) {
+                int q = entId(e) & AMASK;
+                dq[q >> 6] &= ~(1L << (q & 63));
             }
         }
     }
@@ -6841,6 +6892,99 @@ public final class CeHooks {
      * entity loop of THIS level's tick: flush the batch (one JNI crossing),
      * apply the writebacks, run the exact vanilla event snippets.
      */
+    // ==================================================================
+    // L161a — the dispatch-quiet protocol. A native item whose LAST flush
+    // verdict certified TAIL_NONE (the whole post-counter tail a provable
+    // no-op) AND that is not merge-cadence-eligible (!isMergableMirror —
+    // the scan the core cadence-gates can never fire for it, so no merge
+    // ORDER is lost) leaves the dispatch/row/flush cycle entirely:
+    // itemDispatch returns "handled" on one bitset read, no batch row is
+    // built, the Rust core never sees it, and the flush loop A runs no
+    // per-row work for it. A Java-side quiet pass owns the cohort instead:
+    // the exact vanilla counter arithmetic (tickCount++, totalEntityAge++,
+    // age++), the exact despawn tail (age >= rate -> despawnTail), and the
+    // 256-tick belt (re-approve through the full dispatch chain).
+    // WAKES (the bit clears and the next dispatch re-approves):
+    //   l7ExternalMutation — every probed kinematic write;
+    //   the section-revision gate (QUIET_REV vs WORLD_REV + the exact
+    //     L21-rest touched check: water/lava/fire/despawn-time/section);
+    //   registration (a slot collision must not inherit a dead item's
+    //     quiet proof) and box changes (probesAdd/probesBox/regrow);
+    //   removal (RM_BIT skips + the pass clears);
+    //   despawn (the pass runs the exact tail) and the belt.
+    // QUIET ITEMS ARE NEVER MERGE PARTICIPANTS: the candidate gate reads
+    // the LIVE entity (isMergableMirror) — a quiet item fails it by
+    // construction at stamp time, and while quiet its non-mergability is
+    // stable (count/pd have no tick-path writers; age only grows toward
+    // the despawn the pass itself performs). KNOWN LIMITS (documented,
+    // kill-switched): a plugin/hopper pickupDelay or stack write is not
+    // probed — such an item stays quiet up to the 256-tick belt (absent
+    // in the bench and parity shapes); CE_QUIET=0 refuses the arm.
+    // ==================================================================
+    public static volatile boolean CE_QUIET_ON = false;
+    public static final boolean CE_QUIET_FLAG =
+            !"0".equals(System.getenv("CE_QUIET"));
+    public static volatile long[] DS_QUIET;
+    public static volatile long[] QUIET_REV;
+    private static long QUIET_LAST_TICK = -1;
+    public static long quietSkips = 0, quietStamps = 0, quietExits = 0,
+            quietBelt = 0, quietDespawns = 0;
+
+    public static void setItemQuietOn(boolean on) {
+        CE_QUIET_ON = on && CE_QUIET_FLAG;
+    }
+
+    private static void quietClearSlot(int id) {
+        long[] dq = DS_QUIET;
+        if (dq != null) {
+            int q = id & AMASK;
+            dq[q >> 6] &= ~(1L << (q & 63));
+        }
+    }
+
+    /** The dispatch-quiet owner pass — runs once per tick at the flush
+     *  entry (before the n==0 return, so an all-quiet world still ticks
+     *  its cohort). Order-free by construction: the counters are per
+     *  entity and the cohort never merges, scans, or moves. */
+    private static void quietPass() {
+        long[] dq = DS_QUIET;
+        if (dq == null) return;
+        for (int w = 0; w < dq.length; w++) {
+            long word = dq[w];
+            if (word == 0L) continue;
+            long live = word;
+            for (int b = 0; b < 64; b++) {
+                long bit = 1L << b;
+                if ((word & bit) == 0) continue;
+                int slot = (w << 6) | b;
+                Object o = ARENA[slot];
+                if (!(o instanceof ItemEntity e) || RM_BIT[slot] == 1) {
+                    live &= ~bit;
+                    continue;
+                }
+                e.tickCount = e.tickCount + 1;
+                e.totalEntityAge = e.totalEntityAge + 1;
+                e.age = e.age + 1;
+                try {
+                    if (e.age >= VH_DESPAWN_RATE.getInt(e)) {
+                        despawnTail(e);
+                        live &= ~bit;
+                        quietDespawns++;
+                        continue;
+                    }
+                } catch (Throwable tf) {
+                    // event/discard trouble: stay quiet, the next pass
+                    // retries (vanilla's failure mode is the same throw)
+                }
+                if ((e.tickCount & 255) == 0) {
+                    live &= ~bit;
+                    quietBelt++;
+                }
+            }
+            dq[w] = live;
+        }
+    }
+
     public static void itemTickFlush(Level level) {
         int n = ibN;
         itemFlushes++;
@@ -6874,6 +7018,20 @@ public final class CeHooks {
         // return (the mob wire is independent of the item batch size).
         if (NATIVE_MOB_ON && (level instanceof net.minecraft.server.level.ServerLevel)) {
             nativeMobBoundary(level);
+        }
+        // L161a: the quiet cohort's owner pass — ONCE per REAL server tick.
+        // The gate MUST ride the level's gameTime, NOT CUR_TICK: CUR_TICK
+        // counts flush CALLS and the flush fires several times per tick
+        // (29522 calls over ~3600 ticks in the parity leg — the per-level
+        // weave + the n==0 skip flushes), which ran the pass ~8x per tick
+        // and multiplied the whole cohort's counters (the par5 parity fail:
+        // tc off=449 on=935).
+        if (CE_QUIET_ON && ACTIVE && ITEM_TICK_ON && cplugReady) {
+            long gt = level.getLevelData().getGameTime();
+            if (QUIET_LAST_TICK != gt) {
+                QUIET_LAST_TICK = gt;
+                quietPass();
+            }
         }
         // L119b NOTE (the skipped-flush boundary): the n==0 flushes (the
         // levels whose arena slice was already consumed by the processing
@@ -7297,6 +7455,37 @@ public final class CeHooks {
                                 }
                             }
                         }
+                    }
+                    // L161a: the dispatch-quiet stamp — this item leaves the
+                    // dispatch/row/flush cycle from the NEXT tick on; the
+                    // quiet pass owns its counters and despawn. License:
+                    // TAIL_NONE above (the whole tail certified a no-op)
+                    // AND the EXACT zero-delta fixed point (out-delta ==
+                    // 0.0 on every axis — the self-sustaining rest state:
+                    // 0.0*friction == 0.0, gravity-collide keeps dy 0.0,
+                    // the move snaps back bit-identically; a nonzero
+                    // velocity-dust item keeps decaying in vanilla and
+                    // MUST stay dispatched — the par5 lesson, frozen
+                    // 1.1e-14 vs decayed 2.7e-28) AND non-mergable by the
+                    // SAME predicate the scan gate runs (the core's merge
+                    // cadence can never produce a scan for it, so no
+                    // merge order is lost) AND age is not the -32768
+                    // spawn marker (whose age semantics the pass's +1
+                    // would break). The stamp carries the current world
+                    // revision; the dispatch quiet path re-verifies the
+                    // environment when it moves. Wakes: l7External-
+                    // Mutation, section revision, registration/box
+                    // probes, removal, the pass's own despawn + belt.
+                    if (CE_QUIET_ON && MERGP_ON && DS_QUIET != null
+                            && e.age != -32768
+                            && outD[i * 9] == 0.0 && outD[i * 9 + 1] == 0.0
+                            && outD[i * 9 + 2] == 0.0
+                            && !isMergableMirror(e)) {
+                        int qs = (int) (IB_IDS[i] & AMASK);
+                        DS_QUIET[qs >> 6] |= 1L << (qs & 63);
+                        QUIET_REV[qs] = WORLD_REV;
+                        FAST_STAMP[mSlot] = 0L;
+                        quietStamps++;
                     }
                 } else {
                     // L99: the persistent-quiet reset - this applier tail did
@@ -12910,6 +13099,12 @@ public final class CeHooks {
                 TT_REF = new Object[ARENA.length * 5];
                 TT_FLAT = new long[ARENA.length * 2];
                 TT_QUIET = new long[(ARENA.length + 63) >> 6];
+                // L161a: the dispatch-quiet bitset + the per-slot world
+                // revision the quiet proof was stamped under (the dispatch
+                // quiet path compares against WORLD_REV and runs the exact
+                // L21-rest touched check on a mismatch).
+                DS_QUIET = new long[(ARENA.length + 63) >> 6];
+                QUIET_REV = new long[ARENA.length];
                 TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0

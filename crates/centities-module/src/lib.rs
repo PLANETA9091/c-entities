@@ -806,6 +806,14 @@ fn arm_module() {
     precompute_trackedentity(loader);
     precompute_chunkmap(loader);
     precompute_naturalspawner(loader);
+    // L161a: the dispatch-quiet protocol — arms after the tracker-loop
+    // handle init (which allocates DS_QUIET/QUIET_REV regardless of the
+    // tracker weave's own gate). CE_QUIET=0 keeps it off Java-side; the
+    // stamp additionally requires MERGP_ON (the same isMergable predicate
+    // the scan gate runs licenses the no-scan guarantee).
+    if prove_handles("initTrackerLoopHandles", "TTL_HANDLES_OK") == Some(true) {
+        let _ = set_java_bool("setItemQuietOn", true);
+    }
 
     BRIDGE_READY.store(true, Ordering::Release);
 
