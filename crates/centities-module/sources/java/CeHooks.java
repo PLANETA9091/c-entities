@@ -543,6 +543,29 @@ public final class CeHooks {
     public static final boolean MERGE_DBLCHECK =
             "1".equals(System.getenv("CE_MERGE_DBLCHECK"));
     public static long mergeFullSelf = 0;
+    // L163 (the -90% storm): the post-merge snapshot refresh incrementally.
+    // The fired merge's new scanner count IS the sum the pre-gate already
+    // loaded (oc — one iadd); the target survives (the pre-gate proved
+    // target equality and the javap'd 4-arg merge body touches ONLY
+    // pickupDelay/age/discard); and the ItemStack reference swap stays
+    // exact for the FULLBREAK sum gate because the merge() result is
+    // built from the SELF stack (copyWithCount copies the SAME components
+    // — maxStackSize and the isSameItemSameComponents verdict are
+    // reference-independent). The full Unsafe refresh stays for:
+    //   - a plugin listener present (a canceled ItemMergeEvent fires NO
+    //     merge — callItemMergeEvent precedes every merge — and the
+    //     increment would diverge from the untouched stack),
+    //   - the pre-gate path that did not load a count (gGate off or the
+    //     other stack unreadable).
+    // The handler cache is re-counted every 512 merges: a listener
+    // registered mid-run is caught within the next 512 merges.
+    public static final boolean MERGE_INCR =
+            !"0".equals(System.getenv("CE_MERGE_INCR"));
+    public static volatile int mergeEvHandlers = -1; // -1 = recount
+    public static long mergeIncr = 0;
+    // L164: the dispatch fast-gate's RM_BIT belt switch (see itemDispatch).
+    public static final boolean DISP_NORB =
+            "1".equals(System.getenv("CE_DISP_NORB"));
 
     /** Resolves the three mirror offsets (ItemEntity.despawnRate,
      *  ItemStack.count, the DATA_ITEM accessor id). Runs once at arm. */
@@ -5255,11 +5278,19 @@ public final class CeHooks {
             // EntityLookup's choke point fires for EVERY removal path, so
             // the mirror is set before the next dispatch can see the item).
             long st = FAST_STAMP[slot];
+            // L164: the RM_BIT belt is OFF the fast gate — the EntityLookup
+            // choke-point probe fires on EVERY removal path and zeroes the
+            // stamp BEFORE the next dispatch can see the item (the invariant
+            // documented at the FAST_STAMP declaration); a removed item's
+            // stamp reads 0L and the whole fast arm fails on the first
+            // check. The RM_BIT load was a SECOND random-access read per
+            // item per tick (1.34% self at items-100k-mod, run
+            // 43736024359). CE_DISP_NORB=1 restores the belt.
             if (st != 0L
                     && (st & 0x7FFF_FFFF_FFFF_FFFFL)
                             == ((long) ((WORLD_REV ^ MODE_EPOCH) & 0x7FFF_FFFF)
                                     << 32 | (eid & 0xFFFF_FFFFL))
-                    && RM_BIT[eid & AMASK] != 1) {
+                    && (DISP_NORB || RM_BIT[eid & AMASK] != 1)) {
                 // i0-a2: the core's verdict IS the port's decision (the same
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
@@ -7780,10 +7811,12 @@ public final class CeHooks {
                             // Only survivors reach the vanilla per-candidate
                             // chain below: isMergableFast + walls clip +
                             // tryToMerge — unchanged, bit-exact.
+                            int ocF = -1; // L163: the pre-gate's loaded candidate count
                             if (gGate) {
                                 net.minecraft.world.item.ItemStack gOtherSt = stackFast(other);
                                 if (gOtherSt != null) {
                                     int oc = U.getInt(gOtherSt, O_STACK_COUNT);
+                                    ocF = oc;
                                     if (gSelfCnt + oc > (oc == 0 ? 1 : mergeMaxStack(gOtherSt))) continue;
                                     java.util.UUID tg = other.target;
                                     if (gSelfTg != tg && (gSelfTg == null || tg == null
@@ -7808,10 +7841,42 @@ public final class CeHooks {
                             if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1
                                     | RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) mergeOps++; // L115b
                             if (RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) break;
-                            // L154: a fired merge mutates the scanner's stack
-                            // (the winner absorbs; partial merges for max>64
-                            // stacks touch the loser too) — refresh the
-                            // snapshot for the remaining candidates.
+                            // L154/L163: a fired merge mutates the scanner's
+                            // stack count (the winner absorbs) — refresh the
+                            // snapshot for the remaining candidates. The L163
+                            // increment: when NO plugin listens to
+                            // ItemMergeEvent (the cancel path is the ONLY one
+                            // that fires the event without mutating) and the
+                            // pre-gate loaded this candidate's count, the new
+                            // count is EXACTLY the sum — one iadd instead of
+                            // the stackFast + 2 loads + getfield refresh (the
+                            // 16.05% self-time line at items-100k-mod, run
+                            // 43736024359). Every 512th merge re-counts the
+                            // listener cache.
+                            if (gGate && ocF >= 0) {
+                                if ((mergeIncr & 511) == 0) {
+                                    mergeEvHandlers = -1;
+                                }
+                                if (mergeEvHandlers < 0) {
+                                    mergeEvHandlers = org.bukkit.event.entity
+                                            .ItemMergeEvent.getHandlerList()
+                                            .getRegisteredListeners().length;
+                                }
+                                if (MERGE_INCR && mergeEvHandlers == 0) {
+                                    gSelfCnt += ocF;
+                                    mergeIncr++;
+                                    // L163 FULL-SELF BREAK on the increment arm:
+                                    // gSelfSt is stale (merge() swaps the
+                                    // ItemStack) but mergeMaxStack copies the
+                                    // SAME components — the verdict is exact.
+                                    if (MERGE_FULLBREAK
+                                            && gSelfCnt >= mergeMaxStack(gSelfSt)) {
+                                        mergeFullSelf++;
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
                             gSelfSt = stackFast(e);
                             if (gSelfSt == null || O_STACK_COUNT < 0) {
                                 gGate = false;
@@ -12835,16 +12900,23 @@ public final class CeHooks {
         spWalks++;
         while (it.hasNext()) {
             Object o = it.next();
+            // L164: the ItemEntity check FIRST — the dominant population in
+            // the entity benches is items, and one instanceof replaces the
+            // two-check chain (Entity cast + ItemEntity) for every skipped
+            // entity. The vanilla MISC-compare would kill them one line
+            // later either way — the filter order is value-identical
+            // (pure filters, no side effects until the consumer runs).
+            if (o instanceof ItemEntity) {
+                spSkipped++;
+                continue;
+            }
             if (!(o instanceof Entity ent)) {
                 // vanilla checkcasts unconditionally — unreachable, kept total
                 continue;
             }
-            // L163 THE FILTER: vanilla kills every ItemEntity at the MISC
-            // category compare — skip before getType()/paperConfig even run.
-            if (ent instanceof ItemEntity) {
-                spSkipped++;
-                continue;
-            }
+            // (the ItemEntity filter ran above — the first instanceof is the
+            // MISC-compare's proven equivalent, one check for the dominant
+            // population)
             if (ent instanceof net.minecraft.world.entity.Mob mob) {
                 if (mob.isPersistenceRequired()) {
                     spMobKept++;
@@ -13031,6 +13103,12 @@ public final class CeHooks {
     private static volatile boolean TT_MIRROR;
     // the per-ChunkMap armed memo (tiny direct map; #dims entries)
     private static final Object[] TT_ARM_CM = new Object[8];
+    /** L164: the per-ChunkMap player-geometry hash in a parallel raw-long
+     *  array (slot i lives with TT_ARM_CM[i]) — replaces the boxed
+     *  WeakHashMap get/put pair on the hot pass (2.68% self at
+     *  items-100k-mod). A slot primed by a DIFFERENT ChunkMap (rotation
+     *  eviction) forces the arm-state reconcile via TT_ARM_VAL reset. */
+    private static final long[] TT_ARM_PQH = new long[8];
     /** L99: per-ChunkMap hash of the player list (size + x/y/z/yaw/pitch).
      *  A changed hash disarms the tracker cache for that tick — the
      *  full vanilla tracker re-serves the subscription sets first. */
@@ -13553,6 +13631,23 @@ public final class CeHooks {
                     && O_TE_SEEN > 0 && O_SE_TRACKED_PLAYERS > 0
                     && O_SE_INTERP > 0 && O_SE_TICKCOUNT > 0;
             boolean cacheArm = false;
+            // L164: the ChunkMap slot resolve moved ABOVE the geometry hash —
+            // the per-ChunkMap player-geometry hash now lives in the parallel
+            // array TT_ARM_PQH instead of the boxed WeakHashMap (the get/put
+            // pair was 2.68% self at items-100k-mod, run 43736024359:
+            // Long.valueOf + the bin walk per ChunkMap per tick). An unknown
+            // ChunkMap keeps the WeakHashMap first-sight semantics (arm only
+            // if playerless) and fills its slot here; the TT_MIRROR reconcile
+            // below reuses the resolved index.
+            int pqCmi = -1;
+            boolean pqKnown = false;
+            for (int t = 0; t < TT_ARM_CM.length; t++) {
+                if (TT_ARM_CM[t] == cmObj) {
+                    pqCmi = t;
+                    pqKnown = true;
+                    break;
+                }
+            }
             if (on) {
                 cacheArm = TT_REF != null && TT_FLAT != null
                         && O_ENT_SYNC_POS >= 0;
@@ -13593,21 +13688,36 @@ public final class CeHooks {
                                     .PlatformHooks.get().getSendViewDistance(
                                             (net.minecraft.server.level.ServerPlayer) pe);
                         }
-                        Long prev = TT_PQ_HASH.get(cmObj);
-                        if (prev == null || prev != h) {
-                            TT_PQ_HASH.put(cmObj, h);
-                            cacheArm = pn == 0; // first sight: arm only if playerless
+                        // L164: the known-slot path compares the raw long —
+                        // no boxing, no hash walk. An unknown ChunkMap falls
+                        // back to the WeakHashMap once (first sight) and
+                        // primes its slot so the NEXT pass rides the array.
+                        if (pqKnown) {
+                            if (TT_ARM_PQH[pqCmi] != h) {
+                                TT_ARM_PQH[pqCmi] = h;
+                                cacheArm = pn == 0; // changed geometry: arm only if playerless
+                            } else {
+                                cacheArm = true;
+                            }
                         } else {
-                            // L151: the geometry hash is UNCHANGED since the
-                            // previous pass — the last full vanilla pass ran
-                            // at exactly this player set and these positions
-                            // (pass N-1 always served vanilla whenever the
-                            // hash moved, so subscriptions are correct at h),
-                            // and a static geometry cannot invalidate them.
-                            // This re-arms the quiet/cached cohort under a
-                            // STATIC player — the old shape kept cacheArm
-                            // false forever for every player-present world.
-                            cacheArm = true;
+                            Long prev = TT_PQ_HASH.get(cmObj);
+                            if (prev == null || prev != h) {
+                                TT_PQ_HASH.put(cmObj, h);
+                                cacheArm = pn == 0; // first sight: arm only if playerless
+                            } else {
+                                cacheArm = true;
+                            }
+                            pqCmi = (int) (ttlCalls & (TT_ARM_CM.length - 1));
+                            TT_ARM_CM[pqCmi] = cmObj;
+                            TT_ARM_PQH[pqCmi] = h;
+                            // force the arm-state reconcile on first sight:
+                            // TT_ARM_VAL may carry a stale value from a
+                            // rotated-out ChunkMap (the L70 mirror owns the
+                            // tickCount counter only for the CURRENT armed
+                            // state — the reconcile re-captures or hands back
+                            // before the pass proceeds).
+                            TT_ARM_VAL[pqCmi] = !cacheArm;
+                            pqKnown = true;
                         }
                     } catch (Throwable pqFail) {
                         cacheArm = false;
@@ -13622,16 +13732,20 @@ public final class CeHooks {
                 // once the mirror is off (the real field is authoritative
                 // again from the next tick).
                 if (TT_MIRROR) {
-                    int cmi = -1;
+                    int cmi = pqCmi; // L164: resolved above (or primed)
                     boolean lastArm = false;
-                    boolean known = false;
-                    for (int t = 0; t < TT_ARM_CM.length; t++) {
-                        if (TT_ARM_CM[t] == cmObj) {
-                            cmi = t;
-                            lastArm = TT_ARM_VAL[t];
-                            known = true;
-                            break;
+                    boolean known = pqKnown;
+                    if (!known) {
+                        for (int t = 0; t < TT_ARM_CM.length; t++) {
+                            if (TT_ARM_CM[t] == cmObj) {
+                                cmi = t;
+                                lastArm = TT_ARM_VAL[t];
+                                known = true;
+                                break;
+                            }
                         }
+                    } else {
+                        lastArm = TT_ARM_VAL[cmi];
                     }
                     if (!known) {
                         cmi = (int) (ttlCalls & (TT_ARM_CM.length - 1));
