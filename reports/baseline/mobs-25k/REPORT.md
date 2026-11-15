@@ -6,31 +6,31 @@ Server: `26.3-252-5184e9c (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24062 -> 23842) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24096 -> 23888) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 467.585 / 546.043 / 639.198 / 702.284 |
-| MSPT mean, ms | 479.833 |
+| MSPT p50 / p90 / p99 / max, ms | 482.038 / 557.925 / 648.751 / 735.713 |
+| MSPT mean, ms | 488.892 |
 | TPS estimate (1000/p50) | 2.1 |
-| heap used / max, MB | 1258.5 / 4096.0 |
+| heap used / max, MB | 1731.2 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 44.05% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 4.16% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
-| 3 | 2.74% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
-| 4 | 2.20% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable$TableEntry.getValueVolatile() line: 1812` |
-| 5 | 2.14% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 6 | 1.32% | `java.util.HashMap.getNode(Object) line: 586` |
-| 7 | 1.29% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 8 | 1.08% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 9 | 0.99% | `net.minecraft.world.entity.LivingEntity.isCollidable(boolean) line: 4094` |
-| 10 | 0.73% | `net.minecraft.world.level.Level.getFluidState(BlockPos) line: 1324` |
-| 11 | 0.72% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 12 | 0.68% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 13 | 0.68% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 14 | 0.64% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 15 | 0.64% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
+| 1 | 41.11% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 4.97% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
+| 3 | 2.32% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3913` |
+| 4 | 2.15% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 5 | 2.12% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 6 | 1.22% | `net.minecraft.world.entity.LivingEntity.tick() line: 3491` |
+| 7 | 1.13% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
+| 8 | 0.93% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
+| 9 | 0.84% | `com.google.common.collect.RegularImmutableMap.get(Object, ImmutableMapEntry[], int) line: 282` |
+| 10 | 0.80% | `java.util.HashMap.getNode(Object) line: 586` |
+| 11 | 0.68% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 12 | 0.64% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
+| 13 | 0.63% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 14 | 0.62% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 15 | 0.61% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
 
