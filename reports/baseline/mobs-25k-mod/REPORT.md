@@ -6,31 +6,31 @@ Server: `26.3-253-63e41db (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24790 -> 24790) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24445 -> 24445) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 2449.264 / 2640.540 / 2803.364 / 2917.777 |
-| MSPT mean, ms | 2452.716 |
-| TPS estimate (1000/p50) | 0.4 |
-| heap used / max, MB | 2154.5 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 270.286 / 1255.307 / 2162.248 / 2248.419 |
+| MSPT mean, ms | 507.224 |
+| TPS estimate (1000/p50) | 3.7 |
+| heap used / max, MB | 1942.5 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 19.22% | `dev.planeta9091.centities.CeHooks.getEntitiesOfClass(Level, Class, AABB, Predicate) line: 1581` |
-| 2 | 2.70% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 3320` |
-| 3 | 2.63% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 3321` |
-| 4 | 2.00% | `net.minecraft.world.entity.EntitySelector.lambda$static$4(Entity) line: 17` |
-| 5 | 0.99% | `java.util.ArrayList.add(Object, Object[], int) line: 485` |
-| 6 | 0.98% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
-| 7 | 0.97% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getValue(Holder) line: 59` |
-| 8 | 0.94% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
-| 9 | 0.92% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 13818` |
-| 10 | 0.82% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 11 | 0.74% | `java.util.ArrayList.add(Object, Object[], int) line: 483` |
-| 12 | 0.71% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getVolatile(VarHandle, Object) line: 99` |
-| 13 | 0.70% | `net.minecraft.world.entity.ai.goal.WrappedGoal.getFlags() line: 73` |
-| 14 | 0.70% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 15 | 0.69% | `net.minecraft.world.entity.LivingEntity.aiStep() line: 3707` |
+| 1 | 9.89% | `dev.planeta9091.centities.CeHooks.getEntitiesOfClass(Level, Class, AABB, Predicate) line: 1581` |
+| 2 | 4.32% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 3367` |
+| 3 | 2.84% | `java.util.ArrayList.elementData(int) line: 412` |
+| 4 | 2.44% | `java.util.ArrayList.add(Object, Object[], int) line: 485` |
+| 5 | 1.89% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 6 | 1.84% | `net.minecraft.world.entity.ai.attributes.AttributeMap.getValue(Holder) line: 59` |
+| 7 | 1.56% | `net.minecraft.world.entity.ai.goal.WrappedGoal.getFlags() line: 73` |
+| 8 | 1.42% | `it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap.get(Object) line: 323` |
+| 9 | 1.41% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 10 | 1.22% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 11 | 1.21% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate) line: 3088` |
+| 12 | 1.16% | `ca.spottedleaf.moonrise.common.set.OptimizedSmallEnumSet.getBackingSet() line: 62` |
+| 13 | 1.08% | `dev.planeta9091.centities.CeHooks.getEntitiesOfClass(Level, Class, AABB, Predicate) line: 1582` |
+| 14 | 1.02% | `dev.planeta9091.centities.CeHooks.fastQuery(Level, Entity, AABB, Predicate, boolean) line: 3368` |
+| 15 | 1.01% | `dev.planeta9091.centities.CeHooks.goalSelectorTick(GoalSelector) line: 9489` |
 
