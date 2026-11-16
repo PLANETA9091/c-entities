@@ -828,6 +828,58 @@ public final class CeHooks {
     // rowQuery refusal point; read by the mergeScanNative mirror branch.
     public static volatile String fastRefuse = null;
 
+    /** L169: the shared merge-candidate consumer for the native scan routes
+     *  (the n_merge_scan nms route + the big-buffer continuation). Walks
+     *  ids[0..n) in scan order — the doc-36b vanilla scan order — with the
+     *  per-candidate gates in the vanilla order: the L169a mirror-first
+     *  filter (isMergableMirror is the L39 byte-exact Unsafe port with the
+     *  L41 prototype cache — the same verdict isMergableFast gives, at
+     *  ~40ns instead of the vanilla MH walk whose getMaxStackSize chain
+     *  was 13.44% self of the items-100k-mod CI profile), the walls clip,
+     *  the vanilla tryToMerge. Returns true when the scanner got absorbed
+     *  (the vanilla absorb-stop). The rescan continuation re-tries prefix
+     *  candidates that no-op'd — tryToMerge is side-effect-free until
+     *  merge() runs (the L154 proof), so a no-op retry is bit-identical. */
+    private static boolean msConsumeIds(ItemEntity e, long[] ids, int n,
+            boolean walls, net.minecraft.world.level.Level w) throws Throwable {
+        for (int k2 = 0; k2 < n; k2++) {
+            Object candObj = arenaRef(ids[k2]);
+            if (!(candObj instanceof ItemEntity other)
+                    || other == e
+                    || RM_BIT[(int) (ids[k2] & 0xFFFF_FFFFL) & AMASK] == 1) {
+                continue;
+            }
+            // Vanilla loop re-checks isMergable per candidate; the walls fix
+            // is a per-candidate ray clip (paper default off). The provable
+            // rejects never reach the list (the Rust pre-filter) — this
+            // check keeps the verdict exact.
+            if (MERGP_ON ? !isMergableMirror(other) : !isMergableFast(other)) continue;
+            if (walls
+                    && w.clipDirect(e.position(), other.position(),
+                           net.minecraft.world.phys.shapes.CollisionContext.of(e))
+                    == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                continue;
+            }
+            MH_TRY_MERGE.invokeExact(e, other);
+            if (e.isRemoved() | other.isRemoved()) mergeOps++;
+            if (e.isRemoved()) return true; // absorbed — vanilla stops
+        }
+        return false;
+    }
+
+    /** L169b: the big-buffer continuation of a TRUNCATED scan — the same
+     *  deterministic query against the SAME untouched index (the two calls
+     *  bracket zero intervening work on the server thread), so the candidate
+     *  stream is identical; the big buffer just holds more of it. */
+    private static long[] msBigBuf() {
+        long[] b = MS_CAND_BIG;
+        if (b == null) {
+            b = new long[32768];
+            MS_CAND_BIG = b;
+        }
+        return b;
+    }
+
     public static boolean mergeScanNative(ItemEntity e) {
         mergeChecks++;
         if (!MERGE_ON || !ACTIVE) return false;
@@ -896,9 +948,9 @@ public final class CeHooks {
             // candidate ORDER is the documented legal difference).
             // CE_MERGE_NMS=0 restores the fastQuery route.
             if (MERGE_NMS) {
-                int cn = nativeMergeScan(worldId(sl), e.getX(), e.getY(), e.getZ(),
+                int cnRaw = nativeMergeScan(worldId(sl), e.getX(), e.getY(), e.getZ(),
                         r, horizOnly ? 0.0 : r - 0.5, entId(e), MS_CAND_IDS);
-                if (cn < 0) {
+                if (cnRaw < 0) {
                     mergeMirror++;
                     if (msq) {
                         msqPath = "nms-refuse";
@@ -909,27 +961,30 @@ public final class CeHooks {
                 }
                 mergeFast++;
                 boolean wallsNms = w.paperConfig().fixes.fixItemsMergingThroughWalls;
-                for (int k2 = 0; k2 < cn; k2++) {
-                    Object candObj = arenaRef(MS_CAND_IDS[k2]);
-                    if (!(candObj instanceof ItemEntity other)
-                            || other == e
-                            || RM_BIT[(int) (MS_CAND_IDS[k2] & 0xFFFF_FFFFL) & AMASK] == 1) {
-                        continue;
+                boolean trunc = (cnRaw & MS_TRUNC_BIT) != 0;
+                int cn = cnRaw & ~MS_TRUNC_BIT;
+                if (msConsumeIds(e, MS_CAND_IDS, cn, wallsNms, w)) {
+                    return true; // absorbed — vanilla stops at the same candidate
+                }
+                if (trunc) {
+                    // L169b: the prefix exhausted with no merge — continue the
+                    // SAME deterministic candidate stream in the big buffer.
+                    long[] big = msBigBuf();
+                    int cb = nativeMergeScan(worldId(sl), e.getX(), e.getY(), e.getZ(),
+                            r, horizOnly ? 0.0 : r - 0.5, entId(e), big);
+                    if (cb < 0) {
+                        mergeMirror++;
+                        return false; // index unsure — vanilla body (state intact)
                     }
-                    // Vanilla loop re-checks isMergable per candidate; the
-                    // walls fix is a per-candidate ray clip (paper default
-                    // off). The provable rejects never reach the list (the
-                    // Rust pre-filter) — this check keeps the verdict exact.
-                    if (!isMergableFast(other)) continue;
-                    if (wallsNms
-                            && w.clipDirect(e.position(), other.position(),
-                                   net.minecraft.world.phys.shapes.CollisionContext.of(e))
-                            == net.minecraft.world.phys.HitResult.Type.BLOCK) {
-                        continue;
+                    if (msConsumeIds(e, big, cb & ~MS_TRUNC_BIT, wallsNms, w)) {
+                        return true;
                     }
-                    MH_TRY_MERGE.invokeExact(e, other);
-                    if (e.isRemoved() | other.isRemoved()) mergeOps++;
-                    if (e.isRemoved()) return true; // absorbed — vanilla stops
+                    // still truncated past 32k: the vanilla body is the exact
+                    // answer for this density (no side effects yet).
+                    if ((cb & MS_TRUNC_BIT) != 0) {
+                        mergeMirror++;
+                        return false;
+                    }
                 }
                 return true;
             }
@@ -1049,7 +1104,9 @@ public final class CeHooks {
                 ItemEntity other = (ItemEntity) cands.get(k);
                 // Vanilla loop re-checks isMergable per candidate; the walls
                 // fix is a per-candidate ray clip (paper default off).
-                if (!isMergableFast(other)) continue;
+                // L169a: the mirror-first filter (the L39 byte-exact port +
+                // the L41 prototype cache — the same verdict at ~40ns).
+                if (MERGP_ON ? !isMergableMirror(other) : !isMergableFast(other)) continue;
                 if (walls
                         && w.clipDirect(e.position(), other.position(),
                                net.minecraft.world.phys.shapes.CollisionContext.of(e))
@@ -4336,6 +4393,14 @@ public final class CeHooks {
     // exact inputs the port would have read.
     private static final int[] IB_ATI = new int[IB_CAP * 3];
     private static final long[] MS_CAND_IDS = new long[256];
+    // L169b: the big continuation buffer for TRUNCATED scans — the rare
+    // dense-pile scan whose candidate stream exceeds 256. Allocated on the
+    // first truncation (32k candidates = a 1.1-block merge box holding 32k
+    // mergable items — beyond that the vanilla body is the honest answer).
+    private static volatile long[] MS_CAND_BIG;
+    // Mirrors itemcore.rs MS_TRUNC_BIT: set on the n_merge_scan return when
+    // the candidate list is the scan-order PREFIX of the full stream.
+    private static final int MS_TRUNC_BIT = 0x4000_0000;
     private static final long[] IB_IDS = new long[IB_CAP];
     private static final int[] IB_FLAGS = new int[IB_CAP];
     // L21: the entity ref captured AT COLLECT — the flush applies through
@@ -7859,8 +7924,15 @@ public final class CeHooks {
                     double mr = level.spigotConfig.itemMerge;
                     double myinf = level.paperConfig().entities.behavior.onlyMergeItemsHorizontally
                             ? 0.0 : mr - 0.5;
-                    int cands = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
+                    int candsRaw = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
                             mr, myinf, e.getId(), MS_CAND_IDS);
+                    // L169b: decode the TRUNC bit — a positive raw return with
+                    // the bit set is a scan-order PREFIX, not a full count (the
+                    // pre-L169 shape refused the scan and paid the vanilla
+                    // mergeWithNeighbours body: the O(section) has()/indexOf()
+                    // walk on every dense-pile scanner).
+                    boolean msTrunc = (candsRaw & MS_TRUNC_BIT) != 0;
+                    int cands = candsRaw & ~MS_TRUNC_BIT;
                     // L157: the route string is built at the CALL SITE — without
                     // the guard 1575 merge scanners allocate + concat a string
                     // every tick just to hand it to a early-returning diag.
@@ -8041,6 +8113,38 @@ public final class CeHooks {
                                     && gSelfCnt >= mergeMaxStack(gSelfSt)) {
                                 mergeFullSelf++;
                                 break;
+                            }
+                        }
+                        // L169b THE BIG CONTINUATION: the 256-prefix
+                        // exhausted with no fired merge — the candidate stream
+                        // continues in the big buffer. The two scans bracket
+                        // zero intervening work (the same server thread, the
+                        // same untouched index) so the stream is identical;
+                        // the already-tried prefix candidates re-tried here
+                        // are the no-op'd ones (tryToMerge is side-effect-free
+                        // until merge() runs — the L154 proof). Skipped
+                        // entirely when the scanner sits AT capacity: the
+                        // FULLBREAK proof makes every remaining candidate a
+                        // provable no-op (the same verdict the walk gives).
+                        if (msTrunc
+                                && !e.isRemoved()
+                                && RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] != 1
+                                && !(gGate && MERGE_FULLBREAK
+                                        && gSelfCnt >= mergeMaxStack(gSelfSt))) {
+                            long[] big = msBigBuf();
+                            int cb = nativeMergeScan(wid, e.getX(), e.getY(), e.getZ(),
+                                    mr, myinf, e.getId(), big);
+                            if (cb >= 0) {
+                                boolean absorbed2 = msConsumeIds(e, big,
+                                        cb & ~MS_TRUNC_BIT, walls, level);
+                                if (!absorbed2 && (cb & MS_TRUNC_BIT) != 0) {
+                                    // beyond 32k candidates: the vanilla body
+                                    // is the honest answer for this density
+                                    // (the state is intact — nothing fired).
+                                    runVanillaMerge(e);
+                                }
+                            } else {
+                                runVanillaMerge(e);
                             }
                         }
                     }

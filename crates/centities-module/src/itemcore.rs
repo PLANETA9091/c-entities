@@ -23,6 +23,14 @@ use crate::HOOKS_CLASS_GLOBAL;
 const STORE_CAP: usize = 1 << 17;
 const STORE_MASK: u64 = (STORE_CAP - 1) as u64;
 
+/// L169b: the return-value bit marking a TRUNCATED candidate list — the
+/// buffer filled before the scan exhausted, so the returned entries are the
+/// exact SCAN-ORDER PREFIX of the full stream. The Java consumer walks the
+/// prefix; a fired merge is the vanilla absorb-stop, an exhausted prefix
+/// costs one big-buffer rescan (the same deterministic query). Mirrors the
+/// MS_TRUNC_BIT constant in CeHooks.java.
+pub const MS_TRUNC_BIT: i32 = 0x4000_0000;
+
 /// The L55-diag traced id (CE_RTRACE_ID) — shared by the FTICK flush print
 /// and the CMT commit witness. Cached: the env is fixed for the process.
 fn rtrace_id() -> i64 {
@@ -1654,6 +1662,9 @@ pub extern "system" fn n_merge_scan(
     ];
     /// L160: candidates dropped by the trusted pre-filter (telemetry only).
     static MS_PREFLT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// L169b: scans that filled the out buffer (the TRUNC-bit return) —
+    /// telemetry only; the consumer continues with the big-buffer rescan.
+    static MS_TRUNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let refused = |which: usize| -> i32 {
         MS_STATS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         MS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1665,6 +1676,16 @@ pub extern "system" fn n_merge_scan(
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
             std::env::var("CE_MS_PREFILTER")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    }
+    // L169b kill-switch: CE_MS_TRUNC=0 restores the refused(5) full-scan
+    // refusal (the vanilla-body route) for the bisect.
+    fn ms_trunc_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("CE_MS_TRUNC")
                 .map(|v| v != "0")
                 .unwrap_or(true)
         })
@@ -1808,7 +1829,27 @@ pub extern "system" fn n_merge_scan(
                     continue;
                 }
             }
+            // L169b THE TRUNCATION RETURN: a full buffer used to refuse the
+            // WHOLE scan (-1 -> the vanilla mergeWithNeighbours body: the
+            // O(section) has()/indexOf()/isMergable() walk — 6.43% + 4.47%
+            // caller + 13.44% getMaxStackSize of the items-100k-mod CI
+            // profile, run 43775592232). The candidates stream in scan
+            // order, so the first out_len entries are the EXACT PREFIX of
+            // the full stream: return them with the TRUNC bit set and let
+            // the Java consumer decide — it walks the prefix; a fired merge
+            // is the vanilla absorb-stop at the same candidate (the scan
+            // order is the doc-36b vanilla scan order), an exhausted prefix
+            // costs one big-buffer rescan of the SAME deterministic query
+            // (the Rust scan is index-local: no batch, no Java side
+            // effects, the two calls bracket zero intervening work — the
+            // candidate stream is identical). CE_MS_TRUNC=0 restores the
+            // refusal for the bisect.
             if n >= out_len {
+                if ms_trunc_on() {
+                    MS_TRUNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ((*vt).SetLongArrayRegion)(raw, out, 0, n as i32, buf.as_ptr());
+                    return n as i32 | MS_TRUNC_BIT;
+                }
                 return refused(5);
             }
             buf.push(cid);
@@ -1820,11 +1861,12 @@ pub extern "system" fn n_merge_scan(
         let z = MS_ZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if z % 2000 == 0 {
             eprintln!(
-                "[ms] calls={} raw={} stale={} preflt={} zero={} refused={{1:{},2:{},3:{},4:{},5:{}}}",
+                "[ms] calls={} raw={} stale={} preflt={} trunc={} zero={} refused={{1:{},2:{},3:{},4:{},5:{}}}",
                 MS_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 MS_RAW.load(std::sync::atomic::Ordering::Relaxed),
                 MS_STALE.load(std::sync::atomic::Ordering::Relaxed),
                 MS_PREFLT.load(std::sync::atomic::Ordering::Relaxed),
+                MS_TRUNC.load(std::sync::atomic::Ordering::Relaxed),
                 z,
                 MS_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
                 MS_STATS[2].load(std::sync::atomic::Ordering::Relaxed),
@@ -1840,6 +1882,7 @@ pub extern "system" fn n_merge_scan(
     MS_STATS[3].store(MS_ZERO.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     MS_STATS[4].store(MS_REFUSED.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     MS_STATS[5].store(MS_PREFLT.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    MS_STATS[6].store(MS_TRUNC.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     n as i32
 }
 
