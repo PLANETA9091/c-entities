@@ -2468,6 +2468,10 @@ public final class CeHooks {
     private static final int[] FAST_N = new int[GWORLDS * GBUCKETS];
     private static final int[] MIRR_N = new int[GWORLDS * GBUCKETS];
     private static final int[] FAST_SEQ = new int[GWORLDS * GBUCKETS];
+    // L170: the bigbox probe-duty counter per bucket — 1/256 of the
+    // over-budget queries run the resolve anyway so FAST_EMA can train
+    // (the refusal otherwise deadlocks the bucket on the static model).
+    private static final int[] BIGBOX_SEQ = new int[GWORLDS * GBUCKETS];
     private static final int[] MIRR_SEQ = new int[GWORLDS * GBUCKETS];
     /** Re-probe backoff per cell (0..2): when a re-probe lands on a much
      *  more expensive fast sample than mirror, the 1/256 probe rate itself
@@ -3253,6 +3257,19 @@ public final class CeHooks {
         // mob scenarios — see the block comment at BIG_N_REFUSE). The scan
         // is already paid here; refuse ONLY when the predicted resolve
         // would cost more than the vanilla body the caller pays anyway.
+        // L170: the ABS budget short-circuited the honest comparison — the
+        // pickup-shaped scans (the bench bot's aiStep box over the dense
+        // pile, ~7.6k candidates) predicted at ~0.94 ms and the 0.5 ms ABS
+        // refused them BEFORE the known-mirror comparison ever ran
+        // (bigboxAdaptivePassed=0 with bigboxRefused=5320 / bigboxCand=40M,
+        // items-100k-mod run 43775592232) — while the vanilla moonrise
+        // body the refusal pays walks the SAME 7.6k candidates through
+        // per-section has() O(list) + intersects + the predicate (the
+        // measure-window cost family: intersects 5.65% + the getEntities
+        // leaves + the predicate ≈ 10% of the tick). A KNOWN mirror EMA is
+        // the actual vanilla-body price the refusal buys — compare against
+        // IT; the ABS budget stays only for buckets the mirror never
+        // priced (the conservative unknown-bucket default).
         if (n > BIG_N_REFUSE) {
             bigboxRefused++;
             bigboxCand += n;
@@ -3261,13 +3278,43 @@ public final class CeHooks {
         }
         int giL111 = wid * GBUCKETS + bucketOf(box);
         if (n > 1024) {
-            long predicted = (long) n * (FAST_RESOLVE_NS_PER_CAND + FAST_SCAN_NS_PER_ROW);
-            boolean mirrKnown = MIRR_N[giL111] >= MIRR_KNOWN_MIN;
-            long budget = mirrKnown ? MIRR_EMA[giL111] : BIGBOX_DEFAULT_MIRR_NS;
-            if (predicted > BIGBOX_ABS_BUDGET_NS || predicted > budget) {
+            // L170: the ABS budget short-circuited the honest comparison — the
+            // pickup-shaped scans (the bench bot's aiStep box over the dense
+            // pile, ~7.6k candidates) predicted at ~0.94 ms and the 0.5 ms ABS
+            // refused them BEFORE the known-mirror comparison ever ran
+            // (bigboxAdaptivePassed=0 with bigboxRefused=5320 / bigboxCand=40M,
+            // items-100k-mod run 43775592232) — while the vanilla moonrise
+            // body the refusal pays walks the SAME 7.6k candidates through
+            // per-section has() O(list) + intersects + the predicate (the
+            // measure-window cost family: intersects 5.65% + the getEntities
+            // leaves + the predicate ≈ 10% of the tick). A KNOWN mirror EMA is
+            // the actual vanilla-body price the refusal buys — compare against
+            // IT; the ABS budget stays only for buckets the mirror never
+            // priced (the conservative unknown-bucket default).
+            //
+            // L170 DEADLOCK: the refusal also starves the fast EMA — the
+            // bucket's bootstrap probes (wantFast's first 16) land in the
+            // bigbox check and refuse BEFORE the resolve, so FAST_EMA never
+            // prices and the static predicted-model decides FOREVER. Two
+            // arms break it: (1) a trained FAST_EMA (>= 16 priced samples)
+            // replaces the static predicted — the honest measured cost of
+            // this bucket's scan+resolve; (2) 1/256 of the over-budget
+            // queries run the resolve anyway (the same duty the main gate's
+            // backoff uses) so the EMA can train — the probe tax is bounded
+            // and the honest comparison takes over once priced.
+            long predicted;
+            if (FAST_N[giL111] >= MIRR_KNOWN_MIN) {
+                predicted = FAST_EMA[giL111];
+            } else {
+                predicted = (long) n * (FAST_RESOLVE_NS_PER_CAND + FAST_SCAN_NS_PER_ROW);
+            }
+            boolean over = (MIRR_N[giL111] >= MIRR_KNOWN_MIN)
+                    ? predicted > MIRR_EMA[giL111]
+                    : predicted > BIGBOX_ABS_BUDGET_NS;
+            if (over && (++BIGBOX_SEQ[giL111] & 255) != 0) {
                 bigboxRefused++;
                 bigboxCand += n;
-                fastRefuse = "bigbox-a";
+                fastRefuse = (MIRR_N[giL111] >= MIRR_KNOWN_MIN) ? "bigbox-a" : "bigbox-u";
                 return null;
             }
             bigboxAdaptivePassed++;
