@@ -69,6 +69,8 @@ const CHUNKMAP_CLASS: &str = "net/minecraft/server/level/ChunkMap";
 /// transcription with ONE added pre-gate: `instanceof ItemEntity -> continue`
 /// — value-exact because vanilla itself continues at the MISC compare.
 const NATURALSPAWNER_CLASS: &str = "net/minecraft/world/level/NaturalSpawner";
+/// L171: the pickup canHold floor target — Inventory.canHold replace_body.
+const INVENTORY_CLASS: &str = "net/minecraft/world/entity/player/Inventory";
 // L36: the idle AI-control classes (nav/move/look early-out guards).
 const NAVIGATION_CLASS: &str = "net/minecraft/world/entity/ai/navigation/PathNavigation";
 const MOVE_CONTROL_CLASS: &str = "net/minecraft/world/entity/ai/control/MoveControl";
@@ -519,6 +521,7 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(TRACKED_ENTITY_CLASS, |_n, b| patch_trackedentity(b));
     cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
     cplug_sdk::hooks::register_bytes(NATURALSPAWNER_CLASS, |_n, b| patch_naturalspawner(b));
+    cplug_sdk::hooks::register_bytes(INVENTORY_CLASS, |_n, b| patch_inventory(b));
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
@@ -806,6 +809,7 @@ fn arm_module() {
     precompute_trackedentity(loader);
     precompute_chunkmap(loader);
     precompute_naturalspawner(loader);
+    precompute_inventory(loader);
     // L161a: the dispatch-quiet protocol — arms after the tracker-loop
     // handle init (which allocates DS_QUIET/QUIET_REV regardless of the
     // tracker weave's own gate). CE_QUIET=0 keeps it off Java-side; the
@@ -833,6 +837,7 @@ fn arm_module() {
         TRACKED_ENTITY_CLASS,
         CHUNKMAP_CLASS,
         NATURALSPAWNER_CLASS,
+        INVENTORY_CLASS,
         SENSING_CLASS,
         NAVIGATION_CLASS,
         MOVE_CONTROL_CLASS,
@@ -1112,6 +1117,24 @@ fn arm_module() {
                         let rc = cplug_sdk::retransform_class(NATURALSPAWNER_CLASS);
                         cplug_sdk::log::info(&format!(
                             "[c-entities] verifier: deferred NaturalSpawner walk filter applied, rc={rc}"
+                        ));
+                    }
+                }
+                // L171 deferred weave: the Inventory class loads with the
+                // first player (post-arm on every headless bench boot) — the
+                // same stash/retry protocol.
+                if !CH_WOVEN.load(Ordering::Acquire)
+                    && !CH_DECLINED.load(Ordering::Acquire)
+                    && STASH
+                        .lock()
+                        .map(|s| s.contains_key(INVENTORY_CLASS))
+                        .unwrap_or(false)
+                {
+                    precompute_inventory(loader as jni::jobject);
+                    if CH_WOVEN.load(Ordering::Acquire) {
+                        let rc = cplug_sdk::retransform_class(INVENTORY_CLASS);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] verifier: deferred Inventory.canHold floor applied, rc={rc}"
                         ));
                     }
                 }
@@ -1514,6 +1537,9 @@ static ENCH_ARMED: AtomicBool = AtomicBool::new(false);
 static EQUIP_WOVEN: AtomicBool = AtomicBool::new(false);
 static EQUIP_DECLINED: AtomicBool = AtomicBool::new(false);
 static EQUIP_ARMED: AtomicBool = AtomicBool::new(false);
+/// L171: the pickup canHold floor weave state.
+static CH_WOVEN: AtomicBool = AtomicBool::new(false);
+static CH_DECLINED: AtomicBool = AtomicBool::new(false);
 
 fn precompute_item(loader: jni::jobject) {
     // L39: resolve the merge-mirror offsets (despawnRate/count/DATA_ITEM) —
@@ -3644,10 +3670,112 @@ fn precompute_naturalspawner(loader: jni::jobject) {
     }
 }
 
+/// L171: the Inventory.canHold pickup floor — the body becomes
+/// `CeHooks.canHold$(Inventory, ItemStack)` (the fingerprint-memoized exact
+/// port; the memo serves a verdict only on an element-wise-equal full
+/// observable state, so the hit value is the walk value).
+fn canhold_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
+    cplug_sdk::asm::ReplaceBody {
+        method_name: "canHold",
+        method_desc: "(Lnet/minecraft/world/item/ItemStack;)I",
+        bridge_owner: HOOKS_CLASS,
+        bridge_name: "canHold$",
+        bridge_desc:
+            "(Lnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/item/ItemStack;)I",
+        args: &[
+            cplug_sdk::asm::ArgSpec::Local { slot: 0, ty: b'L' },
+            cplug_sdk::asm::ArgSpec::Local { slot: 1, ty: b'L' },
+        ],
+    }
+}
+
+fn precompute_inventory(loader: jni::jobject) {
+    if read_java_flag("CANHOLD_FLAG_ON") != Some(true) {
+        CH_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] canHold floor disabled (CE_CANHOLD) — vanilla kept",
+        );
+        return;
+    }
+    if prove_handles("initCanHold", "CANHOLD_HANDLES_OK") != Some(true) {
+        CH_DECLINED.store(true, Ordering::Release);
+        cplug_sdk::log::info(
+            "[c-entities] canHold handle probe failed — vanilla kept (lastErr in stats)",
+        );
+        return;
+    }
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|s| s.get(INVENTORY_CLASS).cloned())
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] Inventory not stashed yet — canHold floor deferred to the verifier",
+        );
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        cplug_sdk::asm::replace_body(env, loader, &bytes, &canhold_spec())
+    });
+    match patched {
+        Some(Some(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(INVENTORY_CLASS, b);
+            }
+            CH_WOVEN.store(true, Ordering::Release);
+            // Telemetry arm — the bridge body is total (the memo gate falls
+            // back to the exact walk); a failed weave keeps the vanilla body.
+            let _ = set_java_bool("setCanHoldOn", true);
+            cplug_sdk::log::info("[c-entities] precomputed Inventory.canHold pickup floor");
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(
+                "[c-entities] FAILED to precompute Inventory.canHold floor — vanilla kept",
+            );
+        }
+    }
+}
+
 fn patch_naturalspawner(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_naturalspawner_inner(bytes))
         .ok()
         .flatten()
+}
+
+fn patch_inventory(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_inventory_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_inventory_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Boot load (the Inventory class loads with the first player or the
+        // server's connection layer): stash the original bytes, stay vanilla.
+        // The floor is woven at arm time (precompute_inventory).
+        let mut st = STASH.lock().ok()?;
+        st.entry(INVENTORY_CLASS).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(INVENTORY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info("[c-entities] patched Inventory.canHold pickup floor");
+            Some(b)
+        }
+        _ if !CH_WOVEN.load(Ordering::Acquire) && !CH_DECLINED.load(Ordering::Acquire) => {
+            let mut st = STASH.lock().ok()?;
+            st.entry(INVENTORY_CLASS)
+                .or_insert_with(|| bytes.to_vec());
+            cplug_sdk::log::info(
+                "[c-entities] Inventory bytes stashed post-arm — verifier will decide",
+            );
+            None
+        }
+        _ => None,
+    }
 }
 
 fn patch_naturalspawner_inner(bytes: &[u8]) -> Option<Vec<u8>> {

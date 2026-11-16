@@ -629,6 +629,211 @@ public final class CeHooks {
     private static int LAST_PROTO_MAX;
     private static int PREV_PROTO_MAX;
 
+    // ---- L171: the pickup canHold floor — the fingerprint-memoized exact
+    // port of Inventory.canHold ------------------------------------------
+    // The measure-window profile (items-100k-mod, run 43775592232) put the
+    // bot's pickup inventory walk at 14.8% of the tick: ItemEntity.playerTouch
+    // -> Inventory.canHold over a FULL 36-slot inventory walks every slot
+    // through hasRemainingSpaceForItem (isStackable + getMaxStackSize + the
+    // component-map compare) per touched candidate per tick, forever (the
+    // bench bot's inventory fills once and canHold returns 0 from then on —
+    // the verdict repeats identically for the same candidate every tick).
+    //
+    // The replacement body memoizes the verdict keyed by the FULL observable
+    // state canHold reads:
+    //   - the inventory identity, maxStack, every slot's REFERENCE, COUNT and
+    //     components-PATCH reference (the patch field is the only mutable
+    //     component holder — PatchedDataComponentMap.set swaps it, so any
+    //     component mutation changes the fingerprint);
+    //   - the offhand slot (reference + count + patch reference);
+    //   - the candidate: getItem() reference, components reference, patch
+    //     reference, count.
+    // The verdict is a pure function of exactly these inputs (the port below
+    // reads nothing else), so an element-wise-equal fingerprint serves the
+    // identical value the walk would compute. No hashing — the probe compares
+    // the stored fingerprint element-wise (~350ns) against the ~2-5us walk.
+    // CE_CANHOLD=0 keeps the vanilla body; a resolve failure declines the
+    // wire (vanilla kept) at arming time.
+    public static volatile boolean CANHOLD_ON = false;
+    public static volatile boolean CANHOLD_HANDLES_OK = false;
+    public static final boolean CANHOLD_FLAG_ON =
+            !"0".equals(System.getenv("CE_CANHOLD"));
+    private static volatile long O_INV_ITEMS = -1, O_INV_EQUIP = -1, O_INV_MAXSTACK = -1;
+    // the 2-slot memo (the L167 alternating-pair lesson)
+    private static final Object[] CH_INV = new Object[2];
+    private static final int[] CH_INV_MAX = new int[2];
+    private static final Object[] CH_CAND_ITEM = new Object[2];
+    private static final Object[] CH_CAND_COMPS = new Object[2];
+    private static final Object[] CH_CAND_PATCH = new Object[2];
+    private static final int[] CH_CAND_COUNT = new int[2];
+    private static final Object[] CH_SLOT_REF = new Object[2 * 36];
+    private static final int[] CH_SLOT_COUNT = new int[2 * 36];
+    private static final Object[] CH_SLOT_PATCH = new Object[2 * 36];
+    private static final int[] CH_SLOTN = new int[2];
+    private static final Object[] CH_OFF_REF = new Object[2];
+    private static final int[] CH_OFF_COUNT = new int[2];
+    private static final Object[] CH_OFF_PATCH = new Object[2];
+    private static final int[] CH_VERDICT = new int[2];
+    private static int CH_TURN = 0;
+
+    /** The Java-side init: the offsets + the flag. Called from precompute
+     *  before the replace_body lands; a failure keeps CANHOLD_ON false and
+     *  the vanilla body stays (the weave declines). */
+    public static void initCanHold() {
+        if (!CANHOLD_FLAG_ON) return;
+        try {
+            java.lang.reflect.Field f;
+            f = net.minecraft.world.entity.player.Inventory.class.getDeclaredField("items");
+            f.setAccessible(true);
+            O_INV_ITEMS = U.objectFieldOffset(f);
+            f = net.minecraft.world.entity.player.Inventory.class.getDeclaredField("equipment");
+            f.setAccessible(true);
+            O_INV_EQUIP = U.objectFieldOffset(f);
+            f = net.minecraft.world.entity.player.Inventory.class.getDeclaredField("maxStack");
+            f.setAccessible(true);
+            O_INV_MAXSTACK = U.objectFieldOffset(f);
+            CANHOLD_HANDLES_OK = O_STACK_COMPONENTS >= 0 && O_PCM_PATCH >= 0;
+        } catch (Throwable t) {
+            CANHOLD_HANDLES_OK = false;
+            lastError = System.nanoTime();
+            lastErrorText = "initCanHold: " + t;
+        }
+    }
+
+    /** The weave-landed arm (called from the Rust precompute after the
+     *  replace_body accepted the bridge) — turns the memo path on. */
+    public static void setCanHoldOn(boolean on) {
+        CANHOLD_ON = on;
+    }
+
+    /** The exact port of the javap'd 26.3 Inventory.canHold — every gate in
+     *  the bytecode order: the 36-slot loop (an empty slot = the FULL stack
+     *  fits; hasRemainingSpaceForItem = !empty && stackable && count < min(
+     *  inv.maxStack, stack.max) && same-item-same-components; the capacity
+     *  subtract = min(slot.max, inv.max) - slot.count), then the OFFHAND
+    //  equipment slot, then the count tail. */
+    private static int canHoldWalk(net.minecraft.world.entity.player.Inventory inv,
+            net.minecraft.world.item.ItemStack stack, int invMax) {
+        int count = stack.getCount();
+        Object listObj = U.getObject(inv, O_INV_ITEMS);
+        @SuppressWarnings("unchecked")
+        java.util.List<net.minecraft.world.item.ItemStack> items =
+                (java.util.List<net.minecraft.world.item.ItemStack>) listObj;
+        int n = items.size();
+        for (int i = 0; i < n; i++) {
+            net.minecraft.world.item.ItemStack slot = items.get(i);
+            if (slot.isEmpty()) {
+                return stack.getCount();
+            }
+            if (slot.isStackable()
+                    && slot.getCount() < Math.min(invMax, stack.getMaxStackSize())
+                    && net.minecraft.world.item.ItemStack.isSameItemSameComponents(slot, stack)) {
+                count -= Math.min(slot.getMaxStackSize(), invMax) - slot.getCount();
+            }
+            if (count <= 0) {
+                return stack.getCount();
+            }
+        }
+        net.minecraft.world.entity.EntityEquipment eq =
+                (net.minecraft.world.entity.EntityEquipment) U.getObject(inv, O_INV_EQUIP);
+        net.minecraft.world.item.ItemStack off =
+                eq.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND);
+        if (!off.isEmpty() && off.isStackable()
+                && off.getCount() < Math.min(invMax, stack.getMaxStackSize())
+                && net.minecraft.world.item.ItemStack.isSameItemSameComponents(off, stack)) {
+            count -= Math.min(off.getMaxStackSize(), invMax) - off.getCount();
+        }
+        if (count <= 0) {
+            return stack.getCount();
+        }
+        return stack.getCount() - count;
+    }
+
+    /** The replacement body: the memo probe (element-wise fingerprint) with
+     *  the exact walk on a miss. The item's own getItem()/patch/count key
+     *  pins the candidate; the slot fingerprint pins the inventory. */
+    public static int canHold$(net.minecraft.world.entity.player.Inventory inv,
+            net.minecraft.world.item.ItemStack stack) {
+        if (!CANHOLD_ON) {
+            return canHoldWalk(inv, stack, U.getInt(inv, O_INV_MAXSTACK));
+        }
+        int invMax = U.getInt(inv, O_INV_MAXSTACK);
+        Object listObj = U.getObject(inv, O_INV_ITEMS);
+        @SuppressWarnings("unchecked")
+        java.util.List<net.minecraft.world.item.ItemStack> items =
+                (java.util.List<net.minecraft.world.item.ItemStack>) listObj;
+        int n = items.size();
+        if (n > 36) {
+            return canHoldWalk(inv, stack, invMax); // the memo shape is player-sized
+        }
+        Object ci = stack.getItem();
+        Object cc = U.getObject(stack, O_STACK_COMPONENTS);
+        Object cp = cc == null ? null : U.getObject(cc, O_PCM_PATCH);
+        int ccount = stack.getCount();
+        for (int s = 0; s < 2; s++) {
+            if (CH_INV[s] != inv || CH_INV_MAX[s] != invMax || CH_SLOTN[s] != n) continue;
+            if (CH_CAND_ITEM[s] != ci || CH_CAND_COMPS[s] != cc
+                    || CH_CAND_PATCH[s] != cp || CH_CAND_COUNT[s] != ccount) continue;
+            int b = s * 36;
+            boolean hit = true;
+            for (int i = 0; i < n && hit; i++) {
+                if (CH_SLOT_REF[b + i] != items.get(i)) hit = false;
+            }
+            if (hit) {
+                for (int i = 0; i < n && hit; i++) {
+                    Object slot = items.get(i);
+                    net.minecraft.world.item.ItemStack is =
+                            (net.minecraft.world.item.ItemStack) slot;
+                    if (CH_SLOT_COUNT[b + i] != is.getCount()) { hit = false; break; }
+                    Object m = is.isEmpty() ? null : U.getObject(is, O_STACK_COMPONENTS);
+                    Object p = m == null ? null : U.getObject(m, O_PCM_PATCH);
+                    if (CH_SLOT_PATCH[b + i] != p) { hit = false; break; }
+                }
+            }
+            if (hit) {
+                net.minecraft.world.entity.EntityEquipment eq =
+                        (net.minecraft.world.entity.EntityEquipment) U.getObject(inv, O_INV_EQUIP);
+                net.minecraft.world.item.ItemStack off =
+                        eq.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND);
+                Object m = off.isEmpty() ? null : U.getObject(off, O_STACK_COMPONENTS);
+                Object p = m == null ? null : U.getObject(m, O_PCM_PATCH);
+                if (CH_OFF_REF[s] != off || CH_OFF_COUNT[s] != off.getCount()
+                        || CH_OFF_PATCH[s] != p) hit = false;
+            }
+            if (hit) {
+                return CH_VERDICT[s];
+            }
+        }
+        int v = canHoldWalk(inv, stack, invMax);
+        int s = CH_TURN;
+        CH_TURN = (s + 1) & 1;
+        int b = s * 36;
+        CH_INV[s] = inv;
+        CH_INV_MAX[s] = invMax;
+        CH_SLOTN[s] = n;
+        CH_CAND_ITEM[s] = ci;
+        CH_CAND_COMPS[s] = cc;
+        CH_CAND_PATCH[s] = cp;
+        CH_CAND_COUNT[s] = ccount;
+        for (int i = 0; i < n; i++) {
+            net.minecraft.world.item.ItemStack is = items.get(i);
+            CH_SLOT_REF[b + i] = is;
+            CH_SLOT_COUNT[b + i] = is.getCount();
+            Object m = is.isEmpty() ? null : U.getObject(is, O_STACK_COMPONENTS);
+            CH_SLOT_PATCH[b + i] = m == null ? null : U.getObject(m, O_PCM_PATCH);
+        }
+        net.minecraft.world.entity.EntityEquipment eq =
+                (net.minecraft.world.entity.EntityEquipment) U.getObject(inv, O_INV_EQUIP);
+        net.minecraft.world.item.ItemStack off =
+                eq.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND);
+        CH_OFF_REF[s] = off;
+        CH_OFF_COUNT[s] = off.getCount();
+        Object m = off.isEmpty() ? null : U.getObject(off, O_STACK_COMPONENTS);
+        CH_OFF_PATCH[s] = m == null ? null : U.getObject(m, O_PCM_PATCH);
+        CH_VERDICT[s] = v;
+        return v;
+    }
+
     private static void initMergeMaxStack() {
         try {
             java.lang.reflect.Field f;
