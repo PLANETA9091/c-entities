@@ -1500,3 +1500,41 @@ Task ID: 23 (the L171 pickup floor — the canHold fingerprint memo)
   grind; the -90% goal on items needs the flush family (the 50.4%
   CeHooks share) to shrink, which is the next session's hunt (the
   prologue field reads, the tickList walk shape, the ttl bitmap).
+
+Task ID: 24 (the L172a quiet-storm: the dy==0 stamp, the od[+7] friction
+channel, the pass's dust decay)
+- The flush forensics (the L171 CI artifacts): the items-100k batch rode the
+  FULL population every tick (n=62996, flush avg 14.6ms of the 35ms tick);
+  the s] scan telemetry closed the accounting perfectly (every candidate =
+  self + prefilter, ZERO streamed to Java) so the 12.6% at the consume line
+  is the NATIVE box-query cost itself (the cell walks), not the candidate
+  volume.
+- The par5 "frozen 1.1e-14" dust killed the legacy stamp: the exact
+  delta==0.0 term never held (n stayed 63k). The traced local parity pair
+  (PARITY_TRACE_ID=7, run pair 263/264-era) gave the ground truth: vanilla's
+  grounded item keeps dy 0.0 EVERY tick, the horizontal dust decays x0.588
+  ONLY on the open ((tickCount+id)%4==0) ticks (the %4 move gate), the
+  closed ticks are a FULL observable no-op. REV1 (dropping the delta term)
+  diverged: the quiet item's field freezes at its last emitted delta and
+  vanilla keeps mutating the dust -> the T389/T639/final snapshots diverged
+  on ~35% of the pile (vy -0.04/-0.08 frozen mid-cycle).
+- REV3 (shipped): the stamp = dy==0.0 EXACT + (scan-clean | pd==32767 |
+  full stack) + not the MERGE cadence tick + not B_SPD. The scan-clean
+  verdict (the consume pins it to REG_REV; the probes bump REG_REV) is the
+  parity guard: the merging parity pile's scans FIND candidates -> no stamp.
+  The inert pool (pd==32767) and the full stacks never scan in vanilla ->
+  the vacuous-clean license. The horizontal dust: the quiet pass replicates
+  the open-tick friction decay bit-exactly (the multiplier rides od[+7] —
+  dead for non-LAND rows — as (st.friction * 0.98f32) as f64, or 1.0 for
+  friction-disabled; the speed-factor blocks emit TickOutcome::SPEED_FACTOR
+  -> B22 -> the stamp refused).
+- L173: the walk-level quiet fast-skip (dispatchQuietSkip hoisted — the
+  walk skips the whole dispatch prologue for the quiet cohort; the
+  dispatch keeps the same call, idempotent).
+- Local verification (2vCPU sandbox, XMX 2500M): items pair PASS
+  bit-identical at T389/T639/final with the wave engaged (n 16499 -> 1986,
+  the flush 4.5x cheaper, the dust decayed to e-46 in the grid); mixed pair
+  (items+stands+mobs) PASS all snapshots; local mspt items off/on
+  14.55/9.08. The pre-change pair also re-run for the bisect (PASS — the
+  regression was mine, now fixed).
+- Push: this commit; CI: parity (4 pairs) + ab-paired + baseline in flight.

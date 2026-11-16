@@ -921,6 +921,49 @@ public final class CeHooks {
         return count < mergeMaxStack(st);
     }
 
+    /** L172a: the FULL-STACK scanner-gate fail — the third vacuous-clean
+     *  term of the quiet stamp. count >= maxStack means vanilla's
+     *  mergeWithNeighbours scanner gate (isMergable) provably fails, the
+     *  body never runs, and suspending the cadence is exact. count == 0
+     *  keeps the scan path (the EMPTY-map max-1 rule makes it mergeable);
+     *  a null stack (pre-init data) is NOT provable — false. */
+    private static boolean fullStackQuiet(ItemEntity e) {
+        net.minecraft.world.item.ItemStack st = stackFast(e);
+        if (st == null || O_STACK_COUNT < 0) return false;
+        int c = U.getInt(st, O_STACK_COUNT);
+        return c > 0 && c >= mergeMaxStack(st);
+    }
+
+    /** L172a/L173: the shared dispatch-quiet check — the EXACT predicate
+     *  the dispatch's own quiet block runs, hoisted so the walk can skip
+     *  the whole dispatch prologue for a quiet item (no entId re-read in
+     *  the dispatch, no BATCH_POS/BATCH_GEN stores, no level read, no
+     *  fast-stamp). Idempotent: the dispatch keeps its own call. */
+    private static boolean dispatchQuietSkip(ItemEntity e, int eid) {
+        long[] dq = DS_QUIET;
+        if (!CE_QUIET_ON || dq == null) return false;
+        int q = eid & AMASK;
+        if ((dq[q >> 6] & (1L << (q & 63))) != 0
+                && RM_BIT[q] != 1 && ARENA[q] == e) {
+            if (QUIET_REV[q] != WORLD_REV) {
+                if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
+                        || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
+                    dq[q >> 6] &= ~(1L << (q & 63));
+                    quietExits++;
+                    dispDiag(e, "quiet-exit-rev");
+                } else {
+                    QUIET_REV[q] = WORLD_REV; // stale-but-boring
+                }
+            }
+            if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
+                quietSkips++;
+                dispDiag(e, "quiet");
+                return true; // the quiet pass owns this item's tick
+            }
+        }
+        return false;
+    }
+
     /** L154: the L29 3-hop synched-data stack walk (entityData.items
      *  [IDX_ITEM].value) — the same chain isMergableMirror uses, minus the
      *  isMergable verdict. Returns null when the data is not ready or the
@@ -2150,6 +2193,7 @@ public final class CeHooks {
 
     /** Prefix of EntityLookup.addEntity(Entity,boolean,boolean): slot 1 = entity. */
     public static void probeAdd(Entity e) {
+        REG_REV++; // L172a: an entity-structure event invalidates every scan-clean mark
         try {
             if (ACTIVE && INDEXING && e != null && e.level() != null && !e.level().isClientSide()) {
                 probesAdd++;
@@ -2174,6 +2218,7 @@ public final class CeHooks {
 
     /** Prefix of EntityLookup.removeEntity(Entity): slot 1 = entity. */
     public static void probeRemove(Entity e) {
+        REG_REV++; // L172a: conservative — a removal shrinks candidate sets, but the belt re-verdicts
         try {
             if (ACTIVE && INDEXING && e != null) {
                 probesRemove++;
@@ -2271,6 +2316,7 @@ public final class CeHooks {
      *  (javap-verified; skipped only for static HangingEntities — covered by
      *  probeAdd — and for no-op positions). */
     public static void probeBox(Entity e, AABB newBox) {
+        REG_REV++; // L172a: a box/move event can create merge candidates around OTHER items
         try {
             // L7 first (cheapest checks inside): an external box change on a
             // dispatch-owned item clears its native mode. Runs even when the
@@ -2928,6 +2974,7 @@ public final class CeHooks {
      *  callback) — so the exact change test (including the section-Y clamp
      *  the body applies) is computable without touching the body. */
     public static void probeMoveSection(Entity e) {
+        REG_REV++; // L172a: a section move can create merge candidates around OTHER items
         try {
             if (!ACTIVE || !INDEXING || e == null) return;
             if (SECTION_STAMP_SCHEME != 0) return; // slices-append scheme owns the stamp
@@ -5682,29 +5729,11 @@ public final class CeHooks {
             // does the item pay the per-item environment check (water/lava/
             // fire/despawn-time/its own sections) — a stale-but-boring
             // revision re-stamps and stays quiet.
-            if (CE_QUIET_ON) {
-                long[] dq = DS_QUIET;
-                if (dq != null) {
-                    int q = eid & AMASK;
-                    if ((dq[q >> 6] & (1L << (q & 63))) != 0
-                            && RM_BIT[q] != 1 && ARENA[q] == e) {
-                        if (QUIET_REV[q] != WORLD_REV) {
-                            if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
-                                    || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
-                                dq[q >> 6] &= ~(1L << (q & 63));
-                                quietExits++;
-                                dispDiag(e, "quiet-exit-rev");
-                            } else {
-                                QUIET_REV[q] = WORLD_REV; // stale-but-boring
-                            }
-                        }
-                        if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
-                            quietSkips++;
-                            dispDiag(e, "quiet");
-                            return true; // the quiet pass owns this item's tick
-                        }
-                    }
-                }
+            // L173: the block moved into dispatchQuietSkip (the walk calls
+            // the SAME helper before the prologue; the semantics are
+            // byte-identical).
+            if (dispatchQuietSkip(e, eid)) {
+                return true; // the quiet pass owns this item's tick
             }
             int slot = eid & MAMASK;
             // i0-a STAY fast path (doc 62): the core pre-approved this
@@ -7408,8 +7437,33 @@ public final class CeHooks {
     public static volatile boolean CE_QUIET_ON = false;
     public static final boolean CE_QUIET_FLAG =
             !"0".equals(System.getenv("CE_QUIET"));
+    // L172a: the scan-clean stamp gate — CE_SCANCLEAN=0 restores the
+    // legacy stamp predicate (the exact zero-delta + isMergableMirror
+    // shape) for the bisect.
+    public static final boolean SCANCLEAN_OFF =
+            "0".equals(System.getenv("CE_SCANCLEAN"));
     public static volatile long[] DS_QUIET;
     public static volatile long[] QUIET_REV;
+    // L172a REV3: the per-slot friction multiplier the quiet pass applies
+    // to the horizontal dust on every open ((tickCount+id)%4==0) tick —
+    // the f the full body multiplies dx/dz by (the core rides it in
+    // od[+7] for every non-LAND row). 1.0 = never decay (disabled/speed).
+    public static volatile float[] QUIET_FR;
+    // L172a: the scan-clean verdict table. 1 = the item's LAST merge-scan
+    // crossing returned ZERO candidates (a full, non-refused, non-truncated
+    // scan) — or the consume's scanner gate provably failed (vanilla's
+    // mergeWithNeighbours never runs for such an item: pd==32767 or a full
+    // stack, so the scan suspension is vacuously exact). Validity window:
+    // a candidate can only APPEAR around an item via a probed entity event
+    // (add/remove/box/section move), so SC_GEN pins the REG_REV the verdict
+    // was formed under; any probe bump invalidates every mark and the
+    // item's next cadence scan re-verdicts. The stamp reads it at the
+    // applier's TAIL_NONE branch — the item is batched there, so the mark
+    // was formed for THIS entity's slot (ids are unique per run: no slot
+    // collisions at bench/parity scales).
+    public static volatile long[] SCAN_CLEAN;
+    public static volatile int[] SC_GEN;
+    public static volatile long REG_REV = 1;
     private static long QUIET_LAST_TICK = -1;
     public static long quietSkips = 0, quietStamps = 0, quietExits = 0,
             quietBelt = 0, quietDespawns = 0;
@@ -7449,6 +7503,30 @@ public final class CeHooks {
                 e.tickCount = e.tickCount + 1;
                 e.totalEntityAge = e.totalEntityAge + 1;
                 e.age = e.age + 1;
+                // L172a REV3: the open-tick friction decay — vanilla's
+                // grounded item mutates the horizontal dust ONLY on the
+                // open ((tickCount+id)%4==0) ticks (the %4 move gate; the
+                // ground-trace proof: the dust value steps exactly at the
+                // gate-open ticks, dy stays 0.0, the closed ticks change
+                // nothing). The multiplier rides QUIET_FR (the core's
+                // od[+7], stamped) — the f64 multiply of the same operands
+                // the full body applies, bit-exact. The value-identical
+                // write keeps the fresh-Vec3 identity shape via the L122
+                // cache. ARENA_ID carries the true entity id (the gate's
+                // getId() term) without an extra Unsafe read.
+                float qf = QUIET_FR != null ? QUIET_FR[slot] : 1.0f;
+                if (qf != 1.0f && ((e.tickCount + ARENA_ID[slot]) % 4) == 0
+                        && O_ENT_DELTA > 0 && U != null) {
+                    Object dv = U.getObject(e, O_ENT_DELTA);
+                    if (dv instanceof net.minecraft.world.phys.Vec3 v3) {
+                        double ndx = v3.x * qf;
+                        double ndz = v3.z * qf;
+                        if (ndx != v3.x || ndz != v3.z) {
+                            U.putObject(e, O_ENT_DELTA,
+                                    vec3Cached(slot, ndx, v3.y, ndz));
+                        }
+                    }
+                }
                 try {
                     if (e.age >= VH_DESPAWN_RATE.getInt(e)) {
                         despawnTail(e);
@@ -7756,6 +7834,9 @@ public final class CeHooks {
                         + " nat=" + nat + " b5(MERGE)=" + b5 + " b16(TAILNONE)=" + b16
                         + " b18(ACT)=" + b18 + " b20(INACT)=" + b20
                         + " b13(ABORT)=" + b13 + " b11(VNEXT)=" + b11
+                        + " QS=" + quietStamps + " QK=" + quietSkips
+                        + " QE=" + quietExits + " QB=" + quietBelt
+                        + " QD=" + quietDespawns
                         + " tick=" + CUR_TICK);
             }
             // L92: one volatile read per flush - TT_MIRROR flips only in
@@ -7967,14 +8048,73 @@ public final class CeHooks {
                     // environment when it moves. Wakes: l7External-
                     // Mutation, section revision, registration/box
                     // probes, removal, the pass's own despawn + belt.
+                    // L172a: the stamp predicate. The TAIL_NONE branch above
+                    // already proves the whole post-counter tail is a no-op
+                    // (DELTA_SAME = the out-delta is BIT-IDENTICAL to the
+                    // pre-tick delta — the frozen fixed point INCLUDING the
+                    // 1.1e-14 velocity-dust items the legacy exact-0.0 term
+                    // rejected; a decaying-dust item maps dy -> dy*friction
+                    // != dy, so DELTA_SAME is false and it stays dispatched).
+                    // On top of it the license is the MERGE FUTURE:
+                    //   (a) SCAN_CLEAN — the item's last cadence scan (the
+                    //       consume gates it exactly like vanilla's
+                    //       mergeWithNeighbours) returned ZERO candidates,
+                    //       valid while no entity event moved REG_REV;
+                    //   (b) pd == 32767 — the inert pool: vanilla's scanner
+                    //       gate (isMergableMirror) provably fails, the
+                    //       mergeWithNeighbours body NEVER runs, so
+                    //       suspending the cadence is vacuously exact;
+                    //   (c) a full stack — the same provable gate fail
+                    //       (count >= maxStack; count==0 keeps the scan
+                    //       path — the EMPTY-map max-1 semantics).
+                    // The merge cadence arithmetic keeps advancing (the
+                    // pass bumps tickCount identically), so a wake re-batch
+                    // scans at the SAME tick vanilla would have — no merge
+                    // order is lost. The candidates can only APPEAR via a
+                    // probed event (registration/box/move probes bump
+                    // REG_REV; a removal only shrinks the candidate sets so
+                    // a zero verdict stays zero). CE_SCANCLEAN=0 restores
+                    // the legacy predicate.
+                    boolean stampOk;
+                    if (SCANCLEAN_OFF) {
+                        stampOk = outD[i * 9] == 0.0 && outD[i * 9 + 1] == 0.0
+                                && outD[i * 9 + 2] == 0.0
+                                && !isMergableMirror(e);
+                    } else {
+                        // L172a REV3: the quiet item's Java field freezes at its
+                        // last emitted delta, so the stamp license is the state
+                        // vanilla maps to itself while quiet:
+                        //   - dy == 0.0 EXACTLY (the gravity-collide zero: the
+                        //     vertical fixed point — the traced parity proved
+                        //     vanilla's grounded-item field keeps dy 0.0 every
+                        //     tick);
+                        //   - the horizontal dust DECAYS in vanilla on every
+                        //     open ((tickCount+id)%4==0) tick (the friction
+                        //     multiply) — the quiet pass replicates it with the
+                        //     friction multiplier the core rides od[+7]
+                        //     (1.0 = never decay: friction-disabled or a
+                        //     speed-factor block, the latter also blocks the
+                        //     stamp via B_SPD);
+                        //   - the merge future: scan-clean / inert pd / full
+                        //     stack (the cadence suspension is exact — see the
+                        //     L161a/L172a notes).
+                        int qs0 = (int) (IB_IDS[i] & AMASK);
+                        stampOk = outD[i * 9 + 1] == 0.0
+                                && (bits & (1 << 5)) == 0
+                                && (bits & (1 << 22)) == 0
+                                && ((SCAN_CLEAN != null
+                                    && (SCAN_CLEAN[qs0 >> 6] & (1L << (qs0 & 63))) != 0
+                                    && SC_GEN[qs0] == (int) REG_REV)
+                                || IB_I[i * 4 + 2] == 32767
+                                || fullStackQuiet(e));
+                    }
                     if (CE_QUIET_ON && MERGP_ON && DS_QUIET != null
                             && e.age != -32768
-                            && outD[i * 9] == 0.0 && outD[i * 9 + 1] == 0.0
-                            && outD[i * 9 + 2] == 0.0
-                            && !isMergableMirror(e)) {
+                            && stampOk) {
                         int qs = (int) (IB_IDS[i] & AMASK);
                         DS_QUIET[qs >> 6] |= 1L << (qs & 63);
                         QUIET_REV[qs] = WORLD_REV;
+                        QUIET_FR[qs] = (float) outD[i * 9 + 7];
                         FAST_STAMP[mSlot] = 0L;
                         quietStamps++;
                     }
@@ -8185,6 +8325,21 @@ public final class CeHooks {
                     // walk on every dense-pile scanner).
                     boolean msTrunc = (candsRaw & MS_TRUNC_BIT) != 0;
                     int cands = candsRaw & ~MS_TRUNC_BIT;
+                    // L172a: the scan verdict feeds the quiet stamp. A full,
+                    // non-refused, non-truncated ZERO-candidate scan is a
+                    // PROVEN no-merge state (the scanner's own gate passed,
+                    // the index answered, nothing streamed) — pinned to
+                    // REG_REV so any entity event invalidates it. A refused
+                    // scan (-1) or a TRUNC prefix is UNKNOWN -> not clean.
+                    if (SCAN_CLEAN != null) {
+                        int sq = (int) (IB_IDS[i] & AMASK);
+                        if (candsRaw >= 0 && !msTrunc && cands == 0) {
+                            SCAN_CLEAN[sq >> 6] |= 1L << (sq & 63);
+                            SC_GEN[sq] = (int) REG_REV;
+                        } else {
+                            SCAN_CLEAN[sq >> 6] &= ~(1L << (sq & 63));
+                        }
+                    }
                     // L157: the route string is built at the CALL SITE — without
                     // the guard 1575 merge scanners allocate + concat a string
                     // every tick just to hand it to a early-returning diag.
@@ -9213,9 +9368,23 @@ public final class CeHooks {
                         for (int i = 0; i < maxIndex; i++) {
                             Object o = arr[i];
                             if (o instanceof Entity e) {
-                                if (collect && e instanceof ItemEntity
-                                        && itemDispatch((ItemEntity) e)) {
-                                    continue;
+                                if (collect && e instanceof ItemEntity ie) {
+                                    // L173: the quiet fast-skip at the walk
+                                    // level — the dispatch prologue (the
+                                    // BATCH_POS/BATCH_GEN stores, the level
+                                    // read + the DL cache, the fast-stamp)
+                                    // never runs for a quiet item. The
+                                    // helper is the EXACT predicate the
+                                    // dispatch's own quiet block runs (the
+                                    // dispatch keeps its own call for the
+                                    // non-walk paths).
+                                    if (DS_QUIET != null && CE_QUIET_ON
+                                            && dispatchQuietSkip(ie, entId(ie))) {
+                                        continue;
+                                    }
+                                    if (itemDispatch(ie)) {
+                                        continue;
+                                    }
                                 }
                                 if (mobRoute && e instanceof net.minecraft.world.entity.Mob m
                                         && m.getPassengers().isEmpty() && nativeMobTick(m)) {
@@ -13715,6 +13884,12 @@ public final class CeHooks {
                 // L21-rest touched check on a mismatch).
                 DS_QUIET = new long[(ARENA.length + 63) >> 6];
                 QUIET_REV = new long[ARENA.length];
+                // L172a: the scan-clean verdict + the REG_REV it was
+                // formed under (the stamp wave's license — see the
+                // declaration).
+                SCAN_CLEAN = new long[(ARENA.length + 63) >> 6];
+                SC_GEN = new int[ARENA.length];
+                QUIET_FR = new float[ARENA.length];
                 TT_MIRROR = true;
             }
             if (U != null && VH_SIT_STEPS.off >= 0 && VH_SIT_DELTA.off >= 0

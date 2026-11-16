@@ -234,6 +234,10 @@ impl TickOutcome {
     /// Landed with fallDistance > 0 this tick -> Java runs the exact
     /// fallOn + gameEvent + (writeback carries the pre-reset fallDistance).
     pub const LAND: u32 = 1 << 11;
+    /// L172a: the item stands on a block whose getBlockSpeedFactor != 1
+    /// (soul sand / honey). The quiet pass replicates ONLY the friction
+    /// decay, so such an item must NEVER stamp quiet (B22 gate).
+    pub const SPEED_FACTOR: u32 = 1 << 12;
 
     #[inline]
     pub fn has(self, bit: u32) -> bool {
@@ -607,6 +611,14 @@ pub fn tick_item(
             at_e.1
         };
         at_is_water = at_e.2;
+        // L172a: the speed-factor marker — the quiet pass replicates only
+        // the friction decay, so an item standing on a speed-factor block
+        // (soul sand / honey: the extra dx/dz multiplier at_speed) must
+        // never stamp quiet. at_is_water items exit quiet via the dispatch
+        // env check anyway.
+        if !at_is_water && at_speed != 1.0 {
+            out.set(TickOutcome::SPEED_FACTOR);
+        }
 
         // checkInsideBlocks path scan (movement < 1 block for native items;
         // the DDA branch is a safety net)

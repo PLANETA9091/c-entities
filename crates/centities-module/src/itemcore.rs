@@ -508,6 +508,11 @@ const B_REST_CAND: i32 = 1 << 15;
 /// after the counters — the skipped compares are exactly the ones the tails
 /// would skip themselves.
 const B_TAIL_NONE: i32 = 1 << 16;
+/// L172a: the item stands on a speed-factor block (soul sand/honey) — the
+/// quiet pass cannot replicate the extra dx/dz decay, so the stamp gate
+/// refuses these (see TickOutcome::SPEED_FACTOR). Diagnostic/kill path:
+/// the applier checks this bit before stamping.
+const B_SPD: i32 = 1 << 22;
 
 // L118-diag: the outcome-bits census (the merge=0 hunt) — module-level so
 // both the per-item body and the flush-stats print reach them.
@@ -1190,7 +1195,27 @@ unsafe fn n_item_tick_impl(
                                                 od_c[j * 9 + 4] = st.y;
                                                 od_c[j * 9 + 5] = st.z;
                                                 od_c[j * 9 + 6] = st.fall_dist as f64;
-                                                od_c[j * 9 + 7] = st.land_fall as f64;
+                                                // L172a: the LAND rows carry the
+                                                // pre-reset fallDistance here (the
+                                                // Java writeback reads it); the OTHER
+                                                // rows carry the quiet pass's open-tick
+                                                // friction multiplier — the f the full
+                                                // body multiplies dx/dz by on every open
+                                                // ((tc+id)%4==0) tick: (below_friction *
+                                                // 0.98f32) as f64, or 1.0 when disabled/
+                                                // speed-factored (the pass then decays
+                                                // nothing; the speed items never stamp
+                                                // via B_SPD). The stamp stores it per slot
+                                                // and the pass applies it bit-exactly.
+                                                od_c[j * 9 + 7] = if outcome.has(TickOutcome::LAND) {
+                                                    st.land_fall as f64
+                                                } else if st.friction_disabled
+                                                    || outcome.has(TickOutcome::SPEED_FACTOR)
+                                                {
+                                                    1.0
+                                                } else {
+                                                    (st.friction * 0.98f32) as f64
+                                                };
                                                 oi_c[j * 4] = st.age;
                                                 oi_c[j * 4 + 1] = st.pickup_delay;
                                                 let mut ob = 0i32;
@@ -1202,6 +1227,7 @@ unsafe fn n_item_tick_impl(
                                                 }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
                                                 if outcome.has(TickOutcome::MERGE2) { ob |= B_MERGE2; }
+                                                if outcome.has(TickOutcome::SPEED_FACTOR) { ob |= B_SPD; }
                                                 // L118-diag: the outcome-bits census (the merge=0 hunt)
                                                 // (the counters are module-level: CB_*_S, aliased
                                                 // CB_* above — the print in the flush-stats reads
