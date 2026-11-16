@@ -1473,3 +1473,30 @@ Task ID: 23 (the L171 pickup floor — the canHold fingerprint memo)
   (49989 vs 49992 of 50000), ARM with the Inventory retransform rc=0.
   The parity legs run playerless (no pickup) — the exactness proof is
   by construction; the memo shape (fingerprint-complete) is the gate.
+
+- L171 CI verdicts (5e979a3; parity/e2e/module/baseline ALL SUCCESS): the
+  third runner allocation in as many runs (the off sides: items 79.6,
+  mixed 785.8, mobs-native 712.9 — the noisiest yet; the mobs-native off
+  at +82% vs the L170 run). Paired same-runner deltas: items 79.6->34.95
+  (-56.1), mixed 785.8->109.5 (-86.1), spread 452.2->63.7 (-85.9),
+  mobs-native 712.9->25.1 (-96.5). The mod side: items 34.95 at the top
+  of the band (25.1..35.2 — the slow allocation), mixed 109.5 (band
+  84.2..96.3), spread 63.7 (52.7..63.9), mobs-native 25.1 (19.4..27.0) —
+  every mod number inside or at the edge of its historical band on a
+  visibly slower machine; the canHold effect (expected ~-10..-13% of the
+  items mod tick at CI density) is masked by the allocation variance and
+  needs a stable-runner paired comparison to read. The wire is exactness-
+  green (parity bit-identical on all 8 legs) and armed on every leg.
+- The session's landed storm: L169 (the merge-consume mirror + the scan-
+  order prefix truncation), L170 (the bigbox honest-EMA gate + the probe-
+  duty deadlock breaker), L171 (the canHold fingerprint memo). Three CI
+  rounds, 12 workflow runs, every one green; the mod-side items p50 went
+  27.1 (L168) -> 25.1 (L169) on the stable comparison, and the pickup
+  scan + the pickup inventory walk (the two biggest measure-window
+  families, ~25% combined) now ride the honest-EMA gate and the memo.
+- The remaining families by the measure-window profile: the merge work
+  14.6% (vanilla-determined), the flush prologue ~6%, tickListForEach
+  ~4%, the ttl tracker pair ~6%, the spawner floor ~2.5% — each a 1-3%
+  grind; the -90% goal on items needs the flush family (the 50.4%
+  CeHooks share) to shrink, which is the next session's hunt (the
+  prologue field reads, the tickList walk shape, the ttl bitmap).
