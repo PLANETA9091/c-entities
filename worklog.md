@@ -1372,3 +1372,67 @@ Task ID: 21 (the L166/L167/L168 storm — the vanilla merge-walk kill)
     spread); the mod side is the stable, controlled metric.
 - CI in flight: the L168 baseline + the three fresh profiles (items/
   mixed/spread) on 68bb299.
+
+Task ID: 22 (the L169/L170 storm — the merge-consume mirror, the scan-order
+prefix truncation, and the bigbox honest-EMA gate)
+- The L168 CI profiles (run 43775592232, items-100k-mod) decoded line by
+  line: the getMaxStackSize leaf (13.44%) splits 44.1% under the FILL-phase
+  vanilla merge scan (lambda$mergeWithNeighbours$0 — zero samples in the
+  measure window: the native merge route is COMPLETE there) and 53.5%
+  under the bot's pickup inventory walk (Inventory.canHold over a FULL
+  36-slot inventory per touched candidate — the measure window's #1 cost
+  family at 14.8%, vanilla in both legs, a bench-inherent floor). The
+  BasicEntityList.indexOf leaf (6.43%) is the ADD path (has() per
+  EntityLookup.addEntity) + the discard remove path — not a scan walk.
+  The phase split also confirmed: in the measure window CeHooks owns
+  50.43% (the flush), mergeWithNeighbours is ZERO, and the tracker
+  residual is down to ~9% (moonrise$tick + updatePlayer + the ttl pair).
+- L169 (be84386; parity/e2e/module/baseline SUCCESS): (a) the two
+  mergeScanNative consume loops (the nms route + the fastQuery route)
+  rode the vanilla isMergable MH per candidate while the flush loop
+  already rode the L157 mirror-first filter — both now run MERGP_ON ?
+  isMergableMirror : isMergableFast (the L39 byte-exact port + the L41
+  prototype cache; the same verdict at ~40ns vs the vanilla chain).
+  (b) n_merge_scan overflow used to refuse the WHOLE scan (-1 -> the
+  vanilla mergeWithNeighbours body); the candidates stream in scan
+  order, so a full buffer now returns the exact scan-order PREFIX with
+  the TRUNC bit (0x40000000): the consumer walks the prefix, a fired
+  merge is the vanilla absorb-stop at the same candidate, an exhausted
+  prefix costs one big-buffer rescan (32k scratch) of the SAME
+  deterministic query (the two calls bracket zero intervening work;
+  the prefix candidates re-tried are the no-op'd ones — tryToMerge is
+  side-effect-free until merge() runs, the L154 proof); still-truncated
+  past 32k routes the vanilla body (state intact). The flush-path rescan
+  skips when the scanner sits at capacity (the FULLBREAK proof).
+  CE_MS_TRUNC=0 restores the refusal; MS_TRUNC rides the [ms] line.
+- L169 CI paired verdicts (the same-runner pairs; the mod side is the
+  stable metric): items 53.3->25.1 (-53.0; the mod p50 27.1 -> 25.1, the
+  first sub-26 items result), spread 555.5->63.9 (-88.5; the off side at
+  its high end), mixed 415.2->85.4 (-79.4; the mod 85.4 inside the
+  historical 84.2..93.2 band), mobs-native 323.1->21.3 (-93.4). Local
+  pair (items-50k, same box, XMX 2500M): off 34.75 -> L168 21.80 ->
+  L169 19.34; parity pair SCALE=50000 bit-identical PASS on both
+  snapshots; refused=0/trunc=0 locally (the wires arm at CI-100k
+  density; mergeOps 14599 vs 14669 — the same merge workload).
+- L170 (6598364; CI in flight): the fastQuery bigbox gate refused the
+  pickup-shaped scans (the bench bot's aiStep box over the dense pile,
+  ~7.6k candidates) at the 0.5 ms ABS budget before the known-mirror
+  comparison ever ran (bigboxAdaptivePassed=0, bigboxRefused=5320,
+  bigboxCand=40.4M) — the refusal pays the vanilla moonrise body over
+  the SAME candidates (per-section has() O(list) + intersects + the
+  predicate ≈ 10% of the measure tick). The gate now compares against
+  the KNOWN mirror EMA (the actual vanilla-body price); the ABS budget
+  stays for unpriced buckets. The deadlock breaker: the refusal also
+  starved FAST_EMA (the bootstrap probes refused before the resolve —
+  the static model decided forever), so (1) a trained FAST_EMA (>=16
+  priced samples) replaces the static predicted model and (2) 1/256 of
+  the over-budget queries run the resolve anyway to price it — the
+  probe tax is bounded, the mob buckets keep the refusal when their
+  priced fast cost genuinely loses.
+- The remaining items-side measure-window families (the L169 profile):
+  the pickup inventory walk 14.8% (a floor: the full-inventory canHold
+  walk per touched candidate — the exact port would be a body
+  replacement of Inventory.canHold), the inlined tryToMerge/merge work
+  14.6% (the real merge volume, vanilla-determined), the flush
+  prologue ~6% (itemDispatch field reads), tickListForEach 4%, the ttl
+  tracker pair ~6%.
