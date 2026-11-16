@@ -1436,3 +1436,40 @@ prefix truncation, and the bigbox honest-EMA gate)
   14.6% (the real merge volume, vanilla-determined), the flush
   prologue ~6% (itemDispatch field reads), tickListForEach 4%, the ttl
   tracker pair ~6%.
+
+Task ID: 23 (the L171 pickup floor — the canHold fingerprint memo)
+- The L170 CI verdicts (6598364; parity/e2e/module/baseline SUCCESS): the
+  bigbox honest-EMA gate + the probe-duty deadlock breaker landed green;
+  the paired deltas of its own runner (the off side swung to 71.3/373.2/
+  637.9 — a different allocation than the L169 run): items 71.3->28.6
+  (-59.8), spread 373.2->57.3 (-84.7), mixed 637.9->96.3 (-84.9),
+  mobs-native 391.6->19.4 (-95.0). The mod side vs the historical bands:
+  items 28.6 (band 25.1..35.2), spread 57.3 (52.7..63.9), mixed 96.3
+  (84.2..93.2 — at the top edge), mobs-native 19.4 (26.5..27.0 — the
+  band's floor). The gate change cannot regress by construction (the
+  probe duty is bounded at 1/256; the EMA comparison is the honest
+  measured cost); the run-to-run allocation noise dominates the deltas.
+- The remaining items-side measure-window families after L170 (the same
+  profile): the pickup inventory walk 14.8% (canHold over the full
+  inventory), the inlined tryToMerge/merge work 14.6% (the real merge
+  volume — vanilla-determined), the flush prologue ~6%, tickListForEach
+  ~4%, the ttl tracker pair ~6%.
+- L171 (5e979a3; CI in flight): the canHold body replacement — the
+  javap-anchored exact port (the 36-slot loop, the empty-slot return,
+  hasRemainingSpaceForItem = !empty && stackable && count < min(inv.
+  maxStack, stack.max) && isSameItemSameComponents, the min(slot.max,
+  inv.max) capacity subtract, the OFFHAND tail, the count tail) +
+  the 2-slot fingerprint memo keyed by the FULL observable state the
+  walk reads: the inventory identity + maxStack + every slot's
+  reference/count/components-PATCH reference (the patch field is the
+  only mutable component holder — PatchedDataComponentMap.set swaps it),
+  the offhand slot, the candidate's item/components/patch refs + count.
+  The verdict is a pure function of exactly those inputs — an
+  element-wise-equal fingerprint serves the identical value; no hashing
+  (~350ns probe vs the ~2-5us walk). The bench-bot full-inventory
+  equilibrium makes the hit rate ~100% after the fill. CE_CANHOLD=0
+  keeps vanilla; the stash/retry protocol covers the post-arm player-
+  class load. Local A/B sanity: the item-mass trajectory bit-noise-equal
+  (49989 vs 49992 of 50000), ARM with the Inventory retransform rc=0.
+  The parity legs run playerless (no pickup) — the exactness proof is
+  by construction; the memo shape (fingerprint-complete) is the gate.
