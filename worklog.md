@@ -1703,3 +1703,36 @@ Task ID: 26 final (the L176 CI verdicts)
   2. ttlCachedPath ~5.9% (the epoch-counter redesign family);
   3. itemTickFlush 2.03% + quietPass 1.2%; 4. the vanilla floor is the
   -90% wall on items.
+
+---
+Task ID: 27 (the L177/L178 storm: the fused quiet bump + the tracker's minimal bulk path)
+- The -90%-everywhere push: re-profiled the L176 CI artifacts (8d9bd22) with the
+  windowed line attribution (new scripts/line_hot.py + leaf_split.py windows):
+  items-mod p50 11.58 = quietPass 18.65% (41% sweep + 46% honest writes + 9.3%
+  the unconditional QUIET_FR load), itemTickFlush 9.99%, tickListForEach 9.15%;
+  spread-mod ttlCachedPath 10.72% (82.7% of the method at the rf[ob+1] read +
+  cast line), quietPass 4.62%. mixed in between.
+- L177 (the fused quiet bump): the walk visits every entity exactly once per
+  tick — the same visit vanilla's ItemEntity.tick pays — so the quiet cohort's
+  debt (3 counters, the open-tick friction, despawn/belt exits) rides
+  dispatchQuietSkip's confirmed-quiet branch and the ARENA bitset sweep never
+  runs. Shape-exact order (friction -> despawn -> belt); the QUIET_FR load is
+  lazy (the open-tick gate is pure arithmetic; 3-of-4 ticks skip the read);
+  the despawn lands at the item's WALK position (vanilla's own; the sweep
+  over-ticked non-entity-ticking chunks). CE_QUIET_FUSE (-Dcentities.quietFuse)
+  bisect switch; qui=/fN(F|S) counters.
+- L178 (the tracker minimal bulk path): the cached path's bulk rows (TT_OK,
+  no SIT, mirror-owned) collapse to syncVelocity + the mirror bump when the
+  row's updateDataBeforeSync is PROVEN empty — the proof is per-class at fill
+  time (the declaring-class walk; Entity's stub is the javap-proven EMPTY
+  shape), stamped TT_UBS=4 into the row shape; no ServerEntity read/cast,
+  no try frame. ttlm=<mirror>/<hits> counters; unproven rows keep the full path.
+- Local: module tests green (incl. the natives-descriptor suite); parity items
+  20000 + spread 10000 PASS bit-identical on all snapshots (quietFuse ==
+  quietSkips exactly; ttlMin 943737/1193080 items, 240564 spread); local A/B
+  items-50k pair off 37.14 -> on 10.97 p50 (-70.5%; the mod side 12.71 -> 10.97
+  vs L174 on the same box).
+- Push: this commit; CI parity/module/e2e/baseline in flight.
+- NEXT: parse the CI speed table (the -90% verdict per row: items/mixed/spread/
+  mobs-native/despawn); the walk floor + the honest merge volume are the
+  remaining items-side families.

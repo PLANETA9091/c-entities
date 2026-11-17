@@ -964,10 +964,56 @@ public final class CeHooks {
             if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
                 quietSkips++;
                 dispDiag(e, "quiet");
+                if (CE_QUIET_FUSE) {
+                    quietFuseBump(e, q, eid); // L177: the bump rides THIS visit
+                }
                 return true; // the quiet pass owns this item's tick
             }
         }
         return false;
+    }
+
+    /** L177: the fused quiet bump — the per-item body of quietPass at the
+     *  walk's own visit. The qf load is lazy (the open-tick gate is pure
+     *  arithmetic on the just-bumped tickCount + the true id), so the 3-of-4
+     *  closed ticks skip the array read the sweep paid every tick. */
+    private static void quietFuseBump(ItemEntity e, int q, int eid) {
+        quietFuse++;
+        e.tickCount = e.tickCount + 1;
+        e.totalEntityAge = e.totalEntityAge + 1;
+        e.age = e.age + 1;
+        if (((e.tickCount + eid) % 4) == 0 && QUIET_FR != null
+                && O_ENT_DELTA > 0 && U != null) {
+            float qf = QUIET_FR[q];
+            if (qf != 1.0f) {
+                Object dv = U.getObject(e, O_ENT_DELTA);
+                if (dv instanceof net.minecraft.world.phys.Vec3 v3) {
+                    double ndx = v3.x * qf;
+                    double ndz = v3.z * qf;
+                    if (ndx != v3.x || ndz != v3.z) {
+                        U.putObject(e, O_ENT_DELTA, vec3Cached(q, ndx, v3.y, ndz));
+                    }
+                }
+            }
+        }
+        if (VH_READY && O_DESPAWN_RATE >= 0
+                && e.age >= U.getInt(e, O_DESPAWN_RATE)) {
+            try {
+                despawnTail(e);
+                quietDespawns++;
+                long[] dq0 = DS_QUIET;
+                if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
+            } catch (Throwable tf) {
+                // event/discard trouble: stay quiet, the next visit retries
+                // (vanilla's failure mode is the same throw)
+            }
+            return;
+        }
+        if ((e.tickCount & 255) == 0) {
+            long[] dq0 = DS_QUIET;
+            if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
+            quietBelt++;
+        }
     }
 
     /** L154: the L29 3-hop synched-data stack walk (entityData.items
@@ -1620,6 +1666,7 @@ public final class CeHooks {
                 + " qui=" + quietSkips + "/" + quietStamps + "/" + quietExits
                 + "/" + quietBelt + "/" + quietDespawns
                 + "/" + (CE_QUIET_ON ? 1 : 0)
+                + "/f" + quietFuse + (CE_QUIET_FUSE ? "F" : "S")
                 + " offT=" + mOffThread
                 + " dbgExp=" + Long.toHexString(dbgExpKey) + "/" + Long.toHexString(dbgGotKey)
                 + "/" + dbgExpSlot + "/" + dbgMisses
@@ -1659,6 +1706,7 @@ public final class CeHooks {
                 + " delta=" + deltaCalls + "/" + deltaGate
                 + " tt=" + ttCalls + "/" + ttGate
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
+                + " ttlm=" + (TT_MIRROR ? 1 : 0) + "/" + ttlMin
                 + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
@@ -7657,6 +7705,21 @@ public final class CeHooks {
     private static long QUIET_LAST_TICK = -1;
     public static long quietSkips = 0, quietStamps = 0, quietExits = 0,
             quietBelt = 0, quietDespawns = 0;
+    // L177: the quiet bump FUSED into the walk's own quiet skip. The walk
+    // (EntityTickList.forEach, javap-verified sole caller of the woven body)
+    // visits every entity exactly once per tick per level — the same visit
+    // vanilla's ItemEntity.tick pays — so the quiet cohort's bump (tickCount/
+    // totalEntityAge/age, the open-tick friction, the despawn/belt exits)
+    // rides THAT visit and the ARENA bitset sweep (quietPass) never runs.
+    // Shape-exact vs the sweep: same field writes, same open-tick gate
+    // (eid replaces ARENA_ID[slot] — the same true id), same despawn/belt
+    // order; the despawn lands at the item's WALK position (vanilla's own
+    // — the sweep fired pre-flush), and a slot the walk never visits (a
+    // non-entity-ticking chunk) correctly misses the bump like vanilla.
+    // -Dcentities.quietFuse=false restores the sweep for the bisect.
+    public static final boolean CE_QUIET_FUSE =
+            !"false".equals(System.getProperty("centities.quietFuse", "true"));
+    public static long quietFuse = 0;
 
     public static void setItemQuietOn(boolean on) {
         CE_QUIET_ON = on && CE_QUIET_FLAG;
@@ -7786,7 +7849,9 @@ public final class CeHooks {
         // weave + the n==0 skip flushes), which ran the pass ~8x per tick
         // and multiplied the whole cohort's counters (the par5 parity fail:
         // tc off=449 on=935).
-        if (CE_QUIET_ON && ACTIVE && ITEM_TICK_ON && cplugReady) {
+        if (CE_QUIET_ON && ACTIVE && ITEM_TICK_ON && cplugReady && !CE_QUIET_FUSE) {
+            // L177: the fused walk pays the bump at its own visit; the sweep
+            // stays only for the quietFuse=false bisect.
             long gt = level.getLevelData().getGameTime();
             if (QUIET_LAST_TICK != gt) {
                 QUIET_LAST_TICK = gt;
@@ -13937,6 +14002,43 @@ public final class CeHooks {
     private static volatile Object[] TT_REF;   // slot*5 -> te/se/ent/sitObj/steps
     private static volatile long[] TT_FLAT;    // slot*2 -> shape/tickCount
     private static final long TT_OK = 1L, TT_SIT = 2L;
+    // L178: the row's updateDataBeforeSync() is PROVEN a no-op (the declaring
+    // class is Entity itself — the bc 19-23 EMPTY stub the trackerFastExit
+    // port already relies on) — the per-tick virtual call is skipped. Any
+    // subclass override clears the proof (the full path keeps the call).
+    private static final long TT_UBS = 4L;
+    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>
+            UBS_PROOF = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** L178: fill-time proof that updateDataBeforeSync() for this entity's
+     *  class resolves to the Entity stub. The declaring-class walk: any
+     *  override declares the method outside Entity.class and keeps the
+     *  call; Entity itself is javap-proven EMPTY in 26.3 (doc 63). Cached
+     *  per class — the walk runs once per type, never per entity per tick. */
+    private static boolean ubsEmpty(Entity ent) {
+        Class<?> c = ent.getClass();
+        Boolean hit = UBS_PROOF.get(c);
+        if (hit != null) return hit;
+        boolean empty = false;
+        try {
+            for (Class<?> w = c; w != null && w != Object.class; w = w.getSuperclass()) {
+                boolean declared = false;
+                for (java.lang.reflect.Method m : w.getDeclaredMethods()) {
+                    if (m.getName().equals("updateDataBeforeSync")
+                            && m.getParameterCount() == 0) {
+                        declared = true;
+                        empty = (w == Entity.class);
+                        break;
+                    }
+                }
+                if (declared) break;
+            }
+        } catch (Throwable t) {
+            empty = false; // not proven: keep the per-tick call
+        }
+        UBS_PROOF.put(c, empty);
+        return empty;
+    }
     // L92: the QUIET bitset — per mirror slot, set by the item-tick applier
     // for batch-owned items whose ENTIRE tracker-visible surface is provably
     // untouched this tick (TAIL_NONE out-flag + no velocity sync + the fill
@@ -14021,6 +14123,9 @@ public final class CeHooks {
             new java.util.WeakHashMap<>();
     private static final boolean[] TT_ARM_VAL = new boolean[8];
     public static long ttlCache = 0, ttlFill = 0, ttlPopBlock = 0;
+    // L178: the minimal armed bulk path hits (TT_UBS row + mirror) — the
+    // dead-port rule: the new path's traffic MUST be observable
+    public static long ttlMin = 0;
     public static long ttlExit = 0; // L151: the exact fast-exit skips
 
 
@@ -14512,6 +14617,25 @@ public final class CeHooks {
             return false;
         }
         ttlFuseChecks++;
+        // L178: the minimal armed bulk path — non-SIT row, mirror-owned
+        // counter, UBS proven empty at fill: no ServerEntity read, no cast,
+        // no Unsafe RMW, no try frame. The full path's verdict for such a
+        // row is exactly: the syncVelocity consume + updateDataBeforeSync
+        // (the proven no-op) + the mirror bump. The ServerEntity null-
+        // decline cannot fire here (TT_OK pins the fill, and the fill
+        // stamps se BEFORE the TT_OK shape — a null se never gets TT_OK).
+        if ((sh & (TT_SIT | TT_UBS)) == TT_UBS && TT_MIRROR) {
+            if (ent.syncVelocity) {
+                if (ent instanceof net.minecraft.server.level.ServerPlayer) {
+                    return false;
+                }
+                ent.syncVelocity = false;
+            }
+            fl[lb + 1] = fl[lb + 1] + 1;
+            ttlCache++;
+            ttlMin++;
+            return true;
+        }
         try {
             if ((sh & TT_SIT) != 0) {
                 // L65: the interp handler and the steps LIST are fill-cached
@@ -14831,7 +14955,11 @@ public final class CeHooks {
                             // (the fast path just did its real RMW — the
                             // stamp captures the post-increment truth)
                             flf[sid * 2 + 1] = U.getInt(se0, O_SE_TICKCOUNT);
-                            flf[sid * 2] = TT_OK;
+                            // L178: the per-class UBS proof rides the shape
+                            // (a proven-empty updateDataBeforeSync lets the
+                            // cached path skip the virtual call per tick)
+                            flf[sid * 2] = TT_OK
+                                    | (ubsEmpty(ent) ? TT_UBS : 0);
                             if (interp instanceof
                                             net.minecraft.world.entity
                                                     .SteppedInterpolationTracker
@@ -14839,7 +14967,8 @@ public final class CeHooks {
                                     && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
                                 rff[ob + 3] = interp;
                                 rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
-                                flf[sid * 2] = TT_OK | TT_SIT;
+                                flf[sid * 2] = TT_OK | TT_SIT
+                                        | (ubsEmpty(ent) ? TT_UBS : 0);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {
