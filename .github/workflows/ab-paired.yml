@@ -71,8 +71,14 @@ jobs:
               # decision; the populations MUST converge (the samples' entity
               # column carries the curve, the gate asserts the end delta).
               mobs-despawn-10k) SCALE=10000; ITEMS=0.0; STANDS=0.0; AREA=700; REPS=1; DESP=1; MOBW=1;;
-              mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1; DESP=0; MOBW=0;;
-              spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1; DESP=0; MOBW=0;;
+              # N2-M2e alignment (the baseline.yml production rows): the
+              # spread/mixed zombie fractions ride the native wire — the
+              # vanilla-AI zombie fraction made the ab-paired ON legs pay the
+              # vanilla mob floor the production rows never do (the
+              # baseline-matrix spread-mod 47..64ms vs this gate's 299..328ms
+              # era). The honest production ratio needs the production config.
+              mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0; REPS=1; DESP=0; MOBW=1;;
+              spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; REPS=1; DESP=0; MOBW=1;;
             esac
             # mixed-150k on a 2-vCPU runner: fill ~18m + warmup ~9m
             # (about 5.7 s/tick observed) — a 600-tick window does not

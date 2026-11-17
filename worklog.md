@@ -1754,3 +1754,16 @@ Task ID: 27 addendum (the L177/L178 CI verdicts + the ab-paired dispatch)
   mobs-25k-native 568.88->21.90 (-96.2%; the -90% goal row holds).
 - ab-paired dispatched on main (44158062433; 3 repeats, medians, same runner)
   — the honest ratio arbiter; verdicts next addendum.
+
+---
+Task ID: 27 addendum 2 (the ab-paired verdict + the MOBW alignment)
+- The a55f718 ab-paired flight (44158062433) GATE PASS on all 5 legs; the
+  medians: items [98.9,93.0,89.6]->[29.3,25.8,27.6] 0.296, mobs-25k
+  621.1->378.1 0.609, mixed 3261.3->339.0 0.104, spread 428.0->327.8 0.766,
+  despawn 81.5->10.7 0.132 pop delta 13 OK. The module is never slower.
+- The table exposed a WORKFLOW GAP: ab-paired ran spread/mixed with MOBW=0 —
+  the zombie fractions ticked VANILLA while the baseline production rows
+  (the -90% rows) carry CE_NATIVE_MOB=1 (the N2-M2e fix never reached the
+  paired gate; its spread ON legs sat at 299..328ms vs the matrix's 47..64).
+  Fixed: MOBW=1 for spread-100k/mixed-150k (the despawn row already had it);
+  re-dispatched — the next flight arbitrates the PRODUCTION ratios.
