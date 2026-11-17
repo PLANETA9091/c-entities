@@ -1685,3 +1685,21 @@ Task ID: 26 addendum (the L175 CI verdicts + the L176 stand-data row cache)
   valid items pair: PASS bit-identical on all 3 snapshots. CI arbitrates
   spread/mixed parity.
 - CI in flight on 8d9bd22 (parity/module/e2e/baseline).
+
+---
+Task ID: 26 final (the L176 CI verdicts)
+- The 8d9bd22 flight: parity SUCCESS (all 12 gate lines PASS bit-identical;
+  the cache counters closed the accounting exactly — st=1610045/0/1610045/0/
+  11/1608081/1964/0: 1964 fills = the stand count, 1.6M hits, zero bad rows,
+  zero vanilla falls), module/e2e/baseline SUCCESS.
+- The speed table (p50 ms, same-runner pairs): items-100k 57.3->11.6
+  (-79.8%), mixed-150k 385.1->61.7 (-84.0%), spread-100k 545.3->57.1
+  (-89.5%), mobs-25k 731.3->355.4 (-51.4%), mobs-25k-native 560.2->21.4
+  (-96.2%). The vanilla off legs swung this run (mobs 731 vs 546 last
+  run) — the mod legs 11.6/61.7/57.1 vs 21.9/71.6/47.1 are runner noise;
+  the honest read: the stand-data family left the profile.
+- NEXT: 1. tickListForEach self 4.32% (the arena-ordered walk needs the
+  tick-list order proof — the TL parity stream is the judge);
+  2. ttlCachedPath ~5.9% (the epoch-counter redesign family);
+  3. itemTickFlush 2.03% + quietPass 1.2%; 4. the vanilla floor is the
+  -90% wall on items.
