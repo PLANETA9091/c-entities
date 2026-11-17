@@ -1635,6 +1635,8 @@ public final class CeHooks {
                 + " st=" + dispStand + "/" + dispStandMiss
                 + "/" + standPortHit + "/" + standPortMiss
                 + "/" + (STAND_MIRROR_ON ? 1 : 0) + (STAND_PORT ? 1 : 0)
+                + "/" + standCacheHit + "/" + standCacheFill
+                + "/" + standCacheBad + (STAND_CACHE_ON ? "c" : "p")
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
                 + "/w" + travelWalk + "/n" + travelWalkNoMove
@@ -2287,6 +2289,17 @@ public final class CeHooks {
                 Entity[] fe = FROZ_E;
                 if (fe != null) fe[sm] = null;
                 AT_E[sm & (AT_CAP - 1)] = null;
+                // L176: the stand-data row dies with the entity (the row
+                // holds the STRONG stand + its three DataItems — the same
+                // lifecycle rule as the TT_REF release above).
+                Object[] sd0 = SD_ROWS;
+                if (sd0 != null) {
+                    int sk = (sm & SD_CACHE_MASK) * 4;
+                    sd0[sk] = null;
+                    sd0[sk + 1] = null;
+                    sd0[sk + 2] = null;
+                    sd0[sk + 3] = null;
+                }
                 // L73: the AI floor's shadow keys are STRONG — the removed
                 // mob's selector must be dropped explicitly (its goalSelector
                 // rides O_MOB_GOALSEL). A missed drop leaks one bounded
@@ -5470,6 +5483,30 @@ public final class CeHooks {
     public static volatile int O_ACC_FLAGS_ID = -1, O_ACC_NG_ID = -1,
             O_ACC_HEALTH_ID = -1;
     public static long standPortHit = 0, standPortMiss = 0;
+    // L176: the stand-data ROW CACHE. The L175 port reads EIGHT Unsafe
+    // loads per stand per tick (entityData, itemsById, three array slots,
+    // three values) — after it woke up that became 68% of the profile's
+    // Unsafe.getObject leaf (14.9% of the whole spread-100k-mod profile,
+    // CI 97a5d02 artifacts). The itemsById array + the DataItem instances
+    // are FINAL per stand (defineSynchedData allocates both once; set()
+    // swaps the value field INSIDE the same DataItem), so the row
+    // {as, fItem, nItem, hItem} caches: the steady state is ONE identity
+    // load + THREE live value loads. The value reads stay live — the same
+    // boxed objects vanilla unpacks; nothing observable changes. A stale
+    // or collided row fails the identity guard (row[0] == as) and falls to
+    // the fill probe (the exact L175 port) which refills; probeRemove
+    // clears the row so a dead stand's refs stay collectable. 2^17 rows
+    // keyed by entId & mask (~2MB of refs; the bench's ~100k id span maps
+    // under 2^17 — no collisions, every fill is once-per-stand); a denser
+    // world degrades gracefully to more fills. CE_STAND_CACHE=0 restores
+    // the plain L175 8-load port.
+    public static final boolean STAND_CACHE_ON =
+            !"0".equals(System.getenv("CE_STAND_CACHE"));
+    public static final int SD_CACHE_SLOTS = 1 << 17;
+    public static final int SD_CACHE_MASK = SD_CACHE_SLOTS - 1;
+    private static volatile Object[] SD_ROWS;
+    public static long standCacheHit = 0, standCacheFill = 0,
+            standCacheBad = 0;
     // L124: the delta writeback store shape. Default PLAIN (every reader
     // runs on the server thread; the reference store is atomic);
     // CE_DELTA_VOL=1 restores the volatile store for the bisect.
@@ -5596,45 +5633,97 @@ public final class CeHooks {
         if (!STAND_MIRROR_ON) return false;
         try {
             int sid = entId(as) & AMASK;
-            // L165/L175: the THREE data-classification reads through the
-            // Unsafe port (same value slots, fewer loads); the rest of the
-            // classification stays the vanilla accessor calls.
+            // L165/L175/L176: the THREE data-classification reads through
+            // the Unsafe port; the L176 row cache collapses the steady
+            // state to one identity load + three live value loads (the
+            // rest of the classification stays the vanilla accessor calls).
             boolean marker = false;
             boolean noGravity = false;
             boolean alivePort = false;
             boolean alivePorted = false;
             boolean ported = false;
+            boolean hitPath = false;
             if (STAND_PORT && O_EDATA >= 0 && O_SD_ITEMS_BY_ID >= 0
                     && O_DI_VALUE >= 0 && O_ACC_FLAGS_ID >= 0
                     && O_ACC_NG_ID >= 0 && O_ACC_HEALTH_ID >= 0
                     && U != null) {
-                Object ed = U.getObject(as, O_EDATA);
-                Object arr = ed != null ? U.getObject(ed, O_SD_ITEMS_BY_ID) : null;
-                if (arr != null) {
-                    long ab = U.ARRAY_OBJECT_BASE_OFFSET;
-                    long sc = U.ARRAY_OBJECT_INDEX_SCALE;
-                    Object fItem = U.getObject(arr, ab + (long) O_ACC_FLAGS_ID * sc);
-                    Object nItem = U.getObject(arr, ab + (long) O_ACC_NG_ID * sc);
-                    Object hItem = U.getObject(arr, ab + (long) O_ACC_HEALTH_ID * sc);
-                    if (fItem != null && nItem != null && hItem != null) {
-                        Object fv = U.getObject(fItem, O_DI_VALUE);
-                        Object nv = U.getObject(nItem, O_DI_VALUE);
-                        Object hv = U.getObject(hItem, O_DI_VALUE);
-                        if (fv instanceof Byte fb && nv instanceof Boolean nb
-                                && hv instanceof Float hf) {
-                            marker = (fb.byteValue() & 0x10) != 0;
-                            noGravity = nb;
-                            // L175: the isAlive port — javap-verified shape
-                            // (LivingEntity 26.3): !isRemoved() && health > 0
-                            // && !dead; dead through the single-class offset.
-                            if (O_LE_DEAD >= 0) {
-                                alivePort = !as.isRemoved()
-                                        && hf.floatValue() > 0.0f
-                                        && U.getByte(as, O_LE_DEAD) == 0;
-                                alivePorted = true;
+                Object[] rows = null;
+                if (STAND_CACHE_ON) {
+                    rows = SD_ROWS;
+                    if (rows == null) {
+                        rows = new Object[SD_CACHE_SLOTS * 4];
+                        SD_ROWS = rows; // lazily at the first stand (~2MB)
+                    }
+                }
+                int key = rows != null ? (sid & SD_CACHE_MASK) * 4 : -1;
+                // L176 HIT: the identity-guarded cached refs — four loads
+                // total (one identity + three live values).
+                if (key >= 0 && rows[key] == as) {
+                    Object fv = U.getObject(rows[key + 1], O_DI_VALUE);
+                    Object nv = U.getObject(rows[key + 2], O_DI_VALUE);
+                    Object hv = U.getObject(rows[key + 3], O_DI_VALUE);
+                    if (fv instanceof Byte fb && nv instanceof Boolean nb
+                            && hv instanceof Float hf) {
+                        marker = (fb.byteValue() & 0x10) != 0;
+                        noGravity = nb;
+                        if (O_LE_DEAD >= 0) {
+                            alivePort = !as.isRemoved()
+                                    && hf.floatValue() > 0.0f
+                                    && U.getByte(as, O_LE_DEAD) == 0;
+                            alivePorted = true;
+                        }
+                        ported = true;
+                        hitPath = true;
+                        standPortHit++;
+                        standCacheHit++;
+                    } else {
+                        // a type-broken cached row (impossible by the fill
+                        // contract — treat as corrupt and refill)
+                        rows[key] = null;
+                        standCacheBad++;
+                    }
+                }
+                // the L175 8-load port: the fill probe when rows != null, the
+                // plain port when the cache is off (key < 0)
+                if (!hitPath) {
+                    Object ed = U.getObject(as, O_EDATA);
+                    Object arr = ed != null
+                            ? U.getObject(ed, O_SD_ITEMS_BY_ID) : null;
+                    if (arr instanceof Object[] items
+                            && O_ACC_FLAGS_ID < items.length
+                            && O_ACC_NG_ID < items.length
+                            && O_ACC_HEALTH_ID < items.length) {
+                        Object fItem = items[O_ACC_FLAGS_ID];
+                        Object nItem = items[O_ACC_NG_ID];
+                        Object hItem = items[O_ACC_HEALTH_ID];
+                        if (fItem != null && nItem != null && hItem != null) {
+                            Object fv = U.getObject(fItem, O_DI_VALUE);
+                            Object nv = U.getObject(nItem, O_DI_VALUE);
+                            Object hv = U.getObject(hItem, O_DI_VALUE);
+                            if (fv instanceof Byte fb
+                                    && nv instanceof Boolean nb
+                                    && hv instanceof Float hf) {
+                                marker = (fb.byteValue() & 0x10) != 0;
+                                noGravity = nb;
+                                // L175: the isAlive port — javap-verified shape
+                                // (LivingEntity 26.3): !isRemoved() && health > 0
+                                // && !dead; dead through the single-class offset.
+                                if (O_LE_DEAD >= 0) {
+                                    alivePort = !as.isRemoved()
+                                            && hf.floatValue() > 0.0f
+                                            && U.getByte(as, O_LE_DEAD) == 0;
+                                    alivePorted = true;
+                                }
+                                ported = true;
+                                standPortHit++;
+                                if (rows != null) {
+                                    rows[key] = as;
+                                    rows[key + 1] = fItem;
+                                    rows[key + 2] = nItem;
+                                    rows[key + 3] = hItem;
+                                    standCacheFill++;
+                                }
                             }
-                            ported = true;
-                            standPortHit++;
                         }
                     }
                 }
