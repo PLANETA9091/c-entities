@@ -1,106 +1,106 @@
 # JVM hotspots (JFR ExecutionSample)
 
-Samples: 8261
+Samples: 10103
 
 ## Top 60 by self-time (leaf frames)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 21.85% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 2 | 4.32% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9414` |
-| 3 | 3.53% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14420` |
-| 4 | 3.18% | `org.spigotmc.WatchdogThread.run() line: 72` |
-| 5 | 2.03% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8621` |
-| 6 | 1.62% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
-| 7 | 1.38% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14439` |
-| 8 | 1.20% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7612` |
-| 9 | 1.05% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 987` |
-| 10 | 1.04% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14457` |
-| 11 | 1.02% | `net.minecraft.world.entity.Entity.getType() line: 633` |
-| 12 | 1.02% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13695` |
-| 13 | 0.98% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5905` |
-| 14 | 0.94% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 912` |
-| 15 | 0.79% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5901` |
-| 16 | 0.79% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5623` |
-| 17 | 0.79% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 984` |
-| 18 | 0.73% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 19 | 0.71% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8353` |
-| 20 | 0.70% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
-| 21 | 0.70% | `net.minecraft.world.entity.Mob.getLeashData() line: 1487` |
-| 22 | 0.69% | `sun.misc.Unsafe.getDouble(Object, long) line: 409` |
-| 23 | 0.62% | `net.minecraft.world.entity.Mob.isPersistenceRequired() line: 1308` |
-| 24 | 0.58% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThread() line: 122` |
-| 25 | 0.53% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 26 | 0.51% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8357` |
-| 27 | 0.50% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 28 | 0.48% | `sun.misc.Unsafe.putObject(Object, long, Object) line: 240` |
-| 29 | 0.45% | `dev.planeta9091.centities.CeHooks$NmMap.probe(int) line: 11024` |
-| 30 | 0.45% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 982` |
-| 31 | 0.41% | `net.minecraft.world.level.chunk.ChunkAccess.getPos() line: 279` |
-| 32 | 0.41% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8335` |
-| 33 | 0.40% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 34 | 0.40% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7608` |
-| 35 | 0.40% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7599` |
-| 36 | 0.39% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9424` |
-| 37 | 0.38% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.getNode(long) line: 243` |
-| 38 | 0.38% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 39 | 0.36% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
-| 40 | 0.35% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
-| 41 | 0.34% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.getChunkHolder(int, int) line: 929` |
-| 42 | 0.34% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7614` |
-| 43 | 0.33% | `net.minecraft.util.StaticCache2D.<init>(int, int, int, int, StaticCache2D$Initializer) line: 30` |
-| 44 | 0.30% | `java.util.Collections$UnmodifiableCollection$1.<init>(Collections$UnmodifiableCollection) line: 1077` |
-| 45 | 0.30% | `sun.misc.Unsafe.putInt(Object, long, int) line: 210` |
-| 46 | 0.29% | `java.util.HashMap.getNode(Object) line: 586` |
-| 47 | 0.28% | `java.lang.invoke.VarHandleReferences$Array.getAcquire(VarHandle, Object, int) line: 637` |
-| 48 | 0.28% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5859` |
-| 49 | 0.28% | `dev.planeta9091.centities.CeHooks.vec3Cached(int, double, double, double) line: 2941` |
-| 50 | 0.27% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7626` |
-| 51 | 0.24% | `dev.planeta9091.centities.CeHooks.vec3Cached(int, double, double, double) line: 2946` |
-| 52 | 0.24% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.processTicketUpdates() line: 1517` |
-| 53 | 0.23% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5907` |
-| 54 | 0.22% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder.getChunkIfPresentUnchecked(ChunkStatus) line: 476` |
-| 55 | 0.19% | `net.minecraft.nbt.CompoundTag.moonrise$writeWithoutId(AbstractBufferOutputStream, boolean) line: 57` |
-| 56 | 0.19% | `dev.planeta9091.centities.CeHooks.vec3Cached(int, double, double, double) line: 2942` |
-| 57 | 0.19% | `net.minecraft.world.entity.Entity.getVehicle() line: 4939` |
-| 58 | 0.19% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5795` |
-| 59 | 0.18% | `io.papermc.paperclip.Util.readFully(InputStream) line: 46` |
-| 60 | 0.18% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 14648` |
+| 1 | 10.19% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9503` |
+| 2 | 6.07% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 3 | 5.91% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14509` |
+| 4 | 4.57% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8710` |
+| 5 | 2.44% | `org.spigotmc.WatchdogThread.run() line: 69` |
+| 6 | 2.20% | `org.spigotmc.WatchdogThread.run() line: 72` |
+| 7 | 1.94% | `dev.planeta9091.centities.CeHooks.quietPass() line: 7697` |
+| 8 | 1.69% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13784` |
+| 9 | 1.60% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5990` |
+| 10 | 1.46% | `sun.misc.Unsafe.getDouble(Object, long) line: 409` |
+| 11 | 1.20% | `net.minecraft.world.entity.Mob.isPersistenceRequired() line: 1308` |
+| 12 | 1.17% | `sun.misc.Unsafe.putObject(Object, long, Object) line: 240` |
+| 13 | 0.99% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
+| 14 | 0.94% | `net.minecraft.world.entity.Entity.getType() line: 633` |
+| 15 | 0.88% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
+| 16 | 0.78% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 17 | 0.72% | `java.lang.invoke.VarHandleReferences$FieldInstanceReadOnly.getVolatile(VarHandle, Object) line: 99` |
+| 18 | 0.71% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 912` |
+| 19 | 0.68% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8512` |
+| 20 | 0.57% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
+| 21 | 0.52% | `java.lang.invoke.VarHandleReferences$Array.getAcquire(VarHandle, Object, int) line: 637` |
+| 22 | 0.52% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5661` |
+| 23 | 0.52% | `sun.misc.Unsafe.getByte(Object, long) line: 279` |
+| 24 | 0.52% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5994` |
+| 25 | 0.52% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5665` |
+| 26 | 0.50% | `dev.planeta9091.centities.CeHooks$NmMap.probe(int) line: 11113` |
+| 27 | 0.49% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThread() line: 122` |
+| 28 | 0.48% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14546` |
+| 29 | 0.47% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 30 | 0.44% | `net.minecraft.world.entity.Entity.getX() line: 5100` |
+| 31 | 0.43% | `dev.planeta9091.centities.CeHooks.appendDispatch(ItemEntity, boolean, int) line: 6268` |
+| 32 | 0.42% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14528` |
+| 33 | 0.42% | `net.minecraft.world.entity.LivingEntity.updateDirtyEffects() line: 996` |
+| 34 | 0.42% | `net.minecraft.server.level.ServerChunkCache.runDistanceManagerUpdates() line: 453` |
+| 35 | 0.34% | `net.minecraft.world.level.chunk.ChunkAccess.getPos() line: 279` |
+| 36 | 0.34% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9513` |
+| 37 | 0.29% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 38 | 0.28% | `net.minecraft.server.level.WorldGenRegion.lambda$new$2(ChunkAccess, ChunkStep, GenerationChunkHolder, int, int) line: 124` |
+| 39 | 0.28% | `net.minecraft.world.level.chunk.PalettedContainer.get(int) line: 236` |
+| 40 | 0.27% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5996` |
+| 41 | 0.26% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5948` |
+| 42 | 0.25% | `java.util.Collections$UnmodifiableCollection$1.<init>(Collections$UnmodifiableCollection) line: 1077` |
+| 43 | 0.25% | `ca.spottedleaf.moonrise.patches.fast_palette.FastHashMapPalette.valueFor(int) line: 161` |
+| 44 | 0.25% | `net.minecraft.world.entity.LivingEntity.getHealth() line: 1395` |
+| 45 | 0.23% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8442` |
+| 46 | 0.22% | `ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.getChunkHolder(int, int) line: 929` |
+| 47 | 0.22% | `net.minecraft.world.entity.Entity.setPosRaw(double, double, double, boolean) line: 5186` |
+| 48 | 0.22% | `java.util.Map.forEach(BiConsumer) line: 723` |
+| 49 | 0.21% | `java.lang.invoke.DirectMethodHandle.allocateInstance(Object) line: 500` |
+| 50 | 0.21% | `org.spigotmc.WatchdogThread.monotonicMillis() line: 36` |
+| 51 | 0.21% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5957` |
+| 52 | 0.21% | `dev.planeta9091.centities.CeHooks.batchUpsert(int, int, Entity, AABB, boolean, int) line: 2556` |
+| 53 | 0.20% | `net.minecraft.util.StaticCache2D.get(int, int) line: 49` |
+| 54 | 0.20% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 55 | 0.19% | `com.sun.crypto.provider.CounterMode.implCrypt(byte[], int, int, byte[], int) line: 209` |
+| 56 | 0.19% | `java.util.Arrays.copyOf(byte[], int) line: 3537` |
+| 57 | 0.19% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 14796` |
+| 58 | 0.18% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 714` |
+| 59 | 0.18% | `net.minecraft.world.level.levelgen.Heightmap.lambda$static$0(BlockState) line: 28` |
+| 60 | 0.18% | `java.util.ArrayList$Itr.next() line: 1058` |
 
 ## Top 30 callers of hot leaves
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 6.42% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 14711` |
-| 2 | 5.19% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer)` |
-| 3 | 4.79% | `net.minecraft.world.level.Level.tickBlockEntities()` |
-| 4 | 4.79% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5620` |
-| 5 | 4.37% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5612` |
-| 6 | 3.79% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5616` |
-| 7 | 3.05% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9424` |
-| 8 | 2.99% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 7704` |
-| 9 | 2.49% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5807` |
-| 10 | 2.34% | `dev.planeta9091.centities.CeHooks.fullStackQuiet(ItemEntity) line: 931` |
-| 11 | 1.89% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 982` |
-| 12 | 1.55% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 896` |
-| 13 | 1.37% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean)` |
-| 14 | 1.03% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13712` |
-| 15 | 0.98% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9444` |
-| 16 | 0.86% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5749` |
-| 17 | 0.79% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.initBlock() line: 326` |
-| 18 | 0.77% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8335` |
-| 19 | 0.77% | `net.minecraft.network.syncher.SynchedEntityData.get(EntityDataAccessor) line: 53` |
-| 20 | 0.73% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupNoRandPartA() line: 880` |
-| 21 | 0.71% | `dev.planeta9091.centities.CeHooks.mergeMaxStack(Object) line: 879` |
-| 22 | 0.70% | `net.minecraft.world.entity.Leashable.isLeashed() line: 49` |
-| 23 | 0.68% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5621` |
-| 24 | 0.67% | `net.minecraft.server.level.ChunkMap.newTrackerTick()` |
-| 25 | 0.63% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 12337` |
-| 26 | 0.62% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13703` |
-| 27 | 0.61% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.get(long) line: 264` |
-| 28 | 0.58% | `ca.spottedleaf.moonrise.patches.starlight.light.SkyStarLightEngine.lightChunk(LightChunkGetter, ChunkAccess, boolean) line: 551` |
-| 29 | 0.58% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 12290` |
-| 30 | 0.54% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(Entity) line: 170` |
+| 1 | 11.06% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer)` |
+| 2 | 7.19% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 14800` |
+| 3 | 6.80% | `net.minecraft.world.level.Level.tickBlockEntities()` |
+| 4 | 3.37% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9513` |
+| 5 | 2.71% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 7793` |
+| 6 | 2.59% | `dev.planeta9091.centities.CeHooks.standMirror(ArmorStand) line: 5662` |
+| 7 | 1.95% | `net.minecraft.world.level.NaturalSpawner.createState(int, ServerLevel, NaturalSpawner$ChunkGetter, LocalMobCapCalculator, boolean)` |
+| 8 | 1.65% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 982` |
+| 9 | 1.41% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 12426` |
+| 10 | 1.25% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5838` |
+| 11 | 1.20% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13792` |
+| 12 | 1.10% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 12359` |
+| 13 | 1.06% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.initBlock() line: 326` |
+| 14 | 0.94% | `net.minecraft.server.level.ChunkMap.newTrackerTick()` |
+| 15 | 0.93% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 13801` |
+| 16 | 0.78% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9533` |
+| 17 | 0.78% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 18 | 0.75% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 896` |
+| 19 | 0.73% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8428` |
+| 20 | 0.70% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable$TableEntry.getValueVolatile() line: 1812` |
+| 21 | 0.67% | `net.minecraft.world.entity.Entity.setBoundingBox(AABB)` |
+| 22 | 0.61% | `ca.spottedleaf.moonrise.patches.starlight.light.SkyStarLightEngine.lightChunk(LightChunkGetter, ChunkAccess, boolean) line: 551` |
+| 23 | 0.55% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 5896` |
+| 24 | 0.54% | `dev.planeta9091.centities.CeHooks$NmMap.get(int) line: 11120` |
+| 25 | 0.52% | `ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable.getAtIndexAcquire(ConcurrentChainedLong2ReferenceHashTable$TableEntry[], int) line: 187` |
+| 26 | 0.48% | `net.minecraft.util.StaticCache2D.lambda$map$0(StaticCache2D$MappingFunction, int, int) line: 36` |
+| 27 | 0.48% | `net.minecraft.network.syncher.SynchedEntityData.get(EntityDataAccessor) line: 53` |
+| 28 | 0.48% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int) line: 14531` |
+| 29 | 0.47% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.setupNoRandPartA() line: 880` |
+| 30 | 0.47% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(Entity) line: 170` |
 
 GC pauses: 0, total 0 ms
 
