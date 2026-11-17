@@ -1538,3 +1538,51 @@ channel, the pass's dust decay)
   14.55/9.08. The pre-change pair also re-run for the bisect (PASS — the
   regression was mine, now fixed).
 - Push: this commit; CI: parity (4 pairs) + ab-paired + baseline in flight.
+
+---
+Task ID: 25 (the L174 arena tracker: the quiet cohort's zero-deref skip)
+- Session start: sandbox recycled (fresh clone state at e6be05e + a stale
+  doc-36b working tree, already upstream); re-synced to origin main
+  (9ddb523 L172a, parity/e2e/module green, baseline failed once then green
+  on rerun). Rebuilt the whole local stand from scratch (make-stand path):
+  Temurin JDK 25 + maven 3.9.9 into ~/tools, paperclip 26.3 boot (mapped
+  jar + libraries tree), CRUSSTY runtime + launcher, module cdylib,
+  ce-baseline plugin, ViaVersion/ViaBackwards 5.12.2, mineflayer.
+- The L172a local pair re-established the baseline: items-50k off/on
+  50.19/17.03 (-66.1%). The measure-window JFR attribution (new script:
+  scripts/family_attribution.py + a windowed leaf dump) split the tick:
+  tracker 20.7% (entId header reads = 98.7% of Unsafe.getInt, ~2ms at 35k
+  population), walk 25.1% (the dispatch quiet check's ARENA identity =
+  57% of Unsafe.getObject), flush+quietPass 20.6%, merge 7.8%, the
+  vanilla floor ~17%. The GC tail (76 pauses, avg 56ms) rides p90/p99,
+  not the p50 gate.
+- L174 (52f2111): the ARENA-driven tracker pass. The trackers ReferenceList
+  walk paid every entity an entId header read + cold TT lines JUST to
+  learn it is quiet and owes one mirror bump. Coverage-gated replacement:
+  the sweep rides the ARENA slot space via the WORD_CNT/ARENA_NZ summary
+  (only non-empty 64-slot words; the raw 2^22-slot array is a 32MB walk),
+  quiet slots skip on ONE bitmap word + the bump (no entId, no entity
+  load), active slots run the same slot-keyed chain with the slot in
+  hand. Order-free (no RNG, no shared state, playerless parity = no
+  packets). CE_TTL_ARENA=0 restores the raw loop; AR_N != list size routes
+  it per pass. The walk-side quiet check drops the RM_BIT/ARENA belt (the
+  bit dies at every registration/removal on the slot; the id space never
+  recycles — the belt was 57% of the on-leg Unsafe.getObject).
+- The counter caught a REAL pre-existing hole in the same hour: probeBox
+  registers a fresh slot during entity CONSTRUCTION (the constructor's
+  setPos fires the box probe BEFORE addEntity), so probeAdd skipped the ++
+  while probeRemove took the -- and AR_N drifted to -4664 (the gate
+  honestly fell back to the raw loop). probeBox/probeDie now take the
+  coverage accounting.
+- Local verification: parity pair SCALE=50000 PASS bit-identical at
+  T589/T839/final with the arena pass live (ttlA=1027 passes, AR_N 35386
+  stable); items-50k pair off/on 50.19/12.71 = -74.7% (L172a: 17.03,
+  -66.1%) — the arena tracker shaved 4.3ms/tick. CI in flight: parity +
+  module + e2e + baseline on 52f2111, ab-paired dispatched on main.
+- NEXT: the remaining families on the same profile are the flush family
+  (itemTickFlush self + the native box-query cost, the quietPass sweep
+  ~1.7ms — the epoch-counter redesign would zero it) and the walk body
+  (arr load + instanceof + entId — an arena-ordered walk needs the
+  tick-list order proof: the moonrise list must be shift-remove ordered;
+  the TL parity stream is the judge). The vanilla floor (~17%: chunk
+  ticking, light, the world tick) is the -90% wall on items.
