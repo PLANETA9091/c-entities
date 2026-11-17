@@ -943,8 +943,14 @@ public final class CeHooks {
         long[] dq = DS_QUIET;
         if (!CE_QUIET_ON || dq == null) return false;
         int q = eid & AMASK;
-        if ((dq[q >> 6] & (1L << (q & 63))) != 0
-                && RM_BIT[q] != 1 && ARENA[q] == e) {
+        // L174: the bit's owner IS this entity. The bit dies at every
+        // registration/removal touching the slot (quietClearSlot at
+        // probeAdd/probeBox/backfill + the probeRemove belt), and the id
+        // space never recycles — so a set bit proves the slot still holds
+        // the stamping entity. The old RM_BIT/ARENA belt paid a cold
+        // Object[] load per quiet item per tick (57% of the on-leg
+        // Unsafe.getObject samples) for a condition the bit itself proves.
+        if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
             if (QUIET_REV[q] != WORLD_REV) {
                 if (e.isInWater() || e.isInLava() || fireTicks(e) != 0
                         || despawnTimeOf(e) >= 0 || restSectionTouched(e)) {
@@ -1648,6 +1654,7 @@ public final class CeHooks {
                 + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
+                + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -2199,6 +2206,14 @@ public final class CeHooks {
                 probesAdd++;
                 int paId = entId(e);
                 int paSlot = paId & AMASK;
+                // L174: the arena-tracker coverage counter.
+                if (ARENA[paSlot] == null) {
+                    AR_N++;
+                    int wq = paSlot >> 6;
+                    if (AR_WORD_CNT[wq]++ == 0) {
+                        ARENA_NZ[wq >> 6] |= 1L << (wq & 63);
+                    }
+                }
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
                 RM_BIT[paSlot] = 0; // L115: fresh slot — alive
@@ -2224,10 +2239,26 @@ public final class CeHooks {
                 probesRemove++;
                 int prId = entId(e);
                 int prSlot = prId & AMASK;
+                // L174: the arena-tracker coverage counter — the slot dies here.
+                if (ARENA[prSlot] != null) {
+                    AR_N--;
+                    int wq = prSlot >> 6;
+                    if (--AR_WORD_CNT[wq] == 0) {
+                        ARENA_NZ[wq >> 6] &= ~(1L << (wq & 63));
+                    }
+                }
                 ARENA[prSlot] = null;
                 ARENA_ID[prSlot] = 0;
                 REST_GEN[prSlot] = 0; // gone: drop the rest state
                 RM_BIT[prSlot] = 1;   // L115: the removed-bit mirror
+                // L174 belt: a removed entity's quiet proofs are dead — both
+                // bits die with the slot (the ARENA-tracker quiet branch
+                // reads the TT bit WITHOUT the te identity check, so a
+                // stale set bit on a dead slot must be impossible).
+                long[] dq0 = DS_QUIET;
+                if (dq0 != null) dq0[prSlot >> 6] &= ~(1L << (prSlot & 63));
+                long[] tq0 = TT_QUIET;
+                if (tq0 != null) tq0[prSlot >> 6] &= ~(1L << (prSlot & 63));
                 batchRemove(prId);
             }
             // L63b: release the shape-cache slot (the te ref must not outlive
@@ -2296,6 +2327,14 @@ public final class CeHooks {
                     && SERVER_THREAD.get()
                     && e.level() != null && !e.level().isClientSide()) {
                 int pdId = entId(e);
+                // L174: same as probeBox — count a fresh registration.
+                if (ARENA[pdId & AMASK] == null) {
+                    AR_N++;
+                    int wq = (pdId & AMASK) >> 6;
+                    if (AR_WORD_CNT[wq]++ == 0) {
+                        ARENA_NZ[wq >> 6] |= 1L << (wq & 63);
+                    }
+                }
                 ARENA[pdId & AMASK] = e;
                 ARENA_ID[pdId & AMASK] = pdId;
                 batchUpsert(pdId, worldId(e.level()), e, e.getBoundingBox(), true);
@@ -2327,6 +2366,17 @@ public final class CeHooks {
                 probesBox++;
                 int pbId = entId(e);
                 int pbSlot = pbId & AMASK;
+                // L174: the box probe can be the FIRST registration of a slot
+                // (the entity constructor's setPos fires the box probe BEFORE
+                // addEntity's probeAdd — observed as the negative AR_N drift:
+                // every add skipped the ++ while every remove took the --).
+                if (ARENA[pbSlot] == null) {
+                    AR_N++;
+                    int wq = pbSlot >> 6;
+                    if (AR_WORD_CNT[wq]++ == 0) {
+                        ARENA_NZ[wq >> 6] |= 1L << (wq & 63);
+                    }
+                }
                 ARENA[pbSlot] = e;
                 ARENA_ID[pbSlot] = pbId;
                 // L161a: a box change is a disturbance — exit dispatch-quiet.
@@ -3201,6 +3251,16 @@ public final class CeHooks {
                     for (int i = 0; i < all.size(); i++) {
                         Entity en = all.get(i);
                         int enId = entId(en);
+                        // L174: the coverage counter rides the backfill too
+                        // (the ARM-time sweep registers the pre-ARM population).
+                        if (ARENA[enId & AMASK] == null) {
+                            AR_N++;
+                            int wq = enId & AMASK;
+                            wq >>= 6;
+                            if (AR_WORD_CNT[wq]++ == 0) {
+                                ARENA_NZ[wq >> 6] |= 1L << (wq & 63);
+                            }
+                        }
                         ARENA[enId & AMASK] = en;
                         ARENA_ID[enId & AMASK] = enId;
                         // L161a: refreshed slots drop any inherited quiet proof.
@@ -7473,10 +7533,18 @@ public final class CeHooks {
     }
 
     private static void quietClearSlot(int id) {
+        int q = id & AMASK;
         long[] dq = DS_QUIET;
         if (dq != null) {
-            int q = id & AMASK;
             dq[q >> 6] &= ~(1L << (q & 63));
+        }
+        // L174: the tracker-quiet proof is registration-class too — a fresh
+        // occupant must never inherit the predecessor's tracker skip (the
+        // ARENA-tracker quiet branch reads the bit without the te identity
+        // check; see the ARENA_TRACKER_ON declaration).
+        long[] tq0 = TT_QUIET;
+        if (tq0 != null) {
+            tq0[q >> 6] &= ~(1L << (q & 63));
         }
     }
 
@@ -13669,6 +13737,7 @@ public final class CeHooks {
     public static long ttlCalls = 0, ttlFuse = 0, ttlFuseChecks = 0;
     public static long ttlQuiet = 0, ttlQuietBumps = 0; // L92
     public static long ttlQuietI0C = 0; // i0-c: the loop-B expansion stamps
+    public static long ttlArena = 0; // L174: the ARENA-driven tracker passes
     // L59a/L61 decline-site counters (the fuse verdict, per site) + the
     // per-pass chunk memo (reset at every newTrackerTick$ entry).
     public static long ttlDeclChunk = 0, ttlDeclSeen = 0, ttlDeclSe = 0,
@@ -13774,6 +13843,39 @@ public final class CeHooks {
     // disables the mirror (TT_MIRROR=false) — the real RMW stays the
     // fallback.
     private static volatile boolean TT_MIRROR;
+    // L174: the ARENA-driven tracker pass. The vanilla tracker work is
+    // per-entity INDEPENDENT — sendChanges/moonrise$tick touch no shared
+    // state, draw no RNG, and the parity legs are playerless (seenBy
+    // empty: no packet stream at all) — so the pass ORDER is free and the
+    // sweep can ride the ARENA slot space (id order) instead of the
+    // trackers ReferenceList: quiet slots skip on ONE bitmap word with NO
+    // entId dereference and NO cold entity load, the active slots reuse
+    // the same slot-keyed cache tables. The gate is the COVERAGE check:
+    // the tracker list must hold exactly the ARENA population
+    // (probeAdd/probeRemove are the add/remove choke points —
+    // EntityLookup.addEntity(Entity,boolean,boolean), which addNewEntity
+    // funnels into; ServerLevel.addPlayer calls addNewEntity, so players
+    // are covered). A mismatch (multi-world server: the per-ChunkMap list
+    // holds one level, AR_N counts the JVM) routes the exact vanilla-
+    // shaped raw loop. CE_TTL_ARENA=0 restores the raw loop.
+    public static final boolean ARENA_TRACKER_FLAG =
+            !"0".equals(System.getenv("CE_TTL_ARENA"));
+    public static volatile boolean ARENA_TRACKER_ON = false;
+    // the sweep reads every ARENA line (~1MB at AMASK+1 slots) — below
+    // this population the raw loop is cheaper.
+    public static final int ARENA_TRACKER_MIN = 4096;
+    // live-slot count (probeAdd/probeRemove maintain; the ARM backfill
+    // counts the pre-ARM population)
+    public static volatile int AR_N = 0;
+    // L174: the per-64-slot-word live counts + the non-empty word summary —
+    // the ARENA is 2^22 slots (32MB); the tracker sweep must touch only the
+    // ~population/8 lines actually holding entities. WORD_CNT[w] = live
+    // slots in ARENA slots [w<<6, w<<6+63]; ARENA_NZ bit (w>>6, w&63) =
+    // WORD_CNT[w] != 0. Maintained ONLY at the registration choke points
+    // (probeAdd/probeRemove/backfill) — the other ARENA writers keep the
+    // occupant, so the counts cannot drift.
+    public static final int[] AR_WORD_CNT = new int[1 << 16];
+    public static final long[] ARENA_NZ = new long[1 << 10];
     // the per-ChunkMap armed memo (tiny direct map; #dims entries)
     private static final Object[] TT_ARM_CM = new Object[8];
     /** L164: the per-ChunkMap player-geometry hash in a parallel raw-long
@@ -13878,6 +13980,10 @@ public final class CeHooks {
                 TT_REF = new Object[ARENA.length * 5];
                 TT_FLAT = new long[ARENA.length * 2];
                 TT_QUIET = new long[(ARENA.length + 63) >> 6];
+                // L174: the coverage counter starts clean with the tables.
+                AR_N = 0;
+                java.util.Arrays.fill(AR_WORD_CNT, 0);
+                java.util.Arrays.fill(ARENA_NZ, 0L);
                 // L161a: the dispatch-quiet bitset + the per-slot world
                 // revision the quiet proof was stamped under (the dispatch
                 // quiet path compares against WORLD_REV and runs the exact
@@ -13909,6 +14015,10 @@ public final class CeHooks {
 
     public static void setTrackerLoopOn(boolean on) {
         TTL_ON = on;
+        // L174: the ARENA-driven pass rides the tracker-loop arm (the
+        // coverage gate re-checks the population every pass; the flag only
+        // honors the kill-switch + the weave being live).
+        ARENA_TRACKER_ON = on && ARENA_TRACKER_FLAG;
     }
 
     /** L163 telemetry arm: flipped by the module once the spawner floor is
@@ -14493,6 +14603,125 @@ public final class CeHooks {
             // failure routes everything conservative).
             boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON
                     && ACTIVE && ITEM_TICK_ON; // L99: no applier -> no reset path -> stale bits
+            // L174: the ARENA-driven pass. Coverage = the trackers list holds
+            // exactly the ARENA population (single-world, all adds probed) —
+            // then the sweep rides the slot space: the quiet cohort skips on
+            // one bitmap word (no entId, no entity load), the active slots
+            // run the same slot-keyed chain the raw loop runs. Any mismatch
+            // (another level holds entities, an unprobed add) routes the raw
+            // loop below — byte-identical behavior, just slower. The sweep
+            // reads only the NON-EMPTY 64-slot ARENA words (the WORD_CNT/
+            // ARENA_NZ summary — 2^22 raw slots would be a 32MB walk).
+            if (ARENA_TRACKER_ON && quietArm && size >= ARENA_TRACKER_MIN
+                    && AR_N == size) {
+                Entity[] ar = ARENA;
+                long[] tq = TT_QUIET;
+                long[] fl = TT_FLAT;
+                long[] nz = ARENA_NZ;
+                for (int wi = 0; wi < nz.length; wi++) {
+                    long wb = nz[wi];
+                    if (wb == 0) continue;
+                    do {
+                        int j = Long.numberOfTrailingZeros(wb);
+                        wb &= wb - 1;
+                        int slotBase = ((wi << 6) | j) << 6;
+                        for (int s = 0; s < 64; s++) {
+                            int sid = slotBase | s;
+                            Entity ent = ar[sid];
+                            if (ent == null) continue;
+                    // the quiet cohort: ONE bitmap word + the mirror bump.
+                    // The bit's owner is the sweep's own entity (a set bit
+                    // dies at registration/removal — quietClearSlot and the
+                    // probeRemove belt) and the mirror is authoritative
+                    // (quietArm), so the vanilla tracker work for this slot
+                    // reduces to the tickCount debt — the bump.
+                    if ((tq[sid >> 6] & (1L << (sid & 63))) != 0) {
+                        ttlQuiet++;
+                        if (fl != null) {
+                            int lb = sid * 2;
+                            fl[lb + 1] = fl[lb + 1] + 1;
+                        }
+                        continue;
+                    }
+                    if (ttlCachedPath(ent, sid)) {
+                        ttlFuse++;
+                        continue;
+                    }
+                    Object te = (O_ENT_TRACKED >= 0 && U != null)
+                            ? U.getObject(ent, O_ENT_TRACKED)
+                            : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
+                                    .moonrise$getTrackedEntity();
+                    if (te == null) continue;                     // vanilla bc 46-51
+                    // L151: the exact sendChanges fast-exit (the same license
+                    // the raw loop runs — the per-entity chain is order-free).
+                    if (trackerFastExit(ent, te)) {
+                        ttlExit++;
+                        continue;
+                    }
+                    Object chunk = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                            .moonrise$getChunkData().nearbyPlayers;
+                    if (ttlFastPath(ent, te, chunk)) {
+                        ttlFuse++;
+                        try { // fill: cache the structural verdicts + refs
+                            net.minecraft.server.level.ServerEntity se0 =
+                                    (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
+                            Object interp = O_SE_INTERP > 0
+                                    ? U.getObject(se0, O_SE_INTERP) : null;
+                            Object[] rff = TT_REF;
+                            long[] flf = TT_FLAT;
+                            int ob = sid * 5;
+                            rff[ob] = te;
+                            rff[ob + 1] = se0;
+                            rff[ob + 2] = ent;
+                            // L70: stamp the mirror from the real field
+                            // (the fast path just did its real RMW — the
+                            // stamp captures the post-increment truth)
+                            flf[sid * 2 + 1] = U.getInt(se0, O_SE_TICKCOUNT);
+                            flf[sid * 2] = TT_OK;
+                            if (interp instanceof
+                                            net.minecraft.world.entity
+                                                    .SteppedInterpolationTracker
+                                    && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
+                                    && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
+                                rff[ob + 3] = interp;
+                                rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
+                                flf[sid * 2] = TT_OK | TT_SIT;
+                            }
+                            ttlFill++;
+                        } catch (Throwable fillFail) {
+                            TT_REF[sid * 5] = null;
+                        }
+                        continue;
+                    }
+                    ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$tick((ca.spottedleaf.moonrise.common.misc.NearbyPlayers.TrackedChunk) chunk);
+                    // vanilla bc 71-94: sendChanges iff hasPlayers() OR the
+                    // entity's chunk is entity-ticking — NO negation.
+                    if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity) te)
+                            .moonrise$hasPlayers()
+                            || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity) ent)
+                                    .moonrise$getChunkStatus()
+                                    .isOrAfter(net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING)) {
+                        ((net.minecraft.server.level.ServerEntity) VH_TE_SERVERENT.getObj(te))
+                                .sendChanges();
+                    }
+                    // L70: the decline tick ran the REAL sendChanges (its own
+                    // tickCount++ inside) — re-capture so the mirror never
+                    // forks from the real counter while armed.
+                    long[] flc = TT_FLAT;
+                    Object[] rfc = TT_REF;
+                    if (flc != null && rfc != null && rfc[sid * 5] == te) {
+                        Object se2 = U.getObject(te, O_TE_SE);
+                        if (se2 instanceof net.minecraft.server.level.ServerEntity) {
+                            flc[sid * 2 + 1] = U.getInt(se2, O_SE_TICKCOUNT);
+                        }
+                    }
+                        } // s
+                    } while (wb != 0);
+                }
+                ttlArena++;
+                return; // the arena pass replaced the raw loop (finally runs)
+            }
             for (int i = 0; i < size; i++) {
                 Entity ent = raw[i];
                 // moonrise$getTrackedEntity is a one-field final read — the
