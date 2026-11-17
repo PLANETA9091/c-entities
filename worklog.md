@@ -1736,3 +1736,21 @@ Task ID: 27 (the L177/L178 storm: the fused quiet bump + the tracker's minimal b
 - NEXT: parse the CI speed table (the -90% verdict per row: items/mixed/spread/
   mobs-native/despawn); the walk floor + the honest merge volume are the
   remaining items-side families.
+
+---
+Task ID: 27 addendum (the L177/L178 CI verdicts + the ab-paired dispatch)
+- The a55f718 flight: module/e2e/parity ALL SUCCESS (parity = all 12 gate
+  lines bit-identical — the fused bump + the minimal tracker path are CI-exact),
+  baseline SUCCESS.
+- The speed table (p50 ms, same-runner pairs, this run's allocation):
+  items-100k 78.26->23.71 (-69.7%; both sides swung — the off at 78.26 vs the
+  L176-era 57.3..88.7 band, the mod 23.71 inside its 11.6..35.2 band; the
+  local same-box pair said the mod side DROPPED 12.71->10.97),
+  mixed-150k 686.87->81.49 (-88.1%; the mod side BELOW its 84.2..96.3 band —
+  the best mixed-mod ever recorded),
+  spread-100k 434.71->54.58 (-87.4%), mobs-25k 326.60->283.20 (-13.3%; the
+  off leg collapsed to its fastest-ever while the mod 283.2 set a NEW band
+  floor vs 313.2..388.8 — the control row's ratio is off-leg noise),
+  mobs-25k-native 568.88->21.90 (-96.2%; the -90% goal row holds).
+- ab-paired dispatched on main (44158062433; 3 repeats, medians, same runner)
+  — the honest ratio arbiter; verdicts next addendum.
