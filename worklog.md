@@ -1651,3 +1651,37 @@ static; the isAlive port; the st= counters)
   the tick-list order proof — the TL parity stream is the judge);
   2. itemTickFlush 3.67% + the quietPass epoch redesign; 3. the vanilla
   floor ~17% is the -90% wall on items.
+
+---
+Task ID: 26 addendum (the L175 CI verdicts + the L176 stand-data row cache)
+- The 97a5d02 CI flight: parity SUCCESS (all 8 legs bit-identical; the CI
+  spread legs st=1610045/0/1610045/0 — every mirrored stand through the
+  port, zero misses), module/e2e SUCCESS, baseline SUCCESS. The speed
+  table (p50 ms, off->mod): items-100k 88.7->21.9 (-75.3%), mixed-150k
+  563.3->71.6 (-87.3%), spread-100k 408.7->47.1 (-88.5%), mobs-25k
+  546.2->313.2 (-42.7%), mobs-25k-native 399.8->26.2 (-93.4%). The
+  spread-mod leg 54.8->47.1 = -14% relative — exactly the predicted port
+  recovery (doc 63).
+- The post-port profile (spread-mod, 8261 samples): getItem/getValue/
+  getHealth GONE from the top; the read cost moved into Unsafe.getObject
+  21.85%, 68% of it = standMirror (14.9% of the profile — 8 loads per
+  stand per tick: entityData, itemsById, 3 array slots, 3 values). Next:
+  tickListForEach self 4.32%, ttlCachedPath 5.95% total, itemTickFlush
+  2.03% + quietPass 1.2%.
+- L176 (8d9bd22): the stand-data ROW CACHE — the row {as, fItem, nItem,
+  hItem} caches behind the identity guard (the itemsById array + the
+  DataItem instances are final per stand; set() swaps the value field
+  INSIDE the same DataItem), collapsing the steady state to ONE identity
+  load + THREE live value loads. The fill probe is the exact L175 port
+  (+ the array-length bounds check); probeRemove clears the row (the
+  strong-ref lifecycle rule); 2^17 rows keyed by entId & mask (~2MB; the
+  ~100k bench id span maps under it); CE_STAND_CACHE=0 restores the plain
+  L175 port; the st= segment grew the hit/fill/bad counters.
+- The LOCAL spread pair trap (the Task 20 validity note re-proven): the
+  first L176 spread pair FAILED with 10739 type mismatches / only-on 9054
+  — the chunk-gen chicken interleaving at wallclock-dependent timing on
+  this 2-vCPU box, NOT the code (the fingerprint reproduces with
+  CE_STAND_CACHE=0 AND matches the UNPATCHED control note). The locally
+  valid items pair: PASS bit-identical on all 3 snapshots. CI arbitrates
+  spread/mixed parity.
+- CI in flight on 8d9bd22 (parity/module/e2e/baseline).
