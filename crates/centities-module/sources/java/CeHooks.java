@@ -1629,6 +1629,12 @@ public final class CeHooks {
                 + " disp=" + dispChecks + "/" + dispNative + "/" + dispInactive
                 + "/" + dispPass + "/" + dispGate + "/r" + WORLD_REV
                 + "/f" + dispFast
+                // L175: the stand-mirror + stand-port route counters (the
+                // dead-port verdict: an ungated counter is how a dead port
+                // shipped silently — the hit/miss pair MUST be observable)
+                + " st=" + dispStand + "/" + dispStandMiss
+                + "/" + standPortHit + "/" + standPortMiss
+                + "/" + (STAND_MIRROR_ON ? 1 : 0) + (STAND_PORT ? 1 : 0)
                 + " rest=" + dispRest + "/" + restExits + "/" + restSectKeeps
                 + " travel=" + travelChecks + "/" + travelQuiet + "/" + travelFail
                 + "/w" + travelWalk + "/n" + travelWalkNoMove
@@ -5438,11 +5444,31 @@ public final class CeHooks {
     // unpacks, so the verdicts are byte-identical. A non-Byte/Boolean
     // slot (impossible for these two accessors) or any negative offset
     // routes the vanilla accessor chain. CE_STAND_PORT=0 restores it.
+    // L175 FIX: the port shipped DEAD — its gate read O_SDI_VALUE, a static
+    // that was NEVER assigned anywhere (the value offset was resolved into
+    // the older L19 name O_DI_VALUE on the very same line), so the gate
+    // stayed false and every stand rode the vanilla chains forever (the
+    // 567b6ca spread-100k-mod profile: the standMirror family 15.3% of the
+    // whole profile — getItem 7.9 + DataItem.getValue 5.9 + getHealth 0.8).
+    // The gate now checks O_DI_VALUE (the same offset the L19/L28 family
+    // proves); javap 26.3: SynchedEntityData.get(acc) == itemsById[acc.id()]()
+    // .value — the port is the same two loads without the virtual chain.
+    // L175 also ports the THIRD chain the same profile shows under
+    // standMirror: LivingEntity.isAlive (getHealth -> DATA_HEALTH_ID get).
+    // javap: isAlive = !isRemoved() && getHealth() > 0.0F && !dead;
+    // getHealth on a non-ServerPlayer is exactly the DATA_HEALTH_ID read
+    // (the ServerPlayer branch is unreachable for stands), so the port
+    // serves health the same way; `dead` is a protected LivingEntity field
+    // read through its single-class offset (the receiver is the
+    // type-guaranteed ArmorStand). A ported alive==false still routes
+    // vanilla THROUGH the classification (same as a vanilla isAlive()==false
+    // would), so the reduction cannot mask a hurt/dying stand.
     public static final boolean STAND_PORT =
             !"0".equals(System.getenv("CE_STAND_PORT"));
     public static volatile long O_EDATA = -1, O_SD_ITEMS_BY_ID = -1,
-            O_SDI_VALUE = -1;
-    public static volatile int O_ACC_FLAGS_ID = -1, O_ACC_NG_ID = -1;
+            O_LE_DEAD = -1;
+    public static volatile int O_ACC_FLAGS_ID = -1, O_ACC_NG_ID = -1,
+            O_ACC_HEALTH_ID = -1;
     public static long standPortHit = 0, standPortMiss = 0;
     // L124: the delta writeback store shape. Default PLAIN (every reader
     // runs on the server thread; the reference store is atomic);
@@ -5570,15 +5596,18 @@ public final class CeHooks {
         if (!STAND_MIRROR_ON) return false;
         try {
             int sid = entId(as) & AMASK;
-            // L165: the two data-classification reads through the Unsafe
-            // port (same value slots, fewer loads); the rest of the
+            // L165/L175: the THREE data-classification reads through the
+            // Unsafe port (same value slots, fewer loads); the rest of the
             // classification stays the vanilla accessor calls.
             boolean marker = false;
             boolean noGravity = false;
+            boolean alivePort = false;
+            boolean alivePorted = false;
             boolean ported = false;
             if (STAND_PORT && O_EDATA >= 0 && O_SD_ITEMS_BY_ID >= 0
-                    && O_SDI_VALUE >= 0 && O_ACC_FLAGS_ID >= 0
-                    && O_ACC_NG_ID >= 0 && U != null) {
+                    && O_DI_VALUE >= 0 && O_ACC_FLAGS_ID >= 0
+                    && O_ACC_NG_ID >= 0 && O_ACC_HEALTH_ID >= 0
+                    && U != null) {
                 Object ed = U.getObject(as, O_EDATA);
                 Object arr = ed != null ? U.getObject(ed, O_SD_ITEMS_BY_ID) : null;
                 if (arr != null) {
@@ -5586,12 +5615,24 @@ public final class CeHooks {
                     long sc = U.ARRAY_OBJECT_INDEX_SCALE;
                     Object fItem = U.getObject(arr, ab + (long) O_ACC_FLAGS_ID * sc);
                     Object nItem = U.getObject(arr, ab + (long) O_ACC_NG_ID * sc);
-                    if (fItem != null && nItem != null) {
-                        Object fv = U.getObject(fItem, O_SDI_VALUE);
-                        Object nv = U.getObject(nItem, O_SDI_VALUE);
-                        if (fv instanceof Byte fb && nv instanceof Boolean nb) {
+                    Object hItem = U.getObject(arr, ab + (long) O_ACC_HEALTH_ID * sc);
+                    if (fItem != null && nItem != null && hItem != null) {
+                        Object fv = U.getObject(fItem, O_DI_VALUE);
+                        Object nv = U.getObject(nItem, O_DI_VALUE);
+                        Object hv = U.getObject(hItem, O_DI_VALUE);
+                        if (fv instanceof Byte fb && nv instanceof Boolean nb
+                                && hv instanceof Float hf) {
                             marker = (fb.byteValue() & 0x10) != 0;
                             noGravity = nb;
+                            // L175: the isAlive port — javap-verified shape
+                            // (LivingEntity 26.3): !isRemoved() && health > 0
+                            // && !dead; dead through the single-class offset.
+                            if (O_LE_DEAD >= 0) {
+                                alivePort = !as.isRemoved()
+                                        && hf.floatValue() > 0.0f
+                                        && U.getByte(as, O_LE_DEAD) == 0;
+                                alivePorted = true;
+                            }
                             ported = true;
                             standPortHit++;
                         }
@@ -5610,7 +5651,7 @@ public final class CeHooks {
             if (RM_BIT[sid] == 1 || !as.canTick
                     || !marker || !noGravity
                     || !as.getPassengers().isEmpty() || as.isPassenger()
-                    || !as.isAlive()) {
+                    || !(alivePorted ? alivePort : as.isAlive())) {
                 dispStandMiss++;
                 standQuietClear(as, sid);
                 return false;
@@ -13945,9 +13986,13 @@ public final class CeHooks {
             O_ENT_LEVEL = offOf(Entity.class, "level");
             O_LEVEL_CLIENT = offOf(net.minecraft.world.level.Level.class,
                     "isClientSide");
-            // L165: the stand-data port offsets + the two accessor ids.
+            // L165: the stand-data port offsets + the accessor ids.
             // DATA_CLIENT_FLAGS is public static; DATA_NO_GRAVITY is
-            // private static — resolved reflectively once at arm.
+            // private static; DATA_HEALTH_ID is public static — all resolved
+            // reflectively once at arm. The value offset: the L19 family's
+            // O_DI_VALUE (resolved here AND at initDataOffsets — the L175
+            // verdict: the bespoke O_SDI_VALUE name never had an assignment
+            // and the port was dead since its first ship).
             O_EDATA = offOf(Entity.class, "entityData");
             O_SD_ITEMS_BY_ID = offOf(
                     net.minecraft.network.syncher.SynchedEntityData.class,
@@ -13972,6 +14017,26 @@ public final class CeHooks {
                         gf.get(null)).id();
             } catch (Throwable ngFail) {
                 O_ACC_NG_ID = -1;
+            }
+            // L175: the health accessor + the protected `dead` field offset
+            // (both single-class, the receiver is the ArmorStand). Both are
+            // OPTIONAL ports — a miss must NOT throw out of this method:
+            // offOf() throws on failure and everything below (the TT_REF
+            // tables, TTL_HANDLES_OK) would silently die with it.
+            try {
+                java.lang.reflect.Field hf = net.minecraft.world.entity.LivingEntity.class
+                        .getDeclaredField("DATA_HEALTH_ID");
+                hf.setAccessible(true);
+                O_ACC_HEALTH_ID = ((net.minecraft.network.syncher.EntityDataAccessor<?>)
+                        hf.get(null)).id();
+            } catch (Throwable hFail) {
+                O_ACC_HEALTH_ID = -1;
+            }
+            try {
+                O_LE_DEAD = offOf(net.minecraft.world.entity.LivingEntity.class,
+                        "dead");
+            } catch (Throwable dFail) {
+                O_LE_DEAD = -1;
             }
             // L63b: the shape-cache arrays (slot-indexed like the ARENA;
             // allocated once — the identity check tolerates stale entries,
