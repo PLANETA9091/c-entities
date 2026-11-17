@@ -1615,3 +1615,39 @@ Task ID: 25 addendum (the ab-paired verdicts + the despawn pop gate fix)
   tickListForEach 5.5% + itemTickFlush 3.7%. The quietPass epoch redesign
   (~1.7ms/tick local) and the arena-ordered walk (needs the tick-list
   order proof) stay on the list for items.
+
+---
+Task ID: 26 (the L175 stand-data port wakes up: the gate read an unassigned
+static; the isAlive port; the st= counters)
+- The 25-addendum target re-attributed from the CI 567b6ca spread-100k-mod
+  rec.jfr artifact (leaf_caller_attribution.py, any-frame family pass):
+  the "SynchedEntityData.getItem/getValue 14.9%" slice is 94.6%+79.5%
+  ArmorStand.isMarker() called by CeHooks.standMirror (itemDispatch), plus
+  isNoGravity 6.3% and getHealth 4.7% under the same frame — the whole
+  standMirror family is 15.3% of the profile, the largest single family
+  (bigger than tickListForEach 5.46%).
+- The verdict: the L165 STAND_PORT shipped DEAD — its gate checked
+  O_SDI_VALUE, a static with NO assignment anywhere (the value offset was
+  resolved into the older L19 name O_DI_VALUE on the same line), so the
+  port condition stayed false forever and every stand rode the vanilla
+  chains while standPortHit/Miss sat unread. The javap mirror was already
+  byte-exact — it just never ran.
+- L175 (97a5d02): the gate + reads switched to O_DI_VALUE; the isAlive
+  chain joined the port (javap 26.3: !isRemoved && getHealth > 0 && !dead;
+  getHealth on a non-ServerPlayer = the DATA_HEALTH_ID read; dead through
+  its single-class offset O_LE_DEAD); both new resolutions are OPTIONAL
+  try/catch ports — offOf() THROWS and would have killed the whole
+  initTrackerLoopHandles tail (TT_REF tables, TTL_HANDLES_OK); the st=
+  counters joined stats() (the dead-port rule: an ungated counter is how
+  a dead port shipped silently).
+- Local verification: module tests green; the parity spread pair (SCALE
+  10000, 20% stands, area 300) — ON telemetry st=710533/0/710533/0 (every
+  mirrored stand took the port, zero misses), parity-compare PASS
+  bit-identical on all 3 snapshots; doc 63 written.
+- CI in flight on 97a5d02: parity/module/e2e/baseline (the baseline AB
+  matrix carries the paired spread-100k speed verdict); the dd3e320
+  ab-paired re-dispatch still running.
+- NEXT (re-ranked): 1. tickListForEach 5.46% (the arena-ordered walk needs
+  the tick-list order proof — the TL parity stream is the judge);
+  2. itemTickFlush 3.67% + the quietPass epoch redesign; 3. the vanilla
+  floor ~17% is the -90% wall on items.
