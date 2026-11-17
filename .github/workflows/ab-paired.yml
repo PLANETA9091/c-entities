@@ -143,8 +143,11 @@ jobs:
               return out
 
           def last_pop(arm, sc):
-              # the last MSPT sample's entity count (index 1) — the despawn
-              # curve's end state (the surviving strata)
+              # the last MSPT sample's entity count — the despawn
+              # curve's end state (the surviving strata). The sample
+              # rows are dicts since the L37-era harness ({tick,
+              # entities, hoppers, ...}); the old list rows [t, n,
+              # ...] keep the index read as the fallback.
               vals = []
               for r in range(1, reps + 1):
                   p = f"bench/abp-r{r}-{sc}-{arm}/results/baseline.json"
@@ -152,7 +155,9 @@ jobs:
                       d = json.load(open(p))
                       s = d.get("samples") or []
                       if s:
-                          vals.append(s[-1][1])
+                          last = s[-1]
+                          vals.append(last["entities"] if isinstance(last, dict)
+                                      else last[1])
                   except Exception:
                       pass
               return vals
