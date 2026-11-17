@@ -1586,3 +1586,32 @@ Task ID: 25 (the L174 arena tracker: the quiet cohort's zero-deref skip)
   tick-list order proof: the moonrise list must be shift-remove ordered;
   the TL parity stream is the judge). The vanilla floor (~17%: chunk
   ticking, light, the world tick) is the -90% wall on items.
+
+---
+Task ID: 25 addendum (the ab-paired verdicts + the despawn pop gate fix)
+- The L172a ab-paired flight (44090876882) completed ALL legs and the gate
+  table read: items-100k [101.6,94.9,95.5]->[29.4,28.1,28.9] ratio 0.302
+  PASS; mobs-25k 605.1->388.8 0.643 PASS; mixed-150k 3860.2->402.5 0.104
+  PASS (the off leg at a 3.8s tick — the noisiest runner yet); spread-100k
+  435.6->299.7 0.688 PASS; mobs-despawn-10k 86.6->11.0 0.127 speed-PASS
+  but the gate FAILED on 'pop MISSING'.
+- Root cause: the pop check read s[-1][1] (a LIST index) while the L37-era
+  baseline.json rows are dicts — the TypeError hit the except and EVERY
+  despawn verdict was 'MISSING' -> FAIL regardless of the populations.
+  Fixed (dd3e320): the dict accessor primary, the list index as fallback.
+- The L174 flight (44099956447) died BEFORE its gate: the VANILLA mixed-
+  150k OFF leg crashed mid-measure (EPIPE at ~4min, then the poll loop
+  burned the RUN_TIMEOUT) — the known runner-OOM flakiness of the heaviest
+  vanilla leg, module-independent. Re-dispatched on dd3e320 (L174 + the
+  gate fix).
+- The L174 CI baseline (567b6ca, the 4 other workflows ALL GREEN: parity
+  bit-identical 4 pairs, e2e, module): items-100k 69.4->17.4 (-74.9%),
+  mixed-150k 407.5->62.0 (-84.8%), spread-100k 399.4->54.8 (-86.3%),
+  mobs-25k-native 563.3->23.5 (-95.8%). Local items-50k pair 50.19->12.71
+  (-74.7%).
+- The spread mod profile's next target (L175): the tracker cached-path
+  gate reads — SynchedEntityData.getItem/getValue 14.9% + isRemoved/getType/
+  getHealth ~3.9% (the stands/zombies' per-tick fast-exit verdicts), then
+  tickListForEach 5.5% + itemTickFlush 3.7%. The quietPass epoch redesign
+  (~1.7ms/tick local) and the arena-ordered walk (needs the tick-list
+  order proof) stay on the list for items.
