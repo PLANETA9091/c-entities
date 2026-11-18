@@ -1,36 +1,36 @@
 # Baseline run: `mobs-25k`
 
-Server: `26.3-253-63e41db (MC: 26.3)`
+Server: `26.3-255-c22378f (MC: 26.3)`
 
 ## Results
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24151 -> 23453) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24175 -> 23889) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 326.599 / 398.254 / 471.454 / 585.145 |
-| MSPT mean, ms | 337.621 |
-| TPS estimate (1000/p50) | 3.1 |
-| heap used / max, MB | 1238.1 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 411.550 / 496.349 / 599.478 / 751.264 |
+| MSPT mean, ms | 421.742 |
+| TPS estimate (1000/p50) | 2.4 |
+| heap used / max, MB | 957.9 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 25.83% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 3.87% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 3 | 3.38% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
-| 4 | 2.35% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
-| 5 | 2.18% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 6 | 1.84% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
-| 7 | 1.28% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 8 | 1.27% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 9 | 1.27% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3913` |
-| 10 | 1.20% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
-| 11 | 1.19% | `java.util.HashMap.getNode(Object) line: 586` |
-| 12 | 1.14% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 13 | 1.06% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 14 | 1.02% | `net.minecraft.world.entity.EntitySelector.lambda$pushableBy$0(Entity, Team, Team$CollisionRule, Entity) line: 52` |
-| 15 | 0.99% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 1 | 29.15% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 4.39% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 3 | 3.52% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
+| 4 | 3.18% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3913` |
+| 5 | 3.11% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 6 | 1.82% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 7 | 1.57% | `java.util.HashMap.getNode(Object) line: 586` |
+| 8 | 1.46% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
+| 9 | 1.09% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
+| 10 | 0.88% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 11 | 0.83% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
+| 12 | 0.83% | `net.minecraft.world.level.entity.EntityTickList.forEach(Consumer) line: 39` |
+| 13 | 0.80% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 14 | 0.75% | `java.util.EnumMap.get(Object) line: 248` |
+| 15 | 0.72% | `net.minecraft.world.entity.Entity.setDeltaMovement(Vec3) line: 5079` |
 
