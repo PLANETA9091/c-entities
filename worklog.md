@@ -1861,3 +1861,76 @@ Task ID: 28 (L179: the TL mirror walk — the order-exact Entity[]-typed tick li
   items), ttlCachedPath 5.09% spread (the epoch-counter redesign),
   itemTickFlush 6.4-9.3%, the spawner/vec3Cached tails; spread's -90%
   bar (0.110 -> 0.100 needed) is one honest step away.
+
+---
+Task ID: 28 addendum — the L179 CI verdicts (parity, the matrix, the gate)
+- Parity (run 44364155909, f542062): PARITY-A-B-GATE: PASS — all four
+  scenarios bit-identical at all 3 snapshots (12/12 PARITY-GATE lines);
+  the TL mirror served its walks every armed tick (tlM=591/1683/13851/1/1
+  on the mixed leg — the coverage gate held, no mismatch disable). The
+  L179 mirror walk is behaviorally exact on CI, not just locally.
+- The baseline infra story: two flights lost matrix legs to Maven Central
+  429s (mixed-150k on the first push flight, tiles-100k on the re-dispatch
+  — 12 parallel builds resolve the same plugin set and central answers
+  the burst with 429). Fix: scripts/build-plugin.sh retries the mvn
+  package phase (5 attempts, escalating sleep; 821c837). The retry held:
+  the full 12-way matrix went green and publish landed 0c73ac8.
+- The L179 matrix (0c73ac8, run 44373224052): items-100k-mod mean 32.34 /
+  p50 22.37 (the mod p50 low ever; vanilla 103.95/85.29); spread-mod
+  48.53/40.82 (vanilla 410.89/397.35); mixed-mod 93.68/75.44 (vanilla
+  633.40/596.34); mobs-25k-native-mod 36.31/26.16 vs its vanilla 507.32
+  (-92.8% by mean — the production native mob row); the vanilla-wire
+  control mobs-25k-mod p50 417.50 vs 411.55 (+1.4%, inside the 1.05
+  margin; its mean 1087.65 is one GC/despawn storm — the p90 2731 — the
+  control row is mean-noisy by design).
+- The fresh spread-100k profile (the lean profile flight 44372294129,
+  one ON leg + in-log jfr_top): tickListForEach COLLAPSED — 16.16% ->
+  1.16% leaf self (the L179 mirror walk paid in full). The top module
+  family is now the query survivor cluster: getEntitiesOfClass:1894
+  (the isInstance/predicate/out.add loop) 6.33% + the fastQuery resolve
+  leaves (arena load + staleness id check + predicate.test + out.add at
+  3748/3749/3730/3731/3816/3817) ~5.9% + Unsafe.getObject (the ARENA
+  reads) 2.58% — ~15% combined; then ttlCachedPath:14975 2.37% (the
+  non-bulk rows: SIT + non-UBS), itemTickFlush:8777 2.37% (the post-merge
+  U.getInt refresh), goalSelectorTick 0.69%, spawnerCreateState 0.83%.
+  The caller table agrees: Level.getEntitiesOfClass 6.69% + fastQuery
+  6.17% top the list (the 20k zombies' targeting scans).
+- The production ab-paired gate (run 44372209658, ~56 min, f542062, the
+  N2-M2e config, margin 1.05, pop tol 0.05; med = median of the pair's
+  mspt-means):
+  scenario        samples off -> on                med-off   med-on  ratio  verdict
+  items-100k      [79.4,78.4,80.5] -> [25.0,23.6,23.9]  79.42   23.90  0.301  PASS
+  mobs-25k        [479.5] -> [300.6]                    479.52  300.64 0.627  PASS
+  mixed-150k      [1590.6] -> [58.3]                   1590.64   58.25 0.037  PASS
+  spread-100k     [361.7] -> [54.1]                     361.69   54.14 0.150  PASS
+  mobs-despawn-10k[62.7] -> [9.2]                        62.75    9.22 0.147  PASS  pop off=10013 on=10015 delta=2 OK
+  AB-PAIRED-GATE: PASS
+- Reading the gate honestly: every scenario is never-slower-than-vanilla
+  in-pair (PASS across the board), but the -90% standings MOVED on the
+  vanilla off-leg swing — the spread off-leg 485.7 -> 361.7 and the
+  despawn off-leg 98.6 -> 62.7 (the same vanilla code, a faster runner
+  shape this flight), while the ON medians held (spread 54.14 vs 53.56,
+  despawn 9.22 vs 9.52). So THIS pair reads spread -85.0% and despawn
+  -85.3% (both under the 0.100 bar on this sample), mixed holds -96.3%
+  (0.037 << 0.100 — the claim survives any off-leg), and items-100k took
+  its best pair ever: 0.345 -> 0.301 (-69.9%; the med-on 27.03 -> 23.90
+  is the L177 fused quiet bump + L178 tracker minimal path + L179 mirror
+  walk stack, CI-confirmed). The mobs-25k control read 0.627 this pair
+  (the ON leg FASTER in-pair; the vanilla-wire control never gated).
+- The lesson the two flights now teach: single-rep vanilla legs swing
+  +-35% run-to-run, so a -90% verdict on a 1-rep denominator is a
+  coin-flip in BOTH directions (the last flight's despawn -90.3% would
+  fail the same gate today). The ON-side medians are the reproducible
+  quantity (items 23.90, spread 54.14, mixed 58.25, despawn 9.22); the
+  honest fix for the spread/despawn claims is paired repeats on the
+  vanilla leg (the gate already tolerates missing samples — give
+  spread-100k 2-3 off-leg reps in the next dispatch) rather than
+  chasing the ratio across flights.
+- NEXT (L180 design space, from the profile): the query survivor
+  cluster is the one big remaining family — either the row-path
+  Entity[]-typed extension (generalize the L179 mirror pattern to the
+  query candidates: the per-cell typed arrays serve the resolve loop
+  without the ARENA hop) or the ttlCachedPath epoch-counter redesign
+  (2.37%); itemTickFlush's post-merge refresh is already at its L166
+  floor. Dispatch discipline: spread/despawn off-leg repeats for an
+  honest -90% verdict.
