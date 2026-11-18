@@ -1767,3 +1767,42 @@ Task ID: 27 addendum 2 (the ab-paired verdict + the MOBW alignment)
   paired gate; its spread ON legs sat at 299..328ms vs the matrix's 47..64).
   Fixed: MOBW=1 for spread-100k/mixed-150k (the despawn row already had it);
   re-dispatched — the next flight arbitrates the PRODUCTION ratios.
+
+---
+Task ID: 27 addendum 3 (the production-config ab-paired verdicts)
+- The fb6919a flight (run 44174403024, ~1h34m, SUCCESS) is the PRODUCTION
+  config the paired gate never had: MOBW=1 (CE_NATIVE_MOB=1) on mixed-150k /
+  spread-100k / mobs-despawn-10k; items-100k / mobs-25k stay vanilla-wire
+  (no zombies / the control row by design — the native mob row lives in the
+  baseline matrix as mobs-25k-native). Repeats per the runner budget:
+  items-100k 3 reps, the rest 1 rep (the gate tolerates missing samples).
+  The metric is the median of the mspt-mean across the pair's repeats;
+  margin 1.05, despawn pop tolerance 0.05.
+- The final gate table (med = median ms/tick):
+  scenario         samples off -> on                 med-off  med-on  ratio  verdict
+  items-100k       [75.6,78.3,79.5] -> [27.5,27.0,25.0]  78.28   27.03  0.345  PASS
+  mobs-25k         [821.6] -> [354.8]                    821.55  354.83 0.432  PASS
+  mixed-150k       [3567.0] -> [61.4]                   3567.03   61.39 0.017  PASS
+  spread-100k      [485.7] -> [53.6]                     485.68   53.56 0.110  PASS
+  mobs-despawn-10k [98.6] -> [9.5]                        98.64    9.52 0.097  PASS  pop off=10016 on=10017 delta=1 OK
+  AB-PAIRED-GATE: PASS
+- The MOBW fix paid on every production row vs the MOBW=0 flight
+  (44158062433): mixed ON 339.0 -> 61.39 (5.5x), spread ON 327.8 -> 53.56
+  (6.1x); the ON legs finally sit in the baseline-matrix bands — spread
+  53.56 inside the 47..64 era band, mixed 61.39 BELOW its 84.2..96.3 band
+  (the best mixed gate row ever), despawn 9.52 vs 10.7 last flight. The
+  despawn population converged tighter too (delta 1 vs 13, tol 0.05). The
+  vanilla legs swing run-to-run as always (mobs off 821.55 vs 621.1 last
+  flight; items off 78.28 inside its 78.26..98.9 flight band) — the ratios
+  read only within the same flight's pair.
+- The -90% verdicts (reduction = 1 - ratio; the bar is ratio <= 0.100):
+  mixed-150k -98.3% and mobs-despawn-10k -90.3% REACHED -90% in the
+  production config; spread-100k -89.0% missed the bar by 1.0pp (0.110 vs
+  0.100 — within the off-leg swing band, but not claimed); items-100k
+  -65.5% and mobs-25k -56.8% stay below — the item walk floor + the honest
+  merge volume (the addendum-1 NEXT families) and the vanilla-wire mob
+  control row are the remaining walls.
+- NEXT: keep the -90% push on the items-side families (quietPass/
+  itemTickFlush/tickListForEach) and treat spread's 1.0pp as one honest
+  step from the bar; the mobs-25k ratio is the vanilla-wire control, the
+  production native row already holds -96.2% in the matrix.
