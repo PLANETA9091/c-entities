@@ -1806,3 +1806,58 @@ Task ID: 27 addendum 3 (the production-config ab-paired verdicts)
   itemTickFlush/tickListForEach) and treat spread's 1.0pp as one honest
   step from the bar; the mobs-25k ratio is the vanilla-wire control, the
   production native row already holds -96.2% in the matrix.
+
+---
+Task ID: 28 (L179: the TL mirror walk — the order-exact Entity[]-typed tick list)
+- The fresh profiles (the a55f718 flight artifacts, re-profiled with the
+  restored windowed line attribution): tickListForEach is the TOP module
+  family — 15.21% items-100k-mod / 16.16% spread-100k-mod, the SELF at
+  line 9568 (the raw array's instanceof scan) 11.78% / 10.22%. The root
+  is moonrise's IteratorSafeOrderedReferenceSet: adds append at the end,
+  removals NULL the slot, and the defrag fires only on a removal seen
+  with iteratorCount == 0 — every bench removal happens INSIDE the walk
+  (merges/despawns), so the array is never compacted (items measure
+  phase: ~62.9k live in a ~100k-slot array) and every live slot pays an
+  instanceof = an object-header deref (a second cache line per entity).
+- L179 (CE_TL_MIRROR=0 restores the raw loop): the module keeps its OWN
+  Entity[]-typed copy of the tick list, maintained by prefix probes on
+  EntityTickList.add/remove — the EXACT TL membership events (javap: the
+  only caller chain is ServerLevel$EntityCallbacks.onTickingStart/
+  onTickingEnd; the primitives are straight-line, no SMT). The mirror
+  order is the TL order BY CONSTRUCTION — the same event stream (append
+  + mark-dead + the order-preserving compaction at walk end, the
+  moonrise defrag analog) — exact for ANY server shape, no id-order
+  assumption. The walk: a word-skipping alive-bitset scan (a dead slot
+  = one bit test in a hot 32-64KB structure) + a typed Entity[] load
+  with NO instanceof. The per-entity body is the raw walk's verbatim.
+- Gates, every tick (raw stays the honest fallback): TL_MIRROR_N ==
+  indexMap.size() (the moonrise live membership — the coverage proof:
+  the probes ARE the TL add/remove primitives) && N >= 2048 && the
+  backfill (pre-probe members appended from the raw array in TL order;
+  a mismatch sticky-disables the mirror). Mid-walk mutation semantics
+  replicate vanilla exactly (a merge's discard clears the alive bit —
+  the raw walk sees the nulled slot; a mid-walk add appends beyond the
+  snapshot bound). The PD-tick dual hash (TLO-MIRROR-PROOF /
+  TLO-MISMATCH with both id lists) makes the TL parity stream literal.
+- The weave hunt: the first attempt rode ServerLevel$EntityCallbacks —
+  onTickingStart landed, onTickingEnd REFUSED ("StackMapTable
+  re-encoding refused": a same_frame at offset 60 + the shift exceeds
+  the 63-byte same_frame encoding — the builder is right to refuse).
+  Reworked: the probes ride the TL primitives (add/remove, no SMT),
+  chained into the EntityTickList precompute right after the forEach
+  replacement — one retransform, optional on refusal (the count gate
+  never passes without both probes).
+- Local: module tests 14 green (incl. the natives-descriptor suite);
+  parity items 20000 PASS bit-identical at T389/T639/final (tlM=898
+  mirror walks, N=16498 == TL live); parity spread 10000 (the
+  interleaved items+stands+zombies judge) PASS at all 3 snapshots
+  (tlM=878, N=9901); local A/B items-50k: off 26.46 -> on 7.23 p50
+  (-72.7%; the mod side 7.23 vs the L176-era 10.97 = -34% relative).
+  The stats line gained tlM=<mirror>/<raw>/<N>/<backfilled>/<ok>.
+- Push: this commit; CI parity/module/e2e/baseline in flight (the
+  production ab-paired ratios re-arbitrated on the next gate flight).
+- NEXT: parse the CI verdicts; the remaining families are the honest
+  merge volume (AABB.intersects + getBoundingBox under mirror ~4.8%
+  items), ttlCachedPath 5.09% spread (the epoch-counter redesign),
+  itemTickFlush 6.4-9.3%, the spawner/vec3Cached tails; spread's -90%
+  bar (0.110 -> 0.100 needed) is one honest step away.

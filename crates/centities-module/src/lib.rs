@@ -2692,8 +2692,26 @@ fn precompute_entityticklist(loader: jni::jobject) {
     });
     match patched {
         Some(Some(b)) if !b.is_empty() => {
+            // L179: the TL mirror's probes ride the SAME class — the EXACT
+            // TL membership events. javap-verified 26.3: the ONLY callers of
+            // EntityTickList.add/remove are ServerLevel$EntityCallbacks
+            // onTickingStart/onTickingEnd (the LevelCallback the lookup
+            // drives), and both primitives are straight-line bodies with NO
+            // StackMapTable (the callbacks' own onTickingEnd carries a
+            // same_frame at offset 60 that the prefix shift cannot re-encode
+            // — observed live, run parity-l179-items-on: "onTickingEnd probe
+            // refused: StackMapTable re-encoding refused"). Probing the
+            // primitives beats probing the callbacks: a marker stand
+            // (markers.tick=false) never reaches TL.add, so the mirror
+            // matches the TL membership exactly — no marker caveat.
+            // Optional: a refusal keeps the raw walk (the mirror's live-count
+            // gate never passes without BOTH probes).
+            let (b2, probes) = weave_tl_mirror_probes(b);
+            if probes {
+                cplug_sdk::log::info("[c-entities] TL mirror add/remove probes woven");
+            }
             if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(ENTITY_TICK_LIST_CLASS, b);
+                pc.insert(ENTITY_TICK_LIST_CLASS, b2);
             }
             TL_WOVEN.store(true, Ordering::Release);
             cplug_sdk::log::info("[c-entities] precomputed EntityTickList.forEach raw walk");
@@ -2705,6 +2723,47 @@ fn precompute_entityticklist(loader: jni::jobject) {
             );
         }
     }
+}
+
+/// The TL mirror's two prefix inserts on EntityTickList.add/remove. A
+/// refusal degrades gracefully: the original (forEach-replaced) bytes come
+/// back and the mirror stays off — the raw walk owns correctness.
+fn weave_tl_mirror_probes(b: Vec<u8>) -> (Vec<u8>, bool) {
+    let b1 = match patch::insert_static_call_at_start(
+        b.clone(),
+        "add",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        HOOKS_CLASS,
+        "probeTickStart",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            cplug_sdk::log::info(&format!(
+                "[c-entities] TL add probe refused ({e}) — the TL mirror stays off"
+            ));
+            return (b, false);
+        }
+    };
+    let b2 = match patch::insert_static_call_at_start(
+        b1,
+        "remove",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        HOOKS_CLASS,
+        "probeTickStop",
+        "(Lnet/minecraft/world/entity/Entity;)V",
+        &[(1, b'L')],
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            cplug_sdk::log::info(&format!(
+                "[c-entities] TL remove probe refused ({e}) — the TL mirror stays off"
+            ));
+            return (b, false);
+        }
+    };
+    (b2, true)
 }
 
 // ---------------------------------------------------------------------------

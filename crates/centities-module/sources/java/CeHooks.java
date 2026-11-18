@@ -1711,6 +1711,8 @@ public final class CeHooks {
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
+                + " tlM=" + tlMirrorTicks + "/" + tlMirrorRawTicks + "/" + TL_MIRROR_N
+                + "/" + (TL_MIRROR_BACKFILLED ? 1 : 0) + "/" + (TL_MIRROR_OK ? 1 : 0)
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -9524,6 +9526,279 @@ public final class CeHooks {
         TL_HANDLES_OK = initTickListVh();
     }
 
+    // ==================================================================
+    // L179 — the TL mirror walk (doc 65).
+    //
+    // The raw walk's floor is the scan of the moonrise EntityTickList's
+    // backing array: NEVER compacted (removals fire inside the walk, so the
+    // post-iteration defrag never sees iteratorCount == 0 — items-100k-mod
+    // measure-phase: ~63k live in a ~100k-slot array) and every non-null
+    // slot pays an instanceof (an object-header deref — the second cache
+    // line per live entity). The fresh profiles put the walk at 11.78%
+    // self on items-100k-mod and 10.22% on spread-100k-mod (line 9568, the
+    // instanceof line) — the biggest module-owned family left.
+    //
+    // The fix: the module keeps its OWN Entity[]-typed copy of the tick
+    // list, maintained by two prefix probes woven on EntityTickList.add /
+    // remove — the EXACT TL membership events. javap-verified 26.3: their
+    // ONLY caller chain is ServerLevel$EntityCallbacks.onTickingStart /
+    // onTickingEnd (the LevelCallback the chunk-system lookup drives), and
+    // the primitives are straight-line bodies the prefix machinery can
+    // weave (the callbacks' own onTickingEnd carries a same_frame@60 that
+    // refuses the shift — observed live). Probing the primitives beats
+    // probing the callbacks: a marker stand (markers.tick=false) never
+    // reaches TL.add, so the mirror matches the TL membership with no
+    // marker caveat. The mirror order is the TL order BY CONSTRUCTION:
+    // the same event stream (moonrise add = append-at-end, remove = null
+    // the slot, defrag preserves order — all javap-verified), so the walk
+    // is exact for ANY server shape; no entity-id-order assumption.
+    //
+    // The wins per slot: a dead slot costs one bit test in a hot 32-64KB
+    // alive bitset (the raw walk pays a cold ref load + null check), a live
+    // slot costs a typed Entity[] load with NO instanceof (no header deref).
+    //
+    // Gates (every tick, the raw walk stays the honest fallback):
+    //   * the live-count equality: TL_MIRROR_N == indexMap.size() (the
+    //     moonrise set's authoritative live membership — removals update it
+    //     immediately; the raw array's holes do not). Any probe-coverage
+    //     hole or a second ticking level routes the raw walk. Mirror == TL
+    //     membership always (the probes ARE the TL add/remove primitives);
+    //     the count read is the belt-and-suspenders proof.
+    //   * the backfill: on the first gate-passing walk the pre-probe
+    //     members are appended from the raw array (in TL order); the mirror
+    //     is then sticky-enabled. A count mismatch at backfill disables the
+    //     mirror for the process lifetime (correct, just raw).
+    //   * CE_TL_MIRROR=0 kills the walk precompute-side.
+    //   * the PD-tick dual-hash (TLO-MIRROR-PROOF / TLO-MISMATCH lines):
+    //     at parity-dump ticks the raw array order is hashed exactly like
+    //     the walked mirror order; a mismatch prints both orders and
+    //     sticky-disables the mirror (the TL parity stream made literal).
+    //
+    // Mid-walk mutation semantics replicate vanilla exactly: a merge's
+    // discard fires onTickingEnd -> the alive bit clears -> the walk skips
+    // (the raw walk sees the nulled TL slot); a mid-walk start-ticking
+    // appends beyond the snapshot bound (the raw walk skips it beyond
+    // maxIndex). Compaction (order-preserving shift-left, the moonrise
+    // defrag analog) runs at walk END only, never mid-iteration.
+    // ==================================================================
+    public static final boolean TL_MIRROR_FLAG =
+            !"0".equals(System.getenv("CE_TL_MIRROR"));
+    /** Sticky: the mirror was proven (backfilled + counts equal) at least
+     *  once and no divergence was seen. The raw walk is the only writer
+     *  back to false. */
+    public static volatile boolean TL_MIRROR_OK = true;
+    private static volatile boolean TL_MIRROR_BACKFILLED = false;
+    /** Below this population the raw walk is cheaper (the bitset walk's
+     *  fixed word scan); the parity legs (mobs 2500) stay above it. */
+    public static final int TL_MIRROR_MIN = 2048;
+    private static final int TL_MIRROR_CAP = 1 << 19;
+    private static volatile Entity[] TL_MIRROR = new Entity[1 << 18];
+    private static volatile long[] TL_MIRROR_ALIVE = new long[1 << 12];
+    /** id&AMASK -> mirror index + 1 (0 = not mirrored); the TL add no-ops
+     *  on an existing member (putIfAbsent), the mirror matches. */
+    private static final int[] TL_MPOS = new int[1 << 22];
+    private static volatile int TL_MIRROR_N = 0;    // live entries
+    private static volatile int TL_MIRROR_LEN = 0;  // high-water mark
+    private static volatile int TL_MIRROR_DEAD = 0; // dead entries since the last compaction
+    public static volatile long tlMirrorTicks = 0;  // mirror walks served
+    public static volatile long tlMirrorRawTicks = 0; // raw fallback walks
+    public static volatile long tlMirrorBackfillN = 0;
+    private static volatile RefField VH_TL_INDEXMAP;
+    private static volatile boolean TL_INDEXMAP_FAILED = false;
+
+    /** Prefix of EntityTickList.add(Entity) — the EXACT TL membership add.
+     *  The only caller chain (javap-verified 26.3): ServerLevel's
+     *  EntityCallbacks.onTickingStart. Markers with markers.tick=false
+     *  never reach the TL, so the mirror matches the TL membership with no
+     *  marker caveat. The dedup below matches the TL add's putIfAbsent
+     *  no-op on an existing member. */
+    public static void probeTickStart(Entity e) {
+        try {
+            if (ACTIVE && INDEXING && e != null
+                    && e.level() != null && !e.level().isClientSide()) {
+                int id = entId(e);
+                int slot = id & AMASK;
+                if (TL_MPOS[slot] == 0) {
+                    int m = TL_MIRROR_LEN;
+                    if (m >= TL_MIRROR.length && !tlMirrorGrow()) {
+                        return; // the count gate routes the walk raw
+                    }
+                    // re-read: a concurrent grow (never on Paper — one tick
+                    // thread) may have swapped the arrays.
+                    Entity[] mir = TL_MIRROR;
+                    long[] al = TL_MIRROR_ALIVE;
+                    m = TL_MIRROR_LEN;
+                    mir[m] = e;
+                    al[m >> 6] |= 1L << (m & 63);
+                    TL_MPOS[slot] = m + 1;
+                    TL_MIRROR_LEN = m + 1;
+                    TL_MIRROR_N++;
+                }
+                // MPOS != 0: already mirrored — the TL add no-ops the same
+                // way (putIfAbsent on an existing member).
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeTickStart: " + t;
+            TL_MIRROR_OK = false; // the raw walk owns correctness from here
+        }
+    }
+
+    /** Prefix of EntityTickList.remove(Entity) — the EXACT TL membership
+     *  remove (the only caller: EntityCallbacks.onTickingEnd). The remove
+     *  of a non-member is a no-op both in the TL and here. */
+    public static void probeTickStop(Entity e) {
+        try {
+            if (ACTIVE && INDEXING && e != null
+                    && e.level() != null && !e.level().isClientSide()) {
+                int slot = entId(e) & AMASK;
+                int m1 = TL_MPOS[slot];
+                if (m1 != 0) {
+                    int m = m1 - 1;
+                    TL_MIRROR_ALIVE[m >> 6] &= ~(1L << (m & 63));
+                    TL_MPOS[slot] = 0;
+                    TL_MIRROR_N--;
+                    TL_MIRROR_DEAD++;
+                }
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeTickStop: " + t;
+            TL_MIRROR_OK = false;
+        }
+    }
+
+    /** The moonrise set's live membership (indexMap.size()): removals
+     *  update it immediately, the raw array's holes do not. -1 when the
+     *  handle family failed (the gate then never passes). */
+    private static int tlLiveCount(Object set) {
+        if (TL_INDEXMAP_FAILED) return -1;
+        try {
+            RefField f = VH_TL_INDEXMAP;
+            if (f == null) {
+                f = initIndexMapVh();
+                if (f == null) return -1;
+            }
+            Object m = f.getObj(set);
+            if (m instanceof it.unimi.dsi.fastutil.objects.Reference2IntLinkedOpenHashMap h) {
+                return h.size();
+            }
+            return -1;
+        } catch (Throwable t) {
+            TL_INDEXMAP_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "tlLiveCount: " + t;
+            return -1;
+        }
+    }
+
+    private static synchronized RefField initIndexMapVh() {
+        if (TL_INDEXMAP_FAILED) return null;
+        if (VH_TL_INDEXMAP != null) return VH_TL_INDEXMAP;
+        try {
+            RefField f = new RefField(
+                    Class.forName("ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet"),
+                    "indexMap");
+            // SELF-TEST: read the map off a live set before the gate trusts it.
+            Object probe = new net.minecraft.world.level.entity.EntityTickList();
+            Object set = VH_TL_ENTITIES.getObj(probe);
+            Object map = f.getObj(set);
+            if (!(map instanceof it.unimi.dsi.fastutil.objects.Reference2IntLinkedOpenHashMap)) {
+                throw new IllegalStateException("indexMap type drifted");
+            }
+            VH_TL_INDEXMAP = f;
+            return f;
+        } catch (Throwable t) {
+            TL_INDEXMAP_FAILED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "tlIndexMapVh: " + t;
+            return null;
+        }
+    }
+
+    private static synchronized boolean tlMirrorGrow() {
+        int cap = TL_MIRROR.length;
+        if (TL_MIRROR_LEN < cap) return true;
+        int ncap = cap << 1;
+        if (ncap > TL_MIRROR_CAP || ncap <= 0) return false;
+        TL_MIRROR = java.util.Arrays.copyOf(TL_MIRROR, ncap);
+        TL_MIRROR_ALIVE = java.util.Arrays.copyOf(TL_MIRROR_ALIVE, ncap >> 6);
+        return true;
+    }
+
+    /** First gate-passing walk: append the pre-probe members from the raw
+     *  array (TL order), then the equality verdict is final. */
+    private static synchronized void backfillMirror(Object set) {
+        if (TL_MIRROR_BACKFILLED) return;
+        try {
+            int live = tlLiveCount(set);
+            Object[] rarr = (Object[]) ((ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>) set).getListRaw();
+            int rmax = ((ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet<Entity>) set).getListSize();
+            for (int i = 0; i < rmax && i < rarr.length; i++) {
+                Object o = rarr[i];
+                if (!(o instanceof Entity e)) continue;
+                int slot = entId(e) & AMASK;
+                if (TL_MPOS[slot] == 0) {
+                    int m = TL_MIRROR_LEN;
+                    if (m >= TL_MIRROR.length) { tlMirrorGrow(); }
+                    Entity[] mir = TL_MIRROR;
+                    long[] al = TL_MIRROR_ALIVE;
+                    m = TL_MIRROR_LEN;
+                    if (m >= mir.length) {
+                        TL_MIRROR_OK = false; // cannot hold the TL — raw forever
+                        TL_MIRROR_BACKFILLED = true;
+                        return;
+                    }
+                    mir[m] = e;
+                    al[m >> 6] |= 1L << (m & 63);
+                    TL_MPOS[slot] = m + 1;
+                    TL_MIRROR_LEN = m + 1;
+                    TL_MIRROR_N++;
+                }
+            }
+            if (live >= 0 && TL_MIRROR_N == live) {
+                TL_MIRROR_BACKFILLED = true;
+                tlMirrorBackfillN = TL_MIRROR_N;
+            } else {
+                // a second ticking level, or a probe-coverage hole: the raw
+                // walk owns every tick.
+                TL_MIRROR_OK = false;
+                TL_MIRROR_BACKFILLED = true;
+            }
+        } catch (Throwable t) {
+            TL_MIRROR_OK = false;
+            TL_MIRROR_BACKFILLED = true;
+            lastError = System.nanoTime();
+            lastErrorText = "backfillMirror: " + t;
+        }
+    }
+
+    /** Order-preserving shift-left (the moonrise defrag analog). Walk-end
+     *  only: never mid-iteration. */
+    private static synchronized void compactMirror() {
+        Entity[] mir = TL_MIRROR;
+        long[] al = TL_MIRROR_ALIVE;
+        int len = TL_MIRROR_LEN;
+        int out = 0;
+        for (int m = 0; m < len; m++) {
+            if ((al[m >> 6] & (1L << (m & 63))) == 0) continue;
+            Entity e = mir[m];
+            if (e == null) continue;
+            if (out != m) {
+                mir[out] = e;
+                TL_MPOS[entId(e) & AMASK] = out + 1;
+            }
+            out++;
+        }
+        java.util.Arrays.fill(al, 0L);
+        for (int m = 0; m < out; m++) {
+            al[m >> 6] |= 1L << (m & 63);
+        }
+        for (int m = out; m < len; m++) mir[m] = null;
+        TL_MIRROR_LEN = out;
+        TL_MIRROR_DEAD = 0;
+    }
+
     @SuppressWarnings("unchecked")
     public static void tickListForEach(net.minecraft.world.level.entity.EntityTickList tl,
                                        java.util.function.Consumer<Entity> consumer) {
@@ -9554,6 +9829,92 @@ public final class CeHooks {
                 // retry body keeps the identical shape below)
                 final boolean mobRoute = !MOB_WALK_RAW && ACTIVE && cplugReady
                         && NATIVE_MOB_ON && NATIVE_MOB_HANDLES_OK;
+                // L179: the TL mirror walk — the module's own Entity[]-typed,
+                // order-exact copy of the tick list (doc 65). The per-entity
+                // body below is the RAW walk's body — KEEP IN LOCKSTEP.
+                if (TL_MIRROR_OK && TL_MIRROR_FLAG) {
+                    if (!TL_MIRROR_BACKFILLED) backfillMirror(set);
+                    int mN = TL_MIRROR_N;
+                    if (TL_MIRROR_BACKFILLED && mN >= TL_MIRROR_MIN
+                            && mN == tlLiveCount(set)) {
+                        Entity[] mir = TL_MIRROR;
+                        long[] al = TL_MIRROR_ALIVE;
+                        int bound = TL_MIRROR_LEN; // snapshot: mid-walk appends skipped (vanilla: beyond maxIndex)
+                        // TLO: the ACTUAL walk order at PD ticks — the dual
+                        // hash below also hashes the RAW array order, so a
+                        // mirror drift names itself outright.
+                        final boolean tloOn = phDumpTickNow();
+                        StringBuilder tlo = tloOn ? new StringBuilder(512) : null;
+                        long tloH = 0;
+                        int tloN = 0;
+                        for (int w = 0, wEnd = (bound + 63) >> 6; w < wEnd; w++) {
+                            long word = al[w];
+                            if (word == 0) continue;
+                            int base = w << 6;
+                            int tail = bound - base;
+                            long mask = tail >= 64 ? -1L : ((1L << tail) - 1L);
+                            word &= mask;
+                            while (word != 0) {
+                                int b = Long.numberOfTrailingZeros(word);
+                                word &= word - 1;
+                                Entity e = mir[base | b];
+                                if (e == null) continue;
+                                if (tloOn) {
+                                    tloH = tloH * 0x9E3779B97F4A7C15L + entId(e);
+                                    tloH ^= Long.rotateLeft(tloH, 13);
+                                    if (tloN < 48) {
+                                        tlo.append(e.getId()).append(' ');
+                                    }
+                                    tloN++;
+                                }
+                                if (collect && e instanceof ItemEntity
+                                        && itemDispatch((ItemEntity) e)) {
+                                    continue; // native flush computes this tick
+                                }
+                                if (mobRoute && e instanceof net.minecraft.world.entity.Mob m
+                                        && m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                                    walkMobNative++;
+                                    continue; // the wire computes this mob at the flush
+                                }
+                                consumer.accept(e);
+                            }
+                        }
+                        tlMirrorTicks++;
+                        if (tloOn && tloN > 0) {
+                            // the dual hash: the RAW array's order, hashed the
+                            // same way — the TL parity stream made literal.
+                            Object[] rarr = set.getListRaw();
+                            int rmax = set.getListSize();
+                            long rH = 0;
+                            int rN = 0;
+                            StringBuilder rsb = new StringBuilder(512);
+                            for (int i = 0; i < rmax; i++) {
+                                Object o = rarr[i];
+                                if (o instanceof Entity re) {
+                                    rH = rH * 0x9E3779B97F4A7C15L + entId(re);
+                                    rH ^= Long.rotateLeft(rH, 13);
+                                    if (rN < 48) rsb.append(re.getId()).append(' ');
+                                    rN++;
+                                }
+                            }
+                            if (rN == tloN && rH == tloH) {
+                                System.out.println("[ce-baseline] TLO-MIRROR-PROOF t=" + CUR_TICK
+                                        + " n=" + tloN + " h=" + tloH);
+                            } else {
+                                System.out.println("[ce-baseline] TLO-MISMATCH t=" + CUR_TICK
+                                        + " raw n=" + rN + " h=" + rH + " ids=" + rsb.toString().trim()
+                                        + " mirror n=" + tloN + " h=" + tloH + " ids=" + tlo.toString().trim());
+                                TL_MIRROR_OK = false; // the raw walk owns every tick from here
+                            }
+                        }
+                        if (TL_MIRROR_DEAD > 0
+                                && TL_MIRROR_DEAD >= (TL_MIRROR_LEN >> 2)) {
+                            compactMirror();
+                        }
+                        return; // finally: finishRawIterator (vanilla-shaped)
+                    }
+                }
+                tlMirrorRawTicks++;
                 // TLO (addendum 17): the ACTUAL walk order at PD ticks — the
                 // plugin's TL stream reads the same raw array, so this line
                 // must be IDENTICAL to the OFF leg's TL at the mapped tick
