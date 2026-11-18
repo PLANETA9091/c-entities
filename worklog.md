@@ -1934,3 +1934,50 @@ Task ID: 28 addendum — the L179 CI verdicts (parity, the matrix, the gate)
   (2.37%); itemTickFlush's post-merge refresh is already at its L166
   floor. Dispatch discipline: spread/despawn off-leg repeats for an
   honest -90% verdict.
+
+---
+Task ID: 28 addendum 2 — the 3-rep de-noised gate (the honest -90% standings)
+- Dispatch discipline executed: adde5af bumps spread-100k and
+  mobs-despawn-10k from 1 to 3 paired reps (the gate already read
+  REPEATS=3 and tolerates missing samples). The flight (run
+  44384220888, 2h08m) returned full 3-sample rows for both:
+  scenario        samples off -> on                      med-off   med-on  ratio  verdict
+  items-100k      [102.3,91.1,91.2] -> [32.9,28.0,30.4]    91.19    30.39  0.333  PASS
+  mobs-25k        [784.5] -> [491.6]                       784.49   491.55 0.627  PASS
+  mixed-150k      [3740.1] -> [84.0]                      3740.09    84.00 0.022  PASS
+  spread-100k     [567.6,534.7,516.5] -> [73.2,73.8,70.9]  534.66    73.25 0.137  PASS
+  mobs-despawn-10k[98.3,110.4,117.3] -> [14.9,15.8,14.3]   110.37    14.92 0.135  PASS  pop off=10019 on=10015 delta=4 OK
+  AB-PAIRED-GATE: PASS
+- The sampling worked exactly as designed: the per-rep spread is now
+  +-4% on the spread ON leg (73.2/73.8/70.9) and +-9% on the despawn
+  OFF leg (98.3..117.3) — vs the +-35% between-flight vanilla swings
+  that made every 1-rep ratio a coin flip. The medians are reproducible
+  quantities now.
+- The honest -90% standings across THREE flight shapes (fb6919a fast /
+  f542062 fast / adde5af slow-runner — this flight's shape is slower
+  across the board, every leg scaled up ~40-60%, the in-pair ratios
+  stayed shape-stable as the pairing intends):
+  mixed-150k   0.017 / 0.037 / 0.022  -> -98.3 / -96.3 / -97.8%  HOLDS -90% on every shape;
+  spread-100k  0.110 / 0.150 / 0.137  -> -89.0 / -85.0 / -86.3%  the bar reads only on the
+  lucky-fast shape; the honest median standing is about -86%;
+  mobs-despawn-10k 0.097 / 0.147 / 0.135 -> -90.3 / -85.3 / -86.5%  the same story;
+  items-100k   0.345 / 0.301 / 0.333  -> -65.5 / -69.9 / -66.7%  the L177..L179 stack
+  moved the ON medians 27.0 -> 23.9 (fast shape) — the real gain is on
+  the ON side, the ratio just rides the vanilla denominator;
+  mobs-25k control 0.432 / 0.627 / 0.627 — never slower, never gated.
+- The verdict this closes: the -90% claims stand ONLY for mixed-150k
+  (-98%, the claim survives any denominator). spread-100k and
+  mobs-despawn-10k sit at a reproducible -85..-86% — the remaining gap
+  is not sampling noise, it is real module-side work (the spread ON
+  median 73.25 must reach ~53 on this shape). That is the L180 family:
+  the query survivor cluster ~15% (the 20k zombies' targeting scans:
+  getEntitiesOfClass:1894 + the fastQuery resolve leaves + the ARENA
+  Unsafe reads), then ttlCachedPath 2.37%.
+- NEXT (L180): the row-path Entity[]-typed extension — generalize the
+  L179 mirror pattern from the tick list to the query candidates (the
+  per-cell typed arrays serve the resolve loop without the id->ARENA
+  hop and its staleness re-check; the publish path already walks cells
+  in the vanilla order after doc 36b, so the typed rows ride the same
+  versioning). Parity contract unchanged: the ORDER-CHECK + the
+  bit-identical snapshot gate arbitrate; CE_TL_MIRROR-style kill
+  switch (CE_QROW=0) for the raw loop fallback.
