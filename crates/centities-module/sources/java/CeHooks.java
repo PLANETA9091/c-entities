@@ -173,9 +173,13 @@ public final class CeHooks {
     private static final int ROW_CAP = 510;      // must match the native ROW_CAP
     /** L4c graded row total: mid-density rows (spread-100k: 100-300 candidates)
      *  scan in Java at ~40-70ns/candidate — ~3x cheaper than the native query's
-     *  fixed JNI toll. Genuinely dense cells (mobs-25k ~700, items-100k ~830 per
-     *  cell) still bail to the native Rust filter. */
-    private static final int ROW_TOTAL_CAP = 512;
+     *  fixed JNI toll. L180 raised 512 -> 2048: the spread targeting scans
+     *  (16-block boxes, ~700 candidates, NOT narrow) were refused at 512 into
+     *  the native resolve (the JNI toll + the per-candidate ARENA hop) while
+     *  the row walk skips ~85-95% of them at ~3ns via the packed x-window —
+     *  the row path is per-candidate cheaper than the native resolve at every
+     *  measured density, so the cap now binds only past 2048 (4+ dense cells). */
+    private static final int ROW_TOTAL_CAP = 2048;
     /** L35 narrow-shape total cap: a query box whose X and Z spans are both
      *  <= 8 blocks (mob collision ~0.6-1.9, item merge scans ~1-2.5) pays a
      *  packed-x-window scan of ~3-4ns/entry that skips 75-96% of the row
@@ -715,6 +719,16 @@ public final class CeHooks {
     private static int canHoldWalk(net.minecraft.world.entity.player.Inventory inv,
             net.minecraft.world.item.ItemStack stack, int invMax) {
         int count = stack.getCount();
+        // L181: the candidate's max stack is LOOP-INVARIANT in the vanilla
+        // body (the walk is read-only) — the per-slot getMaxStackSize was a
+        // component-map walk x36 per call (isStackable→getMaxStackSize was
+        // 8.02% self on the items-100k-mod profile, the bot's pickup storm:
+        // every absorbed item changes the inventory and kills the CH memo).
+        // The slot/off max rides mergeMaxStack — the L167 exact port (the
+        // prototype constant when the patch map is the shared empty
+        // singleton, the exact walk otherwise) — already proven by the
+        // merge predicate since L41.
+        int stackMax = stack.getMaxStackSize();
         Object listObj = U.getObject(inv, O_INV_ITEMS);
         @SuppressWarnings("unchecked")
         java.util.List<net.minecraft.world.item.ItemStack> items =
@@ -726,9 +740,9 @@ public final class CeHooks {
                 return stack.getCount();
             }
             if (slot.isStackable()
-                    && slot.getCount() < Math.min(invMax, stack.getMaxStackSize())
+                    && slot.getCount() < Math.min(invMax, stackMax)
                     && net.minecraft.world.item.ItemStack.isSameItemSameComponents(slot, stack)) {
-                count -= Math.min(slot.getMaxStackSize(), invMax) - slot.getCount();
+                count -= Math.min(mergeMaxStack(slot), invMax) - slot.getCount();
             }
             if (count <= 0) {
                 return stack.getCount();
@@ -739,9 +753,9 @@ public final class CeHooks {
         net.minecraft.world.item.ItemStack off =
                 eq.get(net.minecraft.world.entity.EquipmentSlot.OFFHAND);
         if (!off.isEmpty() && off.isStackable()
-                && off.getCount() < Math.min(invMax, stack.getMaxStackSize())
+                && off.getCount() < Math.min(invMax, stackMax)
                 && net.minecraft.world.item.ItemStack.isSameItemSameComponents(off, stack)) {
-            count -= Math.min(off.getMaxStackSize(), invMax) - off.getCount();
+            count -= Math.min(mergeMaxStack(off), invMax) - off.getCount();
         }
         if (count <= 0) {
             return stack.getCount();
@@ -1883,20 +1897,18 @@ public final class CeHooks {
                 int gi = gateCell(level, box);
                 if (gi >= 0 && wantFast(gi)) {
                     long t0 = System.nanoTime();
-                    List<Entity> raw = fastQuery(level, null, box, FQ_ALL);
+                    // L180: the class filter rides the resolve loop (fastQuery
+                    // runs isInstance inline) — the FQ_ALL pre-pass + the
+                    // raw.get(i) second scan collapsed into ONE pass. The
+                    // wrapper's filter loop was the profile's top leaf
+                    // (getEntitiesOfClass:1894 = 6.33% self, spread-100k-mod)
+                    // and the raw list churned ArrayList.add entries under it.
+                    List<Entity> out = fastQuery(level, null, box, predicate, false, clazz);
                     long dt = System.nanoTime() - t0;
                     fastNanos += dt;
-                    if (raw != null) {
+                    if (out != null) {
                         queriesFast++;
                         priceFastSample(gi, dt);
-                        List out = new ArrayList<>(Math.min(raw.size(), 64));
-                        for (int i = 0, s = raw.size(); i < s; i++) {
-                            Entity e = raw.get(i);
-                            if (!clazz.isInstance(e)) continue;
-                            if (predicate == null || predicate.test(e)) {
-                                out.add(e);
-                            }
-                        }
                         if (ORDER_CHECK) {
                             orderChecks++;
                             List van = mirrorTyped(level, clazz, box, predicate);
@@ -3472,6 +3484,22 @@ public final class CeHooks {
     private static List<Entity> fastQuery(
             net.minecraft.world.level.Level level, Entity source,
             AABB box, Predicate<? super Entity> predicate, boolean reuseScratch) {
+        return fastQuery(level, source, box, predicate, reuseScratch, null);
+    }
+
+    // L180: the TYPED resolve — the getEntitiesOfClass funnel filters
+    // isInstance INSIDE the resolve loop: one pass over the survivors
+    // instead of the FQ_ALL pre-pass + the raw.get(i) second scan (the
+    // wrapper's filter loop was 6.33% self-time on spread-100k-mod, the
+    // profile's top leaf). The class test is pure, so the observable
+    // predicate sequence is unchanged — non-class entities never reached
+    // the caller predicate in either shape, and the candidate order (the
+    // structural vanilla scan order) is untouched. clazz == null is the
+    // untyped path — identical semantics to the pre-L180 body.
+    private static List<Entity> fastQuery(
+            net.minecraft.world.level.Level level, Entity source,
+            AABB box, Predicate<? super Entity> predicate, boolean reuseScratch,
+            Class clazz) {
         fastRefuse = null;
         // L46: only the OUTERMOST guarded caller may take the scratch —
         // a reentrant query inside a consume loop allocates (see FQ_SCRATCH).
@@ -3505,7 +3533,7 @@ public final class CeHooks {
             if (OVERSIZE_POP != 0) {
                 rowOv++; // native oversize entities: exact scan is native-only
             } else {
-                List<Entity> out = rowQuery(sl, wid, source, box, predicate, useScratch);
+                List<Entity> out = rowQuery(sl, wid, source, box, predicate, useScratch, clazz);
                 if (out != null) {
                     msqPath = "row";
                     return out;
@@ -3812,8 +3840,14 @@ public final class CeHooks {
                 }
                 l109TrimLoc++;
             }
-            // NOTE: the vanilla predicate still applies, as it must.
-            if (predicate.test(e)) {
+            // NOTE: the vanilla predicate still applies, as it must. L180:
+            // the typed funnel's isInstance filter rides here (one pass).
+            // The null-predicate guard matches vanilla (the moonrise body
+            // accepts a null predicate; the pre-L180 shape would have NPE'd
+            // into the disarm catch — a latent funnel bug for plugin
+            // callers of Level.getEntities(Entity, AABB, null)).
+            if (clazz != null && !clazz.isInstance(e)) continue;
+            if (predicate == null || predicate.test(e)) {
                 out.add(e);
             }
         }
@@ -4011,7 +4045,7 @@ public final class CeHooks {
     private static List<Entity> rowQuery(
             net.minecraft.server.level.ServerLevel sl, int wid,
             Entity source, AABB box, Predicate<? super Entity> predicate,
-            boolean useScratch) {
+            boolean useScratch, Class clazz) {
         // L41b CELL EXPANSION: an entity single-homes at its CENTER cell,
         // while vanilla's moonrise EntityLookup registers it in EVERY section
         // its BOX overlaps — a neighbor whose center sits just past a cell
@@ -4349,6 +4383,11 @@ public final class CeHooks {
                     if (MSQ_COLLECT && msqN < MSQ_IDS.length) {
                         MSQ_IDS[msqN++] = cid;
                     }
+                    // L180: the typed funnel's isInstance filter rides here
+                    // (one pass; the class test is pure — the observable
+                    // predicate sequence is unchanged, the row order is
+                    // untouched).
+                    if (clazz != null && !clazz.isInstance(e)) continue;
                     if (predicate == null || predicate.test(e)) {
                         out.add(e);
                     }
@@ -4413,6 +4452,10 @@ public final class CeHooks {
                 if (out.get(k).getId() == PQ_ID[q]) { dup = true; break; }
             }
             if (dup) continue;
+            // L180: the typed funnel's class filter (the PQ tail adds the
+            // pending entries vanilla registered in BOTH sections — the same
+            // isInstance gate applies to them).
+            if (clazz != null && !clazz.isInstance(pe)) continue;
             double bx0 = PQ_BOX[q * 6], bx1 = PQ_BOX[q * 6 + 1];
             double by0 = PQ_BOX[q * 6 + 2], by1 = PQ_BOX[q * 6 + 3];
             double bz0 = PQ_BOX[q * 6 + 4], bz1 = PQ_BOX[q * 6 + 5];
@@ -14972,9 +15015,19 @@ public final class CeHooks {
         // L67: typed read — the te identity above pins this slot to the
         // fill that validated the type (the fill probe's instanceof is
         // the check; per-tick it is a proven tautology).
-        net.minecraft.server.level.ServerEntity serverEntity =
-                (net.minecraft.server.level.ServerEntity) rf[ob + 1];
-        if (serverEntity == null) {
+        // L180: the ServerEntity read rides the NON-mirror arm only. For a
+        // mirror row the full path's verdict never touches the se (the
+        // RMW rides the TT_FLAT mirror counter; the null-decline cannot
+        // fire — TT_OK pins the fill's non-null se), and the L178 bulk arm
+        // never needed it either — the load was 2.37% self-time on
+        // spread-100k-mod paid by every tracked entity every tick. The
+        // volatile flag is snapshotted once (single-threaded caller — the
+        // tracker tick loop; a mid-method flip had mixed arms before).
+        final boolean tm = TT_MIRROR;
+        net.minecraft.server.level.ServerEntity serverEntity = tm
+                ? null
+                : (net.minecraft.server.level.ServerEntity) rf[ob + 1];
+        if (!tm && serverEntity == null) {
             return false;
         }
         ttlFuseChecks++;
@@ -14985,7 +15038,7 @@ public final class CeHooks {
         // (the proven no-op) + the mirror bump. The ServerEntity null-
         // decline cannot fire here (TT_OK pins the fill, and the fill
         // stamps se BEFORE the TT_OK shape — a null se never gets TT_OK).
-        if ((sh & (TT_SIT | TT_UBS)) == TT_UBS && TT_MIRROR) {
+        if ((sh & (TT_SIT | TT_UBS)) == TT_UBS && tm) {
             if (ent.syncVelocity) {
                 if (ent instanceof net.minecraft.server.level.ServerPlayer) {
                     return false;
@@ -15033,7 +15086,7 @@ public final class CeHooks {
             // increment rides the mirror (the real field is handed back on
             // the armed->disarmed transition; the L70 tail below);
             // the real RMW stays the fallback.
-            if (TT_MIRROR) {
+            if (tm) {
                 fl[lb + 1] = fl[lb + 1] + 1;
             } else {
                 U.putInt(serverEntity, O_SE_TICKCOUNT,
