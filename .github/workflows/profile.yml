@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: 'mobs-25k | items-100k | mixed-150k | spread-100k'
+        description: 'mobs-25k | items-100k | mixed-150k | spread-100k | mobs-despawn-10k'
         default: 'mobs-25k'
       measure:
         description: 'MEASURE_TICKS'
@@ -66,17 +66,21 @@ jobs:
           set -euo pipefail
           SC="${{ inputs.scenario }}"
           case "$SC" in
-            mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0;;
-            items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0;;
-            mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;;
-            spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600;;
+            mobs-25k)    SCALE=25000;  ITEMS=0.0; STANDS=0.0; AREA=0;   DESP=0; MOBW=0;;
+            items-100k)  SCALE=100000; ITEMS=1.0; STANDS=0.0; AREA=0;   DESP=0; MOBW=0;;
+            mixed-150k)  SCALE=150000; ITEMS=0.7; STANDS=0.2; AREA=0;   DESP=0; MOBW=1;;
+            spread-100k) SCALE=100000; ITEMS=0.6; STANDS=0.2; AREA=600; DESP=0; MOBW=1;;
+            # the honest-gate row (doc 61b): non-persistent zombies, the far
+            # ring despawns — the production leg carries DESPAWN=1 + MOBW=1
+            mobs-despawn-10k) SCALE=10000; ITEMS=0.0; STANDS=0.0; AREA=700; DESP=1; MOBW=1;;
             *) echo "FATAL: unknown scenario $SC"; exit 1;;
           esac
           MEAS="${{ inputs.measure }}"
           if [ "$SC" = "mixed-150k" ]; then MEAS='300'; fi
+          if [ "$SC" = "mobs-despawn-10k" ]; then MEAS='600'; fi
           RUN_NAME="prof-$SC-on" \
           SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
-          AREA="$AREA" TILE_HOPPERS=0 TILE_FURNACES=0 \
+          AREA="$AREA" DESPAWN="$DESP" CE_NATIVE_MOB="$MOBW" TILE_HOPPERS=0 TILE_FURNACES=0 \
           MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
           MODULE='on' RUN_JFR='1' \
           bash scripts/run-baseline.sh
