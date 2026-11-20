@@ -1981,3 +1981,105 @@ Task ID: 28 addendum 2 — the 3-rep de-noised gate (the honest -90% standings)
   versioning). Parity contract unchanged: the ORDER-CHECK + the
   bit-identical snapshot gate arbitrate; CE_TL_MIRROR-style kill
   switch (CE_QROW=0) for the raw loop fallback.
+
+---
+Task ID: 29 addendum — the L180..L182 production verdicts, the L183 tracker-init
+collapse (caught by the ON-leg read), the L185 no-reflection hotfix
+
+- The L180-L181 gate flight (a39ef10, run 44557400190, PASS — the batch
+  rode the typed resolve, the row-cap raise 2048, the ttl arm snapshot,
+  the canHold hoist; parity 12/12):
+  scenario         med-off   med-on   ratio
+  items-100k        75.83    27.36    0.361
+  mobs-25k         777.75   451.87    0.581
+  mixed-150k       3495.51    62.84   0.018  (holds -98%)
+  spread-100k      467.40    55.58    0.119
+  mobs-despawn-10k  85.11     6.81    0.080  (crossed the bar on this shape)
+- The L182 flight (0faa016, run 44762273990, PASS — the batch: the
+  SLOT_CAP 1<<20 slot-cap diet (~1.1GB of dead statics left the
+  process), the canHold content-key memo, the plain syncVelocity pair,
+  the tick-snapshot mirror arm, the rowQuery pre-size 64):
+  scenario         med-off   med-on   ratio
+  items-100k        92.94    22.44    0.241  <- the best items pair ever
+  mobs-25k         587.68   367.61    0.626
+  mixed-150k       2446.82    69.94   0.029
+  spread-100k      456.59    63.98    0.140
+  mobs-despawn-10k  81.42     9.73    0.119
+  The items win is REAL: the content-key memo stopped the 2-way CH memo
+  thrashing against the pickup storm's ~600 rotating ItemStack instances
+  (canHold$ 7.50% + canHoldWalk 4.58% + getMaxStackSize 4.75% of the
+  a39ef10 items profile), and the diet cut the GC sawtooth the alloc
+  histogram pinned — the med-on dropped 27.36 -> 22.44 (-18%). The
+  spread/despawn ON medians moved WITH the runner shape while their OFF
+  legs moved less — the flight-to-flight ON-side swing (spread 52.1 ->
+  63.0 across adjacent flights) is now the dominant noise term; the
+  worklog's 3-rep lesson extends to BOTH legs for any -90% verdict.
+- The fresh profiles on a39ef10 (the profile workflow's spread/items
+  ON legs, run 44757336010 / 44757331324) named the next walls, and
+  two more diet batches rode out against them (each parity-verified
+  12/12 bit-identical before its gate):
+  - L183 (e0c22dc): the SITAL steps test, the SF DataItem slot-cache
+    (the SynchedEntityData.itemsById putfield audit: written ONLY in
+    <init>, assignValue's array fill is ctor-time — the DataItem ref is
+    stable per entity lifetime, the belt is ARENA_ID), the &3 cadence
+    trio (non-negative operands — bit-identical, the JIT kept the IDIV).
+  - L184 (578d258): the PD dirty-gated row refresh — the row's
+    pickupDelay mirrors the field, the invariant closed by the FOUR
+    probed setters (the javap putfield audit: ItemEntity's
+    setPickUpDelay/setDefaultPickUpDelay/setNoPickUpDelay/
+    setNeverPickUp are the field's only writers, CraftItem delegates to
+    setPickUpDelay — the probe net covers the whole API surface; a
+    weave refusal disarms the belt via pdDirtyScheme(0)), plus the
+    AP-GROUND slot mirror (the apply's onGround compare leaves the
+    scattered entity header for a dense slot byte).
+- THE L183 GATE CAUGHT A NEW FAILURE CLASS (run 44771131859, PASS but
+  the ON legs exploded): items med-on 22.44 -> 53.63, mixed 69.94 ->
+  171.51, spread 63.98 -> 84.20 while every OFF leg stayed in band. The
+  hooks@ telemetry named it outright:
+    lastErr=initTrackerLoopHandles: java.lang.IllegalStateException:
+    offOf: java.util.ArrayList.size
+  The SITAL fix resolved ArrayList.size through offOf() — a
+  getDeclaredField on a java.base class; java.base/java.util is not
+  add-opened to the bench JVM's unnamed module, the reflection threw,
+  and because the call sat INSIDE initTrackerLoopHandles' try it killed
+  every statement after it (VH_SIT_DELTA/VH_SIT_TICKS, O_ENT_SYNC_*,
+  the L151 sync shape, O_TE_SE) AND flipped TTL_HANDLES_OK=false — the
+  tracker's fast-path infrastructure collapsed and every ON leg paid
+  the full vanilla moonrise tracker per entity per tick. The parity
+  gate stayed 12/12 green (the fallback IS the vanilla shape — the
+  referee certifies exactness, not speed) and the ab-paired verdicts
+  stayed PASS (never-slower-than-vanilla in-pair at 0.772) — neither
+  gate grades PERFORMANCE. The lesson now hard: (a) never reflect into
+  java.base from the module (the platform has no --add-opens for it);
+  (b) every flight's hooks@ lastErr= is a MANDATORY read before a
+  verdict counts; (c) an ON-leg swing >20% across ALL scenarios is a
+  module regression, not runner noise, even when the gate passes.
+- The L185 hotfix (7ecb4fc) deletes the reflective surface: the SITAL
+  stamp rides the plain instanceof proof (the fill stamps when the
+  cached steps list is a java.util.ArrayList) and the per-tick empty
+  test is the stamp-proven monomorphic cast
+  ((ArrayList) steps).isEmpty() — ArrayList is final, so the cast
+  devirtualizes the megamorphic List.isEmpty() dispatch into a direct
+  size read (javap: isEmpty() is literally 'return size == 0;'). Same
+  exactness, same win, zero reflection. The L184 gate flight (578d258)
+  was cancelled before its verdict — it carried the same L183 bug and
+  its numbers would have measured the collapse, not the batch.
+- The L183/L185 flight's verdict rides the NEXT addendum (the gate was
+  re-dispatched on the hotfix); the honest -90% standings this
+  addendum certifies: mixed-150k holds -97% on every shape tested;
+  items-100k's reproducible med-on improved 27.36 -> 22.44 (the L182
+  memo win, CI-confirmed twice); spread/despawn sit at -85..-88% with
+  the ON-side flight noise now the dominant term.
+- NEXT (L185+ design space): the native-walk roster — the kernel reads
+  a TL_MIRROR_IDS int[] (one get_int_array_region per tick, ~400KB at
+  100k) plus the stamp/mode arrays and computes a per-entity verdict
+  array; the Java walk consults ONE dense byte per visit and only the
+  non-wired remainder reaches the vanilla accept. The dispatch gate
+  (the instanceof + entId + FAST_STAMP + row-refresh chain, ~5% spread
+  / ~8% items) leaves Java entirely; the batch rows become Rust-internal
+  state (the flush's Java side stays — the apply writes real fields).
+  The moonrise BasicEntityList maintenance (the items profile's ~7%)
+  was scoped and DEFERRED: add() has no duplicate guard (the O(n) cost
+  is the section-crossing add/remove churn), the same population the
+  OFF leg walks — a both-leg cost the ratio barely rewards, and the
+  class-rewrite platform work it needs is priced at several flights.
