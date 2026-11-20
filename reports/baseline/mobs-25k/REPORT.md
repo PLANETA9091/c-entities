@@ -6,31 +6,31 @@ Server: `26.3-257-d81ca50 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24203 -> 24203) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 24183 -> 23523) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 570.822 / 642.041 / 735.530 / 868.804 |
-| MSPT mean, ms | 578.265 |
-| TPS estimate (1000/p50) | 1.8 |
-| heap used / max, MB | 1738.1 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 330.285 / 407.527 / 506.877 / 617.544 |
+| MSPT mean, ms | 341.589 |
+| TPS estimate (1000/p50) | 3.0 |
+| heap used / max, MB | 1571.0 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 39.60% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 2 | 4.39% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
-| 3 | 2.96% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
-| 4 | 2.10% | `java.util.HashMap.getNode(Object) line: 586` |
-| 5 | 2.10% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
-| 6 | 1.94% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3913` |
-| 7 | 0.98% | `net.minecraft.world.entity.LivingEntity.tick() line: 3491` |
-| 8 | 0.98% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 9 | 0.97% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
-| 10 | 0.89% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 544` |
-| 11 | 0.73% | `com.google.common.collect.RegularImmutableMap.get(Object, ImmutableMapEntry[], int) line: 282` |
-| 12 | 0.64% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices.getEntities(Class, Entity, AABB, List, Predicate) line: 381` |
-| 13 | 0.64% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
-| 14 | 0.63% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
-| 15 | 0.62% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 1 | 25.09% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 2 | 3.49% | `net.minecraft.world.phys.AABB.intersects(AABB) line: 231` |
+| 3 | 3.34% | `java.util.HashMap.getNode(Object) line: 586` |
+| 4 | 3.20% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 551` |
+| 5 | 2.36% | `net.minecraft.world.entity.Entity.getBoundingBox() line: 4712` |
+| 6 | 1.92% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 546` |
+| 7 | 1.55% | `net.minecraft.world.entity.ai.goal.GoalSelector.tick() line: 88` |
+| 8 | 1.44% | `it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet$SetIterator.next() line: 989` |
+| 9 | 1.29% | `net.minecraft.world.entity.ConversionTracker.setConverting(boolean) line: 89` |
+| 10 | 1.26% | `net.minecraft.world.entity.Entity.setTicksFrozen(int) line: 3913` |
+| 11 | 1.24% | `net.minecraft.world.entity.LivingEntity.isCollidable(boolean) line: 4094` |
+| 12 | 1.21% | `ca.spottedleaf.moonrise.patches.chunk_system.level.entity.ChunkEntitySlices$EntityCollectionBySection.getEntities(Entity, AABB, List, Predicate) line: 543` |
+| 13 | 1.19% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 14 | 0.96% | `net.minecraft.world.entity.InsideBlockEffectApplier$StepBasedCollector.flushStep() line: 70` |
+| 15 | 0.91% | `java.util.function.Predicate.lambda$and$0(Predicate, Object) line: 69` |
 
