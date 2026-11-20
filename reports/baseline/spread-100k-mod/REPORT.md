@@ -6,31 +6,31 @@ Server: `26.3-257-d81ca50 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 100000 (items 59941 / stands 20059 / zombies 20000) (merge shrink: 88842 -> 88706) |
+| entities spawned | 100000 (items 59941 / stands 20059 / zombies 20000) (merge shrink: 88755 -> 88619) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 38.618 / 58.139 / 166.754 / 227.422 |
-| MSPT mean, ms | 46.315 |
-| TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 2150.4 / 4096.0 |
+| MSPT p50 / p90 / p99 / max, ms | 83.438 / 152.476 / 290.992 / 394.786 |
+| MSPT mean, ms | 100.740 |
+| TPS estimate (1000/p50) | 12.0 |
+| heap used / max, MB | 1958.4 / 4096.0 |
 | measured ticks | 1200 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 11.65% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
-| 2 | 4.55% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int, boolean) line: 15127` |
-| 3 | 4.44% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9942` |
-| 4 | 3.52% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8849` |
-| 5 | 3.12% | `org.spigotmc.WatchdogThread.run() line: 72` |
-| 6 | 1.97% | `dev.planeta9091.centities.CeHooks.quietFuseBump(ItemEntity, int, int) line: 1016` |
-| 7 | 1.49% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int, boolean) line: 15145` |
-| 8 | 1.45% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 14282` |
-| 9 | 1.40% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
-| 10 | 1.27% | `dev.planeta9091.centities.CeHooks.itemDispatch(Entity) line: 6116` |
-| 11 | 1.11% | `dev.planeta9091.centities.CeHooks.stackFast(ItemEntity) line: 1064` |
-| 12 | 1.01% | `net.minecraft.server.level.ServerLevel.lambda$tick$0(TickRateManager, ProfilerFiller, Entity) line: 912` |
-| 13 | 0.99% | `net.minecraft.world.entity.Entity.getType() line: 633` |
-| 14 | 0.99% | `sun.misc.Unsafe.getDouble(Object, long) line: 409` |
-| 15 | 0.93% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 1 | 10.49% | `sun.misc.Unsafe.getObject(Object, long) line: 222` |
+| 2 | 9.41% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 9987` |
+| 3 | 3.67% | `net.minecraft.world.entity.Entity.moonrise$getTrackedEntity() line: 542` |
+| 4 | 3.48% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8894` |
+| 5 | 3.20% | `dev.planeta9091.centities.CeHooks.trackerTickNoOp(Object, Object) line: 14153` |
+| 6 | 2.64% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
+| 7 | 2.42% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 8 | 1.78% | `dev.planeta9091.centities.CeHooks.trackerDispatch(ServerEntity) line: 9529` |
+| 9 | 1.67% | `org.spigotmc.WatchdogThread.run() line: 69` |
+| 10 | 1.39% | `org.spigotmc.WatchdogThread.run() line: 72` |
+| 11 | 1.12% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 14327` |
+| 12 | 1.10% | `dev.planeta9091.centities.CeHooks.itemTickFlush(Level) line: 8630` |
+| 13 | 1.07% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
+| 14 | 1.04% | `net.minecraft.server.level.ChunkMap$TrackedEntity.moonrise$clearPlayers() line: 1336` |
+| 15 | 0.98% | `sun.misc.Unsafe.putObject(Object, long, Object) line: 240` |
 
