@@ -3972,7 +3972,11 @@ mod tests {
             let before = ML_DRAW_SWAPS.load(Ordering::SeqCst);
             let mut out = vec![0i32; OUT_HEADER + MAX_ACTS * OUT_ACT];
             let st = ai_floor(&inb, &mut out);
-            let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst) - before;
+            // wrapping_sub: the counter is process-global and other tests
+            // may reset it CONCURRENTLY with this read — the debug build's
+            // overflow check turned that race into a panic (the L186 CI
+            // core job). The delta is diagnostic-only here (see below).
+            let draws = ML_DRAW_SWAPS.load(Ordering::SeqCst).wrapping_sub(before);
             if st == ST_DONE {
                 // diagnostic only: ML_DRAW_SWAPS is process-global and
                 // cargo runs tests in parallel — the delta is meaningful
