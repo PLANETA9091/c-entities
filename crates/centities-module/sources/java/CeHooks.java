@@ -14585,15 +14585,17 @@ public final class CeHooks {
     // subclass override clears the proof (the full path keeps the call).
     private static final long TT_UBS = 4L;
     // L183 SITAL: the row's fill-cached steps list was PROVEN a
-    // java.util.ArrayList at fill time — the per-tick empty test reads its
-    // size field through the cached O_AL_SIZE offset (one plain int read)
-    // instead of the instanceof + List.isEmpty() virtual dispatch (the
-    // spread-100k ON profile pinned 3.66% self on that single line: a
-    // megamorphic receiver per tracked row per tick). The stamp is set at
-    // BOTH fill sites; TTL_HANDLES_OK / O_AL_SIZE < 0 rows never carry it
-    // and keep the exact old shape.
+    // java.util.ArrayList at fill time — the per-tick empty test runs the
+    // MONOMORPHIC ((ArrayList) steps).isEmpty() (ArrayList is final: the
+    // stamp-proven cast devirtualizes the megamorphic List.isEmpty()
+    // dispatch — 3.66% self on the spread-100k ON profile — into a direct
+    // size read). NO reflection: the first fix rode offOf(java.base) which
+    // threw InaccessibleObjectException INSIDE initTrackerLoopHandles and
+    // killed the whole tracker-handle init (TTL_HANDLES_OK=false — the
+    // flight-183 ON legs paid the full vanilla tracker: items ON 22.44 ->
+    // 53.63). The stamp never carries without the instanceof proof, and
+    // non-ArrayList rows keep the exact old shape.
     private static final long TT_SITAL = 8L;
-    private static long O_AL_SIZE = -1;
     private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>
             UBS_PROOF = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -14730,11 +14732,6 @@ public final class CeHooks {
             Class<?> sit = Class.forName(
                     "net.minecraft.world.entity.SteppedInterpolationTracker");
             VH_SIT_STEPS = new RefField(sit, "trackedSteps");
-            // L183: the ArrayList size-field offset for the SITAL rows —
-            // resolved once; the read is the live `size` int (isEmpty() ==
-            // (size == 0) for ArrayList: size != 0 can never be empty, and
-            // size == 0 with capacity-only backing is empty — javap-trivial).
-            O_AL_SIZE = offOf(java.util.ArrayList.class, "size");
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
@@ -15275,13 +15272,15 @@ public final class CeHooks {
                 }
                 Object steps = rf[ob + 4];
                 if ((sh & TT_SITAL) != 0) {
-                    // L183: the fill proved the steps list is a
-                    // java.util.ArrayList and cached its size offset — one
-                    // plain int read replaces the per-tick instanceof + the
-                    // List.isEmpty() virtual dispatch (3.66% self on the
-                    // spread-100k ON profile; isEmpty() == (size == 0) for
-                    // ArrayList — size != 0 can never be empty).
-                    if (U.getInt(steps, O_AL_SIZE) != 0) {
+                    // L183/L185: the fill proved the steps list is a
+                    // java.util.ArrayList — the stamp-proven cast makes the
+                    // empty test MONOMORPHIC (ArrayList is final, isEmpty()
+                    // == (size == 0) — javap-verified) and the megamorphic
+                    // List.isEmpty() dispatch leaves the per-tick path. The
+                    // first fix read the size through a reflected
+                    // java.base offset and broke the tracker init — the
+                    // cast rides NO reflection at all.
+                    if (!((java.util.ArrayList) steps).isEmpty()) {
                         return false; // a live step: addStep would mutate — vanilla
                     }
                 } else if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
@@ -15617,7 +15616,7 @@ public final class CeHooks {
                                 // exact old shape).
                                 flf[sid * 2] = TT_OK | TT_SIT
                                         | (steps0 instanceof java.util.ArrayList
-                                           && O_AL_SIZE >= 0 ? TT_SITAL : 0L)
+                                           ? TT_SITAL : 0L)
                                         | (ubsEmpty(ent) ? TT_UBS : 0);
                             }
                             ttlFill++;
@@ -15734,7 +15733,7 @@ public final class CeHooks {
                                 flf[m * 2] = TT_OK | TT_SIT
                                         | (U.getObject(interp, O_SIT_STEPS)
                                            instanceof java.util.ArrayList
-                                           && O_AL_SIZE >= 0 ? TT_SITAL : 0L);
+                                           ? TT_SITAL : 0L);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {
