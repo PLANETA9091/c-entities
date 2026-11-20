@@ -32,6 +32,11 @@ const LEVEL_CLASS: &str = "net/minecraft/world/level/Level";
 const ENTITY_CLASS: &str = "net/minecraft/world/entity/Entity";
 const LOOKUP_CLASS: &str = "ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup";
 const ITEM_ENTITY_CLASS: &str = "net/minecraft/world/entity/item/ItemEntity";
+/// L186 AP-FD mirror: the Bukkit wrapper — its setFallDistance writes the
+/// Entity.fallDistance field directly (the whole-jar putfield audit named
+/// CraftEntity alongside ItemEntity itself); the probe invalidates the
+/// mirror slot.
+const CRAFT_ENTITY_CLASS: &str = "org/bukkit/craftbukkit/entity/CraftEntity";
 const SERVER_LEVEL_CLASS: &str = "net/minecraft/server/level/ServerLevel";
 const LIVING_ENTITY_CLASS: &str = "net/minecraft/world/entity/LivingEntity";
 const SERVER_ENTITY_CLASS: &str = "net/minecraft/server/level/ServerEntity";
@@ -502,6 +507,7 @@ pub unsafe extern "C" fn cplugin_init(
 
     // Byte hooks fire at class load AND at our own retransform passes.
     cplug_sdk::hooks::register_bytes(LEVEL_CLASS, |_n, b| patch_level(b));
+    cplug_sdk::hooks::register_bytes(CRAFT_ENTITY_CLASS, |_n, b| patch_craft_entity(b));
     cplug_sdk::hooks::register_bytes(ENTITY_CLASS, |_n, b| patch_entity(b));
     cplug_sdk::hooks::register_bytes(LOOKUP_CLASS, |_n, b| patch_lookup(b));
     cplug_sdk::hooks::register_bytes(CHUNK_SLICES_CLASS, |_n, b| patch_chunk_slices(b));
@@ -793,6 +799,7 @@ fn arm_module() {
     precompute_level(loader);
     force_init_item_entity_raw(loader);
     precompute_item(loader);
+    precompute_craft_entity(loader);
     precompute_serverlevel(loader);
     precompute_livingentity(loader);
     precompute_serverentity(loader);
@@ -4859,6 +4866,104 @@ fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// L186 AP-FD mirror: the CraftEntity.setFallDistance prefix probe — the
+/// Bukkit API's only fallDistance writer (it putfields the Entity field
+/// directly, f2d-widened). The probe invalidates the dense slot mirror so
+/// the next apply re-reads the real field. A weave refusal disarms the
+/// mirror via fdMirrorScheme(0) — the apply returns to the exact field
+/// read; a missed invalidation can never skip a needed write.
+fn patch_craft_entity(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_craft_entity_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_craft_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(CRAFT_ENTITY_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(CRAFT_ENTITY_CLASS).cloned();
+    match pre {
+        Some(b) if !b.is_empty() => {
+            match patch::insert_static_call_at_start(
+                b.clone(),
+                "setFallDistance",
+                "(F)V",
+                HOOKS_CLASS,
+                "probeFallDistWrite",
+                "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
+                &[(0, b'L')],
+            ) {
+                Ok(b2) => {
+                    PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+                    cplug_sdk::log::info(
+                        "[c-entities] patched CraftEntity.setFallDistance probe",
+                    );
+                    Some(b2)
+                }
+                Err(e) => {
+                    PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                    set_java_int("fdMirrorScheme", 0);
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] CraftEntity.setFallDistance probe refused: {e} — fd mirror disarmed"
+                    ));
+                    Some(b)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Deferred weave: the CraftEntity class loads with the FIRST entity wrap
+/// (usually BEFORE the arm) — the boot hook stashed the bytes; precompute
+/// the probe from the stash and let the verifier retransform afterwards.
+fn precompute_craft_entity(loader: jni::jobject) {
+    let Some(bytes) = STASH
+        .lock()
+        .ok()
+        .and_then(|mut s| s.remove(CRAFT_ENTITY_CLASS))
+    else {
+        cplug_sdk::log::info(
+            "[c-entities] CraftEntity bytes not seen at boot — fd mirror disarmed",
+        );
+        let _ = set_java_int("fdMirrorScheme", 0);
+        return;
+    };
+    let patched = cplug_sdk::jni_util::with_attached(|env| {
+        patch::insert_static_call_at_start(
+            bytes,
+            "setFallDistance",
+            "(F)V",
+            HOOKS_CLASS,
+            "probeFallDistWrite",
+            "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
+            &[(0, b'L')],
+        )
+    });
+    match patched {
+        Some(Ok(b)) if !b.is_empty() => {
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CRAFT_ENTITY_CLASS, b);
+            }
+            cplug_sdk::log::info(
+                "[c-entities] precomputed CraftEntity.setFallDistance probe",
+            );
+        }
+        _ => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            let _ = set_java_int("fdMirrorScheme", 0);
+            cplug_sdk::log::info(
+                "[c-entities] CraftEntity probe precompute refused — fd mirror disarmed",
+            );
+        }
+    }
+    let _ = loader;
 }
 
 /// L2a wake probes: EVERY gameplay block write funnels through

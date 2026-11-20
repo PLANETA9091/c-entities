@@ -1122,6 +1122,35 @@ public final class CeHooks {
     private static final byte[] AP_GROUND =
             AP_GROUND_ON ? new byte[SLOT_CAP] : null;
 
+    /** L186 AP-FD MIRROR: the flush apply's fallDistance same-value skip
+     *  read e.fallDistance per item per tick (the field went DOUBLE in
+     *  26.3 — CraftEntity.setFallDistance f2d-widens into it). The
+     *  "current" side rides a dense slot float: NaN = not yet mirrored
+     *  (the FIRST apply reads the real field once — the pre-wire value is
+     *  honored at full double precision), afterwards OUR setFallDist
+     *  writeback is the field's only writer for a dispatch-owned item
+     *  (the vanilla movement is suppressed by the tick guard; the fall
+     *  handling runs inside it) — EXCEPT the Bukkit API: CraftEntity.
+     *  setFallDistance writes the field directly, so its woven probe
+     *  invalidates the mirror slot (a probe refusal disarms the mirror
+     *  via fdMirrorScheme(0) — the apply returns to the exact field
+     *  read). centities.apFd=false keeps the mirror unwoven. */
+    private static final boolean AP_FD_ON =
+            !"false".equals(System.getProperty("centities.apFd", "true"));
+    private static final float[] AP_FD = fillFd();
+    public static volatile int FD_MIRROR_ARM = 1;
+
+    private static float[] fillFd() {
+        if (!AP_FD_ON) return null;
+        float[] a = new float[SLOT_CAP];
+        java.util.Arrays.fill(a, Float.NaN);
+        return a;
+    }
+
+    public static void fdMirrorScheme(int v) {
+        FD_MIRROR_ARM = v;
+    }
+
     private static net.minecraft.world.item.ItemStack stackFast(ItemEntity e) {
         if (IDX_ITEM < 0 || O_ED < 0) return null;
         if (SF_DI != null) {
@@ -6206,16 +6235,14 @@ public final class CeHooks {
                             IB_I[k * 4 + 2] = pd;
                         }
                     }
-                    long at = e.activatedTick;
-                    int a0 = (int) at, a1 = (int) (at >> 32);
-                    int af = (e.isTemporarilyActive ? 1 : 0)
-                            | (e.defaultActivationState ? 2 : 0);
-                    if (IB_ATI[k * 3] != a0 || IB_ATI[k * 3 + 1] != a1
-                            || IB_ATI[k * 3 + 2] != af) {
-                        IB_ATI[k * 3] = a0;
-                        IB_ATI[k * 3 + 1] = a1;
-                        IB_ATI[k * 3 + 2] = af;
-                    }
+                    // L186: the IB_ATI refresh is GONE — the audit says it
+                    // was a dead write: neither the kernel bridge (the JNI
+                    // get_*_array_region list: batch ids/flags/I/sy/seq —
+                    // no ATI) nor any Java reader consumes the quad; the
+                    // activation verdict rides the stamp's top bit (the
+                    // i0-a arm) and the IF_INACTIVE flag. The per-item
+                    // per-tick cost was the e.activatedTick read + two
+                    // flag reads + three compare-set writes — for nothing.
                 } else {
                     appendDispatch(e, act, eid);
                 }
@@ -6679,6 +6706,29 @@ public final class CeHooks {
                 // the belt is an optimization only
             }
         }
+    }
+
+    /** L186: woven prefix probe on CraftEntity.setFallDistance — the ONLY
+     *  non-module writer of Entity.fallDistance for a dispatch-owned item
+     *  (the Bukkit API writes the field directly, f2d-widened into the
+     *  double field). Invalidates the AP-FD mirror slot so the next apply
+     *  re-reads the real field. Pure cache write: no state change. */
+    public static void probeFallDistWrite(
+            org.bukkit.craftbukkit.entity.CraftEntity ce) {
+        if (AP_FD != null && ACTIVE && ce != null) {
+            try {
+                AP_FD[entId(ce.getHandle()) & AMASK] = Float.NaN;
+            } catch (Throwable ignored) {
+                // the mirror is an optimization only
+            }
+        }
+    }
+
+    /** L186: the AP-FD mirror's disarm link — a probe-weave refusal calls
+     *  this (fdMirrorScheme(0)) and the apply returns to the exact field
+     *  read; a missed invalidation can never skip a needed write. */
+    public static void probeFallDistWriteDisarm() {
+        FD_MIRROR_ARM = 0;
     }
 
     /** Empty-stack parity check for the dispatch guard: cached bit when the
@@ -8697,7 +8747,17 @@ public final class CeHooks {
                     }
                 }
                 float fd = (float) outD[o + 6];
-                if (fd != e.fallDistance) { // same-value skip (resting items)
+                if (AP_FD != null && FD_MIRROR_ARM != 0) {
+                    // L186 AP-FD MIRROR: the dense slot float carries the
+                    // last writeback; NaN = the first apply reads the real
+                    // field once (the pre-wire double honored exactly).
+                    float m = AP_FD[idSlot];
+                    double cur = Float.isNaN(m) ? e.fallDistance : (double) m;
+                    if (fd != cur) {
+                        setFallDist(e, fd);
+                        AP_FD[idSlot] = fd;
+                    }
+                } else if (fd != e.fallDistance) { // same-value skip (resting items)
                     setFallDist(e, fd);
                 }
                 boolean wantGround = (bits & (1 << 1)) != 0;
