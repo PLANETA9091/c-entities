@@ -2083,3 +2083,44 @@ collapse (caught by the ON-leg read), the L185 no-reflection hotfix
   is the section-crossing add/remove churn), the same population the
   OFF leg walks — a both-leg cost the ratio barely rewards, and the
   class-rewrite platform work it needs is priced at several flights.
+
+---
+Task ID: 29 addendum 2 — the L185 verdict (the hotfix holds, the stack lands)
+
+- The L185 gate flight (7ecb4fc = L182+L183(fixed)+L184, run 44789470740,
+  PASS, the hooks@ lastErr clean on every telemetry line — the
+  tracker-init collapse is gone):
+  scenario         med-off   med-on   ratio
+  items-100k       120.94    28.95    0.239
+  mobs-25k         738.38   485.83    0.658
+  mixed-150k       3144.18    99.60   0.032
+  spread-100k      544.32    82.32    0.151
+  mobs-despawn-10k 104.00    14.68    0.141
+  This flight ran on the SLOW runner shape (every OFF leg scaled
+  +25-30% vs the L182 flight: items 92.94 -> 120.94, spread 456 ->
+  544, despawn 81 -> 104) and the ON legs scaled WITH it — the
+  ratios held where the stack made real work disappear: items-100k
+  0.239 (the L182 memo + the L183/L184 diets vs 0.241 on the fast
+  shape), mixed 0.032, spread 0.151 (vs 0.140 fast-shape), despawn
+  0.141. The diet stack's wins are shape-stable; the contested rows
+  (spread/despawn) sit at the honest -85..-88%, their ratio reads
+  riding the runner-shape denominator exactly as the 3-rep lesson
+  predicted.
+- The batch lineage this addendum certifies as CI-verified (parity
+  12/12 bit-identical + a PASS gate + a clean lastErr):
+  L182 (0faa016) slot-cap diet + canHold content-key memo + plain
+  syncVelocity + tick-snapshot mirror arm + rowQuery pre-size 64;
+  L183/L185 (e0c22dc + 7ecb4fc) SITAL monomorphic cast (no
+  reflection) + SF DataItem slot-cache + &3 cadence; L184 (578d258)
+  PD dirty-gated row refresh (the four probed setters) + AP-GROUND
+  slot mirror. The gate gained the ON-INIT-FAIL health check (67285e3)
+  — an ON leg's lastErr=init* signature now fails the verdict
+  outright, so the L183 collapse class can never ride a PASS again.
+- NEXT: the profile flights on 7ecb4fc name the post-diet walls; the
+  design queue stands at (a) the fallDistance slot mirror (the
+  CraftEntity.setFallDistance probe closes the net — the field went
+  double in 26.3, the first-apply compare rides the real field once),
+  (b) the native-walk roster (the kernel reads TL_MIRROR_IDS + the
+  stamp arrays, computes the verdict array; the Java walk consults
+  one dense byte per visit), (c) the moonrise BasicEntityList churn
+  (deferred — a both-leg cost the ratio barely rewards).
