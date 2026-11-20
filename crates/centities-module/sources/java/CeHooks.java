@@ -1016,7 +1016,14 @@ public final class CeHooks {
         e.tickCount = e.tickCount + 1;
         e.totalEntityAge = e.totalEntityAge + 1;
         e.age = e.age + 1;
-        if (((e.tickCount + eid) % 4) == 0 && QUIET_FR != null
+        // L183: % 4 -> & 3 — bit-identical for the non-negative operands
+        // (tickCount starts at 0 and only grows; entity ids are positive —
+        // the remainder of a non-negative int by a power of two IS the
+        // masked low bits), but the JIT cannot prove the SUM non-negative
+        // across the field load + the belt read and kept the IDIV. The
+        // clause runs per quiet item per tick (quietFuseBump 2.5% of the
+        // spread-100k ON profile).
+        if (((e.tickCount + eid) & 3) == 0 && QUIET_FR != null
                 && O_ENT_DELTA > 0 && U != null) {
             float qf = QUIET_FR[q];
             if (qf != 1.0f) {
@@ -1054,15 +1061,49 @@ public final class CeHooks {
      *  [IDX_ITEM].value) — the same chain isMergableMirror uses, minus the
      *  isMergable verdict. Returns null when the data is not ready or the
      *  offsets are unresolved; a null means "skip the pre-gate, pay the
-     *  exact vanilla chain" (belt parity, never a wrong verdict). */
+     *  exact vanilla chain" (belt parity, never a wrong verdict).
+     *  L183 SF SLOT-CACHE: the chain's first two hops are PROVEN stable
+     *  per entity lifetime (the paper-26.3 bytecode audit: SynchedEntityData
+     *  writes itemsById ONLY in <init>, and assignValue's array fill runs
+     *  in the ctor — no post-ctor aastore can rebind the IDX_ITEM slot), so
+     *  the DataItem ref rides one slot-keyed Object[] keyed by the
+     *  ARENA_ID full-id belt (ids are monotonic per run; the belt is
+     *  cleared at remove — the same license ARENA_ID itself carries). The
+     *  hit path is 2 flat-array reads + the live value read (the VALUE is
+     *  the only mutable state and is read fresh per call); the miss path
+     *  is the exact old chain. ARENA_ID[slot] != eid (a non-ARENA item or
+     *  an unclassified id) takes the old chain — correct, just uncached.
+     *  centities.sfCache=false nulls SF_DI and restores the raw chain. */
+    private static final boolean SF_CACHE_ON =
+            !"false".equals(System.getProperty("centities.sfCache", "true"));
+    private static final Object[] SF_DI =
+            SF_CACHE_ON ? new Object[SLOT_CAP] : null;
+
     private static net.minecraft.world.item.ItemStack stackFast(ItemEntity e) {
         if (IDX_ITEM < 0 || O_ED < 0) return null;
+        if (SF_DI != null) {
+            int eid = entId(e);
+            int slot = eid & AMASK;
+            if (ARENA_ID[slot] == eid) {
+                Object di0 = SF_DI[slot];
+                if (di0 == null) return null; // belt hit + not-ready data
+                Object st0 = U.getObject(di0, O_DI_VALUE);
+                return st0 instanceof net.minecraft.world.item.ItemStack s0
+                        ? s0 : null;
+            }
+        }
         Object ed = U.getObject(e, O_ED);
         if (ed == null) return null;
         Object[] items = (Object[]) U.getObject(ed, O_ED_ITEMS);
         if (items == null || IDX_ITEM >= items.length) return null;
         Object di = items[IDX_ITEM];
         if (di == null) return null;
+        if (SF_DI != null) {
+            int eid = entId(e);
+            if (eid != 0 && ARENA_ID[eid & AMASK] == eid) {
+                SF_DI[eid & AMASK] = di;
+            }
+        }
         Object st = U.getObject(di, O_DI_VALUE);
         return st instanceof net.minecraft.world.item.ItemStack s ? s : null;
     }
@@ -6315,7 +6356,9 @@ public final class CeHooks {
         // items-340 family was born (PTRACE item 2: vy -0.04 -> -0.08 at
         // t=340; the settle 343 vs vanilla 342; tc bit-identical). L52.
         int tc = e.tickCount + (preIncrement ? 1 : 0);
-        if ((tc + entId(e)) % 4 == 0) return true;
+        // L183: % 4 == & 3 for the non-negative operands (tc = tickCount,
+        // ids positive) — same license as quietFuseBump above.
+        if (((tc + entId(e)) & 3) == 0) return true;
         if (e.defaultActivationState) return true;
         if (tc < 200) return true; // isAlive(): isRemoved gated above
         long cur = net.minecraft.server.MinecraftServer.currentTick;
@@ -7850,7 +7893,9 @@ public final class CeHooks {
                 // cache. ARENA_ID carries the true entity id (the gate's
                 // getId() term) without an extra Unsafe read.
                 float qf = QUIET_FR != null ? QUIET_FR[slot] : 1.0f;
-                if (qf != 1.0f && ((e.tickCount + ARENA_ID[slot]) % 4) == 0
+                // L183: % 4 == & 3 for the non-negative operands (the
+                // quietFuseBump license).
+                if (qf != 1.0f && ((e.tickCount + ARENA_ID[slot]) & 3) == 0
                         && O_ENT_DELTA > 0 && U != null) {
                     Object dv = U.getObject(e, O_ENT_DELTA);
                     if (dv instanceof net.minecraft.world.phys.Vec3 v3) {
@@ -14449,6 +14494,16 @@ public final class CeHooks {
     // port already relies on) — the per-tick virtual call is skipped. Any
     // subclass override clears the proof (the full path keeps the call).
     private static final long TT_UBS = 4L;
+    // L183 SITAL: the row's fill-cached steps list was PROVEN a
+    // java.util.ArrayList at fill time — the per-tick empty test reads its
+    // size field through the cached O_AL_SIZE offset (one plain int read)
+    // instead of the instanceof + List.isEmpty() virtual dispatch (the
+    // spread-100k ON profile pinned 3.66% self on that single line: a
+    // megamorphic receiver per tracked row per tick). The stamp is set at
+    // BOTH fill sites; TTL_HANDLES_OK / O_AL_SIZE < 0 rows never carry it
+    // and keep the exact old shape.
+    private static final long TT_SITAL = 8L;
+    private static long O_AL_SIZE = -1;
     private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>
             UBS_PROOF = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -14585,6 +14640,11 @@ public final class CeHooks {
             Class<?> sit = Class.forName(
                     "net.minecraft.world.entity.SteppedInterpolationTracker");
             VH_SIT_STEPS = new RefField(sit, "trackedSteps");
+            // L183: the ArrayList size-field offset for the SITAL rows —
+            // resolved once; the read is the live `size` int (isEmpty() ==
+            // (size == 0) for ArrayList: size != 0 can never be empty, and
+            // size == 0 with capacity-only backing is empty — javap-trivial).
+            O_AL_SIZE = offOf(java.util.ArrayList.class, "size");
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
@@ -15124,7 +15184,17 @@ public final class CeHooks {
                     return false; // L67: the type was fill-proven
                 }
                 Object steps = rf[ob + 4];
-                if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
+                if ((sh & TT_SITAL) != 0) {
+                    // L183: the fill proved the steps list is a
+                    // java.util.ArrayList and cached its size offset — one
+                    // plain int read replaces the per-tick instanceof + the
+                    // List.isEmpty() virtual dispatch (3.66% self on the
+                    // spread-100k ON profile; isEmpty() == (size == 0) for
+                    // ArrayList — size != 0 can never be empty).
+                    if (U.getInt(steps, O_AL_SIZE) != 0) {
+                        return false; // a live step: addStep would mutate — vanilla
+                    }
+                } else if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
                     return false; // a live step: addStep would mutate — vanilla
                 }
                 if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
@@ -15446,8 +15516,18 @@ public final class CeHooks {
                                     && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
                                     && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
                                 rff[ob + 3] = interp;
-                                rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
+                                Object steps0 = U.getObject(interp, O_SIT_STEPS);
+                                rff[ob + 4] = steps0;
+                                // L183 SITAL stamp: the fill-proven ArrayList
+                                // class takes the size-offset read per tick
+                                // (the List.isEmpty() virtual was 3.66% self
+                                // on the spread-100k ON profile — a
+                                // megamorphic dispatch per tracked row per
+                                // tick; the non-ArrayList rows keep the
+                                // exact old shape).
                                 flf[sid * 2] = TT_OK | TT_SIT
+                                        | (steps0 instanceof java.util.ArrayList
+                                           && O_AL_SIZE >= 0 ? TT_SITAL : 0L)
                                         | (ubsEmpty(ent) ? TT_UBS : 0);
                             }
                             ttlFill++;
@@ -15561,7 +15641,10 @@ public final class CeHooks {
                                     && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
                                 rff[ob + 3] = interp;
                                 rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
-                                flf[m * 2] = TT_OK | TT_SIT;
+                                flf[m * 2] = TT_OK | TT_SIT
+                                        | (U.getObject(interp, O_SIT_STEPS)
+                                           instanceof java.util.ArrayList
+                                           && O_AL_SIZE >= 0 ? TT_SITAL : 0L);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {
