@@ -1079,6 +1079,49 @@ public final class CeHooks {
     private static final Object[] SF_DI =
             SF_CACHE_ON ? new Object[SLOT_CAP] : null;
 
+    /** L184 PD-DIRTY BELT: the dispatch row's pickupDelay mirrors the
+     *  field's last-known value; the invariant (row == field while the bit
+     *  is clear) holds because EVERY pickupDelay write to a row-holding
+     *  item sets the bit — the flush writeback (both arms, the only
+     *  in-module writer) and the four PROBED setters (setPickUpDelay /
+     *  setDefaultPickUpDelay / setNoPickUpDelay / setNeverPickUp — the
+     *  complete putfield audit of the paper-26.3 jar: ItemEntity and
+     *  CraftItem are the only classes referencing the field, and CraftItem
+     *  delegates to setPickUpDelay). Vanilla never touches the field
+     *  between applies (the native tick is suppressed; the decrement rides
+     *  the kernel's port), so a clean bit lets the i0-a2 row refresh skip
+     *  the per-item field read entirely (~60k scattered entity-header
+     *  reads per tick on the 100k legs). A probe-weave refusal disarms the
+     *  belt via pdDirtyScheme(0) — the refresh returns to the exact
+     *  unconditional shape. centities.pdDirty=false keeps the belt
+     *  unwoven from the start. */
+    private static final boolean PD_DIRTY_ON =
+            !"false".equals(System.getProperty("centities.pdDirty", "true"));
+    private static final byte[] PD_DIRTY =
+            PD_DIRTY_ON ? new byte[SLOT_CAP] : null;
+    public static volatile int PD_DIRTY_ARM = 1;
+
+    public static void pdDirtyScheme(int v) {
+        PD_DIRTY_ARM = v;
+    }
+
+    /** L184 AP-GROUND MIRROR: the flush apply's onGround same-value skip
+     *  compares the kernel's verdict against the entity field — an entity-
+     *  header read per item per tick (a DRAM hop on a scattered object;
+     *  the fresh profile pins 1.80% self on the spread-100k ON leg). The
+     *  "current" side rides a dense slot byte instead: 0 = not yet
+     *  mirrored (the FIRST apply initializes it from the field once —
+     *  the pre-wire value is honored), 1 = false, 2 = true. Afterwards
+     *  OUR writeback is the field's only writer for a dispatch-owned
+     *  item: the vanilla movement is suppressed (the tick guard), the
+     *  push wire touches delta only, and neither the Bukkit Item API nor
+     *  any vanilla path writes onGround outside move(). centities.apGround
+     *  =false restores the field read. */
+    private static final boolean AP_GROUND_ON =
+            !"false".equals(System.getProperty("centities.apGround", "true"));
+    private static final byte[] AP_GROUND =
+            AP_GROUND_ON ? new byte[SLOT_CAP] : null;
+
     private static net.minecraft.world.item.ItemStack stackFast(ItemEntity e) {
         if (IDX_ITEM < 0 || O_ED < 0) return null;
         if (SF_DI != null) {
@@ -6150,9 +6193,18 @@ public final class CeHooks {
                     if (IB_FLAGS[k] != wantF) {
                         IB_FLAGS[k] = wantF;
                     }
-                    int pd = e.pickupDelay;
-                    if (IB_I[k * 4 + 2] != pd) {
-                        IB_I[k * 4 + 2] = pd;
+                    if (PD_DIRTY != null && PD_DIRTY_ARM != 0
+                            && PD_DIRTY[slot] != 0) {
+                        // L184: the dirty-gated pickupDelay refresh — the
+                        // bit's owner is any post-refresh field write (the
+                        // writeback + the probed setters; see the belt
+                        // javadoc). A clean bit skips the field read — the
+                        // row already mirrors the field exactly.
+                        PD_DIRTY[slot] = 0;
+                        int pd = e.pickupDelay;
+                        if (IB_I[k * 4 + 2] != pd) {
+                            IB_I[k * 4 + 2] = pd;
+                        }
                     }
                     long at = e.activatedTick;
                     int a0 = (int) at, a1 = (int) (at >> 32);
@@ -6610,6 +6662,22 @@ public final class CeHooks {
         } catch (Throwable ignored) {
             // cache is an optimization only; the dispatch falls back to the
             // synched read for unseen slots
+        }
+    }
+
+    /** L184: woven prefix probe on EVERY ItemEntity pickupDelay setter
+     *  (setPickUpDelay / setDefaultPickUpDelay / setNoPickUpDelay /
+     *  setNeverPickUp) — any external write trips the row-refresh dirty
+     *  bit so the next dispatch re-reads the field into the row. Pure
+     *  cache write: no state change, no parity effect. */
+    public static void probePickupDelayWrite(
+            net.minecraft.world.entity.item.ItemEntity e) {
+        if (PD_DIRTY != null && ACTIVE && e != null) {
+            try {
+                PD_DIRTY[entId(e) & AMASK] = 1;
+            } catch (Throwable ignored) {
+                // the belt is an optimization only
+            }
         }
     }
 
@@ -8542,6 +8610,9 @@ public final class CeHooks {
                     int pd = outI[i * 4 + 1];
                     if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                         e.pickupDelay = pd;
+                        if (PD_DIRTY != null) {
+                            PD_DIRTY[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] = 1;
+                        }
                     }
                     if ((bits & (1 << 7)) != 0) {
                         int rate = VH_DESPAWN_RATE.getInt(e);
@@ -8621,13 +8692,32 @@ public final class CeHooks {
                 int pd = outI[i * 4 + 1];
                 if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                     e.pickupDelay = pd;
+                    if (PD_DIRTY != null) {
+                        PD_DIRTY[idSlot] = 1; // L184: the row refresh reads it back next dispatch
+                    }
                 }
                 float fd = (float) outD[o + 6];
                 if (fd != e.fallDistance) { // same-value skip (resting items)
                     setFallDist(e, fd);
                 }
                 boolean wantGround = (bits & (1 << 1)) != 0;
-                if (wantGround != e.onGround()) {
+                if (AP_GROUND != null) {
+                    // L184 AP-GROUND MIRROR: the "current" side rides the
+                    // dense slot byte (the license at the declaration) — the
+                    // entity-header read leaves the hot path.
+                    int g = AP_GROUND[idSlot];
+                    boolean cur;
+                    if (g == 0) {
+                        cur = e.onGround; // first apply: mirror the pre-wire truth once
+                        AP_GROUND[idSlot] = cur ? (byte) 2 : (byte) 1;
+                    } else {
+                        cur = g == 2;
+                    }
+                    if (wantGround != cur) {
+                        e.onGround = wantGround;
+                        AP_GROUND[idSlot] = wantGround ? (byte) 2 : (byte) 1;
+                    }
+                } else if (wantGround != e.onGround()) {
                     e.onGround = wantGround;
                 }
                 if ((bits & 1) != 0) { // MOVED

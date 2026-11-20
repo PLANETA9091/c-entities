@@ -4807,11 +4807,51 @@ fn patch_item_inner(bytes: &[u8]) -> Option<Vec<u8>> {
                     return None;
                 }
             };
+            // L184 PD-DIRTY BELT probes: EVERY ItemEntity pickupDelay setter
+            // (the javap putfield audit of the paper-26.3 jar lists exactly
+            // these four methods; CraftItem's Bukkit setter delegates to
+            // setPickUpDelay, so the net covers the whole API surface) trips
+            // CeHooks.probePickupDelayWrite — the belt lets the i0-a2 row
+            // refresh skip the per-item field read. A REFUSAL here must NOT
+            // kill the tick guard (the belt is optional): disarm the Java
+            // gate via pdDirtyScheme(0) and keep weaving — the row refresh
+            // returns to the exact unconditional read.
+            let mut belt_bytes = pre3;
+            let mut belt_ok = true;
+            for (mname, mdesc) in [
+                ("setDefaultPickUpDelay", "()V"),
+                ("setNoPickUpDelay", "()V"),
+                ("setNeverPickUp", "()V"),
+                ("setPickUpDelay", "(I)V"),
+            ] {
+                match patch::insert_static_call_at_start(
+                    belt_bytes.clone(),
+                    mname,
+                    mdesc,
+                    HOOKS_CLASS,
+                    "probePickupDelayWrite",
+                    "(Lnet/minecraft/world/entity/item/ItemEntity;)V",
+                    &[(0, b'L')],
+                ) {
+                    Ok(b) => belt_bytes = b,
+                    Err(e) => {
+                        belt_ok = false;
+                        PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                        cplug_sdk::log::info(&format!(
+                            "[c-entities] ItemEntity.{mname} probe refused: {e} — pd belt disarmed"
+                        ));
+                        break;
+                    }
+                }
+            }
+            if !belt_ok {
+                set_java_int("pdDirtyScheme", 0);
+            }
             PATCHES_OK.fetch_add(1, Ordering::AcqRel);
             cplug_sdk::log::info(
-                "[c-entities] patched ItemEntity.tick guard + hurt/setItem probes",
+                "[c-entities] patched ItemEntity.tick guard + hurt/setItem/pickupDelay probes",
             );
-            Some(pre3)
+            Some(belt_bytes)
         }
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
