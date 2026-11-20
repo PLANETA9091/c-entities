@@ -228,10 +228,21 @@ public final class CeHooks {
     // ------------------------------------------------------------------
     public static final boolean REST_ON =
             !"false".equals(System.getProperty("centities.rest", "true"));
-    // Sized to the ARENA (1 << 22) — declared with a literal because static
+    // L182 SLOT-CAP DIET: every id&mask-keyed slot array was sized 1 << 22
+    // (4,194,304 slots — a 4M-entity id-lifetime) while the heaviest scenario
+    // indexes ~150k entities: ~756MB of live zero-initialized statics (TT_REF
+    // alone 160MB, VEC_CACHE 64MB, the pushcore box mirror 192MB natively) of
+    // which >97% is dead weight the GC root scan, the RSS and the TLB pay for
+    // every cycle (the items-100k ON profile's alloc histogram: 448MB in the
+    // 64/256MB buckets, the heap floor 1.8GB). 1 << 20 keeps a 6.6x headroom
+    // over the 150k-entity worst case; the wrap-collision exactness is the
+    // EXISTING full-id validation (ARENA_ID / DISP_ID / FAST_STAMP / REST_ID /
+    // the pushcore key==id) plus the probeAdd fresh-slot wipes (L161a).
+    public static final int SLOT_CAP = 1 << 20;
+    // Sized to the ARENA — declared with SLOT_CAP because static
     // initializers run in declaration order and ARENA is declared below.
-    public static final int[] REST_SLOT = new int[1 << 22]; // packed wake slot
-    public static final int[] REST_GEN = new int[1 << 22];  // epoch+1 at rest; 0 = not resting
+    public static final int[] REST_SLOT = new int[SLOT_CAP]; // packed wake slot
+    public static final int[] REST_GEN = new int[SLOT_CAP];  // epoch+1 at rest; 0 = not resting
     public static final int[] WAKE_EPOCH = new int[1 << 19];     // [wid:3][cx:8][cz:8]
     // Churn backoff (paired-CI spread): items near wandering zombies get
     // woken before their next tick FOREVER — marking them cost 19.5M useless
@@ -239,7 +250,7 @@ public final class CeHooks {
     // stayed 0. The wake probes count per-id wakes; a churny item stops
     // being marked, and each clean full tick decays the counter (the zone
     // heals when the pusher leaves).
-    public static final int[] REST_CHURN = new int[1 << 22];
+    public static final int[] REST_CHURN = new int[SLOT_CAP];
     public static volatile long restFast = 0, restMarks = 0, restWakes = 0;
     // Wake-source attribution (which probe cleared a resting item).
     public static volatile long wakesDelta = 0, wakesBox = 0, wakesSelf = 0;
@@ -786,23 +797,32 @@ public final class CeHooks {
         int ccount = stack.getCount();
         for (int s = 0; s < 2; s++) {
             if (CH_INV[s] != inv || CH_INV_MAX[s] != invMax || CH_SLOTN[s] != n) continue;
-            if (CH_CAND_ITEM[s] != ci || CH_CAND_COMPS[s] != cc
-                    || CH_CAND_PATCH[s] != cp || CH_CAND_COUNT[s] != ccount) continue;
+            // L182 CONTENT KEY: the candidate identity rides (item, patch,
+            // count) — the components CONTENT is a pure function of the
+            // item's prototype + the patch map (both immutable), so two
+            // content-identical stacks share one verdict. The old
+            // per-instance CH_CAND_COMPS compare turned the 2-way memo into
+            // a thrash against the bench's pickup storm: ~600 rotating
+            // ItemStack instances of stone-1 around the AFK bot meant every
+            // call a miss and a full 36-slot component walk (canHoldWalk
+            // 4.58% + getMaxStackSize 4.75% of the items-100k ON profile).
+            if (CH_CAND_ITEM[s] != ci || CH_CAND_PATCH[s] != cp
+                    || CH_CAND_COUNT[s] != ccount) continue;
             int b = s * 36;
             boolean hit = true;
-            for (int i = 0; i < n && hit; i++) {
-                if (CH_SLOT_REF[b + i] != items.get(i)) hit = false;
-            }
-            if (hit) {
-                for (int i = 0; i < n && hit; i++) {
-                    Object slot = items.get(i);
-                    net.minecraft.world.item.ItemStack is =
-                            (net.minecraft.world.item.ItemStack) slot;
-                    if (CH_SLOT_COUNT[b + i] != is.getCount()) { hit = false; break; }
-                    Object m = is.isEmpty() ? null : U.getObject(is, O_STACK_COMPONENTS);
-                    Object p = m == null ? null : U.getObject(m, O_PCM_PATCH);
-                    if (CH_SLOT_PATCH[b + i] != p) { hit = false; break; }
-                }
+            // L182: ONE fingerprint pass (the ref, the count and the patch
+            // of each slot in a single walk — the old shape iterated the
+            // slots twice: refs first, then counts+patches, doubling the
+            // hit-path loads at ~50k calls/tick).
+            for (int i = 0; i < n; i++) {
+                Object slot = items.get(i);
+                if (CH_SLOT_REF[b + i] != slot) { hit = false; break; }
+                net.minecraft.world.item.ItemStack is =
+                        (net.minecraft.world.item.ItemStack) slot;
+                if (CH_SLOT_COUNT[b + i] != is.getCount()) { hit = false; break; }
+                Object m = is.isEmpty() ? null : U.getObject(is, O_STACK_COMPONENTS);
+                Object p = m == null ? null : U.getObject(m, O_PCM_PATCH);
+                if (CH_SLOT_PATCH[b + i] != p) { hit = false; break; }
             }
             if (hit) {
                 net.minecraft.world.entity.EntityEquipment eq =
@@ -2982,7 +3002,7 @@ public final class CeHooks {
     // counter, so id & AMASK is stable for the id's whole lifetime; the
     // id-match check turns any wrapped/stale slot into a clean fallback.
     // ------------------------------------------------------------------
-    private static final Entity[] ARENA = new Entity[1 << 22];
+    private static final Entity[] ARENA = new Entity[SLOT_CAP];
     private static final int AMASK = ARENA.length - 1;
 
     // L122 WRITEBACK VEC3 CACHE: the flush apply writes the item's delta
@@ -4249,9 +4269,18 @@ public final class CeHooks {
         // 512 keeps genuinely dense cells (items-100k ~830, mobs-25k ~700)
         // on the native path while serving mid-density rows at ~10-20us.
         if (total > totalCap) { rowBig++; fastRefuse = "bigcap"; return null; }
+        // L182 PRE-SIZE CAP 64 (was min(total, totalCap)): a wide targeting
+        // scan stages ~700-2000 candidates into the backing array while the
+        // RESULT is 0-3 entries — ~5.6KB of young-gen garbage per served
+        // query x ~6.7k queries/tick on spread-100k ≈ 37MB/tick of pure
+        // churn (the GC sawtooth's spread share). Results beyond 64 grow
+        // the array logarithmically — a handful of arraycopy calls, each
+        // cheaper than the 5.6KB zeroing. The List contract is opaque
+        // (capacity is unobservable); the served contents and order are
+        // byte-identical.
         ArrayList<Entity> out = useScratch
                 ? FQ_SCRATCH
-                : new ArrayList<>(Math.min(total, totalCap));
+                : new ArrayList<>(Math.min(total, 64));
         out.clear();
         int srcId = source == null ? -1 : entId(source);
         int stale = 0;
@@ -5521,7 +5550,7 @@ public final class CeHooks {
      *  since the previous flush. MODE_REV[slot] stamps the revision that
      *  was current at the item's latest re-evaluation; a mismatch forces
      *  the expensive fresh-flag gates for that item on the next dispatch. */
-    public static final int[] MODE_REV = new int[1 << 22];
+    public static final int[] MODE_REV = new int[SLOT_CAP];
     public static volatile int WORLD_REV = 0;
     /** The applier's writeback window: setPos/setDeltaMovement fired inside
      *  the flush are OUR writes, not external mutations — the box/delta
@@ -6427,10 +6456,10 @@ public final class CeHooks {
 
     /** Woven probe (existing): extend with the L6 section invalidation. */
     // (probeWake body below appends via markSectionDirty before its wake bump)
-    private static final int[] MODE_VAL = new int[1 << 22];
-    private static final int[] MODE_GEN = new int[1 << 22];
+    private static final int[] MODE_VAL = new int[SLOT_CAP];
+    private static final int[] MODE_GEN = new int[SLOT_CAP];
     private static volatile int MODE_EPOCH = 1;
-    private static final int MAMASK = (1 << 22) - 1;
+    private static final int MAMASK = (SLOT_CAP - 1);
 
     // ---- L21 native rest ----
     // MODE_VAL == 2 means: the item's last native tick was a VALUE fixed
@@ -6441,7 +6470,7 @@ public final class CeHooks {
     // the FULL entity id the stamp was proven for: entity ids are
     // monotonic per run, so a slot-colliding successor can never inherit
     // the fixed-point proof (the ARENA ref is kept as defense in depth).
-    private static final long[] REST_ID = new long[1 << 22];
+    private static final long[] REST_ID = new long[SLOT_CAP];
     // i0-a STAY verdict (doc 62): the core's pre-decision for the NEXT
     // dispatch — (tickCount+1+id) % 4 == 0, itemCheckActive's first
     // clause, which returns TRUE with ZERO side effects (before the
@@ -6453,11 +6482,11 @@ public final class CeHooks {
     // so every wake gate stays live: an external mutation clears MODE
     // synchronously (probe box/delta), a section change makes MODE_REV
     // stale, a mode transition clears the slot in the applier.
-    private static final long[] DISP_ID = new long[1 << 22];
+    private static final long[] DISP_ID = new long[SLOT_CAP];
     // i0-a2: the verdict's decision for the stamped slot — 0 = no verdict
     // (the slot was cleared), 1 = active, 2 = inactive. The fast path
     // appends with this flag instead of running the port.
-    private static final int[] DISP_VAL = new int[1 << 22];
+    private static final int[] DISP_VAL = new int[SLOT_CAP];
     // L151: the ONE-READ fast-path stamp — folds the five-table verdict
     // tuple {DISP_ID==eid, MODE_GEN==epoch, MODE_VAL==1, MODE_REV==WORLD_REV,
     // DISP_VAL} into one 64-bit word per slot: low 32 bits = the FULL entity
@@ -6470,7 +6499,7 @@ public final class CeHooks {
     // stamp at once (stale words miss the equality and route the slow chain).
     // DISP_ID/DISP_VAL stay for the diagnostic/REST readers; the fast path
     // no longer touches them.
-    private static final long[] FAST_STAMP = new long[1 << 22];
+    private static final long[] FAST_STAMP = new long[SLOT_CAP];
     // Per-section revision stamps: the flush drain stamps every invalidated
     // section with the post-bump WORLD_REV. A rest item whose environment
     // sections were not touched by the current revision keeps resting even
@@ -6527,7 +6556,7 @@ public final class CeHooks {
     // 1 = non-empty, 2 = empty. Entity ids are globally monotonic per run,
     // and any genuinely-empty item was written empty through setItem, so a
     // probed slot cannot go stale in the empty->native direction.
-    private static final byte[] STACK_EMPTY = new byte[1 << 22];
+    private static final byte[] STACK_EMPTY = new byte[SLOT_CAP];
 
     /** Woven prefix probe on ItemEntity.setItem — refreshes the dispatch
      *  cache. Pure cache write: no mode changes, no wake, no state. */
@@ -9639,7 +9668,7 @@ public final class CeHooks {
     private static volatile long[] TL_MIRROR_ALIVE = new long[1 << 12];
     /** id&AMASK -> mirror index + 1 (0 = not mirrored); the TL add no-ops
      *  on an existing member (putIfAbsent), the mirror matches. */
-    private static final int[] TL_MPOS = new int[1 << 22];
+    private static final int[] TL_MPOS = new int[SLOT_CAP];
     private static volatile int TL_MIRROR_N = 0;    // live entries
     private static volatile int TL_MIRROR_LEN = 0;  // high-water mark
     private static volatile int TL_MIRROR_DEAD = 0; // dead entries since the last compaction
@@ -14360,6 +14389,15 @@ public final class CeHooks {
     private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
     private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
     private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
+    // L182: Entity.syncVelocity (volatile boolean) — the tracker's cached
+    // path read it through the volatile field every tracked entity every
+    // tick: 3.66% of the spread ON leg (the acquire barrier the JIT cannot
+    // hoist across the flat-mirror RMW). The plain-Unsafe pair below keeps
+    // the value exact: the tracker loop and every writer (markHurt, the
+    // sync chain) run on the server thread — single-thread ownership, the
+    // established license (DL_CLIENT, the O_ENT_DELTA plain put). A missed
+    // offset routes the volatile field shape.
+    private static long O_ENT_SYNC_VEL = -1;          // Entity.syncVelocity (boolean)
     // L151: the exact sendChanges fast-exit shape's offsets (see
     // initTrackerLoopHandles) — all resolved-or-(-1), gated by the flag.
     private static long O_ENT_POSITION = -1;          // Entity.position (Vec3)
@@ -14550,6 +14588,7 @@ public final class CeHooks {
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
+            O_ENT_SYNC_VEL = offOf(Entity.class, "syncVelocity");
             // L151: the exact sendChanges fast-exit shape. needsSync is a
             // PUBLIC Entity field (direct read); the rest are ServerEntity /
             // codec / data privates read through offsets.
@@ -14997,7 +15036,28 @@ public final class CeHooks {
         }
     }
 
-    private static boolean ttlCachedPath(Entity ent, int m) {
+    /** L182: the plain-Unsafe syncVelocity pair — the volatile field read
+     *  was 3.66% of the spread ON leg (an acquire barrier per tracked
+     *  entity per tick, unhoistable across the flat-mirror RMW). Value
+     *  exactness: the tracker loop and every writer (markHurt, the sync
+     *  chain) run on the server thread — single-thread ownership, the same
+     *  license the delta writeback and DL_CLIENT already carry.
+     *  O_ENT_SYNC_VEL < 0 routes the volatile field shape. */
+    private static boolean syncVelRead(Entity ent) {
+        return O_ENT_SYNC_VEL >= 0 && U != null
+                ? U.getBoolean(ent, O_ENT_SYNC_VEL)
+                : ent.syncVelocity;
+    }
+
+    private static void syncVelClear(Entity ent) {
+        if (O_ENT_SYNC_VEL >= 0 && U != null) {
+            U.putBoolean(ent, O_ENT_SYNC_VEL, false);
+        } else {
+            ent.syncVelocity = false;
+        }
+    }
+
+    private static boolean ttlCachedPath(Entity ent, int m, boolean tm) {
         // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
         // read — the te Unsafe hop existed only to prove the slot).
         // probeRemove clears the slot unconditionally, so a removed
@@ -15021,9 +15081,10 @@ public final class CeHooks {
         // fire — TT_OK pins the fill's non-null se), and the L178 bulk arm
         // never needed it either — the load was 2.37% self-time on
         // spread-100k-mod paid by every tracked entity every tick. The
-        // volatile flag is snapshotted once (single-threaded caller — the
-        // tracker tick loop; a mid-method flip had mixed arms before).
-        final boolean tm = TT_MIRROR;
+        // volatile flag is snapshotted ONCE PER TICK by the caller (L182:
+        // the per-call volatile read was 0.55% self; the tick loop is the
+        // flag's only writer on this thread, so the per-tick value is
+        // exact).
         net.minecraft.server.level.ServerEntity serverEntity = tm
                 ? null
                 : (net.minecraft.server.level.ServerEntity) rf[ob + 1];
@@ -15039,11 +15100,11 @@ public final class CeHooks {
         // decline cannot fire here (TT_OK pins the fill, and the fill
         // stamps se BEFORE the TT_OK shape — a null se never gets TT_OK).
         if ((sh & (TT_SIT | TT_UBS)) == TT_UBS && tm) {
-            if (ent.syncVelocity) {
+            if (syncVelRead(ent)) {
                 if (ent instanceof net.minecraft.server.level.ServerPlayer) {
                     return false;
                 }
-                ent.syncVelocity = false;
+                syncVelClear(ent);
             }
             fl[lb + 1] = fl[lb + 1] + 1;
             ttlCache++;
@@ -15074,12 +15135,12 @@ public final class CeHooks {
                 U.putInt(sitObj, O_SIT_TICKS,
                         U.getInt(sitObj, O_SIT_TICKS) + 1);
             }
-            if (ent.syncVelocity) {
+            if (syncVelRead(ent)) {
                 // the L61 consumption (same shape as the fill path)
                 if (ent instanceof net.minecraft.server.level.ServerPlayer) {
                     return false;
                 }
-                ent.syncVelocity = false;
+                syncVelClear(ent);
             }
             ent.updateDataBeforeSync();
             // L70: the cached path runs ONLY while the cm is ARMED — the
@@ -15295,6 +15356,11 @@ public final class CeHooks {
             // failure routes everything conservative).
             boolean quietArm = cacheArm && TT_MIRROR && TTL_QUIET_ON
                     && ACTIVE && ITEM_TICK_ON; // L99: no applier -> no reset path -> stale bits
+            // L182: ONE volatile read per tick — the pass below (sweep or
+            // raw loop) runs on this same thread, the flag's only writer
+            // this tick is the reconcile block above, so the per-tick
+            // snapshot is exact for every ttlCachedPath call in the pass.
+            final boolean tmTick = TT_MIRROR;
             // L174: the ARENA-driven pass. Coverage = the trackers list holds
             // exactly the ARENA population (single-world, all adds probed) —
             // then the sweep rides the slot space: the quiet cohort skips on
@@ -15335,7 +15401,7 @@ public final class CeHooks {
                         }
                         continue;
                     }
-                    if (ttlCachedPath(ent, sid)) {
+                    if (ttlCachedPath(ent, sid, tmTick)) {
                         ttlFuse++;
                         continue;
                     }
@@ -15446,7 +15512,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
-                    if (ttlCachedPath(ent, m0)) {
+                    if (ttlCachedPath(ent, m0, tmTick)) {
                         ttlFuse++;
                         continue;
                     }

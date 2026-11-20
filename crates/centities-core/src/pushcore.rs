@@ -44,7 +44,15 @@ pub const PF_VEHICLE: u8 = 16;
 pub const PF_PLAYER: u8 = 32;
 pub const PF_NEEDSSYNC: u8 = 64;
 
-const PS_CAP: usize = 1 << 22;
+/// L182 SLOT-CAP DIET: was 1 << 22. The push mirror's per-slot arrays
+/// (key + box6 + px/pz + dx/dy/dz + flags + numCollisions) preallocate
+/// PS_CAP slots at new(): 4M slots = ~390MB of live native memory (the
+/// items-100k ON profile's alloc histogram: the 192MB box6 bucket alone).
+/// 1 << 20 keeps a 6.6x headroom over the 150k-entity worst case; the
+/// slot-exactness contract is unchanged — every slot stores the FULL id
+/// (key[slot] == id) and a removed entity's slot is nulled synchronously,
+/// so a wrapped/colliding successor can never inherit a push mirror row.
+const PS_CAP: usize = 1 << 20;
 const PS_MASK: usize = PS_CAP - 1;
 
 /// Vanilla constants (javap-verified, Entity.push / pushEntities).
