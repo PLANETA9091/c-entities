@@ -2124,3 +2124,67 @@ Task ID: 29 addendum 2 — the L185 verdict (the hotfix holds, the stack lands)
   stamp arrays, computes the verdict array; the Java walk consults
   one dense byte per visit), (c) the moonrise BasicEntityList churn
   (deferred — a both-leg cost the ratio barely rewards).
+
+Task ID: 29 addendum 3 — the L186 verdict (the AP-FD mirror lands) and the L187
+verdict (the TL roster — the walk consults one dense id+byte per visit)
+
+- The L186 gate flight (dc51176b = L182+L183+L184+L185+L186, run
+  44811639587, PASS, the hooks@ lastErr clean): items-100k 110.58 /
+  29.21 = 0.264, mobs-25k 812.91 / 493.23 = 0.607 (control), mixed
+  3401.93 / 101.98 = 0.030, spread 509.91 / 71.15 = 0.140, despawn
+  107.10 / 13.24 = 0.124. The L186 stand (the dead IB_ATI removal +
+  the AP-FD slot mirror) shaved the contested rows' ON legs for real
+  (spread 82.32 -> 71.15, despawn 14.68 -> 13.24 vs the L185 flight)
+  — the field went double in 26.3 and the first-apply compare now
+  rides the real fallDistance field once through the CraftEntity
+  probe net. The items-100k ON profile (the b40bf037 profile pair,
+  mean 22.09) named the post-diet walls: the moonrise BasicEntityList
+  churn (indexOf 7.1% self + has/remove callers, BOTH-leg), the
+  dispatch gate machinery (walk + itemDispatch + dispatchQuietSkip +
+  quietFuseBump ~ 15-18%, ON-side), the flush's Java side (~5%),
+  synched-data reads (~6%) — the design queue's (b) native-walk
+  roster is the biggest ON-side-only lever.
+- The L187 stand (f052d151 = +TL roster) — the first slice of (b):
+  TL_MIRROR_IDS/TL_MIRROR_TYPE stamped at the SAME membership probes
+  that maintain the mirror (add/backfill; shifted at compact, grown
+  at grow) — the EntityTickList churn is world add/remove, not
+  movement, so the stamps pay once per membership change and the
+  mirror walk's per-visit instanceof chain + entId Unsafe read become
+  ONE dense int + ONE byte load. itemDispatch split into the 1-arg
+  woven guard (signature + counter shape unchanged) / itemDispatchWalk
+  (the walk entry: the exact item prefix, the roster id rides in) /
+  itemDispatchItem (the body; the four entId(e) re-reads in the
+  rest/fresh gates ride the eid param — value-identical). The TLO
+  dual-hash now hashes the ROSTER id against the raw walk's entId —
+  a drift names itself outright and falls back to the exact chain
+  (CE_TL_ROSTER=0). quietFuseBump's tickCount/age ride locals (the
+  Unsafe loads below alias the heap and forced the field reloads).
+- The L187 verdict — parity 44883213323 GREEN (12/12 bit-identical),
+  module 44883213386 GREEN, e2e 44883213401 GREEN, gate run
+  44883260792 PASS:
+  scenario          med-off    med-on    ratio
+  items-100k          95.07     24.15    0.254
+  mobs-25k           813.35    535.77    0.659  (control)
+  mixed-150k        4234.88     84.84    0.020
+  spread-100k        507.31     62.57    0.123
+  mobs-despawn-10k   100.93     11.85    0.117  (pop delta 5 OK)
+  Cross-flight (L186 -> L187, both slow-shape OFF legs): items ON
+  29.21 -> 24.15 (-17.3%), mixed 101.98 -> 84.84 (-16.8%), spread
+  71.15 -> 62.57 (-12.1%), despawn 13.24 -> 11.85 (-10.5%). The
+  honest standings: mixed holds -98%, spread reads -87.7% (2.3pp
+  from the -90% line), despawn -88.3% (1.7pp), items -74.6% (the
+  wall: -61% of the remaining ON time must still go). The control
+  row stays 0.659 shape-stable.
+- NEXT (the design queue after the L187 slice): (b2) the kernel-side
+  roster — the walk hands the kernel the TL_MIRROR_IDS int[] (one
+  get_int_array_region per tick) plus the stamp/mode state, the
+  kernel computes the per-position verdict array and owns the batch
+  rows as Rust-internal state; the Java walk consults ONE byte per
+  visit and only the non-wired remainder reaches the vanilla accept;
+  the flush's Java side stays (the apply writes real fields). The
+  dispatch gate's remaining Java share (~10-13% after L187) leaves
+  the thread entirely. (b3) the synched-data read kill (the ~6%
+  SynchedEntityData.getItem caller attribution pending). The
+  BasicEntityList churn stays deferred (a both-leg cost the ratio
+  barely rewards — the platform-level id->index hashmap is priced
+  at several flights and rewards the OFF leg equally).
