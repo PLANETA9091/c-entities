@@ -10228,8 +10228,27 @@ public final class CeHooks {
                                     tloN++;
                                 }
                                 if (ty == 1) {
-                                    if (collect && itemDispatchWalk((ItemEntity) e, eid)) {
-                                        continue; // native flush computes this tick
+                                    if (collect) {
+                                        // L188: the L173 quiet hoist rides the
+                                        // MIRROR walk too — the retry walk has
+                                        // carried this exact shape since L173
+                                        // (the helper is idempotent: the
+                                        // dispatch keeps its own call for the
+                                        // non-walk paths). The dispatch
+                                        // prologue (dispChecks, the IB_CAP
+                                        // gate, the BATCH_POS/BATCH_GEN
+                                        // stores, the level read + the DL
+                                        // cache, the fast-stamp) never runs
+                                        // for a quiet item, and the roster id
+                                        // replaces the entId read the retry
+                                        // walk pays.
+                                        if (DS_QUIET != null && CE_QUIET_ON
+                                                && dispatchQuietSkip((ItemEntity) e, eid)) {
+                                            continue; // the quiet pass owns this item's tick
+                                        }
+                                        if (itemDispatchWalk((ItemEntity) e, eid)) {
+                                            continue; // native flush computes this tick
+                                        }
                                     }
                                 } else if (ty == 2 && mobRoute) {
                                     net.minecraft.world.entity.Mob m = (net.minecraft.world.entity.Mob) e;
@@ -14759,10 +14778,22 @@ public final class CeHooks {
      *  override declares the method outside Entity.class and keeps the
      *  call; Entity itself is javap-proven EMPTY in 26.3 (doc 63). Cached
      *  per class — the walk runs once per type, never per entity per tick. */
+    private static volatile Class<?> UBS_LAST_C;
+    private static volatile boolean UBS_LAST_V;
+
     private static boolean ubsEmpty(Entity ent) {
         Class<?> c = ent.getClass();
+        // L188: the one-entry memo — the tracker fill visits same-class
+        // runs (the items legs are one class), so the concurrent map probe
+        // rides once per class change. The verdict is immutable per class,
+        // so a racing memo write is benign (worst case: one extra probe).
+        if (c == UBS_LAST_C) return UBS_LAST_V;
         Boolean hit = UBS_PROOF.get(c);
-        if (hit != null) return hit;
+        if (hit != null) {
+            UBS_LAST_C = c;
+            UBS_LAST_V = hit;
+            return hit;
+        }
         boolean empty = false;
         try {
             for (Class<?> w = c; w != null && w != Object.class; w = w.getSuperclass()) {
@@ -14781,6 +14812,8 @@ public final class CeHooks {
             empty = false; // not proven: keep the per-tick call
         }
         UBS_PROOF.put(c, empty);
+        UBS_LAST_C = c;
+        UBS_LAST_V = empty;
         return empty;
     }
     // L92: the QUIET bitset — per mirror slot, set by the item-tick applier
