@@ -2188,3 +2188,56 @@ verdict (the TL roster — the walk consults one dense id+byte per visit)
   BasicEntityList churn stays deferred (a both-leg cost the ratio
   barely rewards — the platform-level id->index hashmap is priced
   at several flights and rewards the OFF leg equally).
+
+---
+Task ID: 29 addendum 4 — the L188 and L189 verdicts (the quiet hoist stands), the honest standings vs the -90% line
+
+- The L188 stand (4179aa27 — the L173 quiet hoist rides the MIRROR walk,
+  the ubsEmpty one-entry memo): parity 44895804293 / e2e 44895804247 /
+  module 44895804291 all GREEN, gate run 44895847392 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k          97.07    25.27   0.260
+  mobs-25k           870.87   451.73   0.519  (control)
+  mixed-150k        3607.10    76.00   0.021
+  spread-100k        494.06    60.77   0.123
+  mobs-despawn-10k   94.77    10.43   0.110  (pop delta 2 OK)
+- The L189 stand (ffb37ff7 — the walk-level client proof: ONE exact
+  isClientSide read per walk with the stamp reset at the mirror branch's
+  top, CE_WALK_LVL=0 fallback, wl/walkLvlSkips diag counters; the
+  fromWalk quiet-call skip: the dispatch's own dispatchQuietSkip call is
+  skipped on the walk route because the L188 hoist provably ran the SAME
+  idempotent helper THIS visit): parity 44899646589 / e2e 44899646682 /
+  module 44899646704 all GREEN, gate run 44899683974 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k          91.46    23.96   0.262
+  mobs-25k           879.63   400.25   0.455  (control)
+  mixed-150k        3258.77    71.26   0.022
+  spread-100k        506.79    59.28   0.117
+  mobs-despawn-10k  102.66    11.32   0.110  (pop delta 7 OK)
+- Cross-flight L187 -> L189 (ON legs, all slow-shape): items 24.15 ->
+  23.96 (-0.8%, shape-noise), mixed 84.84 -> 71.26 (-16.0%), spread
+  62.57 -> 59.28 (-5.3%), despawn 11.85 -> 11.32 (-4.5%). Both stands
+  are walk-prologue diets: they shave the per-visit frames the majority
+  quiet population pays, and the rows that walk hardest (mixed, spread)
+  moved most.
+- The ffb37ff profile flight (44899685910) ran the DEFAULT scenario
+  (mobs-25k ON, mean 469.4 mspt, 12613 samples) — the dispatch input was
+  left empty, so the post-L189 walls of the contested rows are not yet
+  named. The mobs-25k control profile's own tail: fastQuery 3.12% self,
+  AABB.intersects 2.79%, moonrise ChunkEntitySlices.getEntities 1.47%,
+  AttributeMap.getValue 1.41%, fastutil Object2ObjectOpenHashMap.get
+  1.21% — the control row has no single wall either; it is exempt.
+- Honest standings vs the -90% line (ratio <= 0.100): mixed -97.8%
+  (certified), despawn -89.0% (ON must lose 9.3% more: 11.32 -> 10.27),
+  spread -88.3% (ON must lose 14.5% more: 59.28 -> 50.68), items -73.8%
+  (ON must lose 61.8% more: 23.96 -> 9.15 — the wall stands), control
+  0.455. The despawn row is now 1.0pp from the line, spread 1.7pp.
+- NEXT: (b2) the kernel-side roster stays the biggest ON-side-only lever
+  — the walk hands the kernel the TL_MIRROR_IDS int[] (one
+  get_int_array_region per tick) plus the stamp/mode state, the kernel
+  computes the per-position verdict array and owns the batch rows as
+  Rust-internal state; the Java walk consults ONE byte per visit and
+  only the non-wired remainder reaches the vanilla accept; the
+  dispatch gate's remaining Java share (~10-13%) leaves the thread
+  entirely. The items/spread profile flights on ffb37ff are dispatched
+  with explicit scenario inputs to re-name the walls post-L189.
