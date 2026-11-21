@@ -1013,9 +1013,17 @@ public final class CeHooks {
      *  closed ticks skip the array read the sweep paid every tick. */
     private static void quietFuseBump(ItemEntity e, int q, int eid) {
         quietFuse++;
-        e.tickCount = e.tickCount + 1;
+        // L187: the counters ride locals — the Unsafe loads below (the
+        // despawn-rate field, the delta read) alias the whole heap for the
+        // JIT, so the pre-L187 shape re-loaded tickCount and age from the
+        // field after them. Each local is the just-incremented counter —
+        // the same value the field holds at every read below — so the
+        // belt and the %4 clause see identical operands.
+        int tc = e.tickCount + 1;
+        e.tickCount = tc;
         e.totalEntityAge = e.totalEntityAge + 1;
-        e.age = e.age + 1;
+        int ag = e.age + 1;
+        e.age = ag;
         // L183: % 4 -> & 3 — bit-identical for the non-negative operands
         // (tickCount starts at 0 and only grows; entity ids are positive —
         // the remainder of a non-negative int by a power of two IS the
@@ -1023,7 +1031,7 @@ public final class CeHooks {
         // across the field load + the belt read and kept the IDIV. The
         // clause runs per quiet item per tick (quietFuseBump 2.5% of the
         // spread-100k ON profile).
-        if (((e.tickCount + eid) & 3) == 0 && QUIET_FR != null
+        if (((tc + eid) & 3) == 0 && QUIET_FR != null
                 && O_ENT_DELTA > 0 && U != null) {
             float qf = QUIET_FR[q];
             if (qf != 1.0f) {
@@ -1038,7 +1046,7 @@ public final class CeHooks {
             }
         }
         if (VH_READY && O_DESPAWN_RATE >= 0
-                && e.age >= U.getInt(e, O_DESPAWN_RATE)) {
+                && ag >= U.getInt(e, O_DESPAWN_RATE)) {
             try {
                 despawnTail(e);
                 quietDespawns++;
@@ -1050,7 +1058,7 @@ public final class CeHooks {
             }
             return;
         }
-        if ((e.tickCount & 255) == 0) {
+        if ((tc & 255) == 0) {
             long[] dq0 = DS_QUIET;
             if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
             quietBelt++;
@@ -6064,22 +6072,13 @@ public final class CeHooks {
         // of the three types; the mob branch still declines non-native mobs
         // with false and never lets a Mob reach the item path (the item
         // branch is unreachable for non-items by construction).
-        ItemEntity e = null;
+        // L187: the item tail delegates to itemDispatchItem with the id
+        // read ONCE here (value-identical to the body's old read — the
+        // entity id is immutable from registration); the walk entry
+        // (itemDispatchWalk) rides the TL roster id instead of this read.
         if (ent instanceof ItemEntity ie) {
-            e = ie;
-            if (!ITEM_TICK_ON) { dispDiag(e, "off"); return false; }
-        } else {
-            if (ent instanceof net.minecraft.world.entity.decoration.ArmorStand as) {
-                return standMirror(as);
-            }
-            if (NATIVE_MOB_ON && ent instanceof net.minecraft.world.entity.Mob m) {
-                if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
-                    dispMobNative++;
-                    return true;
-                }
-                return false; // a non-native mob NEVER takes the item path
-            }
-            return false;
+            if (!ITEM_TICK_ON) { dispDiag(ie, "off"); return false; }
+            return itemDispatchItem(ie, entId(ie));
         }
         // L123 STAND MIRROR: a static marker ArmorStand's dispatch is
         // observably a no-op — the javap-anchored reduction (26.3-249):
@@ -6103,6 +6102,37 @@ public final class CeHooks {
         // the exact vanilla body; the quiet bit is cleared on the miss
         // (the L99 reset contract). CE_STAND_MIRROR=0 kills the wire.
         // (L156: the stand/mob branches live in the type dispatch above.)
+        if (ent instanceof net.minecraft.world.entity.decoration.ArmorStand as) {
+            return standMirror(as);
+        }
+        if (NATIVE_MOB_ON && ent instanceof net.minecraft.world.entity.Mob m) {
+            if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                dispMobNative++;
+                return true;
+            }
+            return false; // a non-native mob NEVER takes the item path
+        }
+        return false;
+    }
+
+    /** L187: the walk's item entry — the EXACT item-path prefix of the
+     *  1-arg guard (dispChecks, the ACTIVE gate, the ITEM_TICK_ON diag)
+     *  with the id riding the TL roster: the probe stamped entId at the
+     *  TL add, the TLO dual-hash names any drift, and the per-visit
+     *  Unsafe read leaves the walk. The entity id is immutable from
+     *  registration, so the roster value IS entId(e). */
+    private static boolean itemDispatchWalk(ItemEntity e, int eid) {
+        dispChecks++;
+        if (!ACTIVE || !cplugReady) return false;
+        if (!ITEM_TICK_ON) { dispDiag(e, "off"); return false; }
+        return itemDispatchItem(e, eid);
+    }
+
+    /** The item body — byte-identical to the pre-L187 tail of the 1-arg
+     *  guard; the eid read is hoisted to the caller (the walk passes the
+     *  roster id, the woven guard reads the field once). The L150b
+     *  single-read contract becomes the caller's single read. */
+    private static boolean itemDispatchItem(ItemEntity e, int eid) {
         if (ibN >= IB_CAP) { dispDiag(e, "cap"); return false; }
         // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
         // stamps its loop position — including the fresh-belt items that
@@ -6111,8 +6141,7 @@ public final class CeHooks {
         // L150b: ONE entity-id read per item per tick — the previous shape
         // called entId(e) three times (BATCH_POS, the slot, the fast-path
         // stamp) and appendDispatch re-read it a fourth; entId was 2.1%
-        // self in items-100k.
-        final int eid = entId(e);
+        // self in items-100k. L187: the read is the caller's eid parameter.
         // L152: BATCH_POS doubles as the cohort's row memory — the store
         // fires only on an order shift (a stable cohort keeps the value);
         // BATCH_GEN stays unconditional (the generation bumps every flush).
@@ -6251,7 +6280,7 @@ public final class CeHooks {
                 return true;
             }
             if (MODE_VAL[slot] == 2) { // L21 REST: the dispatch-owned fixed point
-                if (REST_ID[slot] != entId(e)) {
+                if (REST_ID[slot] != eid) { // L187: value-identical (eid IS entId(e))
                     // slot turnover: entity ids are monotonic per run, so a
                     // mismatched stamp belongs to a dead predecessor
                     MODE_VAL[slot] = 0;
@@ -6260,11 +6289,11 @@ public final class CeHooks {
                     // cheap gates (the same set the native path runs): any
                     // hit leaves rest — vanilla computes the tick exactly
                     // and the resync re-arms the mode (the L6 protocol)
-                    if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
+                    if (RM_BIT[eid & AMASK] == 1 || e.noPhysics // L187: eid
                             || e.portalProcess != null || e.isOnPortalCooldown()
                             || stackEmptyDispatch(e)
                             || !e.getPassengers().isEmpty()
-                            || ARENA[entId(e) & AMASK] != e) {
+                            || ARENA[eid & AMASK] != e) {
                         MODE_VAL[slot] = 0;
                         FAST_STAMP[slot] = 0L;
                         restExits++;
@@ -6355,7 +6384,7 @@ public final class CeHooks {
             // cheap fresh-flag gates: always plain field reads
             // (stackEmptyDispatch: the cached empty bit replaces the
             // SynchedEntityData read — 6.55% MSPT on items-100k)
-            if (RM_BIT[entId(e) & AMASK] == 1 || e.noPhysics
+            if (RM_BIT[eid & AMASK] == 1 || e.noPhysics // L187: value-identical
                     || e.portalProcess != null || e.isOnPortalCooldown()
                     || stackEmptyDispatch(e)) {
                 dispPass++;
@@ -9861,6 +9890,34 @@ public final class CeHooks {
     private static final int TL_MIRROR_CAP = 1 << 19;
     private static volatile Entity[] TL_MIRROR = new Entity[1 << 18];
     private static volatile long[] TL_MIRROR_ALIVE = new long[1 << 12];
+    // L187 — the TL roster: per-position id + type parallel to TL_MIRROR,
+    // maintained by the SAME membership probes (add/stop/backfill/compact/
+    // grow). The mirror walk consults ONE int + ONE byte per visit — the
+    // per-entity instanceof chain and the entId Unsafe read leave the hot
+    // path. Both are stamped at the TL add (one read + one chain per
+    // MEMBERSHIP change — EntityTickList churn is world add/remove, not
+    // movement), so the per-tick cost is a dense load instead of a deref
+    // chain. Type codes mirror the walk's branch order exactly:
+    // 1 = ItemEntity, 2 = Mob, 3 = ArmorStand (the walk routes stands to
+    // the vanilla accept — the stand mirror rides the woven dispatcher),
+    // 0 = other. CE_TL_ROSTER=0 restores the per-visit chain; the value
+    // path is identical either way, and the TLO dual-hash (which hashes
+    // the roster id against the raw walk's entId) names any drift.
+    private static volatile int[] TL_MIRROR_IDS = new int[1 << 18];
+    private static volatile byte[] TL_MIRROR_TYPE = new byte[1 << 18];
+    private static final boolean TL_ROSTER =
+            !"0".equals(System.getenv("CE_TL_ROSTER"));
+
+    /** The walk's type classification, stamped once per membership add.
+     *  The chain order is the walk's own (ItemEntity -> Mob -> ArmorStand);
+     *  the three types are disjoint (no Mob is an ItemEntity or a stand),
+     *  so the byte reproduces the walk's routing exactly. */
+    private static byte tlTypeOf(Entity e) {
+        if (e instanceof ItemEntity) return 1;
+        if (e instanceof net.minecraft.world.entity.Mob) return 2;
+        if (e instanceof net.minecraft.world.entity.decoration.ArmorStand) return 3;
+        return 0;
+    }
     /** id&AMASK -> mirror index + 1 (0 = not mirrored); the TL add no-ops
      *  on an existing member (putIfAbsent), the mirror matches. */
     private static final int[] TL_MPOS = new int[SLOT_CAP];
@@ -9897,6 +9954,10 @@ public final class CeHooks {
                     m = TL_MIRROR_LEN;
                     mir[m] = e;
                     al[m >> 6] |= 1L << (m & 63);
+                    if (TL_ROSTER) {
+                        TL_MIRROR_IDS[m] = id; // the local read at the entry
+                        TL_MIRROR_TYPE[m] = tlTypeOf(e);
+                    }
                     TL_MPOS[slot] = m + 1;
                     TL_MIRROR_LEN = m + 1;
                     TL_MIRROR_N++;
@@ -9990,6 +10051,10 @@ public final class CeHooks {
         if (ncap > TL_MIRROR_CAP || ncap <= 0) return false;
         TL_MIRROR = java.util.Arrays.copyOf(TL_MIRROR, ncap);
         TL_MIRROR_ALIVE = java.util.Arrays.copyOf(TL_MIRROR_ALIVE, ncap >> 6);
+        if (TL_ROSTER) {
+            TL_MIRROR_IDS = java.util.Arrays.copyOf(TL_MIRROR_IDS, ncap);
+            TL_MIRROR_TYPE = java.util.Arrays.copyOf(TL_MIRROR_TYPE, ncap);
+        }
         return true;
     }
 
@@ -10004,7 +10069,8 @@ public final class CeHooks {
             for (int i = 0; i < rmax && i < rarr.length; i++) {
                 Object o = rarr[i];
                 if (!(o instanceof Entity e)) continue;
-                int slot = entId(e) & AMASK;
+                int eid = entId(e);
+                int slot = eid & AMASK;
                 if (TL_MPOS[slot] == 0) {
                     int m = TL_MIRROR_LEN;
                     if (m >= TL_MIRROR.length) { tlMirrorGrow(); }
@@ -10018,6 +10084,10 @@ public final class CeHooks {
                     }
                     mir[m] = e;
                     al[m >> 6] |= 1L << (m & 63);
+                    if (TL_ROSTER) {
+                        TL_MIRROR_IDS[m] = eid;
+                        TL_MIRROR_TYPE[m] = tlTypeOf(e);
+                    }
                     TL_MPOS[slot] = m + 1;
                     TL_MIRROR_LEN = m + 1;
                     TL_MIRROR_N++;
@@ -10045,6 +10115,8 @@ public final class CeHooks {
     private static synchronized void compactMirror() {
         Entity[] mir = TL_MIRROR;
         long[] al = TL_MIRROR_ALIVE;
+        int[] rids = TL_MIRROR_IDS;
+        byte[] rtys = TL_MIRROR_TYPE;
         int len = TL_MIRROR_LEN;
         int out = 0;
         for (int m = 0; m < len; m++) {
@@ -10053,6 +10125,10 @@ public final class CeHooks {
             if (e == null) continue;
             if (out != m) {
                 mir[out] = e;
+                if (TL_ROSTER) {
+                    rids[out] = rids[m];
+                    rtys[out] = rtys[m];
+                }
                 TL_MPOS[entId(e) & AMASK] = out + 1;
             }
             out++;
@@ -10124,24 +10200,43 @@ public final class CeHooks {
                             while (word != 0) {
                                 int b = Long.numberOfTrailingZeros(word);
                                 word &= word - 1;
-                                Entity e = mir[base | b];
+                                int p = base | b;
+                                Entity e = mir[p];
                                 if (e == null) continue;
+                                // L187: the roster consult — ONE int + ONE byte
+                                // replace the per-visit instanceof chain and the
+                                // entId Unsafe read (both stamped at the TL add;
+                                // the TLO dual-hash below hashes the roster id
+                                // against the raw walk's entId — a drift names
+                                // itself). Roster OFF: the exact chain recomputes
+                                // both values.
+                                int eid;
+                                byte ty;
+                                if (TL_ROSTER) {
+                                    eid = TL_MIRROR_IDS[p];
+                                    ty = TL_MIRROR_TYPE[p];
+                                } else {
+                                    eid = entId(e);
+                                    ty = tlTypeOf(e);
+                                }
                                 if (tloOn) {
-                                    tloH = tloH * 0x9E3779B97F4A7C15L + entId(e);
+                                    tloH = tloH * 0x9E3779B97F4A7C15L + eid;
                                     tloH ^= Long.rotateLeft(tloH, 13);
                                     if (tloN < 48) {
                                         tlo.append(e.getId()).append(' ');
                                     }
                                     tloN++;
                                 }
-                                if (collect && e instanceof ItemEntity
-                                        && itemDispatch((ItemEntity) e)) {
-                                    continue; // native flush computes this tick
-                                }
-                                if (mobRoute && e instanceof net.minecraft.world.entity.Mob m
-                                        && m.getPassengers().isEmpty() && nativeMobTick(m)) {
-                                    walkMobNative++;
-                                    continue; // the wire computes this mob at the flush
+                                if (ty == 1) {
+                                    if (collect && itemDispatchWalk((ItemEntity) e, eid)) {
+                                        continue; // native flush computes this tick
+                                    }
+                                } else if (ty == 2 && mobRoute) {
+                                    net.minecraft.world.entity.Mob m = (net.minecraft.world.entity.Mob) e;
+                                    if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
+                                        walkMobNative++;
+                                        continue; // the wire computes this mob at the flush
+                                    }
                                 }
                                 consumer.accept(e);
                             }
