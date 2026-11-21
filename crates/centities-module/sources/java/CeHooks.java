@@ -15918,6 +15918,28 @@ public final class CeHooks {
                             .moonrise$getChunkData().nearbyPlayers;
                     if (ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
+                        // L190c: the WARM slot skips the structural fill —
+                        // the refs and the shape stamps are lifetime-stable
+                        // (the te identity pins the chain, the interp
+                        // handler + the steps list are final, the UBS
+                        // verdict is immutable per class); the ONLY
+                        // per-tick-fresh value is the tickCount capture the
+                        // fast path's real RMW just produced. The pre-L190
+                        // shape re-stamped the whole shape per no-viewer
+                        // entity per tick (ubsEmpty 1.51% + the ref/interp
+                        // reads on the items-100k profile). The ent ref +
+                        // the nonzero shape stamp pin the slot-reuse case;
+                        // a fill whose catch fired clears te (rff[sid*5])
+                        // and never sets the shape stamp, so it reads cold.
+                        Object[] rff0 = TT_REF;
+                        long[] flf0 = TT_FLAT;
+                        if (rff0 != null && flf0 != null
+                                && flf0[sid * 2] != 0
+                                && rff0[sid * 5 + 2] == ent) {
+                            flf0[sid * 2 + 1] = U.getInt(rff0[sid * 5 + 1],
+                                    O_SE_TICKCOUNT);
+                            continue;
+                        }
                         try { // fill: cache the structural verdicts + refs
                             net.minecraft.server.level.ServerEntity se0 =
                                     (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
@@ -16046,6 +16068,17 @@ public final class CeHooks {
                             .moonrise$getChunkData().nearbyPlayers;
                     if (ttlFastPath(ent, te, chunk)) {
                         ttlFuse++;
+                        // L190c: the warm-slot gate — the raw-loop twin of the
+                        // sweep's gate above; same license, the slot rides m.
+                        Object[] rff0 = TT_REF;
+                        long[] flf0 = TT_FLAT;
+                        if (rff0 != null && flf0 != null
+                                && flf0[m * 2] != 0
+                                && rff0[m * 5 + 2] == ent) {
+                            flf0[m * 2 + 1] = U.getInt(rff0[m * 5 + 1],
+                                    O_SE_TICKCOUNT);
+                            continue;
+                        }
                         try { // fill: cache the structural verdicts + refs
                             net.minecraft.server.level.ServerEntity se0 =
                                     (net.minecraft.server.level.ServerEntity) U.getObject(te, O_TE_SE);
