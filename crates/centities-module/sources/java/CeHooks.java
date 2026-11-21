@@ -10231,6 +10231,12 @@ public final class CeHooks {
                 // retry body keeps the identical shape below)
                 final boolean mobRoute = !MOB_WALK_RAW && ACTIVE && cplugReady
                         && NATIVE_MOB_ON && NATIVE_MOB_HANDLES_OK;
+                // L190a: the quiet belt's walk locals — one read per walk
+                // replaces the helper's per-item guard chain (CE_QUIET_ON is
+                // a final env read; DS_QUIET is the init-once belt array).
+                // WORLD_REV and the bit word stay PER-ITEM reads (async
+                // probeWake/probeAdd can move them mid-walk).
+                final long[] wDq = CE_QUIET_ON ? DS_QUIET : null;
                 // L179: the TL mirror walk — the module's own Entity[]-typed,
                 // order-exact copy of the tick list (doc 65). The per-entity
                 // body below is the RAW walk's body — KEEP IN LOCKSTEP.
@@ -10306,19 +10312,63 @@ public final class CeHooks {
                                         // for a quiet item, and the roster id
                                         // replaces the entId read the retry
                                         // walk pays.
-                                        if (DS_QUIET != null && CE_QUIET_ON
-                                                && dispatchQuietSkip((ItemEntity) e, eid)) {
-                                            continue; // the quiet pass owns this item's tick
-                                        }
-                                        if (itemDispatchWalk((ItemEntity) e, eid)) {
+                                        // L190a: the quiet FAST ARM rides the
+                                        // walk body — the helper's fast verdict
+                                        // is (bit set && rev fresh); the slow
+                                        // arms (rev stale -> the env check, bit
+                                        // clear -> the dispatch) fall through
+                                        // EXACTLY: a cleared bit makes the
+                                        // helper return false untouched, so the
+                                        // helper call for a bit-clear item is a
+                                        // pure re-read this arm eliminates.
+                                        if (wDq != null) {
+                                            int q = eid & AMASK;
+                                            if ((wDq[q >> 6] & (1L << (q & 63))) != 0) {
+                                                if (QUIET_REV[q] == WORLD_REV) {
+                                                    quietSkips++;
+                                                    dispDiag(e, "quiet");
+                                                    if (CE_QUIET_FUSE) {
+                                                        quietFuseBump((ItemEntity) e, q, eid);
+                                                    }
+                                                    continue; // the quiet pass owns this item's tick
+                                                }
+                                                // bit set, rev stale: the helper
+                                                // runs the env check / re-stamp; a
+                                                // cleared bit (quietExits) falls
+                                                // through to the dispatch below —
+                                                // the EXACT old shape
+                                                if (dispatchQuietSkip((ItemEntity) e, eid)) {
+                                                    continue;
+                                                }
+                                            }
+                                            if (itemDispatchWalk((ItemEntity) e, eid)) {
+                                                continue; // native flush computes this tick
+                                            }
+                                        } else if (itemDispatchWalk((ItemEntity) e, eid)) {
                                             continue; // native flush computes this tick
                                         }
                                     }
                                 } else if (ty == 2 && mobRoute) {
                                     net.minecraft.world.entity.Mob m = (net.minecraft.world.entity.Mob) e;
-                                    if (m.getPassengers().isEmpty() && nativeMobTick(m)) {
-                                        walkMobNative++;
-                                        continue; // the wire computes this mob at the flush
+                                    if (m.getPassengers().isEmpty()) {
+                                        // L190b: the residency byte answers the
+                                        // store consult — the map's mutation pair
+                                        // (the sight's put, the drain's remove)
+                                        // writes it, so the byte IS the map's
+                                        // verdict; the walk skips the probe and
+                                        // the entId re-read (the roster id rides).
+                                        // mobRoute already proved the route gates
+                                        // the tick route's prologue re-checks.
+                                        if (NM_RES != null
+                                                && NM_RES[eid & AMASK] != 0) {
+                                            nmSkipped++;
+                                            walkMobNative++;
+                                            continue; // the wire computes this mob at the flush
+                                        }
+                                        if (nativeMobTick(m, eid)) {
+                                            walkMobNative++;
+                                            continue; // the wire computes this mob at the flush
+                                        }
                                     }
                                 }
                                 consumer.accept(e);
@@ -11935,6 +11985,21 @@ public final class CeHooks {
      *  (Knuth 6.4 R) — rare (Java-side deaths). */
     private static final NmMap NM_BYID = new NmMap();
 
+    // L190b — THE DENSE RESIDENCY MIRROR: one byte per arena slot answers
+    // "this id sits in NM_BYID" for the hot read routes (the walk's mob
+    // branch, the tick/aiStep routes' own store consult, the activation
+    // gate's containsKey probe). The byte's writers are the map's EXACT
+    // mutation pair (the sight's put, the drain's remove — both
+    // server-thread), so the mirror is exact by construction; the map
+    // itself stays the Mob-ref truth for the boundary apply. The slot
+    // identity carries the L174 quiet-bit license (ids are monotonic per
+    // run, never recycled; the byte dies with the id's removal).
+    // CE_NM_RES=0 restores the map reads.
+    private static final boolean NM_RES_ON =
+            !"0".equals(System.getenv("CE_NM_RES"));
+    private static final byte[] NM_RES =
+            NM_RES_ON ? new byte[ARENA.length] : null;
+
     // N3-N1 phase-2d: the per-level executor split — itemTickFlush is
     // woven per Level (a 3-dimension boot fires the boundary 3x per server
     // tick) and ONE executor would tick every store 3x. The small stable
@@ -13004,7 +13069,10 @@ public final class CeHooks {
             return false;
         }
         int eid = entId(mob);
-        if (NM_BYID.get(eid) == null) {
+        // L190b: the residency byte IS the map's verdict when armed (the
+        // walk's byte consult said 0 one frame up; the map get leaves the
+        // per-tick path entirely — the sight fires once per mob lifetime).
+        if (NM_RES != null ? NM_RES[eid & AMASK] == 0 : NM_BYID.get(eid) == null) {
             long seed;
             try {
                 seed = U.getLong(SHARED_RANDOM, O_RNG_VALUE);
@@ -13037,6 +13105,9 @@ public final class CeHooks {
             }
             nativeMobAdd(nmLevelKey(mob.level()), eid, seed, mob.getX(), mob.getY(), mob.getZ(), kind);
             NM_BYID.put(eid, mob);
+            if (NM_RES != null) {
+                NM_RES[eid & AMASK] = 1;
+            }
             nmAds++;
             if (nmAds == 1) {
                 // cold-path diagnostic: the FIRST live mob the wire absorbed
@@ -13076,7 +13147,7 @@ public final class CeHooks {
             return false;
         }
         int eid = entId(mob);
-        if (NM_BYID.get(eid) != null) {
+        if (NM_RES != null ? NM_RES[eid & AMASK] != 0 : NM_BYID.get(eid) != null) {
             nmSkipped++;
             return true;
         }
@@ -13098,6 +13169,14 @@ public final class CeHooks {
      *  aiStep/serverAiStep guards remain underneath as the L22a route and
      *  the fallback for a config where the tick weave is absent. */
     public static boolean nativeMobTick(net.minecraft.world.entity.Mob mob) {
+        return nativeMobTick(mob, entId(mob));
+    }
+
+    /** L190b: the eid rides the caller (the walk passes the TL roster id —
+     *  value-identical: the id is immutable from registration and the TLO
+     *  dual-hash names any drift); the store consult rides the residency
+     *  byte when armed, the exact map probe otherwise. */
+    public static boolean nativeMobTick(net.minecraft.world.entity.Mob mob, int eid) {
         if (nmTickProbe++ == 0) {
             // M1.5 route marker: distinguishes the tick-entry route from the
             // deeper fallbacks (each has its own one-shot probe line)
@@ -13108,8 +13187,7 @@ public final class CeHooks {
         if (!NATIVE_MOB_ON || !NATIVE_MOB_HANDLES_OK) {
             return false;
         }
-        int eid = entId(mob);
-        if (NM_BYID.get(eid) != null) {
+        if (NM_RES != null ? NM_RES[eid & AMASK] != 0 : NM_BYID.get(eid) != null) {
             nmSkipped++;
             return true;
         }
@@ -13133,7 +13211,13 @@ public final class CeHooks {
         if (!(e instanceof net.minecraft.world.entity.Mob m)) {
             return false;
         }
-        return NM_BYID.containsKey(m.getId());
+        int eid = m.getId();
+        // L190b: the activation gate's residency probe rides the byte —
+        // the vanilla isAlive->getHealth->SynchedEntityData walk this gate
+        // exists to skip stays dead, and the map probe leaves with it.
+        return NM_RES != null
+                ? NM_RES[eid & AMASK] != 0
+                : NM_BYID.containsKey(eid);
     }
 
     /** The boundary driver (itemTickFlush, after the entity loop): the
@@ -13304,6 +13388,9 @@ public final class CeHooks {
             for (int i = 0; i < NM_DEAD_N; i++) {
                 nativeMobRemove(nmLevel, (long) NM_DEAD[i]);
                 NM_BYID.remove(NM_DEAD[i]);
+                if (NM_RES != null) {
+                    NM_RES[NM_DEAD[i] & AMASK] = 0;
+                }
                 nmRemoves++;
             }
             NM_DEAD_N = 0;
