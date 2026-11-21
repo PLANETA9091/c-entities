@@ -1868,6 +1868,7 @@ public final class CeHooks {
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
                 + " tlM=" + tlMirrorTicks + "/" + tlMirrorRawTicks + "/" + TL_MIRROR_N
                 + "/" + (TL_MIRROR_BACKFILLED ? 1 : 0) + "/" + (TL_MIRROR_OK ? 1 : 0)
+                + " wl=" + walkLvlCaptures + "/" + walkLvlSkips + "/" + (WALK_LVL_ON ? 1 : 0)
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -3196,6 +3197,25 @@ public final class CeHooks {
     // the walk (the applier runs later on the same thread).
     private static Object DL_LAST = null;
     private static boolean DL_CLIENT = false;
+    // L189 — the walk-level client proof (the mirror walk's one-level
+    // license): isClientSide is a LEVEL property (e.level().isClientSide()
+    // reads the shared level object, not the entity) and one mirror walk is
+    // one level's tick list, so the walk route stamps the verdict ONCE per
+    // walk — the first wired visit runs the exact block and stamps — and
+    // every later wired visit of the same walk consults the stamp: one
+    // plain-boolean branch instead of the per-item Unsafe getObject +
+    // compare (the 2.23% self line at items-100k, run 44894635402). The
+    // stamp is tick-thread-confined (the DL_LAST pattern) and reset at the
+    // mirror branch's top EVERY walk (one capture per walk per tick — the
+    // non-walk routes never consult it). CE_WALK_LVL=0 restores the
+    // per-item read on the walk route (itemDispatchWalk then passes
+    // fromWalk=false, which also restores the dispatch's own quiet call).
+    public static final boolean WALK_LVL_ON =
+            !"0".equals(System.getenv("CE_WALK_LVL"));
+    private static boolean WALK_LVL_PROVEN = false;
+    private static boolean WALK_LVL_CLIENT = false;
+    public static volatile long walkLvlCaptures = 0;
+    public static volatile long walkLvlSkips = 0;
     private static final int[] BATCH_GEN = new int[ARENA.length];
     // L100a: the id mirror of the ARENA — ARENA_ID[si] is the FULL id of the
     // entity ARENA[si] holds (0 when null). Every ARENA write pairs with an
@@ -6078,7 +6098,7 @@ public final class CeHooks {
         // (itemDispatchWalk) rides the TL roster id instead of this read.
         if (ent instanceof ItemEntity ie) {
             if (!ITEM_TICK_ON) { dispDiag(ie, "off"); return false; }
-            return itemDispatchItem(ie, entId(ie));
+            return itemDispatchItem(ie, entId(ie), false);
         }
         // L123 STAND MIRROR: a static marker ArmorStand's dispatch is
         // observably a no-op — the javap-anchored reduction (26.3-249):
@@ -6120,19 +6140,31 @@ public final class CeHooks {
      *  with the id riding the TL roster: the probe stamped entId at the
      *  TL add, the TLO dual-hash names any drift, and the per-visit
      *  Unsafe read leaves the walk. The entity id is immutable from
-     *  registration, so the roster value IS entId(e). */
+     *  registration, so the roster value IS entId(e).
+     *  L189: fromWalk rides WALK_LVL_ON — it (a) skips the dispatch's own
+     *  quiet call (the walk ran the SAME idempotent helper THIS visit,
+     *  nothing ran between the two calls, and the helper's own DS_QUIET/
+     *  CE_QUIET_ON guard means a skipped walk-side call implies a no-op
+     *  dispatch-side call), and (b) arms the walk-level client proof (the
+     *  stamp consult + the one-capture-per-walk). */
     private static boolean itemDispatchWalk(ItemEntity e, int eid) {
         dispChecks++;
         if (!ACTIVE || !cplugReady) return false;
         if (!ITEM_TICK_ON) { dispDiag(e, "off"); return false; }
-        return itemDispatchItem(e, eid);
+        return itemDispatchItem(e, eid, WALK_LVL_ON);
     }
 
     /** The item body — byte-identical to the pre-L187 tail of the 1-arg
      *  guard; the eid read is hoisted to the caller (the walk passes the
      *  roster id, the woven guard reads the field once). The L150b
-     *  single-read contract becomes the caller's single read. */
-    private static boolean itemDispatchItem(ItemEntity e, int eid) {
+     *  single-read contract becomes the caller's single read.
+     *  L189: fromWalk=true arms the walk-route hoists — the client-proof
+     *  stamp (one exact read per walk) and the quiet-call skip (the walk
+     *  already ran the idempotent helper this visit). The 1-arg dispatcher
+     *  passes false: its per-item exact read and its own quiet call are
+     *  byte-identical to the pre-L189 shape. */
+    private static boolean itemDispatchItem(ItemEntity e, int eid,
+            boolean fromWalk) {
         if (ibN >= IB_CAP) { dispDiag(e, "cap"); return false; }
         // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
         // stamps its loop position — including the fresh-belt items that
@@ -6156,23 +6188,44 @@ public final class CeHooks {
             // isClientSide bit is read only when the level reference CHANGES
             // (the previous shape paid TWO Unsafe reads per item per tick:
             // the level field AND the boolean — 3.5% self in items-100k).
-            Object lv = O_ENT_LEVEL >= 0 && U != null
-                    ? U.getObject(e, O_ENT_LEVEL) : null;
-            boolean client;
-            if (lv == DL_LAST) {
-                client = DL_CLIENT;
-            } else {
-                DL_LAST = lv;
-                if (lv == null || O_LEVEL_CLIENT < 0) {
-                    client = e.level().isClientSide();
-                } else {
-                    client = U.getBoolean(lv, O_LEVEL_CLIENT);
+            // L189 WALK-LEVEL PROOF: the client bit is a property of the
+            // LEVEL and one mirror walk IS one level's tick list (the L150b
+            // license, javap-verified) — the walk route reads the flag ONCE
+            // per walk and every later wired visit consults the stamp (one
+            // plain branch instead of the per-item Unsafe getObject frame,
+            // 2.23% self at items-100k run 44894635402). The capture item
+            // runs the EXACT block below; the DL cache semantics are
+            // untouched; the non-walk routes keep the exact read.
+            if (fromWalk && WALK_LVL_PROVEN) {
+                walkLvlSkips++;
+                if (WALK_LVL_CLIENT) {
+                    dispDiag(e, "client");
+                    return false;
                 }
-                DL_CLIENT = client;
-            }
-            if (client) {
-                dispDiag(e, "client");
-                return false;
+            } else {
+                Object lv = O_ENT_LEVEL >= 0 && U != null
+                        ? U.getObject(e, O_ENT_LEVEL) : null;
+                boolean client;
+                if (lv == DL_LAST) {
+                    client = DL_CLIENT;
+                } else {
+                    DL_LAST = lv;
+                    if (lv == null || O_LEVEL_CLIENT < 0) {
+                        client = e.level().isClientSide();
+                    } else {
+                        client = U.getBoolean(lv, O_LEVEL_CLIENT);
+                    }
+                    DL_CLIENT = client;
+                }
+                if (client) {
+                    dispDiag(e, "client");
+                    return false;
+                }
+                if (fromWalk) {
+                    WALK_LVL_PROVEN = true;
+                    WALK_LVL_CLIENT = false; // client == false here
+                    walkLvlCaptures++;
+                }
             }
             // L161a: the dispatch-quiet skip — one bitset read for the
             // whole per-tick wire of a TAIL_NONE non-mergable item. The
@@ -6186,7 +6239,13 @@ public final class CeHooks {
             // L173: the block moved into dispatchQuietSkip (the walk calls
             // the SAME helper before the prologue; the semantics are
             // byte-identical).
-            if (dispatchQuietSkip(e, eid)) {
+            // L189: fromWalk skips this call — the walk ran the SAME
+            // idempotent helper THIS visit (the L188 hoist) and nothing ran
+            // between the two calls but pure reads; when the walk-side
+            // guard (DS_QUIET null / CE_QUIET_OFF) skipped the helper, the
+            // helper here would have returned false without touching
+            // anything — identical behavior either way.
+            if (!fromWalk && dispatchQuietSkip(e, eid)) {
                 return true; // the quiet pass owns this item's tick
             }
             int slot = eid & MAMASK;
@@ -10183,6 +10242,11 @@ public final class CeHooks {
                         Entity[] mir = TL_MIRROR;
                         long[] al = TL_MIRROR_ALIVE;
                         int bound = TL_MIRROR_LEN; // snapshot: mid-walk appends skipped (vanilla: beyond maxIndex)
+                        // L189: the walk-level client stamp lives ONE walk —
+                        // reset here so the first wired visit of THIS walk
+                        // captures the level verdict fresh (one capture per
+                        // walk per tick, the later visits consult it).
+                        WALK_LVL_PROVEN = false;
                         // TLO: the ACTUAL walk order at PD ticks — the dual
                         // hash below also hashes the RAW array order, so a
                         // mirror drift names itself outright.
