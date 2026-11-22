@@ -779,6 +779,8 @@ unsafe fn n_item_tick_impl(
     let e = JniEnv::from_raw(env);
     let raw = e.raw();
     let vt = *raw;
+    // B21c: one env parse per process; the mirror writes ride the flag.
+    let wv_on = wv_live();
 
     T_IND.with(|td| {
         T_INI.with(|ti| {
@@ -1531,19 +1533,22 @@ unsafe fn n_item_tick_impl(
                                     // Java bit, so the mirror clears too). Aborts and
                                     // non-committed rows keep the stale verdict_gen —
                                     // the prep's gen gate vetoes them exactly like
-                                    // the zeroed FAST_STAMP does.
-                                    let flush_gen = world.flush_gen;
-                                    let entry = world.entry(id);
-                                    entry.verdict = if (bits_now & B_VERDICT) != 0 {
-                                        1
-                                    } else if (bits_now & B_VERDICT_INACT) != 0 {
-                                        2
-                                    } else {
-                                        0
-                                    };
-                                    entry.verdict_gen = flush_gen;
-                                    if !tail_none && (f & F_NATIVE) != 0 {
-                                        entry.qstamp = false;
+                                    // the zeroed FAST_STAMP does. B21c: the writes run
+                                    // only when the consult is armed (CE_WVERD=1).
+                                    if wv_on {
+                                        let flush_gen = world.flush_gen;
+                                        let entry = world.entry(id);
+                                        entry.verdict = if (bits_now & B_VERDICT) != 0 {
+                                            1
+                                        } else if (bits_now & B_VERDICT_INACT) != 0 {
+                                            2
+                                        } else {
+                                            0
+                                        };
+                                        entry.verdict_gen = flush_gen;
+                                        if !tail_none && (f & F_NATIVE) != 0 {
+                                            entry.qstamp = false;
+                                        }
                                     }
                                 }
                                 // state extremes (garbage-detector diagnostics)
@@ -1966,13 +1971,29 @@ pub extern "system" fn n_merge_scan(
 // B21: the kernel verdict walk — the walk-verdict precompute (n_prep)
 // ---------------------------------------------------------------------------
 
+/// B21c: the commit-side verdict mirror writes run ONLY when the consult is
+/// armed (CE_WVERD=1) — the dormant wire must be byte-neutral on the ON leg.
+/// The Java belt appenders gate on the same env value.
+static WV_LIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+fn wv_live() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = WV_LIVE.load(Relaxed);
+    if v == 2 {
+        let nv = std::env::var("CE_WVERD").map(|x| x == "1").unwrap_or(false) as u8;
+        WV_LIVE.store(nv, Relaxed);
+        return nv != 0;
+    }
+    v != 0
+}
+
 thread_local! {
     /// B21 scratch: the roster ids, the alive words, the belt events, the
     /// dirty-id list and the verdict buffer (all reused, sized to bound).
     static T_PREP_IDS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
     static T_PREP_WORDS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static T_PREP_BELT: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
-    static T_PREP_DIRTY: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    static T_PREP_DIRTY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static T_PREP_VERD: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -2066,7 +2087,6 @@ unsafe fn n_prep_impl(
         e.get_long_array_region(alive, 0, words_n as i32, &mut wbuf);
         // The belt: (id<<1|kind) ints, FIFO. kind 0 = quiet SET, 1 = CLR.
         let belt_n = belt_n.max(0) as usize;
-        dirty.clear();
         let mut have_belt = belt_n > 0 && !belt.is_null();
         if have_belt {
             let blen = ((*vt).GetArrayLength)(raw, belt) as usize;
@@ -2082,11 +2102,36 @@ unsafe fn n_prep_impl(
         // untrustworthy (a lost CLR would let a mode-cleared item fast-arm).
         // Full reset: every mirror goes false, all verdicts 0 — the exact
         // chain serves the tick and the next flush re-stamps the mirrors.
+        // B21c THE PREP DIET (the gate 45007660094 read a +12ms spread ON
+        // regression from the per-slot 8-world Option loop + the per-slot
+        // branchy binary search — ~50-80ns/slot at the 100k scale). The
+        // pass hoists THIS wid's world ONCE, drains the belt against it
+        // directly and vetoes the dirty ids through an O(1) byte map (the
+        // 128KB memset is ~10us; the map slot is the STORE slot). The
+        // belt events belong to THIS wid by construction (the per-wid
+        // belt contract — the walk-born, flush-born and probe-born
+        // appenders all resolve the entity's own wid), so the all-worlds
+        // scan was pure waste.
+        let mut wzero = 0u64;
+        for w in 0..8usize {
+            if cst.items.as_ref().map(|c| c.worlds[w].is_some()).unwrap_or(false) {
+                wzero |= 1 << w;
+            }
+        }
         if ovf != 0 {
+            // The mirrors are untrustworthy: full quiet reset on every
+            // materialized world, all verdicts 0 — the exact chain serves
+            // the tick and the next flush re-stamps.
             for w in 0..8usize {
-                if let Some(iw) = cst.items.as_mut().and_then(|c| c.worlds[w].as_mut()) {
-                    for ent in iw.entries.iter_mut() {
-                        ent.qstamp = false;
+                if wzero & (1 << w) != 0 {
+                    if let Some(iw) = cst
+                        .items
+                        .as_mut()
+                        .and_then(|c| c.worlds.get_mut(w).and_then(|x| x.as_mut()))
+                    {
+                        for ent in iw.entries.iter_mut() {
+                            ent.qstamp = false;
+                        }
                     }
                 }
             }
@@ -2095,19 +2140,23 @@ unsafe fn n_prep_impl(
             ((*vt).SetIntArrayRegion)(raw, verd, 0, bound as i32, vbuf.as_ptr());
             return;
         }
-        if have_belt {
-            for &ev in bbuf.iter() {
-                let kind = ev & 1;
-                let id = (ev >> 1) as i64;
-                if id <= 0 {
-                    continue;
-                }
-                let slot = (id as u64 & STORE_MASK) as usize;
-                let tag = (id as u64 >> 17) | 1;
-                for w in 0..8usize {
-                    let Some(iw) = cst.items.as_mut().and_then(|c| c.worlds[w].as_mut()) else {
+        let mut iw_guard = cst
+            .items
+            .as_mut()
+            .and_then(|c| c.worlds.get_mut(wid as usize).and_then(|x| x.as_mut()));
+        // The dirty byte map: STORE slot -> vetoed THIS tick.
+        dirty.clear();
+        dirty.resize(STORE_CAP, 0u8);
+        if let Some(iw) = iw_guard.as_mut() {
+            if have_belt {
+                for &ev in bbuf.iter() {
+                    let kind = ev & 1;
+                    let id = (ev >> 1) as i64;
+                    if id <= 0 {
                         continue;
-                    };
+                    }
+                    let slot = (id as u64 & STORE_MASK) as usize;
+                    let tag = (id as u64 >> 17) | 1;
                     let ent = &mut iw.entries[slot];
                     if ent.tag != tag || ent.id != id {
                         continue;
@@ -2117,56 +2166,51 @@ unsafe fn n_prep_impl(
                         ent.qrev = quiet_rev as i64;
                     } else {
                         ent.qstamp = false;
-                        dirty.push(id as i32);
+                        dirty[slot] = 1;
                     }
-                    break;
                 }
             }
-            dirty.sort_unstable();
-            dirty.dedup();
-        }
-        let fast_fresh = ((stamp_rev ^ stamp_epoch) & 0x7FFF_FFFF)
-            == ((cur_rev ^ cur_epoch) & 0x7FFF_FFFF);
-        vbuf.clear();
-        vbuf.resize(bound, 0);
-        for (wi, &word0) in wbuf.iter().enumerate() {
-            let mut word = word0 as u64;
-            while word != 0 {
-                let b = word.trailing_zeros() as usize;
-                word &= word - 1;
-                let p = (wi << 6) | b;
-                if p >= bound {
-                    break;
-                }
-                let id = idbuf[p] as i64;
-                if id <= 0 {
-                    continue;
-                }
-                let slot = (id as u64 & STORE_MASK) as usize;
-                let tag = (id as u64 >> 17) | 1;
-                let mut v: i32 = 0;
-                for w in 0..8usize {
-                    let Some(iw) = cst.items.as_ref().and_then(|c| c.worlds[w].as_ref()) else {
+            let fast_fresh = ((stamp_rev ^ stamp_epoch) & 0x7FFF_FFFF)
+                == ((cur_rev ^ cur_epoch) & 0x7FFF_FFFF);
+            let flush_gen = iw.flush_gen;
+            vbuf.clear();
+            vbuf.resize(bound, 0);
+            for (wi, &word0) in wbuf.iter().enumerate() {
+                let mut word = word0 as u64;
+                while word != 0 {
+                    let b = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let p = (wi << 6) | b;
+                    if p >= bound {
+                        break;
+                    }
+                    let id = idbuf[p] as i64;
+                    if id <= 0 {
                         continue;
-                    };
+                    }
+                    let slot = (id as u64 & STORE_MASK) as usize;
+                    let tag = (id as u64 >> 17) | 1;
                     let ent = &iw.entries[slot];
-                    if ent.tag != tag || ent.id != id {
-                        continue;
-                    }
-                    if dirty.binary_search(&(id as i32)).is_ok() {
-                        break;
-                    }
-                    if ent.qstamp && ent.qrev == quiet_rev as i64 {
-                        v = 3;
-                        break;
-                    }
-                    if fast_fresh && ent.verdict != 0 && ent.verdict_gen == iw.flush_gen {
-                        v = ent.verdict as i32;
-                    }
-                    break;
+                    let v: i32 = if ent.tag == tag
+                        && ent.id == id
+                        && dirty[slot] == 0
+                    {
+                        if ent.qstamp && ent.qrev == quiet_rev as i64 {
+                            3
+                        } else if fast_fresh && ent.verdict != 0 && ent.verdict_gen == flush_gen {
+                            ent.verdict as i32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    vbuf[p] = v;
                 }
-                vbuf[p] = v;
             }
+        } else {
+            vbuf.clear();
+            vbuf.resize(bound, 0);
         }
         ((*vt).SetIntArrayRegion)(raw, verd, 0, bound as i32, vbuf.as_ptr());
     });

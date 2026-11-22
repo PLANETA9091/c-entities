@@ -6774,9 +6774,15 @@ public final class CeHooks {
     // stamp decision + the l7/belt CLR events + the commit's work-tail
     // reset). The ROW-COHORT half stays Java: a verdict-1/2 visit runs
     // itemDispatchItem(preVerdict) — the L152 cohort check and the
-    // appendDispatch fallback are the untouched shape. CE_WVERD=0 restores
-    // the per-visit reads.
-    public static final boolean WV_ON = !"0".equals(System.getenv("CE_WVERD"));
+    // appendDispatch fallback are the untouched shape.
+    // B21c: the consult ships DORMANT. The gate flight (45007660094)
+    // measured the live consult at +12ms spread ON / +6.6ms items ON: the
+    // verdict coverage (~19% of the visits) cannot pay the prep pass at
+    // the 100k scale. The wire stays for B22 (the kernel-owned fast rows —
+    // the BATCH_POS/BATCH_GEN/cohort/IB_* packing leaves the thread for
+    // the verdict cohort), where the prep cost pays for itself.
+    // CE_WVERD=1 arms the consult for the bisect/bench flights.
+    public static final boolean WV_ON = "1".equals(System.getenv("CE_WVERD"));
     // The verdict array — one int per TL mirror slot, rebuilt by EVERY prep
     // (the mirror regrow/compaction/appends cannot leave stale verdicts:
     // the array is fully rewritten from the live roster each walk).
