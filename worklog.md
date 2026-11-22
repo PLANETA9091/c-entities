@@ -2241,3 +2241,71 @@ Task ID: 29 addendum 4 — the L188 and L189 verdicts (the quiet hoist stands), 
   dispatch gate's remaining Java share (~10-13%) leaves the thread
   entirely. The items/spread profile flights on ffb37ff are dispatched
   with explicit scenario inputs to re-name the walls post-L189.
+
+---
+Task ID: 29 addendum 5 — the L190 and L190c verdicts (both PASS), the post-L189 walls named by the profile flights, the honest standings vs the -90% line
+
+- The L190 stand (39d661c5 — L190a the walk's quiet fast arm: the helper's
+  fast verdict inlined into the mirror walk's item branch, the majority
+  quiet population exits at the SAME two loads minus the call frame and
+  the per-item guard chain; L190b the dense mob residency mirror: one
+  byte per arena slot written by the map's EXACT mutation pair answers
+  'this id sits in NM_BYID', the map probe leaves every per-mob per-tick
+  read route, CE_NM_RES=0 restores): parity 44938771500 / e2e 44938771504
+  / module 44938771527 all GREEN, gate run 44938865974 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k          90.11    18.68   0.207
+  mobs-25k           601.03   381.64   0.635  (control)
+  mixed-150k        2409.94    78.54   0.033
+  spread-100k        418.97    54.11   0.129
+  mobs-despawn-10k    79.71     9.39   0.118  (pop delta 2 OK)
+- The L190c stand (f044433d — the warm tracker slot skips the structural
+  fill: per no-viewer entity per tick the fast path re-stamped refs,
+  re-read the interp handler + steps list and re-ran the ubsEmpty class
+  proof, all lifetime-stable by the L65 license; the warm gate (nonzero
+  shape stamp + the ent ref pinning the slot) serves the slot alone, the
+  cold path runs the exact fill, a catch-fired fill reads cold): parity
+  44939335726 / e2e 44939335779 / module 44939335732 all GREEN, gate run
+  44939386733 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k          72.89    20.29   0.278
+  mobs-25k           756.06   462.52   0.612  (control)
+  mixed-150k        2818.07    69.92   0.025
+  spread-100k        476.41    55.18   0.116
+  mobs-despawn-10k    91.52    11.30   0.123  (pop delta 2 OK)
+- Cross-flight (ON legs, all slow-shape): items 23.96 -> 18.68 -> 20.29
+  (L190's quiet fast arm is the big item win, L190c flat — the single-rep
+  off-leg 90.11 -> 72.89 moves the ratio more than the ON change);
+  spread 59.28 -> 54.11 -> 55.18 (L190 -8.7%, L190c flat); despawn
+  11.32 -> 9.39 -> 11.30 (L190 -17%, L190c flat); mixed 71.26 -> 78.54
+  -> 69.92 (noise band). The control row stays shape-stable 0.61-0.64.
+- The post-L189 walls, named by the two explicit-scenario profile flights
+  on 5106ff3b (spread-100k mean 50.05, items-100k mean 26.12 — both
+  include ~4-6% paperclip/bzip2 startup noise):
+  spread: tickListForEach ~7.0% (lines 10269/10309/10325), itemTickFlush
+  ~7.9%, ttlCachedPath ~5.5%, Unsafe.* ~9.4% (the ubs/fuse field cache),
+  appendDispatch ~1.7%, standMirror ~1.5%, quietFuseBump ~1.5%,
+  SynchedEntityData.getItem ~1.0%, Mob.isPersistenceRequired 1.29%,
+  spawnerCreateState$ 1.20%;
+  items: ChunkEntitySlices$BasicEntityList.indexOf 5.38% (the moonrise
+  churn — the deferred platform both-leg cost), AABB.intersects 4.62%
+  (+its AABB wrapper, the merge-volume physics), tickListForEach 3.45%,
+  itemTickFlush ~3.9%, Entity.getBoundingBox 2.45%, ItemStack.isEmpty
+  1.67%, ItemEntity.playerTouch 1.54%, ubsEmpty 1.51% (L190c's target),
+  SynchedEntityData.getItem 1.41%, quietFuseBump ~1.85%, canHold$ ~1.1%.
+- Honest standings vs the -90% line (ratio <= 0.100, each flight's own
+  med-off; L190c): mixed -97.5% (certified), spread -88.4% (ON must lose
+  13.7% more: 55.18 -> 47.64), despawn -87.7% (ON must lose 19.0% more:
+  11.30 -> 9.15; L190's own row read 9.39/0.118 — inside noise of the
+  line), items -72.2% (ON must lose 64.1% more: 20.29 -> 7.29 — the wall
+  stands), control 0.612.
+- NEXT: (b2) the kernel-side roster — the walk hands the kernel the
+  TL_MIRROR_IDS int[] (one get_int_array_region per tick) plus the
+  stamp/mode state, the kernel computes the per-position verdict array
+  and owns the batch rows as Rust-internal state; the Java walk consults
+  ONE byte per visit and only the non-wired remainder reaches the
+  vanilla accept; the dispatch gate's remaining Java share (~10-13% of
+  the spread walk: tickListForEach frames + appendDispatch guards)
+  leaves the thread entirely. (b3) the synched-data read kill
+  (SynchedEntityData.getItem 1.41% items / 1.0% spread). The
+  BasicEntityList churn stays deferred (rewards the OFF leg equally).
