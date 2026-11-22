@@ -2309,3 +2309,58 @@ Task ID: 29 addendum 5 — the L190 and L190c verdicts (both PASS), the post-L18
   leaves the thread entirely. (b3) the synched-data read kill
   (SynchedEntityData.getItem 1.41% items / 1.0% spread). The
   BasicEntityList churn stays deferred (rewards the OFF leg equally).
+
+---
+Task ID: 29 addendum 6 — the B21 verdict (the verdict walk: parity bit-identical, the gate margin PASSED, the ON legs REGRESSED — the wire ships dormant)
+
+- The B21 stand (387da5e9 — the kernel verdict walk: n_prep hands the
+  walk the roster verdicts, the consult replaces the per-visit random
+  reads; the row cohort stays Java): parity 45007589627 / e2e
+  45007589638 / module 45007589594 all GREEN (the baseline 45007589625
+  leg failed on a Maven Central 429 infra flake, the rerun 45010363045
+  GREEN), gate run 45007660094 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k         113.66    26.92   0.237
+  mobs-25k           720.04   479.16   0.665  (control)
+  mixed-150k        2996.19    80.95   0.027
+  spread-100k        482.79    67.37   0.140
+  mobs-despawn-10k    93.95    11.85   0.126  (pop delta 1 OK)
+- THE HONEST VERDICT: the gate margin held and parity was bit-identical
+  (12/12 legs, PARITY-A-B-GATE PASS, zero ORDER/TLO mismatches, the
+  counters proved the verdicts served: ~14M quiet + ~25M fast across the
+  run) — but the ON legs REGRESSED vs the L190c flight: spread ON
+  55.18 -> 67.37 (+12.2ms, +22%), items ON 20.29 -> 26.92 (+6.6ms),
+  mixed ON 69.92 -> 80.95, despawn ON 11.30 -> 11.85. The -90% chain
+  moves BACKWARD while the consult is live.
+- THE ROOT CAUSE (measured, not guessed): the verdict coverage was ~19%
+  of the visits (the wv counters: ~19k dispatch verdicts + ~12k quiet
+  verdicts per tick of ~60k items), so the per-visit savings (~20ns ×
+  the served visits ≈ 0.5ms/tick) could not pay the prep pass. The pass
+  was fat: the per-slot 8-world Option loop (the all-worlds tag scan)
+  + the per-slot branchy binary search over the dirty belt. The
+  despawn-10k control leg read the PURE prep cost: 418 preps, ZERO
+  verdicts (no items), +0.55ms/tick for 10k live slots ≈ 55ns/slot —
+  ~5.5ms/tick projected at the 100k scale. 5.5ms cost − 0.5ms savings
+  = the observed regression (the spread residual rides the larger belt
+  and the crossings).
+- The b21fix stand (9bd6f4e9): (a) THE PREP DIET — the pass hoists THIS
+  wid's world ONCE (the belt events and the roster both belong to THIS
+  wid by the per-wid belt contract; the all-worlds scan was pure waste),
+  drains the belt against it directly, and vetoes the dirty ids through
+  an O(1) byte map (the STORE-slot-indexed 128KB memset ~10us per prep);
+  (b) DORMANT — CE_WVERD now arms the consult (default OFF), and the
+  Java belt appenders + the Rust commit-mirror writes gate on the SAME
+  env value (one atomic parse per process), so the dormant wire is
+  byte-neutral on the ON leg. The wire stays for B22.
+- THE B22 DOOR (the wire pays for itself here): the kernel-owned fast
+  rows — the VERD=1/2 cohort's BATCH_POS/BATCH_GEN writes, the IB_*
+  packing and the flush's outD/outI build leave the thread (the kernel
+  builds those rows from its own store at the prep; the apply reads the
+  merged rows back in walk order; ARENA[id & AMASK] names the entity
+  ref). The named walls it eats: the dispatch gate's remaining Java
+  share (~10-13%) + the flush packing (~4-8%).
+- Honest standings vs the -90% line (the L190c flight, the last
+  consult-free read): mixed -97.5% (certified), spread -88.4% (1.6pp),
+  despawn -87.7% (2.3pp), items -72.2% (the wall). The B21 flight's own
+  rows are NOT the new baseline — the consult ships dormant and the
+  L190c numbers stand.

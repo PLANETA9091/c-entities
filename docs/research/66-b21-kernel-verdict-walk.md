@@ -108,3 +108,22 @@ separate arc (the honest merge volume + the BasicEntityList churn).
   (JDK 25, --release 17).
 - The flights: parity (the bit-identical judge), e2e, module, and the
   ab-paired gate (the medians judge) — CI arbitrates.
+
+## The verdict (the CI arbitration, flight 45007660094)
+
+ALL FOUR LEGS GREEN, PARITY BIT-IDENTICAL (12/12, zero ORDER/TLO
+mismatches) — and the ON legs REGRESSED: spread ON 55.18 -> 67.37,
+items ON 20.29 -> 26.92. The honest math after the flight: the verdict
+coverage was ~19% of the visits (the wv counters), so the killed reads
+(~0.5ms/tick) could not pay the prep pass (~5.5ms/tick at the 100k
+scale — the despawn-10k leg measured the pure prep cost at 55ns/slot:
+the per-slot 8-world Option loop + the branchy dirty binary search).
+
+The b21fix stand (9bd6f4e9): the prep pass diet (the hoisted THIS-wid
+world, the direct belt drain, the O(1) dirty byte map) + the consult
+ships DORMANT (CE_WVERD=1 arms it; the Java belt appenders and the Rust
+commit-mirror gate on the same env). The wire stays for B22 — the
+kernel-owned fast rows (the BATCH/cohort/IB_* packing leaves the thread
+for the verdict cohort) — where the prep cost pays for itself. The
+parity discipline held: the live B21 was exact; the regression was pure
+cost, caught by the honest cross-flight ON-leg comparison.
