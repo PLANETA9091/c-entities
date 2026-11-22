@@ -2364,3 +2364,46 @@ Task ID: 29 addendum 6 — the B21 verdict (the verdict walk: parity bit-identic
   despawn -87.7% (2.3pp), items -72.2% (the wall). The B21 flight's own
   rows are NOT the new baseline — the consult ships dormant and the
   L190c numbers stand.
+
+---
+Task ID: 29 addendum 7 — the b21fix neutrality verdict (the gate PASS; the runner class shifted — the ratios hold), the fresh profile walls, the B22 door
+
+- The b21fix stand (9bd6f4e9/7d78d271 — the prep diet + the consult
+  dormant): parity 45018251473 / e2e 45018251482 / module 45018251569
+  all GREEN, gate run 45018427880 PASS:
+  scenario          med-off   med-on   ratio
+  items-100k         106.07    26.76   0.252
+  mobs-25k           852.33   475.38   0.558  (control)
+  mixed-150k        4965.14    91.51   0.018
+  spread-100k        596.53    65.39   0.110
+  mobs-despawn-10k    99.45    12.80   0.129  (pop delta 2 OK)
+- RUNNER-CLASS WARNING: the OFF legs (the module-free vanilla runs —
+  untouched by any module code) shifted +9..+76% vs the L190c flight
+  (items 72.89 -> 106.07, spread 476.41 -> 596.53, mixed 2818 ->
+  4965.14): this flight ran on a slower runner class, so the cross-
+  flight ON-leg comparison is VOID for this cycle. The per-flight
+  ratios hold (spread 0.110 vs L190c 0.116, items 0.252 vs 0.278) —
+  the dormant wire is ratio-neutral; the next stand's flight gives
+  the clean absolute read.
+- The fresh profile walls (the two explicit-scenario flights on
+  7d78d271: spread mean 63.99, items mean 22.86):
+  spread: tickListForEach ~5.0%, itemTickFlush ~5.1%, Unsafe.* ~6.3%,
+  ttlCachedPath ~3.8%, appendDispatch ~1.44%, spawnerCreateState$ ~1.36%
+  (the WatchdogThread ~7.8% and the bzip2 ~1.5% are harness noise);
+  items: the moonrise BasicEntityList churn ~13% (has 5.07 + indexOf
+  6.40 + remove 1.54 — the BOTH-LEG cost, ratio-dead by the addendum-4
+  note), SynchedEntityData.get ~3.0% (the b3 target), the walk ~3.5%,
+  itemTickFlush ~4.3%, quietFuseBump ~2.5%.
+- THE B22 DOOR (doc 67): the kernel-owned fast rows — the verdict
+  cohort's IB_* packing, the appendDispatch block and the flush loop
+  A's packed reads leave the thread (the kernel builds those rows from
+  its own store at the prep; the walk keeps the L119 BATCH stamps and
+  appends TWO sequential identity writes; the read-back gains the row
+  kind; the interleave-mismatch falls back wholesale to the exact
+  IB_-only batch). Priced at ~2.5-3.5ms spread ON + ~2ms items ON —
+  the largest ON-leg-only family left. The wire's prep cost pays for
+  itself at ~2x margin once the cohort stops paying the row plumbing.
+- Honest standings vs the -90% line (the ratio metric, per-flight):
+  mixed certified, spread 1.0pp from the line (0.110 this flight —
+  the off-leg inflation flattered it; the true read rides the next
+  same-class flight), despawn 2.9pp, items the wall.
