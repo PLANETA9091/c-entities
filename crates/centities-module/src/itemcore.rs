@@ -102,6 +102,29 @@ struct ItemEntry {
     /// the current flush's batch (the mirror is dispatch-fresh and
     /// natively modeled); 0 = never batched.
     sync_gen: u64,
+    /// B21 (the kernel verdict walk): the LAST flush's i0-a2 verdict for
+    /// this entry — 0 = none (the applier writes FAST_STAMP 0L, the
+    /// dispatch slow chain re-approves), 1 = B_VERDICT (the active fast
+    /// arm), 2 = B_VERDICT_INACT (the inactive fast arm). Written at the
+    /// commit from the SAME bits the applier transcribes into FAST_STAMP;
+    /// the validity rides verdict_gen (a per-flush decision).
+    verdict: u8,
+    /// B21: the flush generation the verdict was computed at. A stale gen
+    /// (abort / resync / not batched) vetoes the fast verdict exactly like
+    /// the zeroed FAST_STAMP does on the Java side.
+    verdict_gen: u64,
+    /// B21: the quiet-bit mirror (DS_QUIET). SET only via the walk-prep
+    /// belt (the stamp decision is Java-only: the SCAN_CLEAN belt and
+    /// fullStackQuiet are Java state); CLEARED by the belt CLR events
+    /// (l7ExternalMutation, the fuse bump's belt clear) and by the
+    /// commit's own work-tail reset (the !B_TAIL_NONE rows — the exact
+    /// shape of the applier's L99 persistent-quiet reset).
+    qstamp: bool,
+    /// B21: the WORLD_REV the quiet bit was stamped with (the applier's
+    /// QUIET_REV = the field value at the apply). The walk's quiet gate is
+    /// QUIET_REV == WORLD_REV; the mirror compares against the prep-time
+    /// WORLD_REV scalar.
+    qrev: i64,
 }
 
 impl ItemEntry {
@@ -141,6 +164,10 @@ impl ItemEntry {
             rest_rev: 0,
             rest_dy: 0.0,
             sync_gen: 0,
+            verdict: 0,
+            verdict_gen: 0,
+            qstamp: false,
+            qrev: 0,
         }
     }
 }
@@ -1495,6 +1522,29 @@ unsafe fn n_item_tick_impl(
                                         oi[n4 + 1 + cn] = k as i32;
                                         cn += 1;
                                     }
+                                    // B21: the verdict mirror — the SAME bits the
+                                    // applier transcribes into FAST_STAMP (18|20),
+                                    // stamped with THIS flush's generation; plus the
+                                    // quiet-bit reset for the work tails (the exact
+                                    // shape of the applier's L99 persistent-quiet
+                                    // reset: the !TAIL_NONE F_NATIVE rows cleared the
+                                    // Java bit, so the mirror clears too). Aborts and
+                                    // non-committed rows keep the stale verdict_gen —
+                                    // the prep's gen gate vetoes them exactly like
+                                    // the zeroed FAST_STAMP does.
+                                    let flush_gen = world.flush_gen;
+                                    let entry = world.entry(id);
+                                    entry.verdict = if (bits_now & B_VERDICT) != 0 {
+                                        1
+                                    } else if (bits_now & B_VERDICT_INACT) != 0 {
+                                        2
+                                    } else {
+                                        0
+                                    };
+                                    entry.verdict_gen = flush_gen;
+                                    if !tail_none && (f & F_NATIVE) != 0 {
+                                        entry.qstamp = false;
+                                    }
                                 }
                                 // state extremes (garbage-detector diagnostics)
                                 let ad = od[k * 9]
@@ -1910,6 +1960,221 @@ pub extern "system" fn n_merge_scan(
     MS_STATS[5].store(MS_PREFLT.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     MS_STATS[6].store(MS_TRUNC.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     n as i32
+}
+
+// ---------------------------------------------------------------------------
+// B21: the kernel verdict walk — the walk-verdict precompute (n_prep)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// B21 scratch: the roster ids, the alive words, the belt events, the
+    /// dirty-id list and the verdict buffer (all reused, sized to bound).
+    static T_PREP_IDS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    static T_PREP_WORDS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static T_PREP_BELT: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    static T_PREP_DIRTY: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    static T_PREP_VERD: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// B21 verdict bytes (Java int[] out): 0 = the exact Java chain,
+/// 1 = fast-native active, 2 = fast-native inactive, 3 = quiet-owned.
+///
+/// The contract (doc 66): Java hands the TL mirror's alive bitset + the
+/// roster id array + THIS walk's per-wid event belt; the kernel answers
+/// ONE verdict per live roster slot. The fast verdict replicates the
+/// dispatch gate's stamp half BIT-EXACTLY (the entry's verdict bits are
+/// the same 18/20 the applier transcribes into FAST_STAMP, the gen gate
+/// mirrors the zeroed stamp, the (rev^epoch) compare is the stamp's own
+/// field compare); the quiet verdict mirrors DS_QUIET + QUIET_REV (SET
+/// only via the belt — the stamp decision is Java-only; the commit's
+/// work-tail reset and the belt CLRs are the exact Java clear set). The
+/// row-cohort half STAYS Java (B21 keeps the rows): a verdict-1/2 visit
+/// runs itemDispatchItem(preVerdict) whose cohort check + appendDispatch
+/// fallback are the untouched L152 shape. Any drift falls to verdict 0 =
+/// the exact chain, and the belt overflow resets the quiet mirrors.
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn n_prep(
+    env: *mut jni::JNIEnv,
+    _cls: jni::jclass,
+    wid: i32,
+    alive: jni::jlongArray,
+    ids: jni::jintArray,
+    verd: jni::jintArray,
+    belt: jni::jintArray,
+    belt_n: i32,
+    cur_rev: i32,
+    cur_epoch: i32,
+    stamp_rev: i32,
+    stamp_epoch: i32,
+    quiet_rev: i32,
+    ovf: i32,
+) -> i32 {
+    let _site_guard = centities_core::SiteGuard::enter(21);
+    // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
+    // vtable pattern proven in lib.rs.
+    unsafe { n_prep_impl(env, wid, alive, ids, verd, belt, belt_n, cur_rev, cur_epoch, stamp_rev, stamp_epoch, quiet_rev, ovf) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn n_prep_impl(
+    env: *mut jni::JNIEnv,
+    wid: i32,
+    alive: jni::jlongArray,
+    ids: jni::jintArray,
+    verd: jni::jintArray,
+    belt: jni::jintArray,
+    belt_n: i32,
+    cur_rev: i32,
+    cur_epoch: i32,
+    stamp_rev: i32,
+    stamp_epoch: i32,
+    quiet_rev: i32,
+    ovf: i32,
+) -> i32 {
+    if wid < 0 || wid >= 8 || alive.is_null() || ids.is_null() || verd.is_null() {
+        return -1;
+    }
+    let Ok(mut g) = crate::INDEX.try_lock() else {
+        return -1;
+    };
+    let cst = g.get_or_insert_with(crate::new_state);
+    let e = JniEnv::from_raw(env);
+    let raw = e.raw();
+    let vt = *raw;
+    let bound = ((*vt).GetArrayLength)(raw, ids) as usize;
+    let vlen = ((*vt).GetArrayLength)(raw, verd) as usize;
+    let alen = ((*vt).GetArrayLength)(raw, alive) as usize;
+    if bound == 0 || vlen < bound || (alen << 6) < bound {
+        return -1;
+    }
+    let words_n = (bound + 63) >> 6;
+    T_PREP_IDS.with(|tid| {
+    T_PREP_WORDS.with(|tw| {
+    T_PREP_BELT.with(|tb| {
+    T_PREP_DIRTY.with(|td| {
+    T_PREP_VERD.with(|tv| {
+        let mut idbuf = tid.borrow_mut();
+        let mut wbuf = tw.borrow_mut();
+        let mut bbuf = tb.borrow_mut();
+        let mut dirty = td.borrow_mut();
+        let mut vbuf = tv.borrow_mut();
+        idbuf.clear();
+        idbuf.resize(bound, 0);
+        e.get_int_array_region(ids, 0, bound as i32, &mut idbuf);
+        wbuf.clear();
+        wbuf.resize(words_n, 0i64);
+        e.get_long_array_region(alive, 0, words_n as i32, &mut wbuf);
+        // The belt: (id<<1|kind) ints, FIFO. kind 0 = quiet SET, 1 = CLR.
+        let belt_n = belt_n.max(0) as usize;
+        dirty.clear();
+        let mut have_belt = belt_n > 0 && !belt.is_null();
+        if have_belt {
+            let blen = ((*vt).GetArrayLength)(raw, belt) as usize;
+            if blen < belt_n {
+                have_belt = false;
+            } else {
+                bbuf.clear();
+                bbuf.resize(belt_n, 0);
+                e.get_int_array_region(belt, 0, belt_n as i32, &mut bbuf);
+            }
+        }
+        // Overflow: events were DROPPED at append — the quiet mirrors are
+        // untrustworthy (a lost CLR would let a mode-cleared item fast-arm).
+        // Full reset: every mirror goes false, all verdicts 0 — the exact
+        // chain serves the tick and the next flush re-stamps the mirrors.
+        if ovf != 0 {
+            for w in 0..8usize {
+                if let Some(iw) = cst.items.as_mut().and_then(|c| c.worlds[w].as_mut()) {
+                    for ent in iw.entries.iter_mut() {
+                        ent.qstamp = false;
+                    }
+                }
+            }
+            vbuf.clear();
+            vbuf.resize(bound, 0);
+            ((*vt).SetIntArrayRegion)(raw, verd, 0, bound as i32, vbuf.as_ptr());
+            return;
+        }
+        if have_belt {
+            for &ev in bbuf.iter() {
+                let kind = ev & 1;
+                let id = (ev >> 1) as i64;
+                if id <= 0 {
+                    continue;
+                }
+                let slot = (id as u64 & STORE_MASK) as usize;
+                let tag = (id as u64 >> 17) | 1;
+                for w in 0..8usize {
+                    let Some(iw) = cst.items.as_mut().and_then(|c| c.worlds[w].as_mut()) else {
+                        continue;
+                    };
+                    let ent = &mut iw.entries[slot];
+                    if ent.tag != tag || ent.id != id {
+                        continue;
+                    }
+                    if kind == 0 {
+                        ent.qstamp = true;
+                        ent.qrev = quiet_rev as i64;
+                    } else {
+                        ent.qstamp = false;
+                        dirty.push(id as i32);
+                    }
+                    break;
+                }
+            }
+            dirty.sort_unstable();
+            dirty.dedup();
+        }
+        let fast_fresh = ((stamp_rev ^ stamp_epoch) & 0x7FFF_FFFF)
+            == ((cur_rev ^ cur_epoch) & 0x7FFF_FFFF);
+        vbuf.clear();
+        vbuf.resize(bound, 0);
+        for (wi, &word0) in wbuf.iter().enumerate() {
+            let mut word = word0 as u64;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let p = (wi << 6) | b;
+                if p >= bound {
+                    break;
+                }
+                let id = idbuf[p] as i64;
+                if id <= 0 {
+                    continue;
+                }
+                let slot = (id as u64 & STORE_MASK) as usize;
+                let tag = (id as u64 >> 17) | 1;
+                let mut v: i32 = 0;
+                for w in 0..8usize {
+                    let Some(iw) = cst.items.as_ref().and_then(|c| c.worlds[w].as_ref()) else {
+                        continue;
+                    };
+                    let ent = &iw.entries[slot];
+                    if ent.tag != tag || ent.id != id {
+                        continue;
+                    }
+                    if dirty.binary_search(&(id as i32)).is_ok() {
+                        break;
+                    }
+                    if ent.qstamp && ent.qrev == quiet_rev as i64 {
+                        v = 3;
+                        break;
+                    }
+                    if fast_fresh && ent.verdict != 0 && ent.verdict_gen == iw.flush_gen {
+                        v = ent.verdict as i32;
+                    }
+                    break;
+                }
+                vbuf[p] = v;
+            }
+        }
+        ((*vt).SetIntArrayRegion)(raw, verd, 0, bound as i32, vbuf.as_ptr());
+    });
+    });
+    });
+    });
+    });
+    0
 }
 
 #[cfg(test)]

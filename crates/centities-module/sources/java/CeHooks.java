@@ -993,6 +993,11 @@ public final class CeHooks {
                     dispDiag(e, "quiet-exit-rev");
                 } else {
                     QUIET_REV[q] = WORLD_REV; // stale-but-boring
+                    // B21: the mirror re-stamp — the bit's freshness renewed;
+                    // the SET rides the item's own level's belt.
+                    if (WV_ON) {
+                        wvBelt(worldId(e.level()), eid, false);
+                    }
                 }
             }
             if ((dq[q >> 6] & (1L << (q & 63))) != 0) {
@@ -1062,6 +1067,13 @@ public final class CeHooks {
             long[] dq0 = DS_QUIET;
             if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
             quietBelt++;
+            // B21: the mirror CLR — the item re-verifies via the exact chain
+            // next tick (the bump served THIS visit; the verdict array is
+            // rebuilt by the next prep anyway). The walk-born event rides
+            // the walk's own wid.
+            if (WV_ON) {
+                wvBelt(WV_WALK_WID, eid, true);
+            }
         }
     }
 
@@ -1869,6 +1881,8 @@ public final class CeHooks {
                 + " tlM=" + tlMirrorTicks + "/" + tlMirrorRawTicks + "/" + TL_MIRROR_N
                 + "/" + (TL_MIRROR_BACKFILLED ? 1 : 0) + "/" + (TL_MIRROR_OK ? 1 : 0)
                 + " wl=" + walkLvlCaptures + "/" + walkLvlSkips + "/" + (WALK_LVL_ON ? 1 : 0)
+                + " wv=" + wvPreps + "/" + wvQuiet + "/" + wvFast + "/" + wvOvf
+                + "/" + (WV_ON ? 1 : 0)
                 + " ttlDecl=" + ttlDeclChunk + "/" + ttlDeclSeen + "/" + ttlDeclSe
                 + "/" + ttlDeclTrk + "/" + ttlDeclInterp + "/" + ttlDeclHard
                 + "/" + ttlDeclSync
@@ -6165,6 +6179,19 @@ public final class CeHooks {
      *  byte-identical to the pre-L189 shape. */
     private static boolean itemDispatchItem(ItemEntity e, int eid,
             boolean fromWalk) {
+        return itemDispatchItem(e, eid, fromWalk, 0);
+    }
+
+    /** B21: the preVerdict overload — the kernel's walk-prep verdict
+     *  replaces the FAST_STAMP read+compare (the STAMP half of the gate is
+     *  provably identical: the same 18/20 bits, the same gen gate, the same
+     *  (rev^epoch) field compare — see the wvNative contract). preVerdict 0
+     *  = the exact pre-B21 shape (the stamp read + compare); 1 = the active
+     *  fast arm without the stamp read; 2 = the inactive fast arm. The
+     *  cohort half (IB_IDS[ibN] == eid / appendDispatch) is UNCHANGED for
+     *  both shapes — the L152 row-cohort discipline is untouched. */
+    private static boolean itemDispatchItem(ItemEntity e, int eid,
+            boolean fromWalk, int preVerdict) {
         if (ibN >= IB_CAP) { dispDiag(e, "cap"); return false; }
         // L119 POSITIONAL DRAIN: EVERY ItemEntity that reaches the guard
         // stamps its loop position — including the fresh-belt items that
@@ -6268,7 +6295,10 @@ public final class CeHooks {
             // replaces the cold isRemoved() field load (the remove probe at
             // EntityLookup's choke point fires for EVERY removal path, so
             // the mirror is set before the next dispatch can see the item).
-            long st = FAST_STAMP[slot];
+            // B21: preVerdict != 0 skips the stamp read+compare entirely —
+            // the kernel's verdict IS the stamp's field compare result (the
+            // same inputs, computed at the prep over the mirrored tables).
+            long st = preVerdict != 0 ? 0L : FAST_STAMP[slot];
             // L164: the RM_BIT belt is OFF the fast gate — the EntityLookup
             // choke-point probe fires on EVERY removal path and zeroes the
             // stamp BEFORE the next dispatch can see the item (the invariant
@@ -6277,17 +6307,19 @@ public final class CeHooks {
             // check. The RM_BIT load was a SECOND random-access read per
             // item per tick (1.34% self at items-100k-mod, run
             // 43736024359). CE_DISP_NORB=1 restores the belt.
-            if (st != 0L
+            if (preVerdict != 0
+                    || (st != 0L
                     && (st & 0x7FFF_FFFF_FFFF_FFFFL)
                             == ((long) ((WORLD_REV ^ MODE_EPOCH) & 0x7FFF_FFFF)
                                     << 32 | (eid & 0xFFFF_FFFFL))
-                    && (DISP_NORB || RM_BIT[eid & AMASK] != 1)) {
+                    && (DISP_NORB || RM_BIT[eid & AMASK] != 1))) {
                 // i0-a2: the core's verdict IS the port's decision (the same
                 // inputs, the same clause order — the batch carried the
                 // post-sweep activatedTick); the side effects were applied
                 // by the last flush's writeback. L151: the inactive verdict
-                // rides the stamp's top bit.
-                boolean act = st >= 0L;
+                // rides the stamp's top bit; B21: preVerdict carries it
+                // (1 = active, 2 = inactive).
+                boolean act = preVerdict != 0 ? (preVerdict == 1) : st >= 0L;
                 // L152: the row-cohort hit. The hit validates THE ROW ITSELF
                 // (IB_IDS[ibN] carries this entity's full id) — NOT the
                 // remembered position: entity ids are unique per run, so a
@@ -6620,7 +6652,8 @@ public final class CeHooks {
      *  gates (it must fire even when the query index is suspended). */
     private static void l7ExternalMutation(Entity e) {
         if (ITEM_TICK_ON && !IN_ITEM_APPLY && e instanceof ItemEntity) {
-            int slot = entId(e) & MAMASK;
+            int eid0 = entId(e);
+            int slot = eid0 & MAMASK;
             if (MODE_GEN[slot] == MODE_EPOCH) {
                 MODE_VAL[slot] = 0;
                 FAST_STAMP[slot] = 0L; // L151: the stamp dies with the mode
@@ -6630,8 +6663,23 @@ public final class CeHooks {
             // needs the exact vanilla/flush tail again.
             long[] dq = DS_QUIET;
             if (dq != null) {
-                int q = entId(e) & AMASK;
+                int q = eid0 & AMASK;
                 dq[q >> 6] &= ~(1L << (q & 63));
+            }
+            // B21: the verdict veto + the mirror CLR. The prep verdict for
+            // THIS slot is stale the moment the mode cleared — TL_MPOS names
+            // the roster slot and the write is harmless outside the walk
+            // (the next prep rebuilds the array from the live roster). The
+            // probe-born CLR rides the entity's own wid.
+            if (WV_ON) {
+                int mp = TL_MPOS[eid0 & AMASK];
+                if (mp != 0) {
+                    int[] v0 = WV_VERD;
+                    if (mp - 1 < v0.length) {
+                        v0[mp - 1] = 0;
+                    }
+                }
+                wvBelt(worldId(e.level()), eid0, true);
             }
         }
     }
@@ -6710,6 +6758,106 @@ public final class CeHooks {
     // DISP_ID/DISP_VAL stay for the diagnostic/REST readers; the fast path
     // no longer touches them.
     private static final long[] FAST_STAMP = new long[SLOT_CAP];
+
+    // B21: the kernel verdict walk (doc 66) — the walk-verdict precompute.
+    // The TL mirror walk consults ONE sequential int per visit instead of
+    // the per-item random reads (the wDq bitset + QUIET_REV for the quiet
+    // arm, FAST_STAMP for the fast arm): the kernel receives the roster
+    // (the alive bitset + the id array) + THIS level's event belt ONCE per
+    // walk and answers one verdict int per live roster slot — 0 = the exact
+    // Java chain (the untouched fallback), 1 = fast-native active, 2 =
+    // fast-native inactive, 3 = quiet-owned. The verdicts replicate the
+    // dispatch gate's STAMP half bit-exactly (the entry's verdict bits are
+    // the same 18/20 the applier transcribes into FAST_STAMP; the gen gate
+    // mirrors the zeroed stamp; the (rev^epoch) compare is the stamp's own
+    // field compare; the quiet mirror rides the belt = the applier's exact
+    // stamp decision + the l7/belt CLR events + the commit's work-tail
+    // reset). The ROW-COHORT half stays Java: a verdict-1/2 visit runs
+    // itemDispatchItem(preVerdict) — the L152 cohort check and the
+    // appendDispatch fallback are the untouched shape. CE_WVERD=0 restores
+    // the per-visit reads.
+    public static final boolean WV_ON = !"0".equals(System.getenv("CE_WVERD"));
+    // The verdict array — one int per TL mirror slot, rebuilt by EVERY prep
+    // (the mirror regrow/compaction/appends cannot leave stale verdicts:
+    // the array is fully rewritten from the live roster each walk).
+    private static volatile int[] WV_VERD = new int[1 << 18];
+    // The per-wid event belt: (id<<1|kind) ints, FIFO — kind 0 = quiet SET
+    // (the applier's stamp / the stale-but-boring re-stamp), kind 1 = CLR
+    // (l7ExternalMutation, the fuse bump's 256-tick belt). The belt carries
+    // ONE flush's events (the processing flush is one per level-tick); the
+    // prep drains its own wid's belt. Overflow drops events — the mirrors
+    // reset (all verdicts 0, the exact chain serves the tick) and the next
+    // flush re-stamps what the applier decides anew.
+    private static final int WV_BELT_CAP = 1 << 14;
+    private static final int[][] WV_BELT = new int[16][];
+    private static final int[] WV_BELT_N = new int[16];
+    private static final int[] WV_OVF = new int[16];
+    // The flush-side stamp scalars, per wid: the FAST_STAMP's field compare
+    // is (revBefore ^ epoch) vs the walk-time (WORLD_REV ^ MODE_EPOCH); the
+    // quiet stamp's QUIET_REV is the WORLD_REV field value at the apply.
+    private static final int[] WV_STAMP_REV = new int[16];
+    private static final int[] WV_STAMP_EPOCH = new int[16];
+    private static final int[] WV_QUIET_REV = new int[16];
+    // The walk's own wid — resolved at the prep (the first live roster
+    // entity's level), used by the walk-born belt events (the fuse bump).
+    private static int WV_WALK_WID = -1;
+    public static volatile long wvPreps = 0, wvQuiet = 0, wvFast = 0, wvOvf = 0;
+
+    /** B21: the belt append. Rare by construction (the stamp transitions
+     *  and the external mutations); overflow drops the event and flags the
+     *  wid — the prep resets the mirrors and the verdicts go all-zero for
+     *  the tick (the exact chain serves it, the next flush re-stamps). */
+    private static void wvBelt(int wid, int id, boolean clr) {
+        if (wid < 0 || wid >= 16) return;
+        int[] b = WV_BELT[wid];
+        if (b == null) {
+            b = new int[WV_BELT_CAP];
+            WV_BELT[wid] = b;
+        }
+        int n = WV_BELT_N[wid];
+        if (n >= WV_BELT_CAP) {
+            WV_OVF[wid] = 1;
+            wvOvf++;
+            return;
+        }
+        b[n] = clr ? ((id << 1) | 1) : (id << 1);
+        WV_BELT_N[wid] = n + 1;
+    }
+
+    /** B21: the walk prep — resolves the walk's wid (the first live roster
+     *  entity's level; one memoized worldId call per walk), drains THIS
+     *  wid's belt into the kernel and reads the verdict array back. Any
+     *  failure returns null and the walk runs the exact per-visit chain. */
+    private static int[] wvPrep() {
+        int[] verd = WV_VERD;
+        // CE_QUIET_FUSE=false (the bisect sweep mode): the sweep's bump runs
+        // OUTSIDE any walk, so its belt events have no trustworthy wid — the
+        // consult is a fused-mode feature; the bisect keeps the exact chain.
+        if (!WV_ON || !TL_ROSTER || !CE_QUIET_FUSE
+                || WV_WALK_WID < 0 || WV_WALK_WID >= 16) {
+            return null;
+        }
+        int wid = WV_WALK_WID;
+        int rc = nativeWalkPrep(wid, TL_MIRROR_ALIVE, TL_MIRROR_IDS, verd,
+                WV_BELT[wid], WV_BELT_N[wid],
+                WORLD_REV, MODE_EPOCH,
+                WV_STAMP_REV[wid], WV_STAMP_EPOCH[wid], WV_QUIET_REV[wid],
+                WV_OVF[wid]);
+        if (rc == 0) {
+            WV_BELT_N[wid] = 0;
+            WV_OVF[wid] = 0;
+            wvPreps++;
+            return verd;
+        }
+        return null; // the belt stays (a lost drain must not lose its CLRs)
+    }
+
+    /** B21 native: the walk-verdict precompute (see itemcore::n_prep). */
+    private static native int nativeWalkPrep(
+            int wid, long[] alive, int[] ids, int[] verd, int[] belt, int beltN,
+            int curRev, int curEpoch, int stampRev, int stampEpoch,
+            int quietRev, int ovf);
+
     // Per-section revision stamps: the flush drain stamps every invalidated
     // section with the post-bump WORLD_REV. A rest item whose environment
     // sections were not touched by the current revision keeps resting even
@@ -8404,6 +8552,17 @@ public final class CeHooks {
             IN_ITEM_APPLY = true;
             try {
             int epoch = MODE_EPOCH + 1;
+            // B21: the stamp scalars for this flush's verdict mirror — the
+            // FAST_STAMP field compare is (revBefore ^ epoch) vs the walk's
+            // (WORLD_REV ^ MODE_EPOCH); the quiet stamp's QUIET_REV is the
+            // WORLD_REV FIELD value here (post-drain, pre-apply — nothing
+            // bumps inside the apply window). Wid >= 16 = the map-path world
+            // (no belt, no mirror) — the stash simply skips it.
+            if (wid >= 0 && wid < 16) {
+                WV_STAMP_REV[wid] = revBefore;
+                WV_STAMP_EPOCH[wid] = epoch;
+                WV_QUIET_REV[wid] = WORLD_REV;
+            }
             // L118-diag: the outcome-bits census — the merge=0 hunt (which
             // bits does the core actually emit in the parity legs?)
             if ((itemFlushes & 2047) == 0 && n > 0) {
@@ -8705,6 +8864,14 @@ public final class CeHooks {
                         QUIET_FR[qs] = (float) outD[i * 9 + 7];
                         FAST_STAMP[mSlot] = 0L;
                         quietStamps++;
+                        // B21: the mirror SET — the applier's exact stamp
+                        // decision rides the belt (the SCAN_CLEAN/fullStack
+                        // conditions are Java-only; the kernel cannot derive
+                        // them). The quietRev scalar was stashed at the apply
+                        // head (the field value the QUIET_REV line reads).
+                        if (WV_ON) {
+                            wvBelt(wid, (int) (IB_IDS[i] & 0xFFFF_FFFFL), false);
+                        }
                     }
                 } else {
                     // L99: the persistent-quiet reset - this applier tail did
@@ -10113,6 +10280,9 @@ public final class CeHooks {
         if (TL_ROSTER) {
             TL_MIRROR_IDS = java.util.Arrays.copyOf(TL_MIRROR_IDS, ncap);
             TL_MIRROR_TYPE = java.util.Arrays.copyOf(TL_MIRROR_TYPE, ncap);
+            // B21: the verdict array rides the same lifecycle (fully rebuilt
+            // by every prep — the copy preserves nothing but the length).
+            WV_VERD = java.util.Arrays.copyOf(WV_VERD, ncap);
         }
         return true;
     }
@@ -10248,6 +10418,26 @@ public final class CeHooks {
                         Entity[] mir = TL_MIRROR;
                         long[] al = TL_MIRROR_ALIVE;
                         int bound = TL_MIRROR_LEN; // snapshot: mid-walk appends skipped (vanilla: beyond maxIndex)
+                        // B21: the walk prep — the wid rides the FIRST live
+                        // roster entity's level (one memoized worldId call
+                        // per walk; the whole roster belongs to THIS walk's
+                        // level). The prep drains THIS wid's belt and reads
+                        // the verdict array back; a null verdict = the exact
+                        // per-visit chain below (the untouched shape).
+                        int[] wv = null;
+                        if (WV_ON && TL_ROSTER && collect) {
+                            WV_WALK_WID = -1;
+                            for (int w0 = 0, w0End = (bound + 63) >> 6;
+                                    w0 < w0End && WV_WALK_WID < 0; w0++) {
+                                long w0w = al[w0];
+                                if (w0w == 0) continue;
+                                Entity e0 = mir[(w0 << 6)
+                                        | Long.numberOfTrailingZeros(w0w)];
+                                if (e0 == null) continue;
+                                WV_WALK_WID = worldId(e0.level());
+                            }
+                            wv = wvPrep();
+                        }
                         // L189: the walk-level client stamp lives ONE walk —
                         // reset here so the first wired visit of THIS walk
                         // captures the level verdict fresh (one capture per
@@ -10299,6 +10489,34 @@ public final class CeHooks {
                                 }
                                 if (ty == 1) {
                                     if (collect) {
+                                        // B21: the verdict consult — ONE
+                                        // sequential int read replaces the
+                                        // quiet arm's bitset+rev reads and the
+                                        // fast arm's stamp read+compare. The
+                                        // verdicts are the mirrored stamp
+                                        // halves; the row-cohort half runs
+                                        // inside itemDispatchItem unchanged.
+                                        if (wv != null) {
+                                            int v = wv[p];
+                                            if (v == 3) {
+                                                quietSkips++;
+                                                wvQuiet++;
+                                                dispDiag(e, "quiet");
+                                                if (CE_QUIET_FUSE) {
+                                                    quietFuseBump((ItemEntity) e, eid & AMASK, eid);
+                                                }
+                                                continue; // the quiet pass owns this item's tick
+                                            }
+                                            if (v != 0) {
+                                                wvFast++;
+                                                if (itemDispatchItem((ItemEntity) e, eid, true, v)) {
+                                                    continue; // native flush computes this tick
+                                                }
+                                                // v==1/2 return true (the cohort or the
+                                                // append); a false means the IB_CAP gate
+                                                // fired — fall to the exact chain below.
+                                            }
+                                        }
                                         // L188: the L173 quiet hoist rides the
                                         // MIRROR walk too — the retry walk has
                                         // carried this exact shape since L173

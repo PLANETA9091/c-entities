@@ -4243,6 +4243,12 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
         "(II[J[I[DI[I[D[I[D[I[I)I",
         itemcore::n_item_tick as *const c_void
     );
+    // B21: the kernel verdict walk — the walk-verdict precompute (doc 66).
+    push!(
+        "nativeWalkPrep",
+        "(I[J[I[I[IIIIIIII)I",
+        itemcore::n_prep as *const c_void
+    );
     // THE STORM BISECT: the call happens, the result is ignored.
     push!(
         "nativeMergeScan",
