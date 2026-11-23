@@ -81,6 +81,7 @@ jobs:
           RUN_NAME="prof-$SC-on" \
           SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
           AREA="$AREA" DESPAWN="$DESP" CE_NATIVE_MOB="$MOBW" TILE_HOPPERS=0 TILE_FURNACES=0 \
+          CE_WVERD=1 \
           MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
           MODULE='on' RUN_JFR='1' \
           bash scripts/run-baseline.sh
