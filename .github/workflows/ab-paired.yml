@@ -103,6 +103,7 @@ jobs:
                 RUN_NAME="abp-r$r-$SC-$ARM" \
                 SCALE="$SCALE" PCT_ITEMS="$ITEMS" PCT_STANDS="$STANDS" \
                 AREA="$AREA" DESPAWN="${DESP:-0}" CE_NATIVE_MOB="${MOBW:-0}" TILE_HOPPERS=0 TILE_FURNACES=0 \
+                CE_WVERD=1 \
                 MEASURE_TICKS="$MEAS" RUN_TIMEOUT='1800' XMX='8G' \
                 MODULE="$M" \
                 bash scripts/run-baseline.sh

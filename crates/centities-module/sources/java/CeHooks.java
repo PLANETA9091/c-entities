@@ -5077,6 +5077,35 @@ public final class CeHooks {
     private static final int IF_CDMASK = 0x3F; // the IF_* bit namespace
     private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
     private static int ibN = 0;
+    // B22 (doc 67): the kernel-owned fast rows — the verdict cohort's lane.
+    // A preVerdict-1/2 visit writes THREE sequential entries instead of the
+    // IB_ packing (appendDispatch / the cohort refresh): the KEY, the AT and
+    // the entity ref. The kernel synthesizes the batch row from its own
+    // store + this lane at the flush; the stale IB_ content at the row's
+    // position is never read. KEY layout: [63..40) = the batch position m
+    // (the ibN slot this visit consumed), [35] defaultActivationState,
+    // [34] isTemporarilyActive, [33] the inactive verdict, [32] the pd-dirty
+    // flag, [31..0] = the entity id. AT layout: activatedTick in the low 62
+    // bits + isTemp bit 62 + defAct bit 63 (the sweep's stamps are Java
+    // state the store cannot own — the same post-sweep reads appendDispatch
+    // makes). FAST_ROW_PD is the sparse pd lane: written ONLY at a dirty
+    // visit (the L184 bit), read by the kernel only when the KEY's dirty
+    // bit is set. All lanes drain with ibN at the processing flush.
+    private static long[] FAST_ROW_KEY;
+    private static long[] FAST_ROW_AT;
+    private static ItemEntity[] FAST_ROW_REFS;
+    private static int[] FAST_ROW_PD;
+    private static int fastN = 0;
+
+    /** B22: the lane allocation (once, on the first armed fast visit). */
+    private static void fastRowInit() {
+        if (FAST_ROW_KEY == null) {
+            FAST_ROW_KEY = new long[IB_CAP];
+            FAST_ROW_AT = new long[IB_CAP];
+            FAST_ROW_REFS = new ItemEntity[IB_CAP];
+            FAST_ROW_PD = new int[IB_CAP];
+        }
+    }
     // L64c: the batch's RESYNC|FORCE_VANILLA population — the flush's pass-1
     // re-read loop and the L44 view-build loop both scan ALL n entries to
     // find these; on the bench steady state the count is ZERO and both
@@ -6320,6 +6349,51 @@ public final class CeHooks {
                 // rides the stamp's top bit; B21: preVerdict carries it
                 // (1 = active, 2 = inactive).
                 boolean act = preVerdict != 0 ? (preVerdict == 1) : st >= 0L;
+                // B22: the verdict cohort's row goes KERNEL-OWNED (doc 67).
+                // The walk writes THREE sequential lane entries instead of the
+                // IB_ packing; the kernel synthesizes the batch row from its
+                // store + the lane at the flush. The position contract (L119)
+                // is untouched: BATCH_POS/BATCH_GEN were stamped by the
+                // prologue, ibN++ consumes the slot (the merged row index IS
+                // the batch position), and the KEY carries it at bits 40+.
+                // The activation truth rides the AT lane with the SAME
+                // post-sweep reads appendDispatch makes (the sweep ran before
+                // the dispatches; no vanilla body runs between the visit and
+                // the flush). The pre-B22 cohort/append shape below stays for
+                // the stamp-routed visits (preVerdict == 0) — the exact old
+                // chain, byte-identical.
+                if (preVerdict != 0) {
+                    if (FAST_ROW_KEY == null) {
+                        fastRowInit();
+                    }
+                    int k = fastN;
+                    fastN = k + 1;
+                    int m = ibN;
+                    ibN = m + 1;
+                    boolean pdDirty = PD_DIRTY != null && PD_DIRTY_ARM != 0
+                            && PD_DIRTY[slot] != 0;
+                    if (pdDirty) {
+                        // L184: the dirty-gated pickupDelay lane capture — the
+                        // bit's owner is any post-refresh field write (the
+                        // writeback + the probed setters). A clean bit means
+                        // the store already mirrors the field exactly.
+                        PD_DIRTY[slot] = 0;
+                        FAST_ROW_PD[k] = e.pickupDelay;
+                    }
+                    FAST_ROW_KEY[k] = ((long) m << 40)
+                            | ((long) eid & 0xFFFF_FFFFL)
+                            | (pdDirty ? (1L << 32) : 0L)
+                            | (act ? 0L : (1L << 33))
+                            | (e.isTemporarilyActive ? (1L << 34) : 0L)
+                            | (e.defaultActivationState ? (1L << 35) : 0L);
+                    FAST_ROW_AT[k] = e.activatedTick
+                            | (e.isTemporarilyActive ? (1L << 62) : 0L)
+                            | (e.defaultActivationState ? (1L << 63) : 0L);
+                    FAST_ROW_REFS[k] = e;
+                    dispFast++;
+                    dispDiag(e, act ? "fast-native" : "fast-inactive");
+                    return true;
+                }
                 // L152: the row-cohort hit. The hit validates THE ROW ITSELF
                 // (IB_IDS[ibN] carries this entity's full id) — NOT the
                 // remembered position: entity ids are unique per run, so a
@@ -8289,6 +8363,7 @@ public final class CeHooks {
 
     public static void itemTickFlush(Level level) {
         int n = ibN;
+        int fn = fastN; // B22: the fast-row lane drains with the batch
         itemFlushes++;
         CUR_TICK++;
         // L92: the quiet-bitset epoch — cleared at every flush entry, so a
@@ -8350,6 +8425,7 @@ public final class CeHooks {
         // stable across ticks.
         if (n == 0) return;
         ibN = 0;
+        fastN = 0; // B22: the lane drains with the batch (fn captured above)
         int cdN = ibCDN;
         ibCDN = 0;
         // L64c: captured before the reset — the two resync-scans below skip
@@ -8472,16 +8548,28 @@ public final class CeHooks {
             // L119-DIAG: the batch's dispatch order at the dump ticks — the
             // apply order = this order (the compact list preserves it), so
             // the merge-scan interleaving question needs the raw sequence.
+            // B22: the fast rows' honest ids come from the KEY lane (the
+            // packed IB_IDS holds stale content at those positions).
             if (phDumpTickNow() && n > 0) {
                 StringBuilder bb2 = new StringBuilder(160);
                 bb2.append("BORD t=").append(CUR_TICK).append(" n=").append(n);
+                int bk = 0;
                 for (int q = 0; q < n; q++) {
-                    bb2.append(' ').append((int) (IB_IDS[q] & 0xFFFF_FFFFL));
+                    int idq;
+                    if (fn > 0 && FAST_ROW_KEY != null && bk < fn
+                            && (int) (FAST_ROW_KEY[bk] >>> 40) == q) {
+                        idq = (int) FAST_ROW_KEY[bk];
+                        bk++;
+                    } else {
+                        idq = (int) (IB_IDS[q] & 0xFFFF_FFFFL);
+                    }
+                    bb2.append(' ').append(idq);
                 }
                 System.out.println("[ce-baseline] " + bb2);
             }
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
-                    envD, envI, outD, outI, IB_ATI);
+                    envD, envI, outD, outI, IB_ATI,
+                    fn, FAST_ROW_KEY, FAST_ROW_AT, FAST_ROW_PD);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
             }
@@ -8581,7 +8669,10 @@ public final class CeHooks {
                     if ((db & (1 << 20)) != 0) b20++;
                     if ((db & (1 << 13)) != 0) b13++;
                     if ((db & (1 << 11)) != 0) b11++;
-                    if ((IB_FLAGS[di] & IF_NATIVE) != 0) nat++;
+                    // B22: the fast rows carry the marker in the read-back
+                    // bits (their packed IB_FLAGS slot is stale).
+                    if ((IB_FLAGS[di] & IF_NATIVE) != 0
+                            || (db & (1 << 23)) != 0) nat++;
                 }
                 System.out.println("[bits] flush=" + itemFlushes + " n=" + n
                         + " nat=" + nat + " b5(MERGE)=" + b5 + " b16(TAILNONE)=" + b16
@@ -8595,15 +8686,37 @@ public final class CeHooks {
             // L92: one volatile read per flush - TT_MIRROR flips only in
             // the tracker reconcile (between flushes), never mid-flush.
             final boolean quietStampArm = TTL_QUIET_ON && TT_MIRROR;
+            // B22: the fast-row routing cursor — the KEY positions are the
+            // batch order (strictly increasing), so one forward cursor maps
+            // every bit-23 row to its lane entry.
+            int fastK = 0;
             for (int i = 0; i < n; i++) {
                 // L119b: the release cursor rides the apply loop - the entries
                 // this item's writeback probes are at or behind its own arena
                 // index, so the DRAIN_CAP overflow may release exactly them
                 // (the vanilla mid-loop view) and nothing past it.
                 drainCursor = i;
-                int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
-                int mSlot = (int) (IB_IDS[i] & MAMASK);
+                // B22: the fast rows' identity/ref ride the sequential lane
+                // (the packed IB_ slots hold stale content at those positions);
+                // the chain rows keep the exact pre-B22 reads.
+                boolean rowFast = (bits & (1 << 23)) != 0
+                        && FAST_ROW_KEY != null && fastK < fn
+                        && (int) (FAST_ROW_KEY[fastK] >>> 40) == i;
+                long keyRow = 0L;
+                int eidRow;
+                ItemEntity eRow;
+                if (rowFast) {
+                    keyRow = FAST_ROW_KEY[fastK];
+                    eidRow = (int) keyRow;
+                    eRow = FAST_ROW_REFS[fastK];
+                    fastK++;
+                } else {
+                    eidRow = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
+                    eRow = IB_ITEM[i];
+                }
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                int mSlot = eidRow & MAMASK;
                 // L151: the verdict tables are written ONCE at the arm and on
                 // transitions — a steady NATIVE_OK item re-writes nothing
                 // (the conditional reads are L1-hot next to the batch rows).
@@ -8676,7 +8789,7 @@ public final class CeHooks {
                     // (the exact MODE_GEN==MODE_EPOCH contract).
                     if ((bits & ((1 << 18) | (1 << 20))) != 0) {
                         FAST_STAMP[mSlot] = ((long) ((revBefore ^ epoch) & 0x7FFF_FFFF)
-                                << 32 | (IB_IDS[i] & 0xFFFF_FFFFL))
+                                << 32 | (eidRow & 0xFFFF_FFFFL))
                                 | ((bits & (1 << 18)) != 0
                                         ? 0L : Long.MIN_VALUE);
                     } else {
@@ -8686,7 +8799,7 @@ public final class CeHooks {
                     // the Java fields value-exact without running the port
                     // (the od slot 8 carries activatedTick; bit 19 isTemp).
                     if ((bits & (1 << 13)) == 0) {
-                        ItemEntity aw = IB_ITEM[i];
+                        ItemEntity aw = eRow;
                         if (aw != null) {
                             // i0-a2c: write only on a real change — the echo
                             // case (no stamp, isTemp already false in the
@@ -8695,7 +8808,12 @@ public final class CeHooks {
                                 aw.activatedTick = (long) outD[i * 9 + 8];
                             }
                             boolean tv = (bits & (1 << 19)) != 0;
-                            if (tv || (IB_ATI[i * 3 + 2] & 1) != 0) {
+                            // B22: the fast rows' append-time isTemp truth
+                            // rides the KEY's bit 34 (the packed IB_ATI slot
+                            // is stale foreign content at that position).
+                            if (tv || (rowFast
+                                    ? (keyRow & (1L << 34)) != 0L
+                                    : (IB_ATI[i * 3 + 2] & 1) != 0)) {
                                 aw.isTemporarilyActive = tv;
                             }
                         }
@@ -8710,17 +8828,17 @@ public final class CeHooks {
                     }
                     FAST_STAMP[mSlot] = 0L;
                 }
-                if ((f & IF_NATIVE) == 0 || (bits & (1 << 13)) != 0) {
+                if ((!rowFast && (f & IF_NATIVE) == 0) || (bits & (1 << 13)) != 0) {
                     // aborted (bit 13): the core did not compute — nothing to
                     // apply, the item froze this tick and runs vanilla next.
                     if ((bits & (1 << 13)) != 0) itemAbort++;
                     continue;
                 }
-                ItemEntity e = IB_ITEM[i];
+                ItemEntity e = eRow;
                 // L115b (the loop-A head): the mirror read replaces the cold
                 // removal-reason load — the entity object is only touched
                 // for the counter writes now (one cache line, not two).
-                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue;
+                if (e == null || RM_BIT[eidRow & AMASK] == 1) continue;
                 // L7: mirror the suppressed dispatcher's tickCount++ and
                 // totalEntityAge++ (the vanilla tickNonPassenger body was
                 // skipped for dispatch-owned entries). L78: the age write
@@ -8753,7 +8871,7 @@ public final class CeHooks {
                     // EMPTY dirty set (no metadata writer ran — merge is a
                     // TAIL_NONE breaker).
                     if (quietStampArm && !e.syncVelocity) {
-                        int mq = (int) (IB_IDS[i] & AMASK);
+                        int mq = eidRow & AMASK;
                         long[] tq = TT_QUIET;
                         // L159: the already-quiet short-circuit — the steady-state
                         // quiet cohort (~30k items/tick at items-100k) paid the
@@ -8851,20 +8969,21 @@ public final class CeHooks {
                         //   - the merge future: scan-clean / inert pd / full
                         //     stack (the cadence suspension is exact — see the
                         //     L161a/L172a notes).
-                        int qs0 = (int) (IB_IDS[i] & AMASK);
+                        int qs0 = eidRow & AMASK;
                         stampOk = outD[i * 9 + 1] == 0.0
                                 && (bits & (1 << 5)) == 0
                                 && (bits & (1 << 22)) == 0
                                 && ((SCAN_CLEAN != null
                                     && (SCAN_CLEAN[qs0 >> 6] & (1L << (qs0 & 63))) != 0
                                     && SC_GEN[qs0] == (int) REG_REV)
-                                || IB_I[i * 4 + 2] == 32767
+                                || (rowFast ? (bits & (1 << 26)) != 0
+                                        : IB_I[i * 4 + 2] == 32767)
                                 || fullStackQuiet(e));
                     }
                     if (CE_QUIET_ON && MERGP_ON && DS_QUIET != null
                             && e.age != -32768
                             && stampOk) {
-                        int qs = (int) (IB_IDS[i] & AMASK);
+                        int qs = eidRow & AMASK;
                         DS_QUIET[qs >> 6] |= 1L << (qs & 63);
                         QUIET_REV[qs] = WORLD_REV;
                         QUIET_FR[qs] = (float) outD[i * 9 + 7];
@@ -8876,7 +8995,7 @@ public final class CeHooks {
                         // them). The quietRev scalar was stashed at the apply
                         // head (the field value the QUIET_REV line reads).
                         if (WV_ON) {
-                            wvBelt(wid, (int) (IB_IDS[i] & 0xFFFF_FFFFL), false);
+                            wvBelt(wid, eidRow, false);
                         }
                     }
                 } else {
@@ -8890,7 +9009,7 @@ public final class CeHooks {
                         Object[] rq2 = TT_REF;
                         long[] fq2 = TT_FLAT;
                         if (rq2 != null && fq2 != null) {
-                            int mq2 = (int) (IB_IDS[i] & AMASK);
+                            int mq2 = eidRow & AMASK;
                             int obq2 = mq2 * 5;
                             if (rq2[obq2 + 2] == e) {
                                 TT_QUIET[mq2 >> 6] &= ~(1L << (mq2 & 63));
@@ -8909,20 +9028,44 @@ public final class CeHooks {
             // unobservable (discard fires no reads of them; the store
             // mirror already holds the core's committed values).
             int cn = outI[n * 4];
+            // B22: the compact list is batch-ordered (the core lists the
+            // !TAIL_NONE rows in order), so one forward KEY cursor maps the
+            // fast rows exactly like loop A's.
+            int bK = 0;
             for (int j = 0; j < cn; j++) {
                 int i = outI[n * 4 + 1 + j];
-                int f = IB_FLAGS[i] & IF_CDMASK;
                 int bits = outI[i * 4 + 2];
-                ItemEntity e = IB_ITEM[i];
-                if (e == null || RM_BIT[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] == 1) continue; // L115b
+                while (bK < fn && FAST_ROW_KEY != null
+                        && (int) (FAST_ROW_KEY[bK] >>> 40) < i) {
+                    bK++;
+                }
+                boolean rowFast = (bits & (1 << 23)) != 0
+                        && FAST_ROW_KEY != null && bK < fn
+                        && (int) (FAST_ROW_KEY[bK] >>> 40) == i;
+                int eidRow;
+                ItemEntity e;
+                if (rowFast) {
+                    eidRow = (int) FAST_ROW_KEY[bK];
+                    e = FAST_ROW_REFS[bK];
+                    bK++;
+                } else {
+                    eidRow = (int) (IB_IDS[i] & 0xFFFF_FFFFL);
+                    e = IB_ITEM[i];
+                }
+                int f = IB_FLAGS[i] & IF_CDMASK;
+                if (e == null || RM_BIT[eidRow & AMASK] == 1) continue; // L115b
                 if ((bits & (1 << 16)) != 0) continue; // belt: the core excludes these
-                if ((f & IF_INACTIVE) != 0) {
+                // B22: the fast rows' tick-body routing rides bit 24 (the
+                // packed IB_FLAGS slot is stale foreign content).
+                if ((rowFast ? (bits & (1 << 24)) != 0 : (f & IF_INACTIVE) != 0)) {
                     // inactiveTick semantics: pickupDelay/age/despawn only
                     int pd = outI[i * 4 + 1];
-                    if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
+                    // B22: the fast rows' same-value skip rides bit 25 (the
+                    // pre-tick pd the IB_I quad would carry is stale for them).
+                    if (rowFast ? (bits & (1 << 25)) == 0 : pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                         e.pickupDelay = pd;
                         if (PD_DIRTY != null) {
-                            PD_DIRTY[(int) (IB_IDS[i] & 0xFFFF_FFFFL) & AMASK] = 1;
+                            PD_DIRTY[eidRow & AMASK] = 1;
                         }
                     }
                     if ((bits & (1 << 7)) != 0) {
@@ -8930,7 +9073,7 @@ public final class CeHooks {
                         // IF_NATIVE entries carry no batch despawnRate — the
                         // field IS the truth (ctor-fixed in vanilla); the
                         // age check below still gates the event.
-                        boolean rateOk = (f & IF_NATIVE) != 0
+                        boolean rateOk = rowFast || (f & IF_NATIVE) != 0
                                 || rate == IB_I[i * 4 + 3];
                         if (rateOk && e.age >= rate) {
                             despawnTail(e);
@@ -8938,7 +9081,7 @@ public final class CeHooks {
                     }
                     continue;
                 }
-                int idSlot = (int) (IB_IDS[i] & 0xFFFF_FFFF);
+                int idSlot = eidRow;
                 int o = i * 9; // i0-a2: the od stride gained the activatedTick slot
                 // L16 DELTA_SAME: when the core reports the post-tick delta
                 // is bit-identical to the pre-tick delta (the resting-item
@@ -9001,7 +9144,9 @@ public final class CeHooks {
                     dsame++;
                 }
                 int pd = outI[i * 4 + 1];
-                if (pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
+                // B22: the fast rows' same-value skip rides bit 25 (the
+                // pre-tick pd the IB_I quad would carry is stale for them).
+                if (rowFast ? (bits & (1 << 25)) == 0 : pd != IB_I[i * 4 + 2]) { // same-value skip (resting items)
                     e.pickupDelay = pd;
                     if (PD_DIRTY != null) {
                         PD_DIRTY[idSlot] = 1; // L184: the row refresh reads it back next dispatch
@@ -9125,7 +9270,7 @@ public final class CeHooks {
                     // REG_REV so any entity event invalidates it. A refused
                     // scan (-1) or a TRUNC prefix is UNKNOWN -> not clean.
                     if (SCAN_CLEAN != null) {
-                        int sq = (int) (IB_IDS[i] & AMASK);
+                        int sq = eidRow & AMASK;
                         if (candsRaw >= 0 && !msTrunc && cands == 0) {
                             SCAN_CLEAN[sq >> 6] |= 1L << (sq & 63);
                             SC_GEN[sq] = (int) REG_REV;
@@ -9762,7 +9907,8 @@ public final class CeHooks {
     public static native int nativeItemTick(
             int wid, int n, long[] ids, int[] flags,
             double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
-            double[] outD, int[] outI, int[] at);
+            double[] outD, int[] outI, int[] at,
+            int fastN, long[] frKey, long[] frAt, int[] frPd);
     public static native int nativeMergeScan(
             int wid, double x, double y, double z, double r, double yinf,
             long selfId, long[] out);

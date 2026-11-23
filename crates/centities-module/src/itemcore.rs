@@ -181,6 +181,12 @@ pub struct ItemWorld {
     /// L160: bumped once per n_item_tick flush of THIS world; entries
     /// stamped with the current value carry tick-fresh pd/age/rate.
     flush_gen: u64,
+    /// B22: the flush_gen value the LAST walk prep answered verdicts at.
+    /// 0 = no prep this cycle. The fast-row validation requires the
+    /// entry's verdict_gen to equal THIS value exactly (the verdict the
+    /// walk consulted was computed at that flush and nothing re-wrote it
+    /// between the prep and this flush — no flush ran in between).
+    prep_gen: u64,
     pub grid: SectionGrid,
     // ---- flush scratch (sized to n; only grows) ----
     /// Phase-1 hydrated states, mutated in place by phase 2.
@@ -193,6 +199,10 @@ pub struct ItemWorld {
     /// = ~12MB of per-tick allocation and double-writes).
     c_flag: Vec<u8>,
     c_l6: Vec<L6Rec>,
+    /// B22: per-row "this position is a synthesized fast row" flag — phase
+    /// 2 ORs B22_FAST into the abort/normal bit writes, phase 3 inherits
+    /// them (the compact-list rows keep the marker for loop B's routing).
+    fr_flag: Vec<bool>,
 }
 
 /// The L6 persistent parts of one committed tick (store-only fields the
@@ -239,12 +249,14 @@ impl ItemWorld {
         ItemWorld {
             entries: (0..STORE_CAP).map(|_| ItemEntry::fresh(u64::MAX)).collect(),
             flush_gen: 1,
+            prep_gen: 0,
             grid: SectionGrid::new(),
             sts: Vec::new(),
             tickable: Vec::new(),
             aborts_in: Vec::new(),
             c_flag: Vec::new(),
             c_l6: Vec::new(),
+            fr_flag: Vec::new(),
         }
     }
 
@@ -541,6 +553,24 @@ const B_TAIL_NONE: i32 = 1 << 16;
 /// the applier checks this bit before stamping.
 const B_SPD: i32 = 1 << 22;
 
+// B22 (doc 67): the kernel-owned fast rows — read-back bits. The verdict
+// cohort's rows are synthesized from the store + the walk lane at phase 1;
+// the applier routes their identity/ref through the sequential FAST_ROW
+// lanes instead of the packed IB_ rows.
+/// the row is a B22 fast row: the applier consumes FAST_ROW_KEY/REFS at
+/// this position (the sequential fast cursor) and skips the stale IB_
+/// id/ref/flags/ATI reads.
+const B22_FAST: i32 = 1 << 23;
+/// the row's tick ran the INACTIVE body (the applier's loop B routes the
+/// inactive tail for fast rows without the stale IB_FLAGS read).
+const B22_INACT: i32 = 1 << 24;
+/// the row's post-tick pickupDelay equals its pre-tick value (the applier's
+/// same-value skip for fast rows — the IB_I quad is stale for them).
+const B22_PD_SAME: i32 = 1 << 25;
+/// the row's pre-tick pickupDelay was the 32767 inert sentinel (the quiet
+/// stamp's pd clause for fast rows — the IB_I quad is stale for them).
+const B22_PD_INERT: i32 = 1 << 26;
+
 // L118-diag: the outcome-bits census (the merge=0 hunt) — module-level so
 // both the per-item body and the flush-stats print reach them.
 static CB_MERGE_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -706,6 +736,38 @@ fn proc_rss_mb() -> u64 {
         .unwrap_or(0)
 }
 
+/// B22 (doc 67): the fast-row KEY stream validation — the positions ride
+/// bits 40+, must STRICTLY increase and land inside the batch; the id half
+/// (bits 0-31) must be nonzero. Any drift refuses the whole tick (the
+/// flush's rc != 0 path recovers vanilla-exact).
+fn b22_keys_valid(keys: &[i64], n: usize) -> bool {
+    let mut prev: i64 = -1;
+    for &k in keys {
+        let pos = k >> 40;
+        if pos <= prev || pos >= n as i64 || (k & 0xFFFF_FFFF) == 0 {
+            return false;
+        }
+        prev = pos;
+    }
+    true
+}
+
+/// B22: the fast-row store validation — the entry must be THIS id (the
+/// full-id membership test, slot aliasing cannot cross) and carry the
+/// verdict the walk consulted, committed at the prep's generation. A
+/// verdict_gen older than prep_gen means the verdict died (an abort, a
+/// resync, a vanilla_next) — the prep's own gate would have answered 0 and
+/// the walk would have run the exact chain, so a live KEY with a stale
+/// verdict is drift; the row aborts (one frozen tick, exact recovery).
+fn b22_row_valid(ent: &ItemEntry, eid: i64, prep_gen: u64, want_verdict: u8) -> bool {
+    let tag = (eid as u64 >> 17) | 1;
+    ent.tag == tag
+        && ent.id == eid
+        && prep_gen != 0
+        && ent.verdict_gen == prep_gen
+        && ent.verdict == want_verdict
+}
+
 thread_local! {
     static T_IDS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static T_FLAGS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
@@ -718,6 +780,14 @@ thread_local! {
     /// packed by the flush from the live entities (the vanilla sweep's
     /// stamps ride it).
     static T_ATI: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    /// B22: the walk's fast-row lane — FAST_ROW_KEY longs
+    /// ([63..40) = the batch position, [35] defAct, [34] isTemp, [33]
+    /// inactive, [32] pd-dirty, [31..0] = the entity id), the FAST_ROW_AT
+    /// longs (activatedTick low 62 bits + isTemp bit 62 + defAct bit 63)
+    /// and the sparse pd lane (read only when the KEY's dirty bit is set).
+    static T_FRK: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static T_FRAT: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static T_FRPD: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// JNI native: env is live on the calling (server) thread.
@@ -737,12 +807,17 @@ pub extern "system" fn n_item_tick(
     out_d: jni::jdoubleArray,
     out_i: jni::jintArray,
     at: jni::jintArray,
+    fast_n: i32,
+    fr_key: jni::jlongArray,
+    fr_at: jni::jlongArray,
+    fr_pd: jni::jintArray,
 ) -> i32 { let _site_guard = centities_core::SiteGuard::enter(6); 
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
     // vtable pattern proven in lib.rs.
     return unsafe {
         n_item_tick_impl(
             env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i, at,
+            fast_n, fr_key, fr_at, fr_pd,
         )
     };
 }
@@ -763,6 +838,10 @@ unsafe fn n_item_tick_impl(
     out_d: jni::jdoubleArray,
     out_i: jni::jintArray,
     at: jni::jintArray,
+    fast_n: i32,
+    fr_key: jni::jlongArray,
+    fr_at: jni::jlongArray,
+    fr_pd: jni::jintArray,
 ) -> i32 {
     let n = n.max(0) as usize;
     if n == 0 || wid < 0 || wid >= 8 {
@@ -789,6 +868,9 @@ unsafe fn n_item_tick_impl(
                     T_OUTD.with(|tod| {
                         T_OUTI.with(|toi| {
                     T_ATI.with(|tat| {
+                    T_FRK.with(|tfrk| {
+                    T_FRAT.with(|tfrat| {
+                    T_FRPD.with(|tfrpd| {
                             let mut d = td.borrow_mut();
                             let mut iv = ti.borrow_mut();
                             let mut idv = tid.borrow_mut();
@@ -813,6 +895,46 @@ unsafe fn n_item_tick_impl(
                             ((*vt).GetLongArrayRegion)(raw, ids, 0, n as i32, idv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, flags, 0, n as i32, fv.as_mut_ptr());
                             ((*vt).GetIntArrayRegion)(raw, in_i, 0, (n * 4) as i32, iv.as_mut_ptr());
+                            // B22: the walk's fast-row lane. fast_n == 0 (the
+                            // dormant consult) keeps the exact pre-B22 path.
+                            let fast_n = fast_n.max(0) as usize;
+                            let mut frk = tfrk.borrow_mut();
+                            let mut frat = tfrat.borrow_mut();
+                            let mut frpd = tfrpd.borrow_mut();
+                            frk.clear();
+                            frat.clear();
+                            frpd.clear();
+                            if fast_n > 0 {
+                                if !wv_on || fr_key.is_null() || fr_at.is_null() || fr_pd.is_null() {
+                                    // the walk armed the lane but the kernel's
+                                    // env parse disagrees — refuse the tick (the
+                                    // flush treats rc != 0 as vanilla-this-tick).
+                                    return -1;
+                                }
+                                let klen = ((*vt).GetArrayLength)(raw, fr_key) as usize;
+                                let alen = ((*vt).GetArrayLength)(raw, fr_at) as usize;
+                                let plen = ((*vt).GetArrayLength)(raw, fr_pd) as usize;
+                                if klen < fast_n || alen < fast_n || plen < fast_n {
+                                    return -1;
+                                }
+                                frk.resize(fast_n, 0);
+                                frat.resize(fast_n, 0);
+                                frpd.resize(fast_n, 0);
+                                ((*vt).GetLongArrayRegion)(raw, fr_key, 0, fast_n as i32, frk.as_mut_ptr() as *mut i64);
+                                ((*vt).GetLongArrayRegion)(raw, fr_at, 0, fast_n as i32, frat.as_mut_ptr() as *mut i64);
+                                ((*vt).GetIntArrayRegion)(raw, fr_pd, 0, fast_n as i32, frpd.as_mut_ptr());
+                                if e.exception_check() {
+                                    e.exception_clear();
+                                    return -1;
+                                }
+                                // The positions ride bits 40+: strictly
+                                // increasing and inside the batch. Any drift
+                                // refuses the whole tick (the exact-chain
+                                // recovery is the flush's rc != 0 path).
+                                if !b22_keys_valid(&frk, n) {
+                                    return -1;
+                                }
+                            }
                             let mut envv_d = [0.0f64; 6];
                             let mut envv_i = [0i32; 6];
                             ((*vt).GetDoubleArrayRegion)(raw, env_d, 0, 6, envv_d.as_mut_ptr());
@@ -905,13 +1027,90 @@ unsafe fn n_item_tick_impl(
                                 world.c_flag.resize(n, 0);
                                 world.c_l6.clear();
                                 world.c_l6.resize(n, L6Rec::default());
+                                world.fr_flag.clear();
+                                world.fr_flag.resize(n, false);
                             } else {
                                 world.tickable.fill(false);
                                 world.aborts_in.fill(0);
                                 world.c_flag.fill(0);
                                 world.c_l6.fill(L6Rec::default());
+                                world.fr_flag.fill(false);
                             }
+                            // B22: the fast-row merge-join cursor. The keys'
+                            // positions were validated strictly increasing in
+                            // the phase-0 pre-scan, so a single forward cursor
+                            // matches each key to exactly one batch position.
+                            let mut fk: usize = 0;
                             for k in 0..n {
+                                // B22 SYNTHESIS: a fast row's identity/flags/pd/
+                                // activation truth are written into the LOCAL
+                                // batch copies BEFORE the body reads them — the
+                                // whole downstream pipeline (the F_NATIVE branch,
+                                // phase 2, phase 3, TAIL_NONE) then treats it
+                                // exactly like a hand-packed native row. The
+                                // store is the state source (validated below);
+                                // the stale IB_ content at this position is
+                                // never read.
+                                if fk < fast_n && (frk[fk] >> 40) as usize == k {
+                                    let key = frk[fk];
+                                    let eid = (key & 0xFFFF_FFFF) as i64;
+                                    let inact = (key >> 33) & 1 == 1;
+                                    let dirty = (key >> 32) & 1 == 1;
+                                    let want_verdict: u8 = if inact { 2 } else { 1 };
+                                    let slot = (eid as u64 & STORE_MASK) as usize;
+                                    let valid = b22_row_valid(
+                                        &world.entries[slot],
+                                        eid,
+                                        world.prep_gen,
+                                        want_verdict,
+                                    );
+                                    if !valid {
+                                        // Drift (the verdict died between the prep
+                                        // and the visit — l7 veto, a mode clear):
+                                        // the row ABORTS (bit 13) — the item
+                                        // freezes this tick and the vanilla body
+                                        // re-ingests next tick. The position still
+                                        // carries B22_FAST so the applier consumes
+                                        // the KEY/REF pair and keeps its cursor.
+                                        oi[k * 4 + 2] = B22_FAST | B_ABORTED;
+                                        world.tickable[k] = false;
+                                        fk += 1;
+                                        continue;
+                                    }
+                                    let pre_pd = if dirty {
+                                        frpd[fk]
+                                    } else {
+                                        world.entries[slot].pickup_delay
+                                    };
+                                    // The activation truth rides the AT lane (the
+                                    // sweep's stamps are Java state the store
+                                    // cannot own): activatedTick in the low 62
+                                    // bits + isTemp bit 62 + defAct bit 63. The
+                                    // batch ATI layout is (int)at / (int)(at>>32)
+                                    // / flags — identical to appendDispatch's
+                                    // stamp, so the verdict consumes the SAME
+                                    // shape the packed rows carry.
+                                    let atw = frat[fk] as u64;
+                                    let at_val = (atw & 0x3FFF_FFFF_FFFF_FFFF) as i64;
+                                    let at_flags = ((atw >> 62) & 1) as i32
+                                        | (((atw >> 63) & 1) as i32) << 1;
+                                    idv[k] = eid;
+                                    fv[k] = F_NATIVE | (if inact { F_INACTIVE } else { 0 });
+                                    // The pd freshness contract (L184/plugin
+                                    // parity): a dirty bit carries the fresh value
+                                    // in the lane; a clean bit means the row
+                                    // already mirrors the store exactly (the
+                                    // F_NATIVE branch's fresh_pd compare then
+                                    // equals and the store wins — identical).
+                                    iv[k * 4 + 2] = pre_pd;
+                                    atv[k * 3] = (at_val & 0xFFFF_FFFF) as i32;
+                                    atv[k * 3 + 1] = ((at_val >> 32) & 0xFFFF_FFFF) as i32;
+                                    atv[k * 3 + 2] = at_flags;
+                                    fk += 1;
+                                    world.fr_flag[k] = true;
+                                    // fall through to the shared body with the
+                                    // synthesized batch row
+                                }
                                 let id = idv[k];
                                 let f_raw = fv[k];
                                 let f = f_raw & 0x3F;
@@ -1140,7 +1339,7 @@ unsafe fn n_item_tick_impl(
                                 // the tick, the SoA scratch arrays are chunk-
                                 // disjoint (each parallel chunk touches only its
                                 // own 512 slots).
-                                let ItemWorld { grid, sts, tickable, aborts_in, c_flag, c_l6, .. } =
+                                let ItemWorld { grid, sts, tickable, aborts_in, c_flag, c_l6, fr_flag, .. } =
                                     world;
                                 let grid = &*grid;
                                 use rayon::prelude::*;
@@ -1154,8 +1353,9 @@ unsafe fn n_item_tick_impl(
                                     .zip(idv.par_chunks(512))
                                     .zip(fv.par_chunks(512))
                                     .zip(atv.par_chunks(512 * 3))
+                                    .zip(fr_flag.par_chunks(512))
                                     .for_each(
-                                        |(((((((((st_c, od_c), oi_c), cf_c), cl_c), tk_c), ab_c), id_c), f_c), at_c)| {
+                                        |((((((((((st_c, od_c), oi_c), cf_c), cl_c), tk_c), ab_c), id_c), f_c), at_c), ff_c)| {
                                             let mut scratch = Scratch::new();
                                             let mut provider = make_provider(wid);
                                             let mut cache = SectionCache::new(grid, &mut provider);
@@ -1210,7 +1410,13 @@ unsafe fn n_item_tick_impl(
                                                         && centities_core::tick::want_native(st, &tenv);
                                                     let mode =
                                                         if want { B_NATIVE_OK } else { B_VANILLA_NEXT };
-                                                    oi_c[j * 4 + 2] = B_ABORTED | mode;
+                                                    // B22: the fast-row marker rides the
+                                                    // abort write too — the applier consumes
+                                                    // the KEY/REF pair at this position
+                                                    // regardless of the outcome.
+                                                    oi_c[j * 4 + 2] = B_ABORTED | mode
+                                                        | (if ff_c[j] { B22_FAST } else { 0 })
+                                                        | (if ff_c[j] && (f_c[j] & F_INACTIVE) != 0 { B22_INACT } else { 0 });
                                                     // c_flag: 2 = abort (streak+1),
                                                     // 3 = abort + clear the streak (the
                                                     // vanilla tick re-ingests)
@@ -1355,7 +1561,9 @@ unsafe fn n_item_tick_impl(
                                                         None => od_c[j * 9 + 8] = 0.0,
                                                     }
                                                 }
-                                                oi_c[j * 4 + 2] = ob;
+                                                oi_c[j * 4 + 2] = ob
+                                                    | (if ff_c[j] { B22_FAST } else { 0 })
+                                                    | (if ff_c[j] && (f_c[j] & F_INACTIVE) != 0 { B22_INACT } else { 0 });
                                                 oi_c[j * 4 + 3] = st.tick_count;
                                                 // L6 persistent parts only — the physics
                                                 // fields ride in od/oi (phase 3 reads them
@@ -1524,6 +1732,19 @@ unsafe fn n_item_tick_impl(
                                         oi[n4 + 1 + cn] = k as i32;
                                         cn += 1;
                                     }
+                                    // B22: the fast rows' pd semantics ride bits —
+                                    // the IB_I quad is stale for them, so the
+                                    // applier's same-value skip (loop B) and the
+                                    // quiet stamp's inert-pd clause route through
+                                    // B22_PD_SAME / B22_PD_INERT instead.
+                                    if world.fr_flag[k] {
+                                        if out_pd == pre_pd {
+                                            oi[k * 4 + 2] |= B22_PD_SAME;
+                                        }
+                                        if pre_pd == 32767 {
+                                            oi[k * 4 + 2] |= B22_PD_INERT;
+                                        }
+                                    }
                                     // B21: the verdict mirror — the SAME bits the
                                     // applier transcribes into FAST_STAMP (18|20),
                                     // stamped with THIS flush's generation; plus the
@@ -1622,6 +1843,9 @@ unsafe fn n_item_tick_impl(
             })
         })
     })
+})
+})
+})
 })
 }
 
@@ -2148,6 +2372,10 @@ unsafe fn n_prep_impl(
         dirty.clear();
         dirty.resize(STORE_CAP, 0u8);
         if let Some(iw) = iw_guard.as_mut() {
+            // B22: the fast-row validation anchors on THIS prep's generation —
+            // the verdicts the walk consults were committed at flush_gen and
+            // nothing re-writes them before this flush consumes the plan.
+            iw.prep_gen = iw.flush_gen;
             if have_belt {
                 for &ev in bbuf.iter() {
                     let kind = ev & 1;
@@ -2305,5 +2533,110 @@ mod parse_tests {
         assert!(!s.complex);
         assert!(s.entries[1].step_on_special);
         assert!(s.entries[1].fall_on_special);
+    }
+}
+
+/// B22 (doc 67) — the kernel-owned fast rows: the lane contract tests. The
+/// verdict cohort's rows are synthesized from the store + the walk lane at
+/// phase 1; these tests pin the lane layout, the plan validation and the
+/// store-membership gate (the exactness envelope of the merge-join).
+#[cfg(test)]
+mod b22_tests {
+    use super::*;
+
+    /// The Java walk packs the KEY the same way the kernel unpacks it:
+    /// [63..40) the batch position, [35] defAct, [34] isTemp, [33] inactive,
+    /// [32] pd-dirty, [31..0] the entity id. Round-trip both directions.
+    #[test]
+    fn key_layout_round_trip() {
+        let mk = |pos: i64, eid: i64, dirty: bool, inact: bool, is_temp: bool, def: bool| -> i64 {
+            (pos << 40)
+                | (eid & 0xFFFF_FFFF)
+                | (if dirty { 1i64 << 32 } else { 0 })
+                | (if inact { 1i64 << 33 } else { 0 })
+                | (if is_temp { 1i64 << 34 } else { 0 })
+                | (if def { 1i64 << 35 } else { 0 })
+        };
+        let k = mk(17, 123_456, true, true, false, true);
+        assert_eq!((k >> 40) as usize, 17);
+        assert_eq!(k & 0xFFFF_FFFF, 123_456);
+        assert!((k >> 32) & 1 == 1);
+        assert!((k >> 33) & 1 == 1);
+        assert!((k >> 34) & 1 == 0);
+        assert!((k >> 35) & 1 == 1);
+        // a position-shifted key never aliases the id half
+        let k2 = mk(41, 7, false, false, false, false);
+        assert_eq!(k2 & 0xFFFF_FFFF, 7);
+        assert_eq!((k2 >> 40) as usize, 41);
+    }
+
+    /// The AT lane packs activatedTick (low 62 bits) + isTemp bit 62 + defAct
+    /// bit 63; the kernel unpacks into the batch ATI triple exactly like
+    /// appendDispatch's stamp.
+    #[test]
+    fn at_lane_unpack_matches_append_dispatch() {
+        let at: i64 = 92_345_678_901; // activatedTick with the sweep's stamps
+        let atw = at | (1i64 << 62) | (1i64 << 63);
+        let at_val = (atw as u64 & 0x3FFF_FFFF_FFFF_FFFF) as i64;
+        let at_flags = ((atw as u64 >> 62) & 1) as i32 | ((((atw as u64 >> 63) & 1) as i32) << 1);
+        assert_eq!(at_val, at);
+        assert_eq!(at_flags, 3); // isTemp | defAct
+        // the batch ATI triple reconstruction (the verdict's at_in path)
+        let lo = (at_val & 0xFFFF_FFFF) as i32;
+        let hi = ((at_val >> 32) & 0xFFFF_FFFF) as i32;
+        let back = (hi as i64) << 32 | (lo as i64 & 0xFFFF_FFFF);
+        assert_eq!(back, at);
+    }
+
+    /// The plan validation: strictly increasing positions inside the batch,
+    /// nonzero ids; any drift refuses the tick.
+    #[test]
+    fn keys_validation_gates() {
+        let mk = |pos: i64, eid: i64| -> i64 { (pos << 40) | (eid & 0xFFFF_FFFF) };
+        // the clean interleave: 3 fast rows inside a 10-row batch
+        assert!(b22_keys_valid(&[mk(0, 5), mk(2, 9), mk(7, 3)], 10));
+        // out of range
+        assert!(!b22_keys_valid(&[mk(10, 5)], 10));
+        // non-monotonic (a repeat)
+        assert!(!b22_keys_valid(&[mk(1, 5), mk(1, 6)], 10));
+        // descending
+        assert!(!b22_keys_valid(&[mk(4, 5), mk(2, 6)], 10));
+        // a zero id half
+        assert!(!b22_keys_valid(&[mk(0, 0)], 10));
+        // empty plan is trivially valid (the dormant consult)
+        assert!(b22_keys_valid(&[], 10));
+    }
+
+    /// The store-membership gate: the verdict the walk consulted must be the
+    /// entry's committed verdict at the prep's generation; a slot-aliased id,
+    /// a stale verdict_gen or a verdict flip all veto the row.
+    #[test]
+    fn row_validity_gate() {
+        let mut w = ItemWorld::new();
+        let id: i64 = (17 << 17) + 555; // a real (tag-unique) id
+        {
+            let e = w.entry(id);
+            e.verdict = 1;
+            e.verdict_gen = 9;
+        }
+        w.prep_gen = 9;
+        let slot = (id as u64 & STORE_MASK) as usize;
+        // the live verdict the walk consulted
+        assert!(b22_row_valid(&w.entries[slot], id, w.prep_gen, 1));
+        // the verdict flipped (the walk consulted 2, the store says 1)
+        assert!(!b22_row_valid(&w.entries[slot], id, w.prep_gen, 2));
+        // a stale gen (an abort / a resync re-wrote verdict_gen)
+        assert!(!b22_row_valid(&w.entries[slot], id, 8, 1));
+        // no prep this cycle
+        assert!(!b22_row_valid(&w.entries[slot], id, 0, 1));
+        // a slot-aliased different id (the tag/id membership test)
+        let other = id + 1; // same 17-block tag, different id
+        let o_slot = (other as u64 & STORE_MASK) as usize;
+        assert!(o_slot == slot || !b22_row_valid(&w.entries[o_slot], other, w.prep_gen, 1));
+        // an unknown id (never ingested): entry() would fresh-create, the
+        // read-only gate must refuse
+        let ghost: i64 = (42 << 17) + 1;
+        let g_slot = (ghost as u64 & STORE_MASK) as usize;
+        assert!(!b22_row_valid(&w.entries[g_slot], ghost, w.prep_gen, 1));
     }
 }

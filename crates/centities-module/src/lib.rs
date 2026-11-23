@@ -4240,7 +4240,7 @@ fn register_natives(env: &JniEnv, cls: jni::jclass) -> bool {
     );
     push!(
         "nativeItemTick",
-        "(II[J[I[DI[I[D[I[D[I[I)I",
+        "(II[J[I[DI[I[D[I[D[I[II[J[J[I)I",
         itemcore::n_item_tick as *const c_void
     );
     // B21: the kernel verdict walk — the walk-verdict precompute (doc 66).
