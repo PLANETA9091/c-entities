@@ -302,8 +302,8 @@ pub fn tick_item(
     });
     if rtick >= 0 && id == rtick {
         eprintln!(
-            "[ce] RTICK id={} st_tc={} st_onG={} st_dx={:e} st_dy={:e}",
-            id, st.tick_count, st.on_ground, st.dx, st.dy
+            "[ce] RTICK id={} st_tc={} st_onG={} st_pd={} st_dx={:e} st_dy={:e}",
+            id, st.tick_count, st.on_ground, st.pickup_delay, st.dx, st.dy
         );
     }
 

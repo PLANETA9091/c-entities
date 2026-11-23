@@ -33,8 +33,8 @@ fn rust_registered() -> BTreeSet<(&'static str, &'static str)> {
     s.insert(("nativeBoxDirect", "(JIDDDDDD)V"));
     s.insert(("nativeRemoveDirect", "(J)V"));
     s.insert(("nativeReset", "()V"));
-    // B22 (doc 67): + the fast-row lane (fastN, frKey, frAt, frPd).
-    s.insert(("nativeItemTick", "(II[J[I[DI[I[D[I[D[I[II[J[J[I)I"));
+    // B22 (doc 67): + the fast-row lane (fastN, frKey, frPd).
+    s.insert(("nativeItemTick", "(II[J[I[DI[I[D[I[D[I[II[J[I)I"));
     // B21: the kernel verdict walk — the walk-verdict precompute (doc 66).
     s.insert(("nativeWalkPrep", "(I[J[I[I[IIIIIIII)I"));
     // i0-b v3: the in-process merge scan (one crossing per scan at the

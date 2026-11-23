@@ -5078,21 +5078,19 @@ public final class CeHooks {
     private static final int[] IB_I = new int[IB_CAP * 4];        // tickCount, age, pickupDelay, despawnRate
     private static int ibN = 0;
     // B22 (doc 67): the kernel-owned fast rows — the verdict cohort's lane.
-    // A preVerdict-1/2 visit writes THREE sequential entries instead of the
-    // IB_ packing (appendDispatch / the cohort refresh): the KEY, the AT and
-    // the entity ref. The kernel synthesizes the batch row from its own
-    // store + this lane at the flush; the stale IB_ content at the row's
-    // position is never read. KEY layout: [63..40) = the batch position m
-    // (the ibN slot this visit consumed), [35] defaultActivationState,
-    // [34] isTemporarilyActive, [33] the inactive verdict, [32] the pd-dirty
-    // flag, [31..0] = the entity id. AT layout: activatedTick in the low 62
-    // bits + isTemp bit 62 + defAct bit 63 (the sweep's stamps are Java
-    // state the store cannot own — the same post-sweep reads appendDispatch
-    // makes). FAST_ROW_PD is the sparse pd lane: written ONLY at a dirty
-    // visit (the L184 bit), read by the kernel only when the KEY's dirty
-    // bit is set. All lanes drain with ibN at the processing flush.
+    // A preVerdict-1/2 visit writes TWO sequential entries instead of the
+    // IB_ packing (appendDispatch / the cohort refresh): the KEY and the
+    // entity ref. The kernel synthesizes the batch row from its own store
+    // + this lane at the flush (the activation truth rides the STORE's
+    // anchor — the last committed row's frozen ATI triple — the exact value
+    // the packed verdict evolution consumes); the stale IB_ content at the
+    // row's position is never read. KEY layout: [63..40) = the batch
+    // position m (the ibN slot this visit consumed), [33] the inactive
+    // verdict, [32] the pd-dirty flag, [31..0] = the entity id.
+    // FAST_ROW_PD is the sparse pd lane: written ONLY at a dirty visit (the
+    // L184 bit), read by the kernel only when the KEY's dirty bit is set.
+    // All lanes drain with ibN at the processing flush.
     private static long[] FAST_ROW_KEY;
-    private static long[] FAST_ROW_AT;
     private static ItemEntity[] FAST_ROW_REFS;
     private static int[] FAST_ROW_PD;
     private static int fastN = 0;
@@ -5101,7 +5099,6 @@ public final class CeHooks {
     private static void fastRowInit() {
         if (FAST_ROW_KEY == null) {
             FAST_ROW_KEY = new long[IB_CAP];
-            FAST_ROW_AT = new long[IB_CAP];
             FAST_ROW_REFS = new ItemEntity[IB_CAP];
             FAST_ROW_PD = new int[IB_CAP];
         }
@@ -6380,15 +6377,17 @@ public final class CeHooks {
                         PD_DIRTY[slot] = 0;
                         FAST_ROW_PD[k] = e.pickupDelay;
                     }
+                    // KEY: [63..40) the batch position, [33] the inactive
+                    // verdict, [32] the pd-dirty flag, [31..0] the id. The
+                    // activation truth is NOT captured here — the kernel
+                    // consumes its STORE anchor (the item's last committed
+                    // row's frozen ATI), the exact value the packed rows'
+                    // verdict evolution uses; a fresh field capture broke the
+                    // parity (the immunity-loop ACTIVE lock, run 45249174531).
                     FAST_ROW_KEY[k] = ((long) m << 40)
                             | ((long) eid & 0xFFFF_FFFFL)
                             | (pdDirty ? (1L << 32) : 0L)
-                            | (act ? 0L : (1L << 33))
-                            | (e.isTemporarilyActive ? (1L << 34) : 0L)
-                            | (e.defaultActivationState ? (1L << 35) : 0L);
-                    FAST_ROW_AT[k] = e.activatedTick
-                            | (e.isTemporarilyActive ? (1L << 62) : 0L)
-                            | (e.defaultActivationState ? (1L << 63) : 0L);
+                            | (act ? 0L : (1L << 33));
                     FAST_ROW_REFS[k] = e;
                     dispFast++;
                     dispDiag(e, act ? "fast-native" : "fast-inactive");
@@ -8569,7 +8568,7 @@ public final class CeHooks {
             }
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI, IB_ATI,
-                    fn, FAST_ROW_KEY, FAST_ROW_AT, FAST_ROW_PD);
+                    fn, FAST_ROW_KEY, FAST_ROW_PD);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
             }
@@ -8808,11 +8807,13 @@ public final class CeHooks {
                                 aw.activatedTick = (long) outD[i * 9 + 8];
                             }
                             boolean tv = (bits & (1 << 19)) != 0;
-                            // B22: the fast rows' append-time isTemp truth
-                            // rides the KEY's bit 34 (the packed IB_ATI slot
-                            // is stale foreign content at that position).
+                            // B22: the fast rows' was_temp truth rides bit 27
+                            // (the kernel's activation ANCHOR flag byte bit0 —
+                            // the packed rows read the row's own faithful
+                            // IB_ATI bit; the fast rows' packed slot is
+                            // foreign content).
                             if (tv || (rowFast
-                                    ? (keyRow & (1L << 34)) != 0L
+                                    ? (bits & (1 << 27)) != 0
                                     : (IB_ATI[i * 3 + 2] & 1) != 0)) {
                                 aw.isTemporarilyActive = tv;
                             }
@@ -9196,6 +9197,21 @@ public final class CeHooks {
                 }
                 if ((bits & (1 << 5)) != 0) { // MERGE cadence -> exact L3 path
                     dispDiag(e, "merge-verdict");
+                    // B22: vanilla's absorb writes the survivor's pickupDelay
+                    // DIRECTLY (the javap merge body: pickupDelay =
+                    // Math.max(this, other) — a putfield, NO setter call), so
+                    // probePickupDelayWrite never fires and the store's pd
+                    // mirror goes stale for exactly this shape. The armed
+                    // fast rows skip the packed writeback's dirty-bit set
+                    // when the pd same-value gate holds (B22_PD_SAME), so
+                    // the merge row is the one writer left that must arm the
+                    // lane by hand: the next dispatch re-reads the live
+                    // field into the lane and the tick decays it exactly
+                    // like vanilla's. (The armed-parity items-100k pd
+                    // off=0/on=1 two-item lag, local pair 5043/16518.)
+                    if (PD_DIRTY != null) {
+                        PD_DIRTY[idSlot] = 1;
+                    }
                     // L118 THE SURVIVOR GATE (the parity-items divergence,
                     // n 16537 -> 13197): the javap ItemEntity.tick cadence is
                     // `tickCount % (floor_changed ? 2 : 40) == 0 &&
@@ -9908,7 +9924,7 @@ public final class CeHooks {
             int wid, int n, long[] ids, int[] flags,
             double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
             double[] outD, int[] outI, int[] at,
-            int fastN, long[] frKey, long[] frAt, int[] frPd);
+            int fastN, long[] frKey, int[] frPd);
     public static native int nativeMergeScan(
             int wid, double x, double y, double z, double r, double yinf,
             long selfId, long[] out);

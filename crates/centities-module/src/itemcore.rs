@@ -125,6 +125,23 @@ struct ItemEntry {
     /// QUIET_REV == WORLD_REV; the mirror compares against the prep-time
     /// WORLD_REV scalar.
     qrev: i64,
+    /// B22: the activation-truth ANCHOR — the batch ATI triple the item's
+    /// LAST COMMITTED row carried (activatedTick + the isTemp/defAct flag
+    /// byte). The packed rows consume the row's own ATI for the verdict
+    /// recomputation: a cohort-hit row's ATI is the item's LAST APPEND-TIME
+    /// capture, FROZEN (the L186 audit removed the refresh) — an item that
+    /// arms the verdict stamp never re-anchors unless it re-appends (a
+    /// slow-chain dispatch after a veto/belt tick). Feeding the LIVE field
+    /// instead hit the immunity loop (the falling-phase grant wrote
+    /// activatedTick = cur+100; the fresh capture kept the verdict ACTIVE
+    /// for the whole grant window while vanilla rode the 1-in-20 wakeup —
+    /// the armed-parity items-100k vy divergence, run 45249174531). The
+    /// identity the parity proved: row ATI == the last commit's anchor, so
+    /// the synthesized fast row consumes EXACTLY what the packed row would.
+    at_anchor: i64,
+    /// B22: the anchor's flag byte (bit0 = isTemporarilyActive, bit1 =
+    /// defaultActivationState — the appendDispatch stamp layout).
+    atf_anchor: u8,
 }
 
 impl ItemEntry {
@@ -168,6 +185,8 @@ impl ItemEntry {
             verdict_gen: 0,
             qstamp: false,
             qrev: 0,
+            at_anchor: 0,
+            atf_anchor: 0,
         }
     }
 }
@@ -570,6 +589,11 @@ const B22_PD_SAME: i32 = 1 << 25;
 /// the row's pre-tick pickupDelay was the 32767 inert sentinel (the quiet
 /// stamp's pd clause for fast rows — the IB_I quad is stale for them).
 const B22_PD_INERT: i32 = 1 << 26;
+/// the row's activation anchor carries isTemporarilyActive (bit0 of the
+/// anchor's flag byte) — the applier's isTemp echo condition for fast rows
+/// (the packed rows read the stale-but-faithful IB_ATI bit; the fast rows'
+/// packed slot is foreign content).
+const B22_ISTEMP: i32 = 1 << 27;
 
 // L118-diag: the outcome-bits census (the merge=0 hunt) — module-level so
 // both the per-item body and the flush-stats print reach them.
@@ -781,12 +805,14 @@ thread_local! {
     /// stamps ride it).
     static T_ATI: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
     /// B22: the walk's fast-row lane — FAST_ROW_KEY longs
-    /// ([63..40) = the batch position, [35] defAct, [34] isTemp, [33]
-    /// inactive, [32] pd-dirty, [31..0] = the entity id), the FAST_ROW_AT
-    /// longs (activatedTick low 62 bits + isTemp bit 62 + defAct bit 63)
-    /// and the sparse pd lane (read only when the KEY's dirty bit is set).
+    /// ([63..40) = the batch position, [33] inactive, [32] pd-dirty,
+    /// [31..0] = the entity id) and the sparse pd lane (read only when
+    /// the KEY's dirty bit is set). The activation truth rides the
+    /// STORE's anchor (at_anchor/atf_anchor — the last committed row's
+    /// ATI triple), NOT a fresh field capture: the packed path's verdict
+    /// consumes the row's own frozen ATI, and the identity the parity
+    /// proved is anchor == row ATI.
     static T_FRK: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-    static T_FRAT: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static T_FRPD: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -809,7 +835,6 @@ pub extern "system" fn n_item_tick(
     at: jni::jintArray,
     fast_n: i32,
     fr_key: jni::jlongArray,
-    fr_at: jni::jlongArray,
     fr_pd: jni::jintArray,
 ) -> i32 { let _site_guard = centities_core::SiteGuard::enter(6); 
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
@@ -817,7 +842,7 @@ pub extern "system" fn n_item_tick(
     return unsafe {
         n_item_tick_impl(
             env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i, at,
-            fast_n, fr_key, fr_at, fr_pd,
+            fast_n, fr_key, fr_pd,
         )
     };
 }
@@ -840,7 +865,6 @@ unsafe fn n_item_tick_impl(
     at: jni::jintArray,
     fast_n: i32,
     fr_key: jni::jlongArray,
-    fr_at: jni::jlongArray,
     fr_pd: jni::jintArray,
 ) -> i32 {
     let n = n.max(0) as usize;
@@ -869,7 +893,6 @@ unsafe fn n_item_tick_impl(
                         T_OUTI.with(|toi| {
                     T_ATI.with(|tat| {
                     T_FRK.with(|tfrk| {
-                    T_FRAT.with(|tfrat| {
                     T_FRPD.with(|tfrpd| {
                             let mut d = td.borrow_mut();
                             let mut iv = ti.borrow_mut();
@@ -899,29 +922,24 @@ unsafe fn n_item_tick_impl(
                             // dormant consult) keeps the exact pre-B22 path.
                             let fast_n = fast_n.max(0) as usize;
                             let mut frk = tfrk.borrow_mut();
-                            let mut frat = tfrat.borrow_mut();
                             let mut frpd = tfrpd.borrow_mut();
                             frk.clear();
-                            frat.clear();
                             frpd.clear();
                             if fast_n > 0 {
-                                if !wv_on || fr_key.is_null() || fr_at.is_null() || fr_pd.is_null() {
+                                if !wv_on || fr_key.is_null() || fr_pd.is_null() {
                                     // the walk armed the lane but the kernel's
                                     // env parse disagrees — refuse the tick (the
                                     // flush treats rc != 0 as vanilla-this-tick).
                                     return -1;
                                 }
                                 let klen = ((*vt).GetArrayLength)(raw, fr_key) as usize;
-                                let alen = ((*vt).GetArrayLength)(raw, fr_at) as usize;
                                 let plen = ((*vt).GetArrayLength)(raw, fr_pd) as usize;
-                                if klen < fast_n || alen < fast_n || plen < fast_n {
+                                if klen < fast_n || plen < fast_n {
                                     return -1;
                                 }
                                 frk.resize(fast_n, 0);
-                                frat.resize(fast_n, 0);
                                 frpd.resize(fast_n, 0);
                                 ((*vt).GetLongArrayRegion)(raw, fr_key, 0, fast_n as i32, frk.as_mut_ptr() as *mut i64);
-                                ((*vt).GetLongArrayRegion)(raw, fr_at, 0, fast_n as i32, frat.as_mut_ptr() as *mut i64);
                                 ((*vt).GetIntArrayRegion)(raw, fr_pd, 0, fast_n as i32, frpd.as_mut_ptr());
                                 if e.exception_check() {
                                     e.exception_clear();
@@ -1082,18 +1100,18 @@ unsafe fn n_item_tick_impl(
                                     } else {
                                         world.entries[slot].pickup_delay
                                     };
-                                    // The activation truth rides the AT lane (the
-                                    // sweep's stamps are Java state the store
-                                    // cannot own): activatedTick in the low 62
-                                    // bits + isTemp bit 62 + defAct bit 63. The
-                                    // batch ATI layout is (int)at / (int)(at>>32)
-                                    // / flags — identical to appendDispatch's
-                                    // stamp, so the verdict consumes the SAME
-                                    // shape the packed rows carry.
-                                    let atw = frat[fk] as u64;
-                                    let at_val = (atw & 0x3FFF_FFFF_FFFF_FFFF) as i64;
-                                    let at_flags = ((atw >> 62) & 1) as i32
-                                        | (((atw >> 63) & 1) as i32) << 1;
+                                    // The activation truth rides the STORE's
+                                    // anchor — the last committed row's ATI triple
+                                    // (activatedTick + the isTemp/defAct flags).
+                                    // The packed path's verdict consumes the row's
+                                    // own frozen ATI; the anchor identity makes the
+                                    // synthesized row consume the SAME value (see
+                                    // ItemEntry.at_anchor for the immunity-loop
+                                    // lesson). The batch ATI layout is (int)at /
+                                    // (int)(at>>32) / flags — identical to
+                                    // appendDispatch's stamp.
+                                    let anch = world.entries[slot].at_anchor;
+                                    let anchf = world.entries[slot].atf_anchor as i32;
                                     idv[k] = eid;
                                     fv[k] = F_NATIVE | (if inact { F_INACTIVE } else { 0 });
                                     // The pd freshness contract (L184/plugin
@@ -1103,9 +1121,9 @@ unsafe fn n_item_tick_impl(
                                     // F_NATIVE branch's fresh_pd compare then
                                     // equals and the store wins — identical).
                                     iv[k * 4 + 2] = pre_pd;
-                                    atv[k * 3] = (at_val & 0xFFFF_FFFF) as i32;
-                                    atv[k * 3 + 1] = ((at_val >> 32) & 0xFFFF_FFFF) as i32;
-                                    atv[k * 3 + 2] = at_flags;
+                                    atv[k * 3] = (anch & 0xFFFF_FFFF) as i32;
+                                    atv[k * 3 + 1] = ((anch >> 32) & 0xFFFF_FFFF) as i32;
+                                    atv[k * 3 + 2] = anchf;
                                     fk += 1;
                                     world.fr_flag[k] = true;
                                     // fall through to the shared body with the
@@ -1381,8 +1399,8 @@ unsafe fn n_item_tick_impl(
                                                 });
                                                 if rtick >= 0 && id == rtick {
                                                     eprintln!(
-                                                        "[ce] FTICK id={} f={:#x} inactive={} tc={} onG={} dx={:e} dy={:e}",
-                                                        id, f, (f & F_INACTIVE) != 0, st.tick_count, st.on_ground, st.dx, st.dy
+                                                        "[ce] FTICK id={} f={:#x} inactive={} tc={} onG={} pd={} dx={:e} dy={:e}",
+                                                        id, f, (f & F_INACTIVE) != 0, st.tick_count, st.on_ground, st.pickup_delay, st.dx, st.dy
                                                     );
                                                 }
                                                 // L16: pre-tick delta snapshot for
@@ -1563,7 +1581,8 @@ unsafe fn n_item_tick_impl(
                                                 }
                                                 oi_c[j * 4 + 2] = ob
                                                     | (if ff_c[j] { B22_FAST } else { 0 })
-                                                    | (if ff_c[j] && (f_c[j] & F_INACTIVE) != 0 { B22_INACT } else { 0 });
+                                                    | (if ff_c[j] && (f_c[j] & F_INACTIVE) != 0 { B22_INACT } else { 0 })
+                                                    | (if ff_c[j] && (at_c[j * 3 + 2] & 1) != 0 { B22_ISTEMP } else { 0 });
                                                 oi_c[j * 4 + 3] = st.tick_count;
                                                 // L6 persistent parts only — the physics
                                                 // fields ride in od/oi (phase 3 reads them
@@ -1767,6 +1786,17 @@ unsafe fn n_item_tick_impl(
                                             0
                                         };
                                         entry.verdict_gen = flush_gen;
+                                        // B22: the activation anchor — the row's
+                                        // own batch ATI triple (the append-time
+                                        // capture for a chain row; the synthesized
+                                        // anchor for a fast row — idempotent). The
+                                        // packed path's next verdict consumes the
+                                        // row's frozen ATI; the anchor identity
+                                        // (anchor == row ATI) keeps the fast rows
+                                        // on the exact same verdict evolution.
+                                        entry.at_anchor = ((atv[k * 3 + 1] as i64) << 32)
+                                            | (atv[k * 3] as i64 & 0xFFFF_FFFF);
+                                        entry.atf_anchor = (atv[k * 3 + 2] & 3) as u8;
                                         if !tail_none && (f & F_NATIVE) != 0 {
                                             entry.qstamp = false;
                                         }
@@ -1843,7 +1873,6 @@ unsafe fn n_item_tick_impl(
             })
         })
     })
-})
 })
 })
 })
@@ -2545,47 +2574,52 @@ mod b22_tests {
     use super::*;
 
     /// The Java walk packs the KEY the same way the kernel unpacks it:
-    /// [63..40) the batch position, [35] defAct, [34] isTemp, [33] inactive,
-    /// [32] pd-dirty, [31..0] the entity id. Round-trip both directions.
+    /// [63..40) the batch position, [33] inactive, [32] pd-dirty,
+    /// [31..0] the entity id. Round-trip both directions.
     #[test]
     fn key_layout_round_trip() {
-        let mk = |pos: i64, eid: i64, dirty: bool, inact: bool, is_temp: bool, def: bool| -> i64 {
+        let mk = |pos: i64, eid: i64, dirty: bool, inact: bool| -> i64 {
             (pos << 40)
                 | (eid & 0xFFFF_FFFF)
                 | (if dirty { 1i64 << 32 } else { 0 })
                 | (if inact { 1i64 << 33 } else { 0 })
-                | (if is_temp { 1i64 << 34 } else { 0 })
-                | (if def { 1i64 << 35 } else { 0 })
         };
-        let k = mk(17, 123_456, true, true, false, true);
+        let k = mk(17, 123_456, true, true);
         assert_eq!((k >> 40) as usize, 17);
         assert_eq!(k & 0xFFFF_FFFF, 123_456);
         assert!((k >> 32) & 1 == 1);
         assert!((k >> 33) & 1 == 1);
-        assert!((k >> 34) & 1 == 0);
-        assert!((k >> 35) & 1 == 1);
         // a position-shifted key never aliases the id half
-        let k2 = mk(41, 7, false, false, false, false);
+        let k2 = mk(41, 7, false, false);
         assert_eq!(k2 & 0xFFFF_FFFF, 7);
         assert_eq!((k2 >> 40) as usize, 41);
     }
 
-    /// The AT lane packs activatedTick (low 62 bits) + isTemp bit 62 + defAct
-    /// bit 63; the kernel unpacks into the batch ATI triple exactly like
-    /// appendDispatch's stamp.
+    /// The anchor identity: the store's anchor triple reconstructs into the
+    /// batch ATI layout exactly like appendDispatch's stamp — the same
+    /// (int)at / (int)(at>>32) / flags encoding the verdict consumes.
     #[test]
-    fn at_lane_unpack_matches_append_dispatch() {
-        let at: i64 = 92_345_678_901; // activatedTick with the sweep's stamps
-        let atw = at | (1i64 << 62) | (1i64 << 63);
-        let at_val = (atw as u64 & 0x3FFF_FFFF_FFFF_FFFF) as i64;
-        let at_flags = ((atw as u64 >> 62) & 1) as i32 | ((((atw as u64 >> 63) & 1) as i32) << 1);
-        assert_eq!(at_val, at);
-        assert_eq!(at_flags, 3); // isTemp | defAct
-        // the batch ATI triple reconstruction (the verdict's at_in path)
-        let lo = (at_val & 0xFFFF_FFFF) as i32;
-        let hi = ((at_val >> 32) & 0xFFFF_FFFF) as i32;
+    fn anchor_reconstruction_matches_append_dispatch() {
+        // the parity items' frozen anchor: activatedTick = INT_MIN, flags 0
+        let anch: i64 = -2_147_483_648;
+        let anchf: u8 = 0;
+        let lo = (anch & 0xFFFF_FFFF) as i32;
+        let hi = ((anch >> 32) & 0xFFFF_FFFF) as i32;
+        assert_eq!(lo, i32::MIN); // the (int)at low word
+        assert_eq!(hi, -1); // the (int)(at>>32) high word (arithmetic shift)
+        // the verdict's at_in reconstruction (the batch echo path)
         let back = (hi as i64) << 32 | (lo as i64 & 0xFFFF_FFFF);
-        assert_eq!(back, at);
+        assert_eq!(back, anch);
+        assert_eq!(anchf & 3, 0);
+        // an immunity-granted anchor (cur + 100) round-trips too
+        let anch2: i64 = 700;
+        let lo2 = (anch2 & 0xFFFF_FFFF) as i32;
+        let hi2 = ((anch2 >> 32) & 0xFFFF_FFFF) as i32;
+        assert_eq!((hi2 as i64) << 32 | (lo2 as i64 & 0xFFFF_FFFF), 700);
+        // the flag byte: isTemp bit0 | defAct bit1
+        let f: u8 = 1 | 2;
+        assert_eq!(f & 1, 1);
+        assert_eq!((f >> 1) & 1, 1);
     }
 
     /// The plan validation: strictly increasing positions inside the batch,
@@ -2618,6 +2652,8 @@ mod b22_tests {
             let e = w.entry(id);
             e.verdict = 1;
             e.verdict_gen = 9;
+            e.at_anchor = -2_147_483_648; // the frozen append anchor
+            e.atf_anchor = 0;
         }
         w.prep_gen = 9;
         let slot = (id as u64 & STORE_MASK) as usize;
