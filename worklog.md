@@ -2563,3 +2563,66 @@ Task ID: 29 addendum 9 — the B23 round (the armed walk diet): the sv writer-ce
   getInt family (T2 — the quietFuseBump diet), ItemStack.isEmpty 1.16%
   (T3). The ratio movement reads ONLY on the next gate flight (the
   cross-flight ON-leg comparison stays void).
+
+---
+Task ID: 29 addendum 10 — the B24 round (the SIT-empty inline diet) + the armed triple-profile read: the ttlCachedPath SIT-empty test becomes its own tiny method (the giant path's inline budget left ArrayList.isEmpty a real invoke — 3.87% spread / 2.14% despawn self at the call line); the local armed mobs pair BIT-IDENTICAL (T382/T632/final); the B23 gate attempt died INFRA on the mixed-150k OFF leg (the known stall shape, the OFF leg cannot see the module) — the re-dispatch rides the B24 head
+
+- The armed triple-profile (45482066062 items-100k / 45483964993
+  spread-100k / 45483968972 mobs-despawn-10k, CE_WVERD=1, the post-B23
+  shape) reads the fresh ON-leg walls:
+  items-100k: moonrise BasicEntityList.indexOf 5.79% (both-leg,
+  ratio-dead) + has/remove callers 4.11/1.99%, AABB.intersects 4.03%
+  (both-leg), tickListForEach 3.28+0.25% (the quiet cohort's inlined
+  bump), itemTickFlush 2.37+0.78+0.40% (the merge winner refresh
+  U.getInt(O_STACK_COUNT) is the single hottest line), ItemStack.isEmpty
+  2.09% (the vanilla chain, both-leg), Unsafe.getObject 1.64%,
+  SynchedEntityData.getItem 1.56% + get 1.71% (the vanilla item-tick
+  chain, the ON leg pays LESS of it than vanilla — the vanilla-routed
+  cohort only), ubsEmpty 1.41% (the getClass + memo probes), the
+  quietFuseBump counter RMW family (totalEntityAge 1.34% + age 0.91% +
+  the despawn-mirror compare 0.33%).
+  spread-100k: tickListForEach 6.75+0.87% (the quiet cohort — the
+  bump's RMWs are the mirrored vanilla semantics: tickCount,
+  totalEntityAge, age), WatchdogThread 6.86% (both-leg noise),
+  itemTickFlush 4.13+1.28% (the merge refresh + the AP_FD mirror read),
+  ttlCachedPath 3.87% AT THE ArrayList.isEmpty CALL LINE, Unsafe
+  getObject/putObject/getDouble/getBoolean 3.20/1.18/1.02/0.77% (the
+  sv word table already served the boolean), spawnerCreateState$ 1.50%,
+  ubsEmpty 0.76%, standMirror 0.66%.
+  mobs-despawn-10k: WatchdogThread 9.29+2.13% + bzip2 2.14% (runner
+  noise, both-leg), ttlCachedPath 2.14% at the SAME isEmpty call line,
+  VarHandle RefField reads 1.57% + Array VH 1.02%, ChunkAccess.getPos
+  1.12% + PalettedContainer.get 0.88% (the vanilla chunk-gen floor,
+  both-leg).
+- B24/T1 (the SIT-empty inline diet): the giant ttlCachedPath exhausted
+  C2's inline budget and the stamped (TT_SITAL) ArrayList.isEmpty test
+  stayed a REAL invoke per SIT visit per tick — the self-time sits at
+  the CALL line (3.87% spread / 2.14% despawn). The test becomes its own
+  tiny static method (sitStepsEmpty — a fresh leaf chain inlines the
+  4-bytecode isEmpty for free), plus a direct LIVE size read
+  (U.getInt(steps, O_ARR_SIZE)) when the offset resolves — value-
+  identical by javap (`isEmpty() == size == 0` for the final ArrayList),
+  NO mirror. The javap/restrict reality: paperclip's JVM does NOT open
+  java.base/java.util — setAccessible refuses, O_ARR_SIZE stays -1, the
+  helper shape serves (the leg diag: sitD=0/2060814/1/-1 — 2.06M
+  helper-served visits). Kill switch -Dcentities.sitSize=false; the
+  counters sitDirect/sitCast ride the hooks@ diag (dead-port rule).
+- The local proof: the armed mobs parity pair (seed 4242, CE_WVERD=1,
+  module ARMED) — the SIT-heavy shape (2.06M SIT visits): PARITY-GATE
+  PASS bit-identical at T382/T632/final.
+- The walls (honest, post-B24): the quiet-bump counter RMW family
+  (tickCount/totalEntityAge/age — the quiet cohort's mirrored vanilla
+  semantics, ~7.6% spread) is the quiet path's FLOOR — a belt mirror
+  trades entity-header RMWs for belt RMWs (same op count, no win); the
+  merge winner refresh (4.13% spread / 2.37% items) is the merge
+  kernel's documented floor (the L162 FULL-SELF BREAK already took it
+  from 12.05%); the moonrise churn + AABB physics are both-leg
+  ratio-dead; WatchdogThread/bzip2 are runner noise (both-leg).
+- The B23 gate attempt (45481945585, dispatched on 56bcf87c) died INFRA:
+  FATAL: no baseline.json on abp-r1-mixed-150k-OFF (the vanilla leg —
+  the module is not even loaded there; the RSS stayed flat ~3.7GB, the
+  measure window opened, the budget died — the same one-tick stall shape
+  the first B22 gate attempt (45267601069) died of; that re-dispatch
+  passed clean). The ratios from the completed legs are NOT a gate read
+  (the flight failed) — the re-dispatch rides the B24 head and reads
+  B23+B24 together.

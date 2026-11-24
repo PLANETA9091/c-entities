@@ -1926,6 +1926,7 @@ public final class CeHooks {
                 + " sv=" + svSkips + "/" + svRealReads + "/" + svProbes
                 + "/" + svWordScheme
                 + " dm=" + despMirHits + "/" + despMirFills
+                + " sitD=" + sitDirect + "/" + sitCast + "/" + (SIT_SIZE_ON ? 1 : 0) + "/" + O_ARR_SIZE
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
@@ -15315,6 +15316,32 @@ public final class CeHooks {
     private static volatile RefField VH_SIT_DELTA;    // SteppedInterpolationTracker.predictedDelta
     private static volatile RefField VH_SIT_TICKS;    // SteppedInterpolationTracker.ticksSinceLastStep
     private static long O_SIT_STEPS = -1, O_SIT_DELTA = -1, O_SIT_TICKS = -1;
+    // B24/T1: the direct ArrayList.size offset — the TT_SITAL-gated SIT-empty
+    // test reads the live size field INSTEAD of the isEmpty() dispatch (the
+    // stamp-proven class is exactly java.util.ArrayList, a final class whose
+    // isEmpty() is javap-verified `return size == 0`). Value-identical by
+    // construction — the LIVE field, no mirror; the cast shape stays as the
+    // fallback when the offset is unresolved. Kill switch
+    // -Dcentities.sitSize=false.
+    private static long O_ARR_SIZE = -1;
+    public static final boolean SIT_SIZE_ON =
+            !"false".equals(System.getProperty("centities.sitSize", "true"));
+    public static long sitDirect = 0, sitCast = 0;
+
+    /** B24/T1: the SIT-empty test as its OWN tiny method — the giant
+     *  ttlCachedPath exhausted C2's inline budget and the ArrayList.isEmpty
+     *  call stayed a real invoke (3.87% of the spread-100k ON profile self
+     *  at the call line, 2.14% despawn — flights 45483964993/45483968972).
+     *  A fresh leaf chain inlines the 4-bytecode isEmpty for free; the
+     *  stamp (TT_SITAL) keeps the cast monomorphic and exact. The direct
+     *  LIVE size read (U.getInt on the resolved offset — value-identical
+     *  `size == 0` by javap) rides when the offset resolved — paperclip's
+     *  JVM does NOT open java.base/java.util, so setAccessible usually
+     *  refuses and the helper shape serves. Kill switch
+     *  -Dcentities.sitSize=false. */
+    private static boolean sitStepsEmpty(Object steps) {
+        return ((java.util.ArrayList) steps).isEmpty();
+    }
     private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
     // L182: Entity.syncVelocity (volatile boolean) — the tracker's cached
     // path read it through the volatile field every tracked entity every
@@ -15540,6 +15567,12 @@ public final class CeHooks {
             VH_SIT_STEPS = new RefField(sit, "trackedSteps");
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
+            // B24/T1: the ArrayList.size offset for the direct SIT-empty read.
+            try {
+                O_ARR_SIZE = offOf(java.util.ArrayList.class, "size");
+            } catch (Throwable tsz) {
+                O_ARR_SIZE = -1; // the exact cast shape stays
+            }
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
             O_ENT_SYNC_VEL = offOf(Entity.class, "syncVelocity");
             // L151: the exact sendChanges fast-exit shape. needsSync is a
@@ -16238,8 +16271,23 @@ public final class CeHooks {
                     // first fix read the size through a reflected
                     // java.base offset and broke the tracker init — the
                     // cast rides NO reflection at all.
-                    if (!((java.util.ArrayList) steps).isEmpty()) {
-                        return false; // a live step: addStep would mutate — vanilla
+                    // B24/T1: the direct LIVE size read — the dispatch itself
+                    // (3.87% of the spread-100k ON profile, 2.14% despawn —
+                    // flight 45483964993/45483968972) leaves the per-tick
+                    // path; the same field the cast body reads. Value-
+                    // identical for the stamped ArrayList (isEmpty() is
+                    // `size == 0`); the exact cast shape stays as the
+                    // fallback (unresolved offset / kill switch).
+                    if (SIT_SIZE_ON && O_ARR_SIZE >= 0 && U != null) {
+                        sitDirect++;
+                        if (U.getInt(steps, O_ARR_SIZE) != 0) {
+                            return false; // a live step: addStep would mutate — vanilla
+                        }
+                    } else {
+                        sitCast++;
+                        if (!sitStepsEmpty(steps)) {
+                            return false; // a live step: addStep would mutate — vanilla
+                        }
                     }
                 } else if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
                     return false; // a live step: addStep would mutate — vanilla
