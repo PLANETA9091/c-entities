@@ -1051,7 +1051,7 @@ public final class CeHooks {
             }
         }
         if (VH_READY && O_DESPAWN_RATE >= 0
-                && ag >= U.getInt(e, O_DESPAWN_RATE)) {
+                && ag >= despawnRateMirror(e, q)) {
             try {
                 despawnTail(e);
                 quietDespawns++;
@@ -1075,6 +1075,50 @@ public final class CeHooks {
                 wvBelt(WV_WALK_WID, eid, true);
             }
         }
+    }
+
+    // ==================================================================
+    // B23/T2 — the despawn-rate MIRROR. The quiet bump's despawn compare
+    // reads ItemEntity.despawnRate through the Unsafe hop per quiet item
+    // per tick — the field lives on the ItemEntity tail (a second cache
+    // line behind the Entity-header fields the bump already touches), and
+    // the write census (javap putfield audit of the shipped paper-26.3
+    // build 262) is EXACTLY TWO writers, both covered:
+    //   1. ItemEntity.<init> bc 46: despawnRate = -1 (the ctor default) —
+    //      runs BEFORE the entity is registered (probeAdd clears the
+    //      mirror slot on the fresh belt),
+    //   2. ItemEntity.setItem bc 85: the paper altItemDespawnRate /
+    //      spigotConfig.itemDespawnRate lookup — setItem is ALREADY
+    //      probed (probeSetItem, the L8.4 stack cache), so the probe adds
+    //      one byte-array write invalidating the mirror.
+    // No other putfield exists in the shipped jar (paper patches included).
+    // The mirror slot is belt-keyed like SF_DI (L183): probeAdd/probeRemove
+    // clear it at the registration choke points, so a fresh tenant can
+    // never inherit a predecessor's rate. The read falls back to the exact
+    // Unsafe hop when the mirror is off. Kill switch:
+    // -Dcentities.despMirror=false.
+    // ==================================================================
+    public static final boolean DESP_MIRROR_ON =
+            !"false".equals(System.getProperty("centities.despMirror", "true"));
+    public static final int[] DESP_VAL = DESP_MIRROR_ON
+            ? new int[SLOT_CAP] : null;
+    public static final byte[] DESP_OK = DESP_MIRROR_ON
+            ? new byte[SLOT_CAP] : null;
+    public static long despMirHits = 0, despMirFills = 0;
+
+    private static int despawnRateMirror(ItemEntity e, int q) {
+        byte[] ok = DESP_OK;
+        if (ok != null && ok[q] != 0) {
+            despMirHits++;
+            return DESP_VAL[q];
+        }
+        int dr = U.getInt(e, O_DESPAWN_RATE);
+        if (ok != null) {
+            DESP_VAL[q] = dr;
+            ok[q] = 1;
+            despMirFills++;
+        }
+        return dr;
     }
 
     /** L154: the L29 3-hop synched-data stack walk (entityData.items
@@ -1875,6 +1919,13 @@ public final class CeHooks {
                 + " ttl=" + ttlCalls + "/" + ttlFuse + "/" + ttlFuseChecks + "/" + (TTL_ON ? 1 : 0)
                 + " ttlm=" + (TT_MIRROR ? 1 : 0) + "/" + ttlMin
                 + " ttlc=" + ttlCache + "/" + ttlFill + "/" + ttlPopBlock
+                // B23: the writer-census syncVel word table + the despawn-rate
+                // mirror counters (the dead-port rule: the new paths' traffic
+                // must be observable — skips=served-by-bit, reads=the real
+                // field, probes=the census bit-sets, dmH/dmF=the mirror).
+                + " sv=" + svSkips + "/" + svRealReads + "/" + svProbes
+                + "/" + svWordScheme
+                + " dm=" + despMirHits + "/" + despMirFills
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
@@ -2443,6 +2494,11 @@ public final class CeHooks {
                 ARENA[paSlot] = e;
                 ARENA_ID[paSlot] = paId;
                 RM_BIT[paSlot] = 0; // L115: fresh slot — alive
+                // B23/T2: a fresh tenant must never inherit a predecessor's
+                // despawn-rate mirror (the belt discipline — the same
+                // license quietClearSlot carries for the quiet proofs).
+                byte[] dokA = DESP_OK;
+                if (dokA != null) dokA[paSlot] = 0;
                 // L161a: the fresh slot must not inherit a dead predecessor's
                 // quiet proof (id&AMASK collisions across generations).
                 quietClearSlot(paId);
@@ -2477,6 +2533,9 @@ public final class CeHooks {
                 ARENA_ID[prSlot] = 0;
                 REST_GEN[prSlot] = 0; // gone: drop the rest state
                 RM_BIT[prSlot] = 1;   // L115: the removed-bit mirror
+                // B23/T2: the despawn-rate mirror dies with the slot.
+                byte[] dokR = DESP_OK;
+                if (dokR != null) dokR[prSlot] = 0;
                 // L174 belt: a removed entity's quiet proofs are dead — both
                 // bits die with the slot (the ARENA-tracker quiet branch
                 // reads the TT bit WITHOUT the te identity check, so a
@@ -5831,7 +5890,9 @@ public final class CeHooks {
         if (rq[ob + 2] != as) return;
         long sh = fq[sid * 2];
         if ((sh & TT_OK) == 0 || (sh & TT_SIT) != 0) return;
-        if (as.syncVelocity) return;
+        // B23/T1: the flag read rides the writer-census word table (the
+        // same exactness license as the tracker's consume read).
+        if (svFlagWord(as, sid)) return;
         TT_QUIET[sid >> 6] |= 1L << (sid & 63);
     }
 
@@ -7000,7 +7061,17 @@ public final class CeHooks {
     public static void probeSetItem(net.minecraft.world.entity.item.ItemEntity e,
             net.minecraft.world.item.ItemStack st) {
         try {
-            STACK_EMPTY[entId(e) & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
+            int eid = entId(e);
+            STACK_EMPTY[eid & MAMASK] = st.isEmpty() ? (byte) 2 : (byte) 1;
+            // B23/T2: setItem is the SECOND (and only live) despawnRate
+            // writer — the paper config lookup rides the stack write.
+            // Invalidate the mirror slot so the next bump re-reads the
+            // fresh rate (the ctor's -1 default predates registration and
+            // probeAdd's clear).
+            byte[] dok = DESP_OK;
+            if (dok != null) {
+                dok[eid & AMASK] = 0;
+            }
         } catch (Throwable ignored) {
             // cache is an optimization only; the dispatch falls back to the
             // synched read for unseen slots
@@ -8056,9 +8127,19 @@ public final class CeHooks {
             // wakeup's active body read !st.on_ground and ran a SPURIOUS
             // move+friction vanilla's gate skipped — 53 items at t=413, one
             // 0.588 vx/vz step each, 1214 by T639).
+            // B23/T3: the empty-stack check rides the L8.4 STACK_EMPTY cache
+            // (the setItem probe covers every stack write — javap-verified 4
+            // call sites) — the same exactness license the dispatch gates
+            // (6458/6553) already run with on CI. The byte verdict is
+            // value-identical to the raw getItem().isEmpty() chain; a
+            // never-probed slot (0) takes the exact raw chain.
+            byte svEmpty = STACK_EMPTY[eid & MAMASK];
+            boolean stackEmpty = svEmpty == 0
+                    ? e.getItem().isEmpty()
+                    : svEmpty == (byte) 2;
             if (RM_BIT[eid & AMASK] == 1 || e.noPhysics || e.isInWater() || e.isInLava()
                     || fireTicks(e) != 0 || despawnTimeOf(e) >= 0
-                    || e.getItem().isEmpty()) {
+                    || stackEmpty) {
                 appendItem(e, IF_FORCE_VANILLA | (e.onGround() ? IF_ON_GROUND : 0));
                 dispDiag(e, "skip-force-vanilla");
                 return false;
@@ -15929,6 +16010,152 @@ public final class CeHooks {
         }
     }
 
+    // ==================================================================
+    // B23/T1 — the syncVelocity WRITER-CENSUS word table. The tracker's
+    // minimal arm (TT_UBS + mirror) pays ONE entity deref per tracked
+    // entity per tick — the syncVel consume read — and that read is the
+    // ONLY entity touch the arm makes: 2.46% of the armed items-100k
+    // profile (Unsafe.getBoolean, flight 45284236783) on a cold header
+    // line per slot, the same family that was 3.66% of the spread ON leg
+    // when it was still a volatile read (L182). The consume itself is
+    // load-bearing (the flag is observable state), so the read is replaced
+    // by a WRITER-CENSUS bitset: svDirty[slot] set by a prefix probe on
+    // EVERY vanilla writer of `true`, consumed (cleared) by the reader.
+    //
+    // THE CENSUS (javap putfield audit of the shipped paper-26.3 jar,
+    // build 262 — every putfield syncVelocity in every class, including
+    // paper's own patches and the CraftBukkit API layer):
+    //   true-writers:
+    //     Entity.markHurt()                     — the hurt flag (aload_0)
+    //     PrimedTnt.tick()                      — the explosion knockback (aload_0)
+    //     Ravager.blockedByItem(LE,DS,F,Z)      — the blocked-entity knockback (aload_1)
+    //     HoglinBase.throwTarget(LE,LE) static  — the hoglin shove (aload_1)
+    //     ApplyEntityImpulse.apply(SL,I,EIU,E,V)— the wind-burst impulse (aload 4)
+    //     CraftEntity.setVelocity(Vec)          — the Bukkit API (this.entity handle)
+    //     CraftPlayer.knockback(DDD)            — the Bukkit API (this.entity handle)
+    //   false-writers (irrelevant — the invariant only needs the true set):
+    //     ServerEntity.sendChanges tail, Player.aiStep, ApplyEntityImpulse,
+    //     ApplyEntityImpulse 2nd site, this module's syncVelClear.
+    // THE INVARIANT: bit==0 => the flag is false. Every true-write is
+    // preceded (same thread, same method body) by its probe's bit-set; the
+    // bit clears only on (a) a read that SAW false, (b) a consume that wrote
+    // false, (c) nothing else. A fresh Entity object's flag is false
+    // (javap: no ctor write; the field default), so slot reuse needs no
+    // maintenance. The table initializes ALL-ONES: the first armed read per
+    // slot takes the real field once (covering any pre-arm truth) and
+    // self-heals to the skipped shape. A probe that cannot set the bit
+    // (entId unassigned, the handle read threw) DISARMS the whole layer
+    // (svWordScheme=0) — a bare writer without its bit can never exist
+    // while the reads trust the bits. A weave refusal at class load also
+    // disarms (the disarm lands before the refused class executes anything).
+    // Kill switch: -Dcentities.svWord=false restores the plain read shape.
+    // ==================================================================
+    public static final boolean SV_WORD_ON =
+            !"false".equals(System.getProperty("centities.svWord", "true"));
+    public static final long[] SV_DIRTY = SV_WORD_ON
+            ? new long[SLOT_CAP >> 6] : null;
+    static {
+        if (SV_DIRTY != null) java.util.Arrays.fill(SV_DIRTY, -1L);
+    }
+    /** 0 = disarmed (the exact plain-read shape); 1 = armed by the Rust
+     *  side after the pre-arm probe weaves landed. Lazy classes weave at
+     *  their own load; a refusal there re-zeroes this and the reads fall
+     *  back per-read. */
+    public static volatile int svWordScheme = 0;
+
+    /** The Rust-side scheme setter (the disarm/kill contract — the same
+     *  shape as pdDirtyScheme/fdMirrorScheme). */
+    public static void svWordScheme(int v) {
+        svWordScheme = v;
+    }
+
+    public static long svSkips = 0, svRealReads = 0, svProbes = 0;
+
+    /** The probe body: set the slot's bit. Any failure disarms the layer —
+     *  the invariant must never rest on a partial probe set. */
+    private static void svMark(Entity h) {
+        try {
+            int q = entId(h) & AMASK;
+            SV_DIRTY[q >> 6] |= 1L << (q & 63);
+            svProbes++;
+        } catch (Throwable t) {
+            svWordScheme = 0; // disarm: the plain read serves everything again
+        }
+    }
+
+    /** Woven prefix probe on Entity.markHurt / PrimedTnt.tick — the
+     *  receiver writes its own flag. Pure bit-set; no state change. */
+    public static void probeSyncVelWrite(Entity e) {
+        if (SV_DIRTY == null || svWordScheme != 1 || e == null) return;
+        svMark(e);
+    }
+
+    /** Woven prefix probe on HoglinBase.throwTarget (STATIC — the shove
+     *  lands on the second argument; both are probed conservatively). */
+    public static void probeSyncVelWrite2(Entity a, Entity b) {
+        if (SV_DIRTY == null || svWordScheme != 1) return;
+        if (a != null) svMark(a);
+        if (b != null) svMark(b);
+    }
+
+    /** Woven prefix probe on CraftEntity.setVelocity / CraftPlayer.knockback
+     *  — the Bukkit API writes the HANDLE's flag directly. */
+    public static void probeSyncVelWriteCraft(
+            org.bukkit.craftbukkit.entity.CraftEntity ce) {
+        if (SV_DIRTY == null || svWordScheme != 1 || ce == null) return;
+        try {
+            Entity h = ce.getHandle();
+            if (h != null) svMark(h);
+        } catch (Throwable t) {
+            svWordScheme = 0; // disarm: the handle read failed
+        }
+    }
+
+    /** The word-served consume read: bit clear => the flag is provably
+     *  false (the census invariant) with NO entity touch; bit set => the
+     *  real field read, self-healing (a false verdict clears the bit; a
+     *  true verdict leaves it — the consume path below owns the field
+     *  write and its bit clear via syncVelClearWord). */
+    private static boolean syncVelReadWord(Entity ent, int slot) {
+        long[] sv = SV_DIRTY;
+        if (sv == null || svWordScheme != 1
+                || O_ENT_SYNC_VEL < 0 || U == null) {
+            return syncVelRead(ent); // the exact pre-B23 shape
+        }
+        long w = sv[slot >> 6];
+        if ((w & (1L << (slot & 63))) == 0) {
+            svSkips++;
+            return false; // provably false: no true-writer ran since the last consume
+        }
+        boolean v = U.getBoolean(ent, O_ENT_SYNC_VEL);
+        svRealReads++;
+        if (!v) {
+            sv[slot >> 6] = w & ~(1L << (slot & 63));
+        }
+        return v;
+    }
+
+    /** The word-served consume write: the field write + the bit clear (the
+     *  pair the minimal arm's consume semantics needs). */
+    private static void syncVelClearWord(Entity ent, int slot) {
+        if (O_ENT_SYNC_VEL >= 0 && U != null) {
+            U.putBoolean(ent, O_ENT_SYNC_VEL, false);
+        } else {
+            ent.syncVelocity = false;
+        }
+        long[] sv = SV_DIRTY;
+        if (sv != null) {
+            sv[slot >> 6] &= ~(1L << (slot & 63));
+        }
+    }
+
+    /** The non-consuming flag read for the quiet-stamp gates (the stamp
+     *  only declines on a TRUE flag — the vanilla body then owns both the
+     *  consume and the bit lifecycle). */
+    private static boolean svFlagWord(Entity ent, int slot) {
+        return syncVelReadWord(ent, slot);
+    }
+
     private static boolean ttlCachedPath(Entity ent, int m, boolean tm) {
         // L72/L66r: the identity key is TT_REF[ob+2] == ent (one array
         // read — the te Unsafe hop existed only to prove the slot).
@@ -15972,11 +16199,17 @@ public final class CeHooks {
         // decline cannot fire here (TT_OK pins the fill, and the fill
         // stamps se BEFORE the TT_OK shape — a null se never gets TT_OK).
         if ((sh & (TT_SIT | TT_UBS)) == TT_UBS && tm) {
-            if (syncVelRead(ent)) {
+            // B23/T1: the consume rides the writer-census word table — a
+            // clear bit PROVES the flag false (the javap census covers every
+            // true-writer) and skips the entity deref the arm otherwise pays
+            // per slot per tick; a set bit reads the real field once and
+            // self-heals. The non-ServerPlayer decline leaves the bit set —
+            // the vanilla body owns the consume.
+            if (syncVelReadWord(ent, m)) {
                 if (ent instanceof net.minecraft.server.level.ServerPlayer) {
                     return false;
                 }
-                syncVelClear(ent);
+                syncVelClearWord(ent, m);
             }
             fl[lb + 1] = fl[lb + 1] + 1;
             ttlCache++;
@@ -16019,12 +16252,12 @@ public final class CeHooks {
                 U.putInt(sitObj, O_SIT_TICKS,
                         U.getInt(sitObj, O_SIT_TICKS) + 1);
             }
-            if (syncVelRead(ent)) {
+            if (syncVelReadWord(ent, m)) {
                 // the L61 consumption (same shape as the fill path)
                 if (ent instanceof net.minecraft.server.level.ServerPlayer) {
                     return false;
                 }
-                syncVelClear(ent);
+                syncVelClearWord(ent, m);
             }
             ent.updateDataBeforeSync();
             // L70: the cached path runs ONLY while the cm is ARMED — the

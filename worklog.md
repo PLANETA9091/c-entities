@@ -2490,3 +2490,76 @@ Task ID: 29 addendum 8 — the B22 stand (the kernel-owned fast rows): the armed
   wall stands on the moonrise churn (both-leg, ratio-dead) — the ratio
   moves only through the ON-leg-only families left: itemTickFlush ~2.3%
   + the walk remainder.
+
+---
+Task ID: 29 addendum 9 — the B23 round (the armed walk diet): the sv writer-census word table + the despawn-rate mirror + the stack-empty gate, all census-backed; the local armed items-20000 pair BIT-IDENTICAL (T389/T639/final); the disarm contract closes every refusal door; the ratio reads ride the next gate flight
+
+- The B23 round takes the addendum 8 NEXT list's cheap ON-leg-only
+  families (the items wall itself stays parked on the moonrise churn):
+  three diets on the ARMED walk, each backed by a javap putfield census
+  of the shipped paper-26.3 build 262 (paper patches + the CraftBukkit
+  API layer included).
+- B23/T1 (the sv word table): the tracker's minimal arm pays ONE entity
+  deref per tracked entity per tick — the syncVelocity consume read
+  (Unsafe.getBoolean 2.72% of the armed items-100k profile, a cold
+  header line per slot). The consume is load-bearing (the flag is
+  observable state), so the READ is replaced by a WRITER-CENSUS bitset:
+  SV_DIRTY word table (slot = entId & AMASK — the same belt key the
+  readers walk; ARENA is belt-keyed so the arena-walk sid and the
+  cache-walk m0 agree with the writer's slot). The census: SEVEN
+  true-writers (Entity.markHurt, PrimedTnt.tick, Ravager.blockedByItem,
+  HoglinBase.throwTarget, ApplyEntityImpulse.apply, CraftEntity.
+  setVelocity, CraftPlayer.knockback) each carry a woven prefix probe;
+  false-writers are irrelevant (the invariant only needs the true set).
+  bit==0 => the flag is PROVABLY false — no entity touch; bit set => the
+  real field once + self-heal (a false verdict clears the bit, the
+  consume path owns the field write + its bit clear). The table
+  initializes ALL-ONES: the first armed read per slot takes the real
+  field once (any pre-arm truth covered). A fresh Entity's flag is false
+  by javap (no ctor write), so slot reuse needs no maintenance. Kill
+  switch -Dcentities.svWord=false; env CE_SV_WORD=0.
+- The disarm contract (the census must stay COMPLETE or the reads fall
+  back): every refusal door lands sv_disarm() — SV_DISARMED=true +
+  svWordScheme=0 BEFORE the refused class executes anything. Doors: a
+  lazy census class' weave refusal (TNT/Ravager/HoglinBase/
+  ApplyEntityImpulse/CraftPlayer), the CraftEntity fd-probe chain
+  (refused fd == bare setVelocity), a pre-arm CraftEntity load
+  (post-arm bare), the Entity probe chain refusal (bare markHurt), a
+  precomputed-but-retransform-failed census class, a probe Throwable at
+  runtime. The session's OWN FIX on the inherited WIP: the draft
+  disarmed the java int only — arm_module's arming step (which checks
+  SV_DISARMED) would have re-armed the word table over a bare writer
+  (the CraftEntity/Entity refusal doors). All five sites now route
+  through sv_disarm().
+- B23/T2 (the despawn-rate mirror): the quiet bump's despawn compare
+  reads ItemEntity.despawnRate through the Unsafe hop per quiet item per
+  tick (the field lives on the item tail — a second cache line behind
+  the header fields the bump already touches). The census: EXACTLY TWO
+  writers in the shipped jar — ItemEntity.<init> bc 46 (the -1 ctor
+  default, runs BEFORE registration: probeAdd clears the mirror slot on
+  the fresh belt) and ItemEntity.setItem bc 85 (the paper
+  altItemDespawnRate / spigotConfig.itemDespawnRate lookup — setItem is
+  ALREADY probed by the L8.4 stack cache, the probe adds one
+  byte-array write invalidating the mirror). Belt-keyed DESP_VAL/DESP_OK
+  (SLOT_CAP): probeAdd/probeRemove clear the slot (the belt discipline —
+  a fresh tenant never inherits a predecessor's rate), probeSetItem
+  invalidates, the read falls back to the exact Unsafe hop when the
+  mirror is off. Kill switch -Dcentities.despMirror=false.
+- B23/T3: the dispatch force-vanilla gate's empty-stack check rides the
+  L8.4 STACK_EMPTY cache (the setItem probe covers every stack write —
+  javap-verified 4 call sites; the byte verdict is value-identical to
+  the raw getItem().isEmpty() chain; a never-probed slot 0 takes the
+  exact raw chain).
+- The local proof (the armed shape): the items-20000 parity pair
+  (seed 4242, CE_WVERD=1, module ARMED, sv word table armed scheme=1):
+  PARITY-GATE PASS bit-identical at T389/T639/final (n 16498 = 16498,
+  zero drift). The mirror counters on the ON leg: sv=3,822,186 skips /
+  19,999 real reads (99.5% of the consume reads served with NO entity
+  touch), dm=8,758,089 hits / 14,678 fills (99.8% served). The
+  dormant-shape guarantee is structural (the null tables take the exact
+  pre-B23 read chain per-site).
+- The targeted walls (the armed items-100k jfr_top, addendum 8):
+  Unsafe.getBoolean 1.72-2.72% (T1), the quiet bump's per-item Unsafe
+  getInt family (T2 — the quietFuseBump diet), ItemStack.isEmpty 1.16%
+  (T3). The ratio movement reads ONLY on the next gate flight (the
+  cross-flight ON-leg comparison stays void).

@@ -60,6 +60,18 @@ const ZOMBIE_VILLAGER_CLASS: &str = "net/minecraft/world/entity/monster/zombie/Z
 /// the check short-circuits to `true` through a pure NmMap probe.
 const ACTIVATION_CLASS: &str = "io/papermc/paper/entity/activation/ActivationRange";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
+// B23/T1: the syncVelocity true-writer census classes (the javap putfield
+// audit of the shipped paper-26.3 build 262 — every putfield syncVelocity
+// in the jar, paper patches and the CraftBukkit API layer included). Each
+// class gets a prefix probe on the exact method whose body writes `true`;
+// a weave refusal anywhere disarms the word table (svWordScheme=0) — a bare
+// writer without its bit can never exist while the reads trust the bits.
+const PRIMED_TNT_CLASS: &str = "net/minecraft/world/entity/item/PrimedTnt";
+const RAVAGER_CLASS: &str = "net/minecraft/world/entity/monster/Ravager";
+const HOGLIN_BASE_CLASS: &str = "net/minecraft/world/entity/monster/hoglin/HoglinBase";
+const APPLY_IMPULSE_CLASS: &str =
+    "net/minecraft/world/item/enchantment/effects/ApplyEntityImpulse";
+const CRAFT_PLAYER_CLASS: &str = "org/bukkit/craftbukkit/entity/CraftPlayer";
 const SENSING_CLASS: &str = "net/minecraft/world/entity/ai/sensing/Sensing";
 const TRACKED_ENTITY_CLASS: &str = "net/minecraft/server/level/ChunkMap$TrackedEntity";
 /// L30: the tracker-loop floor target — ChunkMap.newTrackerTick replace_body.
@@ -528,6 +540,17 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(CHUNKMAP_CLASS, |_n, b| patch_chunkmap(b));
     cplug_sdk::hooks::register_bytes(NATURALSPAWNER_CLASS, |_n, b| patch_naturalspawner(b));
     cplug_sdk::hooks::register_bytes(INVENTORY_CLASS, |_n, b| patch_inventory(b));
+    // B23/T1: the syncVelocity census probes — the lazy classes (TNT,
+    // Ravager, HoglinBase, ApplyEntityImpulse) and the CraftPlayer wrapper.
+    for spec in SV_PROBES_LAZY.iter() {
+        let spec: &'static SvProbe = spec;
+        cplug_sdk::hooks::register_bytes(spec.class, move |_n, b| {
+            patch_sv_probe(b, spec)
+        });
+    }
+    cplug_sdk::hooks::register_bytes(CRAFT_PLAYER_CLASS, |_n, b| {
+        patch_craft_player(b)
+    });
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
@@ -564,6 +587,10 @@ pub unsafe extern "C" fn cplugin_init(
 
 static SP_WOVEN: AtomicBool = AtomicBool::new(false);
 static SP_DECLINED: AtomicBool = AtomicBool::new(false);
+// B23/T1: the syncVelocity word-table gate state — WANTED (the census is
+// enabled), DISARMED (a refusal anywhere killed the layer for the run).
+static SV_WANTED: AtomicBool = AtomicBool::new(true);
+static SV_DISARMED: AtomicBool = AtomicBool::new(false);
 static NAV_WOVEN: AtomicBool = AtomicBool::new(false);
 static NAV_DECLINED: AtomicBool = AtomicBool::new(false);
 static MOVE_WOVEN: AtomicBool = AtomicBool::new(false);
@@ -817,6 +844,9 @@ fn arm_module() {
     precompute_chunkmap(loader);
     precompute_naturalspawner(loader);
     precompute_inventory(loader);
+    // B23/T1: the syncVelocity census precompute (the pre-arm-loaded lazy
+    // classes — ApplyEntityImpulse rides the bootstrap enchant registry).
+    precompute_sv_probes(loader);
     // L161a: the dispatch-quiet protocol — arms after the tracker-loop
     // handle init (which allocates DS_QUIET/QUIET_REV regardless of the
     // tracker weave's own gate). CE_QUIET=0 keeps it off Java-side; the
@@ -867,6 +897,53 @@ fn arm_module() {
     ] {
         let rc = cplug_sdk::retransform_class(cls);
         cplug_sdk::log::info(&format!("[c-entities] retransform {cls}: rc={rc}"));
+    }
+
+    // B23/T1: the syncVelocity census classes' retransform pass. Classes
+    // with PRECOMPUTED bytes were loaded pre-arm — a failed retransform
+    // leaves their writers bare, so the word table disarms. Absent bytes =
+    // the class never loaded = the byte hook owns its first load (a
+    // not-yet-loaded class retransform failing is benign).
+    if SV_WANTED.load(Ordering::Acquire) {
+        for spec in SV_PROBES_LAZY.iter() {
+            let precomputed = PRECOMPUTED
+                .lock()
+                .ok()
+                .and_then(|pc| pc.get(spec.class).cloned())
+                .map(|b| !b.is_empty())
+                .unwrap_or(false);
+            let rc = cplug_sdk::retransform_class(spec.class);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] retransform {} (sv census): rc={rc}",
+                spec.class
+            ));
+            if precomputed && rc != 0 {
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] {} loaded pre-arm but retransform failed — word table disarmed",
+                    spec.class
+                ));
+                sv_disarm();
+            }
+        }
+    }
+
+    // B23/T1: arm the word table. The pre-arm probe classes (Entity.markHurt
+    // via entity_probes, CraftEntity.setVelocity via the fd probe chain) are
+    // woven above; the lazy census classes (TNT/Ravager/HoglinBase/
+    // ApplyEntityImpulse/CraftPlayer) weave at their own load, and any
+    // refusal there re-zeroes the scheme per-read. The Java reads stay on
+    // the exact plain shape until this lands (svWordScheme starts 0).
+    if SV_WANTED.load(Ordering::Acquire)
+        && !SV_DISARMED.load(Ordering::Acquire)
+        && set_java_int("svWordScheme", 1)
+    {
+        cplug_sdk::log::info(
+            "[c-entities] sv word table armed (census probes woven, scheme=1)",
+        );
+    } else if SV_WANTED.load(Ordering::Acquire) {
+        cplug_sdk::log::info(
+            "[c-entities] sv word table NOT armed (refusal or the scheme setter failed)",
+        );
     }
 
     // Paper re-loads kernel classes after bootstrap: a retransform that
@@ -3395,7 +3472,18 @@ fn apply_entity_frozen_and_probes(loader: jni::jobject, bytes: &[u8]) -> Option<
         gated
     };
     // the existing rust probe prefixes (box/impulse probes), on the gated bytes
-    entity_probes(gated).ok()
+    match entity_probes(gated) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            // B23/T1: a refused Entity chain means the markHurt census probe
+            // never wove — the word table must fall back to the plain reads.
+            sv_disarm();
+            cplug_sdk::log::info(&format!(
+                "[c-entities] Entity probe surgery refused ({e}) — vanilla kept, word table disarmed"
+            ));
+            None
+        }
+    }
 }
 
 fn precompute_entity(loader: jni::jobject) {
@@ -4896,33 +4984,60 @@ fn patch_craft_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
     let pre = PRECOMPUTED.lock().ok()?.get(CRAFT_ENTITY_CLASS).cloned();
     match pre {
         Some(b) if !b.is_empty() => {
-            match patch::insert_static_call_at_start(
-                b.clone(),
-                "setFallDistance",
-                "(F)V",
-                HOOKS_CLASS,
-                "probeFallDistWrite",
-                "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
-                &[(0, b'L')],
-            ) {
-                Ok(b2) => {
-                    PATCHES_OK.fetch_add(1, Ordering::AcqRel);
-                    cplug_sdk::log::info(
-                        "[c-entities] patched CraftEntity.setFallDistance probe",
-                    );
-                    Some(b2)
-                }
+            match craft_entity_fd_probe(b.clone()) {
+                Ok(b2) => Some(craft_entity_sv_probe(b2)),
                 Err(e) => {
                     PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
                     set_java_int("fdMirrorScheme", 0);
                     cplug_sdk::log::info(&format!(
                         "[c-entities] CraftEntity.setFallDistance probe refused: {e} — fd mirror disarmed"
                     ));
+                    // B23/T1: the sv probe rides the SAME bytes — disarm it
+                    // too when the fd weave refused (the census must stay
+                    // complete or the reads fall back).
+                    sv_disarm();
                     Some(b)
                 }
             }
         }
         _ => None,
+    }
+}
+
+fn craft_entity_fd_probe(b: Vec<u8>) -> Result<Vec<u8>, String> {
+    patch::insert_static_call_at_start(
+        b,
+        "setFallDistance",
+        "(F)V",
+        HOOKS_CLASS,
+        "probeFallDistWrite",
+        "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
+        &[(0, b'L')],
+    )
+}
+
+/// B23/T1: the CraftEntity.setVelocity census probe — the Bukkit API writes
+/// the HANDLE's syncVelocity directly (the whole-jar putfield audit: the
+/// putfield target is this.entity). SOFT: a refusal disarms the word table
+/// and keeps the fd probe bytes.
+fn craft_entity_sv_probe(b: Vec<u8>) -> Vec<u8> {
+    match patch::insert_static_call_at_start(
+        b.clone(),
+        "setVelocity",
+        "(Lorg/bukkit/util/Vector;)V",
+        HOOKS_CLASS,
+        "probeSyncVelWriteCraft",
+        "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(b2) => b2,
+        Err(e) => {
+            sv_disarm();
+            cplug_sdk::log::info(&format!(
+                "[c-entities] CraftEntity.setVelocity sv probe refused: {e} — word table disarmed"
+            ));
+            b
+        }
     }
 }
 
@@ -4939,34 +5054,232 @@ fn precompute_craft_entity(loader: jni::jobject) {
             "[c-entities] CraftEntity bytes not seen at boot — fd mirror disarmed",
         );
         let _ = set_java_int("fdMirrorScheme", 0);
+        // B23/T1: a post-arm CraftEntity load would leave setVelocity bare —
+        // disarm the word table with the fd mirror (the reads fall back).
+        sv_disarm();
         return;
     };
     let patched = cplug_sdk::jni_util::with_attached(|env| {
-        patch::insert_static_call_at_start(
-            bytes,
-            "setFallDistance",
-            "(F)V",
-            HOOKS_CLASS,
-            "probeFallDistWrite",
-            "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
-            &[(0, b'L')],
-        )
+        craft_entity_fd_probe(bytes)
     });
-    match patched {
-        Some(Ok(b)) if !b.is_empty() => {
-            if let Ok(mut pc) = PRECOMPUTED.lock() {
-                pc.insert(CRAFT_ENTITY_CLASS, b);
-            }
-            cplug_sdk::log::info(
-                "[c-entities] precomputed CraftEntity.setFallDistance probe",
-            );
-        }
+    let patched = match patched {
+        Some(Ok(b)) if !b.is_empty() => Some(b),
         _ => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
             let _ = set_java_int("fdMirrorScheme", 0);
             cplug_sdk::log::info(
                 "[c-entities] CraftEntity probe precompute refused — fd mirror disarmed",
             );
+            None
+        }
+    };
+    match patched {
+        Some(b) => {
+            let b = craft_entity_sv_probe(b);
+            if let Ok(mut pc) = PRECOMPUTED.lock() {
+                pc.insert(CRAFT_ENTITY_CLASS, b);
+            }
+            cplug_sdk::log::info(
+                "[c-entities] precomputed CraftEntity.setFallDistance + setVelocity probes",
+            );
+        }
+        None => {
+            // the sv census rides the same weave — disarm it with the fd one
+            sv_disarm();
+        }
+    }
+    let _ = loader;
+}
+
+// ---------------------------------------------------------------------------
+// B23/T1 — the syncVelocity writer-census probes (the lazy classes + the
+// CraftPlayer wrapper). The spec table carries the javap-verified method
+// shapes: the putfield receiver per site (the slot index into the method's
+// locals — instance methods hold the receiver at 0, static methods start
+// their locals at the first argument).
+// ---------------------------------------------------------------------------
+
+struct SvProbe {
+    class: &'static str,
+    method: &'static str,
+    desc: &'static str,
+    probe: &'static str,
+    probe_desc: &'static str,
+    args: &'static [(u16, u8)],
+}
+
+static SV_PROBES_LAZY: [SvProbe; 4] = [
+    // PrimedTnt.tick: `aload_0; iconst_1; putfield syncVelocity` (the
+    // explosion knockback writes the TNT itself).
+    SvProbe {
+        class: PRIMED_TNT_CLASS,
+        method: "tick",
+        desc: "()V",
+        probe: "probeSyncVelWrite",
+        probe_desc: "(Lnet/minecraft/world/entity/Entity;)V",
+        args: &[(0, b'L')],
+    },
+    // Ravager.blockedByItem (instance): the blocked entity is the FIRST
+    // argument (slot 1; the receiver is slot 0) — `aload_1; iconst_1;
+    // putfield LivingEntity.syncVelocity`.
+    SvProbe {
+        class: RAVAGER_CLASS,
+        method: "blockedByItem",
+        desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/damagesource/DamageSource;FZ)V",
+        probe: "probeSyncVelWrite",
+        probe_desc: "(Lnet/minecraft/world/entity/Entity;)V",
+        args: &[(1, b'L')],
+    },
+    // HoglinBase.throwTarget (STATIC): the shove lands on the second
+    // argument (slot 1); both are probed conservatively (a false-positive
+    // bit costs one exact field read, never a missed one).
+    SvProbe {
+        class: HOGLIN_BASE_CLASS,
+        method: "throwTarget",
+        desc: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/LivingEntity;)V",
+        probe: "probeSyncVelWrite2",
+        probe_desc: "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/entity/Entity;)V",
+        args: &[(0, b'L'), (1, b'L')],
+    },
+    // ApplyEntityImpulse.apply (instance): the wind-burst impulse target is
+    // the Entity argument at slot 4 (`aload 4; ...; putfield`, both sites).
+    SvProbe {
+        class: APPLY_IMPULSE_CLASS,
+        method: "apply",
+        desc: "(Lnet/minecraft/server/level/ServerLevel;ILnet/minecraft/world/item/enchantment/EnchantedItemInUse;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/Vec3;)V",
+        probe: "probeSyncVelWrite",
+        probe_desc: "(Lnet/minecraft/world/entity/Entity;)V",
+        args: &[(4, b'L')],
+    },
+];
+
+fn sv_census_wanted() -> bool {
+    std::env::var("CE_SV_WORD").map(|v| v != "0").unwrap_or(true)
+}
+
+fn sv_disarm() {
+    SV_DISARMED.store(true, Ordering::Release);
+    set_java_int("svWordScheme", 0);
+}
+
+/// The census probe weave for one spec. Pre-arm loads stash (the arm's
+/// precompute + retransform applies); post-arm loads weave inline (the
+/// probe surgery is pure byte work — no class queries inside the hook).
+fn patch_sv_probe(bytes: &[u8], spec: &SvProbe) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_sv_probe_inner(bytes, spec))
+        .ok()
+        .flatten()
+}
+
+fn patch_sv_probe_inner(bytes: &[u8], spec: &SvProbe) -> Option<Vec<u8>> {
+    if !sv_census_wanted() {
+        return None;
+    }
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        let mut st = STASH.lock().ok()?;
+        st.entry(spec.class).or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    let pre = PRECOMPUTED.lock().ok()?.get(spec.class).cloned();
+    if let Some(b) = pre {
+        if !b.is_empty() {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            return Some(b);
+        }
+    }
+    match patch::insert_static_call_at_start(
+        bytes.to_vec(),
+        spec.method,
+        spec.desc,
+        HOOKS_CLASS,
+        spec.probe,
+        spec.probe_desc,
+        spec.args,
+    ) {
+        Ok(b) => {
+            PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] patched {} {} sv census probe",
+                spec.class.replace('/', "."),
+                spec.method
+            ));
+            Some(b)
+        }
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] {} {} sv census probe refused: {e} — word table disarmed",
+                spec.class.replace('/', "."),
+                spec.method
+            ));
+            sv_disarm();
+            None
+        }
+    }
+}
+
+/// CraftPlayer.knockback(DDD) — the Bukkit API's second handle-flag writer.
+/// Same stash-or-inline contract as the lazy census classes.
+fn patch_craft_player(bytes: &[u8]) -> Option<Vec<u8>> {
+    let spec = SvProbe {
+        class: CRAFT_PLAYER_CLASS,
+        method: "knockback",
+        desc: "(DDD)V",
+        probe: "probeSyncVelWriteCraft",
+        probe_desc: "(Lorg/bukkit/craftbukkit/entity/CraftEntity;)V",
+        args: &[(0, b'L')],
+    };
+    patch_sv_probe(bytes, &spec)
+}
+
+/// The arm-time precompute for the census classes that loaded pre-arm
+/// (ApplyEntityImpulse rides the bootstrap enchant registry). Absent stash
+/// = the class never loaded = no writers have run = the hook covers it.
+fn precompute_sv_probes(loader: jni::jobject) {
+    if !sv_census_wanted() {
+        SV_WANTED.store(false, Ordering::Release);
+        return;
+    }
+    SV_WANTED.store(true, Ordering::Release);
+    for spec in SV_PROBES_LAZY.iter() {
+        let Some(bytes) = STASH
+            .lock()
+            .ok()
+            .and_then(|mut s| s.remove(spec.class))
+        else {
+            continue; // not loaded yet — the byte hook owns the first load
+        };
+        let patched = cplug_sdk::jni_util::with_attached(|env| {
+            patch::insert_static_call_at_start(
+                bytes,
+                spec.method,
+                spec.desc,
+                HOOKS_CLASS,
+                spec.probe,
+                spec.probe_desc,
+                spec.args,
+            )
+        });
+        match patched {
+            Some(Ok(b)) if !b.is_empty() => {
+                if let Ok(mut pc) = PRECOMPUTED.lock() {
+                    pc.insert(spec.class, b);
+                }
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] precomputed {} {} sv census probe",
+                    spec.class.replace('/', "."),
+                    spec.method
+                ));
+            }
+            _ => {
+                PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] {} {} sv census precompute refused — word table disarmed",
+                    spec.class.replace('/', "."),
+                    spec.method
+                ));
+                sv_disarm();
+            }
         }
     }
     let _ = loader;
@@ -5052,7 +5365,9 @@ fn patch_entity_inner(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         Err(e) => {
             PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
-            cplug_sdk::log::info(&format!("[c-entities] Entity probe refused: {e}"));
+            // B23/T1: the refused chain never wove the markHurt census probe.
+            sv_disarm();
+            cplug_sdk::log::info(&format!("[c-entities] Entity probe refused: {e} — word table disarmed"));
             None
         }
     }
@@ -5109,6 +5424,31 @@ fn entity_probes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
         "(Lnet/minecraft/world/entity/Entity;)V",
         &[(0, b'L')],
     )
+    // B23/T1: the markHurt prefix — Entity.markHurt is the BASE hurt-flag
+    // writer of the syncVelocity census (`iconst_1; putfield syncVelocity`,
+    // javap bc 0-5). SOFT probe: a refusal disarms the word table
+    // (svWordScheme=0) and keeps the bytes WITHOUT the markHurt weave —
+    // the box/delta probes above stay load-bearing exactly as before.
+    .and_then(|d2| {
+        match patch::insert_static_call_at_start(
+            d2.clone(),
+            "markHurt",
+            "()V",
+            HOOKS_CLASS,
+            "probeSyncVelWrite",
+            "(Lnet/minecraft/world/entity/Entity;)V",
+            &[(0, b'L')],
+        ) {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                sv_disarm();
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] Entity.markHurt sv probe refused: {e} — word table disarmed, box/delta probes kept"
+                ));
+                Ok(d2)
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
