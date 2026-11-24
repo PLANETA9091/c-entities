@@ -2407,3 +2407,86 @@ Task ID: 29 addendum 7 — the b21fix neutrality verdict (the gate PASS; the run
   mixed certified, spread 1.0pp from the line (0.110 this flight —
   the off-leg inflation flattered it; the true read rides the next
   same-class flight), despawn 2.9pp, items the wall.
+
+---
+Task ID: 29 addendum 8 — the B22 stand (the kernel-owned fast rows): the armed parity GREEN after two exactness fixes, the gate PASS; the honest standings: mixed certified, spread 0.142, despawn 0.110, items the wall
+
+- The B22 stand (472f2d1c + the b22fix 22ce2e59): the verdict cohort's row
+  plumbing leaves the thread — a preVerdict-1/2 visit writes TWO
+  sequential lane entries (FAST_ROW_KEY: the batch position + the id +
+  the inactive verdict + the pd-dirty bit packed at bits 40/33/32/0;
+  FAST_ROW_REFS: the entity) + the sparse FAST_ROW_PD lane (the dirty
+  visits only, the L184 contract), and the kernel SYNTHESIZES the batch
+  row at phase 1 from its own L7 store state + the lane; the whole
+  downstream pipeline (phase 2, phase 3, TAIL_NONE, the verdict mirror,
+  the merge-scan pre-filter) runs unchanged. The pre-B22 cohort/append
+  shape stays for the stamp-routed visits (preVerdict == 0) — the exact
+  old chain.
+- The armed parity run 45249174531 (472f2d1c): RED — items/mixed/spread
+  all failed (mobs PASS), the ON items' vy = -k*0.04 cycles: the ON
+  items ran the FULL tick (the %4 move-gate gravity accumulation) while
+  vanilla kept them INACTIVE. ROOT CAUSE 1 (the immunity loop): the
+  fast rows fed the verdict recomputation a FRESH e.activatedTick
+  capture; the packed rows consume the row's own FROZEN ATI (the last
+  append-time capture — the L186 audit removed the refresh). The
+  falling-phase grant wrote activatedTick = cur+100 (the dv2 > eps
+  branch), the fresh at kept the verdict ACTIVE for the whole grant
+  window. FIX: ItemEntry.at_anchor/atf_anchor — the store remembers the
+  last committed row's ATI triple (the chain rows anchor at the
+  append-time capture; the fast rows re-write their own — the idempotent
+  identity anchor == row ATI), the synthesis hydrates the batch ATI from
+  it, the applier's isTemp echo rides the new bit 27 (B22_ISTEMP). The
+  FAST_ROW_AT lane and the KEY's isTemp/defAct bits are GONE (two lane
+  writes per visit).
+- ROOT CAUSE 2 (the merge pd lane): the local bit-identical
+  reproduction (the items-20000 pair, seed 4242) drifted on TWO items
+  (5043/16518: pd off=0/on=1, self-healing). javap ground truth: the
+  vanilla absorb writes the survivor's pickupDelay DIRECTLY
+  (Math.max(this, other) — a putfield, no setter call), so
+  probePickupDelayWrite never fires; the packed path's writeback set
+  the dirty bit on the same tick anyway, the armed fast rows skip that
+  write when B22_PD_SAME holds, and the absorb's direct write stayed
+  invisible to the store. FIX: the merge-verdict rows arm PD_DIRTY by
+  hand before the scan.
+- The local reproduction after the fixes: the items-20000 parity pair
+  BIT-IDENTICAL at T389/T639/final (n 16498 = 16498, zero drift). The
+  armed CI parity (45267595813, 22ce2e59): GREEN — 12/12 legs
+  PARITY-A-B-GATE PASS, zero ORDER/TLO mismatches. The dormant CI
+  parity (45249099608): GREEN (the byte-neutral default, fn == 0).
+- The gate (45286026510, CE_WVERD=1 armed on the ON legs, ab-paired
+  MOBW=1): PASS — all five scenarios never-slower, pop delta 0:
+  scenario           off-samples            on-samples             med-off  med-on   ratio
+  items-100k         [86.6, 93.3, 91.4]     [19.2, 22.3, 21.7]     91.37    21.72    0.238
+  mobs-25k           [498.1]                [373.5]                498.11   373.45   0.750  (control)
+  mixed-150k         [2037.5]               [68.1]                 2037.48  68.12    0.033
+  spread-100k        [380.7, 376.9, 344.3]  [56.6, 52.3, 53.7]     376.88   53.70    0.142
+  mobs-despawn-10k   [63.3, 65.1, 66.1]     [6.6, 7.2, 9.2]        65.12    7.17     0.110  (pop OK)
+- The first gate attempt (45267601069) failed INFRA: a one-tick stall
+  >60s on an items leg (the watchdog fired at the 30-min mark, the
+  server kept ticking slowly, the measure window opened but the budget
+  died — "FATAL: no baseline.json"). The re-dispatch passed clean; the
+  armed profile (45284236783, items-100k, CE_WVERD=1) also completed
+  with no stall (wvQuiet 2.29M / wvFast 8.97M across the leg — the
+  consult served, the dieted prep invisible in the JFR top).
+- The armed walls (the profile jfr_top, items-100k): the moonrise
+  BasicEntityList.indexOf 6.94% (the both-leg churn, ratio-dead),
+  AABB.intersects 3.83% (the merge-volume physics, both-leg),
+  Unsafe.getObject 2.52%, SynchedEntityData.getItem 2.34% (b3's target),
+  tickListForEach 2.31%, itemTickFlush 2.25%, ubsEmpty 1.39%,
+  quietFuseBump 1.39% (the walk's quiet arm pays it per quiet item per
+  tick — the diet candidate), Entity.getBoundingBox 1.33%,
+  ItemStack.isEmpty 1.16%, Unsafe.getBoolean 1.72%.
+- Honest standings vs the -90% line (ratio <= 0.100, each flight's own
+  med-off): mixed certified (-96.7%), spread 0.142 (the ON must lose
+  ~29.6%: 53.70 -> 37.69 at this flight's off leg), despawn 0.110 (the
+  ON must lose ~9.1%: 7.17 -> 6.51), items 0.238 (the wall: the ON must
+  lose ~58%). The cross-flight ON-leg comparison stays void (the runner
+  classes shift); the B22 ON spread read 53.70 vs L190c's 55.18 —
+  consistent with the priced ~2.5-3.5ms win.
+- NEXT: (b4) the spread arc: the ttlCachedPath diet + the Unsafe cluster
+  (getObject/getBoolean ~4.2% armed) + tickListForEach's remaining
+  frames; the quietFuseBump diet (the per-item walk overhead); (b3) the
+  SynchedEntityData.getItem kill (2.34% armed items/spread); the items
+  wall stands on the moonrise churn (both-leg, ratio-dead) — the ratio
+  moves only through the ON-leg-only families left: itemTickFlush ~2.3%
+  + the walk remainder.
