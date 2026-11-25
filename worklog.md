@@ -2626,3 +2626,34 @@ Task ID: 29 addendum 10 — the B24 round (the SIT-empty inline diet) + the arme
   passed clean). The ratios from the completed legs are NOT a gate read
   (the flight failed) — the re-dispatch rides the B24 head and reads
   B23+B24 together.
+
+---
+Task ID: 29 addendum 11 — the B23+B24 gate verdict (45504249032, CE_WVERD=1 armed on the ON legs, ab-paired MOBW=1): PASS all five never-slower, pop delta 2 OK; mixed certified 0.020; the runner class shifted (the off legs inflated 1.3-2.1x vs the B22-era gate — the control row proves it) — the ratios are per-flight honest reads
+
+- The gate table (45504249032, 258e8534):
+  scenario           off-samples             on-samples              med-off   med-on   ratio
+  items-100k         [94.5, 88.1, 91.7]      [25.4, 27.0, 25.3]      91.69     25.41    0.277
+  mobs-25k           [789.6]                 [446.4]                 789.57    446.40   0.565  (control)
+  mixed-150k         [4197.0]                [85.1]                  4196.96   85.07    0.020
+  spread-100k        [491.4, 492.9, 490.9]   [63.9, 62.3, 64.9]      491.43    63.87    0.130
+  mobs-despawn-10k   [102.5, 95.7, 100.3]    [11.9, 12.1, 10.4]      100.25    11.86    0.118  (pop off=10012 on=10014 delta=2 OK)
+- The runner class shifted: the OFF legs inflated vs the B22-era gate
+  (mixed-off 4196.96 vs 2037.48, despawn-off 100.25 vs 65.12,
+  spread-off 491.43 vs 376.88, mobs-off 789.57 vs 498.11) AND the
+  control row's ratio moved 0.750 -> 0.565 — the per-flight medians are
+  the ONLY honest reads; the cross-flight comparison stays void (the
+  B22 gate's ON legs read 21.72/68.12/53.70/7.17 on a faster runner).
+- The honest standings vs the -90% line (ratio <= 0.100, each flight's
+  own med-off): mixed CERTIFIED (-98.0% this flight), spread 0.130 (the
+  ON must lose ~23.1%: 63.87 -> 49.14 at this flight's off leg),
+  despawn 0.118 (the ON must lose ~15.4%: 11.86 -> 10.03), items 0.277
+  (the wall: the ON must lose ~58%: 25.41 -> 9.17 — the moonrise churn
+  is both-leg ratio-dead, the wall stands on the ON-leg-only families
+  itemTickFlush ~3.5% + the walk remainder).
+- NEXT (b5 candidates, the profile-named list): the ubsEmpty
+  getClass+memo probes (1.41% items / 0.76% spread); the itemTickFlush
+  AP_FD mirror read (1.28% spread / 0.78% items); the VarHandle
+  RefField read family (1.57% + 1.02% despawn); the
+  tickListForEach walk frame remainder; the merge winner refresh stands
+  (the merge kernel floor) and the quiet-bump counter RMW family stands
+  (the mirrored vanilla semantics floor).
