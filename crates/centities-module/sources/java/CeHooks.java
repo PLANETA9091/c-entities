@@ -15415,8 +15415,34 @@ public final class CeHooks {
     // 53.63). The stamp never carries without the instanceof proof, and
     // non-ArrayList rows keep the exact old shape.
     private static final long TT_SITAL = 8L;
-    private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>
-            UBS_PROOF = new java.util.concurrent.ConcurrentHashMap<>();
+    // B25: the per-class proof store rides a ClassValue (VM-assisted per-class
+    // slot, no identity hashing on the miss path) — the SAME verdicts as the
+    // retired ConcurrentHashMap (computeValue carries the walk verbatim),
+    // only the lookup mechanism changed. The L188 one-entry memo stays.
+    private static final ClassValue<Boolean> UBS_PROOF = new ClassValue<>() {
+        @Override
+        protected Boolean computeValue(Class<?> c) {
+            boolean empty = false;
+            try {
+                for (Class<?> w = c; w != null && w != Object.class;
+                        w = w.getSuperclass()) {
+                    boolean declared = false;
+                    for (java.lang.reflect.Method m : w.getDeclaredMethods()) {
+                        if (m.getName().equals("updateDataBeforeSync")
+                                && m.getParameterCount() == 0) {
+                            declared = true;
+                            empty = (w == Entity.class);
+                            break;
+                        }
+                    }
+                    if (declared) break;
+                }
+            } catch (Throwable t) {
+                empty = false; // not proven: keep the per-tick call
+            }
+            return empty;
+        }
+    };
 
     /** L178: fill-time proof that updateDataBeforeSync() for this entity's
      *  class resolves to the Entity stub. The declaring-class walk: any
@@ -15429,37 +15455,17 @@ public final class CeHooks {
     private static boolean ubsEmpty(Entity ent) {
         Class<?> c = ent.getClass();
         // L188: the one-entry memo — the tracker fill visits same-class
-        // runs (the items legs are one class), so the concurrent map probe
+        // runs (the items legs are one class), so the proof-store probe
         // rides once per class change. The verdict is immutable per class,
         // so a racing memo write is benign (worst case: one extra probe).
+        // B25: the ClassValue probe computes the same L178 walk on the
+        // first-ever miss and serves the VM slot after — the CHM
+        // identity-hash + bin walk leaves the miss path.
         if (c == UBS_LAST_C) return UBS_LAST_V;
-        Boolean hit = UBS_PROOF.get(c);
-        if (hit != null) {
-            UBS_LAST_C = c;
-            UBS_LAST_V = hit;
-            return hit;
-        }
-        boolean empty = false;
-        try {
-            for (Class<?> w = c; w != null && w != Object.class; w = w.getSuperclass()) {
-                boolean declared = false;
-                for (java.lang.reflect.Method m : w.getDeclaredMethods()) {
-                    if (m.getName().equals("updateDataBeforeSync")
-                            && m.getParameterCount() == 0) {
-                        declared = true;
-                        empty = (w == Entity.class);
-                        break;
-                    }
-                }
-                if (declared) break;
-            }
-        } catch (Throwable t) {
-            empty = false; // not proven: keep the per-tick call
-        }
-        UBS_PROOF.put(c, empty);
+        boolean hit = UBS_PROOF.get(c);
         UBS_LAST_C = c;
-        UBS_LAST_V = empty;
-        return empty;
+        UBS_LAST_V = hit;
+        return hit;
     }
     // L92: the QUIET bitset — per mirror slot, set by the item-tick applier
     // for batch-owned items whose ENTIRE tracker-visible surface is provably
@@ -16570,10 +16576,30 @@ public final class CeHooks {
                         ttlFuse++;
                         continue;
                     }
-                    Object te = (O_ENT_TRACKED >= 0 && U != null)
-                            ? U.getObject(ent, O_ENT_TRACKED)
-                            : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
-                                    .moonrise$getTrackedEntity();
+                    // B25: the te slot-cache hoist — the L190c WARM-GATE
+                    // condition verbatim (the nonzero shape stamp + the ent
+                    // ref pin — the SAME license the warm skip runs below),
+                    // read one step earlier: the pinned te ref serves the
+                    // fast-exit and fast-path chain without the entity-header
+                    // field hop (one per non-quiet visit per tick; the walk
+                    // already pays the sid-indexed arrays here). A gate miss
+                    // (fresh slot / TT_REF null / the fill-catch null) takes
+                    // the exact pre-B25 chain — the read result is identical
+                    // either way (the same Object the interface returns).
+                    Object te = null;
+                    Object[] rffH = TT_REF;
+                    long[] flfH = TT_FLAT;
+                    if (flfH != null && rffH != null
+                            && flfH[sid * 2] != 0
+                            && rffH[sid * 5 + 2] == ent) {
+                        te = rffH[sid * 5];
+                    }
+                    if (te == null) {
+                        te = (O_ENT_TRACKED >= 0 && U != null)
+                                ? U.getObject(ent, O_ENT_TRACKED)
+                                : (Object) ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerEntity) ent)
+                                        .moonrise$getTrackedEntity();
+                    }
                     if (te == null) continue;                     // vanilla bc 46-51
                     // L151: the exact sendChanges fast-exit (the same license
                     // the raw loop runs — the per-entity chain is order-free).
@@ -16622,11 +16648,17 @@ public final class CeHooks {
                             // (the fast path just did its real RMW — the
                             // stamp captures the post-increment truth)
                             flf[sid * 2 + 1] = U.getInt(se0, O_SE_TICKCOUNT);
+                            // B25: ONE UBS verdict per fill — the SIT branch
+                            // re-stamps from scratch and used to re-derive the
+                            // per-class proof a second time per SIT fill (the
+                            // verdict is immutable per class; one call serves
+                            // both stamps).
+                            final boolean ubs = ubsEmpty(ent);
                             // L178: the per-class UBS proof rides the shape
                             // (a proven-empty updateDataBeforeSync lets the
                             // cached path skip the virtual call per tick)
                             flf[sid * 2] = TT_OK
-                                    | (ubsEmpty(ent) ? TT_UBS : 0);
+                                    | (ubs ? TT_UBS : 0);
                             if (interp instanceof
                                             net.minecraft.world.entity
                                                     .SteppedInterpolationTracker
@@ -16645,7 +16677,7 @@ public final class CeHooks {
                                 flf[sid * 2] = TT_OK | TT_SIT
                                         | (steps0 instanceof java.util.ArrayList
                                            ? TT_SITAL : 0L)
-                                        | (ubsEmpty(ent) ? TT_UBS : 0);
+                                        | (ubs ? TT_UBS : 0);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {

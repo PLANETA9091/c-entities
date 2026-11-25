@@ -2657,3 +2657,67 @@ Task ID: 29 addendum 11 — the B23+B24 gate verdict (45504249032, CE_WVERD=1 ar
   tickListForEach walk frame remainder; the merge winner refresh stands
   (the merge kernel floor) and the quiet-bump counter RMW family stands
   (the mirrored vanilla semantics floor).
+
+---
+Task ID: 29 addendum 12 — the B25 round (the ubs diet + the te warm-gate hoist), the FULL local parity sweep: FOUR armed pairs (items-20000 / mobs-2500 / spread-10000 / mixed-15000, seed 4242, CE_WVERD=1, module ARMED) ALL bit-identical; the gate flight is NOT dispatched — the sandbox lost the GitHub token (the recycled environment carries no credentials; the push + dispatch ride the next session with the token)
+
+- The B25 round takes the addendum 11 NEXT list's LOCALY-provable
+  members. Three exact Java-source diets, each riding a shipped
+  license, no wire change, no new invariant:
+  - B25/T1 (the ubs one-call fill): the fill's SIT branch re-stamped
+    from scratch and re-derived the per-class proof a SECOND time per
+    SIT fill (ubsEmpty at the TT_OK stamp AND at the TT_SITAL stamp).
+    The verdict is immutable per class — ONE call now serves both
+    stamps (final boolean ubs). Exactly one ubsEmpty call site remains
+    (the fill hoist).
+  - B25/T2 (the ClassValue proof store): the L178 per-class proof store
+    leaves the ConcurrentHashMap — a ClassValue (VM-assisted per-class
+    slot, no identity hashing on the miss path). computeValue carries
+    the reflection walk VERBATIM (the same verdicts, the same
+    Throwable->false catch); the L188 one-entry memo stays. No kill
+    switch: the lookup mechanism changed, the read semantics did not.
+  - B25/T3 (the te warm-gate hoist): the mirror walk's per-visit
+    TrackedEntity read (U.getObject(ent, O_ENT_TRACKED) — one
+    entity-header hop per non-quiet visit per tick) is served from the
+    slot cache when the L190c WARM-GATE condition holds verbatim
+    (flf[sid*2] != 0 && rff[sid*5+2] == ent). A gate miss (fresh slot /
+    TT_REF null / the fill-catch null) takes the exact pre-B25 chain.
+    The te+ent pair is written together by the same fill, so the pin
+    admits only te generations the L190c warm path already trusts —
+    NO new license surface.
+- The inspected, NOT dieted (honest): the itemTickFlush AP_FD mirror
+  read is already the L186 diet — the remaining self time is the array
+  load + the NaN guard; removal needs a kernel-side fd-changed bit (a
+  wire change, out of the local-diet scope). The VarHandle RefField
+  family rides the Unsafe offsets (off >= 0) on this JVM — the despawn
+  profile frames need a FRESH JFR read on the B25 head to name before
+  anything is touched. The quiet-bump counter RMW family and the merge
+  winner refresh stand (the documented floors).
+- The local proof (the FULL sweep, not one pair — the -90%-everywhere
+  shape): four parity pairs, PARITY=1 PARITY_SEED=4242, EXTRA_JVM
+  hashCode=5, XMX=4G, module legs CE_WVERD=1 ARMED:
+    items-20000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+                 (n 16498 = 16498, zero drift)
+    mobs-2500    T382 / T632 / final  PARITY-GATE PASS bit-identical
+    spread-10000 T389 / T639 / final  PARITY-GATE PASS bit-identical
+    mixed-15000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+  The armed counters on the spread ON leg (hooks@T1058): the sv word
+  table served 4,948,074 skips / 10,008 real reads (99.8% no-touch),
+  the despawn-rate mirror 1,814,805 hits / 2,995 fills, the SIT-empty
+  helper 3,276,173 visits, the armed consult wv=878 walks serving
+  1,817,800 quiet + 2,933,639 fast verdicts, arenaMiss=0 stale=0
+  susp=0, refused doors closed (refused=-).
+- The gate: NOT dispatched. The recycled sandbox carries NO GitHub
+  credentials (the token from the earlier session is gone with the old
+  environment) — `git push` cannot authenticate and workflow_dispatch
+  needs the same token. The honest state: B25 is committed LOCALLY on
+  the B24 head (a44d6dcf + the B25 commit), proven by the four local
+  pairs above; the ab-paired MOBW=1 gate + the fresh armed profile fly
+  on the next session with the token restored. NO ratio claims — the
+  ratio movement reads ONLY on the gate flight (the cross-flight
+  comparison stays void).
+- NEXT: (with auth) push the B25 head -> dispatch ab-paired (armed,
+  MOBW=1) + native-profile on items/spread/despawn -> the gate table
+  + the fresh walls -> the b6 round reads the fresh profile. The b5
+  members left standing: the AP_FD kernel-side fd-changed bit (wire),
+  the VarHandle family (fresh-profile-named), the walk frame remainder.
