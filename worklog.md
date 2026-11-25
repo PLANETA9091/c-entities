@@ -2721,3 +2721,86 @@ Task ID: 29 addendum 12 — the B25 round (the ubs diet + the te warm-gate hoist
   + the fresh walls -> the b6 round reads the fresh profile. The b5
   members left standing: the AP_FD kernel-side fd-changed bit (wire),
   the VarHandle family (fresh-profile-named), the walk frame remainder.
+
+---
+Task ID: 29 addendum 13 — the B26 round (the no-open SIT offset unlock) on
+the fresh-profile read: the VarHandle family RESOLVED as the chunk-system
+floor (not module code — the b5 candidate retired), the NM applier mirror
+NOT dieted (the ON/ON determinism proof FAILED — the despawn ON shape is
+run-to-run divergent), T1 shipped and served (sitD=2060814/0/1/16); the
+FULL local parity sweep 4/4 pairs BIT-IDENTICAL on the B26 head; the gate
+flight is NOT dispatched — the sandbox still carries no GitHub credentials
+
+- The fresh armed profile on the B25 head (prof-despawn-on, this sandbox,
+  the despawn bench shape, bot-present, CE_WVERD=1, CE_NATIVE_MOB=1,
+  DESPAWN=1, JFR settings=profile, 4136 ExecutionSamples). The b5
+  candidate "VarHandle RefField read family (1.57% + 1.02% despawn)"
+  RESOLVED: the depth-2..5 aggregation above the VarHandle leaves
+  (FieldInstanceReadOnly.getVolatile 1.04% + Array.getAcquire 0.80% +
+  Array.getVolatile 0.36% self) lands ENTIRELY in the moonrise chunk
+  system — ConcurrentChainedLong2ReferenceHashTable.get 77 samples /
+  ChunkHolderManager.getChunkHolder 71 / checkNeighbour 23 — the chunk
+  floor is both-leg ratio-dead. NOT module code; the candidate is
+  RETIRED as a diet target. The module self frames on the fresh read:
+  sitStepsEmpty 1.09% (T1's target), tickListForEach 0.51% (the walk
+  loop body — the walk floors), spawnerCreateState$ 0.41% +
+  newTrackerTick$ 0.39% (the weave prefixes — kernel domain, parked),
+  Unsafe.getBoolean 0.65% (the post-sv-word remainder). WatchdogThread
+  15.8% + bzip2/GHASH noise — the runner class again (both-leg).
+- T2 (the NM applier's three-Vec3-double compare — Unsafe.getDouble
+  1.28% self, the nativeMobBoundary caller rows 1.21+0.80%): a
+  belt-keyed (ref,x,y,z) mirror on the NmMap slot would kill the three
+  loads on parked mobs (the Vec3 immutability invariant — the same
+  license shape the N2-M2f delta mirror rides). The proof attempt:
+  TWO identical B25-head despawn ON legs (CE_NATIVE_MOB=1 DESPAWN=1
+  PARITY=1 seed 4242, playerless) DIVERGED — hurtT id 27: 85 vs 51;
+  id 2: 21 vs 5; final id 2: 29 vs 33. The NM-wire shape is
+  run-to-run nondeterministic locally (the native decisions' entropy;
+  the wire is population-convergent by design — doc 61b — not
+  bit-identical), and the off/on pair cannot exercise it (the parity
+  legs never set CE_NATIVE_MOB). The ON/ON bit-identity proof the
+  mirror needs is IMPOSSIBLE locally — NOT dieted. The gate flight's
+  next armed profile names the real share; the mirror rides a future
+  round with a kernel-side determinism anchor.
+- B26/T1 (the no-open SIT offset unlock): the leg JVM proof (Temurin
+  25.0.5.1) — sun.misc.Unsafe.objectFieldOffset resolves
+  java.util.ArrayList.size WITHOUT setAccessible (offset 16) and
+  U.getInt reads the live value — the offset is not reflection access.
+  The old offOf's setAccessible ALWAYS refused on java.base
+  (java.base/java.util is not open on the paperclip JVM) — O_ARR_SIZE
+  stayed -1 and the B24 helper served every visit. The new resolver
+  (offOfNoOpen) is the exact offOf walk minus the setAccessible call;
+  a refusal (the walk end / the native resolve / a null U) returns -1
+  — the exact pre-B26 helper shape; the vanilla (unnamed-module)
+  targets keep riding offOf unchanged. The tracker-init break the B24
+  comment recorded cannot repeat (the old resolver THREW on refusal —
+  the new one folds to -1). The diag (the armed mobs ON leg, hooks@):
+  sitD=2060814/0/1/16 — ALL 2.06M SIT visits ride the direct
+  U.getInt, sitCast=0 (the helper left the per-tick path), O_ARR_SIZE
+  resolved. Kill switch -Dcentities.sitSize=false unchanged.
+- The local proof (the FULL sweep on the B26 head): four off/on parity
+  pairs (PARITY=1 PARITY_SEED=4242, EXTRA_JVM hashCode=5, XMX=4G, the
+  module legs CE_WVERD=1 ARMED; the OFF legs re-used from the same-
+  seeded sweep this session — vanilla is unchanged):
+    mobs-2500    T382 / T632 / final  PARITY-GATE PASS bit-identical
+    items-20000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+    mixed-15000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+    spread-10000 T389 / T639 / final  PARITY-GATE PASS bit-identical
+  12/12 snapshot gates green.
+- The gate: NOT dispatched. The recycled sandbox carries NO GitHub
+  credentials (the token is gone with the old environment; nothing
+  persisted) — `git push` cannot authenticate and workflow_dispatch
+  needs the same token. The honest state: B25 + B26 committed LOCALLY
+  on the B24 head (a44d6dcf -> 30ddf078 the B25 re-am -> the B26
+  commit); the ab-paired MOBW=1 gate + the fresh armed profiles fly on
+  the session with the token restored. NO ratio claims — the ratio
+  movement reads ONLY on the gate flight (the cross-flight comparison
+  stays void).
+- NEXT (with auth): push the B25+B26 head -> dispatch ab-paired
+  (armed, MOBW=1) + native-profile on items/spread/despawn -> the gate
+  table + the fresh walls -> the b7 round reads the fresh profile. The
+  b6 members left standing: the AP_FD kernel-side fd-changed bit
+  (wire), the tickListForEach walk frame remainder (the loop body —
+  the walk floors), the spawner/tracker weave prefixes (kernel
+  domain), the NM applier ref-mirror (T2 — needs the determinism
+  anchor).

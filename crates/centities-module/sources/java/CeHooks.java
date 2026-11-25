@@ -7189,6 +7189,33 @@ public final class CeHooks {
         }
         throw new IllegalStateException("offOf: " + start.getName() + "." + name);
     }
+    /** B26/T1: the no-open offset resolver — the EXACT offOf walk minus the
+     *  setAccessible call. sun.misc.Unsafe.objectFieldOffset resolves the
+     *  offset WITHOUT module opens (the offset is not reflection access;
+     *  the jdk-25 Temurin 25.0.5.1 leg proved it live: ArrayList.size ->
+     *  the offset resolves and U.getInt reads the live value). java.base
+     *  targets (ArrayList.size — the B24/T1 SIT-empty direct read) stayed
+     *  refused by setAccessible on the paperclip JVM (java.base/java.util
+     *  is not open) and the old resolver's catch folded them to the helper
+     *  shape; this resolver unlocks exactly those, reads the SAME field the
+     *  helper read, and a refusal (the NoSuchField walk end / the native
+     *  offset resolve / a null U) returns -1 — the exact pre-B26 shape.
+     *  The vanilla (unnamed-module) targets keep riding offOf — no
+     *  behavior change there. */
+    private static long offOfNoOpen(Class<?> start, String name) {
+        Class<?> k = start;
+        while (k != null) {
+            try {
+                java.lang.reflect.Field f = k.getDeclaredField(name);
+                return U.objectFieldOffset(f); // NO setAccessible — the offset is not access
+            } catch (NoSuchFieldException notHere) {
+                k = k.getSuperclass();
+            } catch (Throwable t) {
+                return -1L;
+            }
+        }
+        return -1L;
+    }
     private static Object refAt(Object o, long off) { return U.getObject(o, off); }
     private static void putRefAt(Object o, long off, Object v) { U.putObject(o, off, v); }
     private static int intAt(Object o, long off) { return U.getInt(o, off); }
@@ -15574,11 +15601,12 @@ public final class CeHooks {
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
             // B24/T1: the ArrayList.size offset for the direct SIT-empty read.
-            try {
-                O_ARR_SIZE = offOf(java.util.ArrayList.class, "size");
-            } catch (Throwable tsz) {
-                O_ARR_SIZE = -1; // the exact cast shape stays
-            }
+            // B26/T1: the resolver drops setAccessible (java.base is not open
+            // on the paperclip JVM — the old resolve ALWAYS refused here and
+            // the helper shape served; objectFieldOffset itself needs no
+            // opens — proven live on the leg JVM). A refusal keeps -1 — the
+            // exact pre-B26 helper shape.
+            O_ARR_SIZE = offOfNoOpen(java.util.ArrayList.class, "size");
             O_ENT_SYNC_POS = offOf(Entity.class, "syncPosition");
             O_ENT_SYNC_VEL = offOf(Entity.class, "syncVelocity");
             // L151: the exact sendChanges fast-exit shape. needsSync is a
