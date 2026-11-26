@@ -2804,3 +2804,50 @@ flight is NOT dispatched — the sandbox still carries no GitHub credentials
   the walk floors), the spawner/tracker weave prefixes (kernel
   domain), the NM applier ref-mirror (T2 — needs the determinism
   anchor).
+
+---
+Task ID: 29 addendum 14 — the session re-am: the B25+B26 patches applied
+verbatim via git am on the a44d6dcf head (commits 83ac967 the B25 re-am ->
+51f50c5 the B26 re-am; the content byte-identical to the trees the
+addendum 12/13 proofs rode), the jdk-25 javac compile PROOF on this
+sandbox (clean, the known Unsafe.objectFieldOffset deprecation warnings
+only), the push re-attempted and REFUSED (no credentials — the recycled
+sandbox carries none); the gate flight still rides the session with the token
+
+- The re-am: the previous session saved the B25 and B26 commits as
+  format-patch exports in the deliverable dir before the environment was
+  recycled. This session re-cloned the public repo (the token is NOT
+  restored — the clone rides anonymous read), applied both patches with
+  git am on the a44d6dcf head: 83ac967 (B25: the ubs one-call fill + the
+  ClassValue proof store + the te warm-gate hoist) -> 51f50c5 (B26: the
+  no-open SIT offset unlock). git am preserves the authorship and the
+  exact commit messages; the tree content is byte-identical to the
+  proven addendum 12/13 state (git am fidelity — the same hunks, the
+  same parents).
+- The compile proof on THIS sandbox: jdk-25 javac (the paper-26.3.jar
+  class files are v69 — the jdk-21 javac refuses them), the classpath
+  paper/paper-26.3.jar (mojang-mapped) + every jar under
+  paper-boot/libraries (the fastutil completion build.rs walks). CeHooks.java
+  compiles clean on the B26 head: EXIT=0, only the pre-existing
+  Unsafe.objectFieldOffset deprecation-for-removal warnings (the same
+  sites the shipped module has carried). No new warnings from B25/B26.
+- The AP_FD kernel-side fd-changed bit was INSPECTED, not built: the
+  belt-load-free shape (the kernel packs the fd-changed verdict into the
+  bits word the apply already reads) needs a Rust-side prev-fd compare +
+  a probe-visible invalidation word (the CraftEntity.setFallDistance
+  probe must re-assert the kernel value after a foreign write — bit-identical
+  requires it), i.e. a cross-language change on a stale pre-B26 profile
+  share (1.28% spread / 0.78% items measured BEFORE B23..B26). The fresh
+  CI profile names the real share first. NOT dieted this session.
+- The push: `git push origin main` -> "could not read Username for
+  'https://github.com'" (no credential helper, no token, no SSH key in
+  the recycled environment). The gate flight (ab-paired MOBW=1, armed)
+  + the fresh armed profiles stay dispatched-ready: the head carries
+  B25+B26 proven 4/4 local parity pairs BIT-IDENTICAL (addendum 12/13)
+  + this session's compile proof.
+- NEXT (with auth, one message): push the 51f50c5 head -> dispatch
+  ab-paired (armed, MOBW=1) -> the gate table (the honest per-flight
+  reads vs the 0.130/0.118/0.277 standings) + the fresh armed profiles
+  -> the b7 round reads the fresh walls (the AP_FD kernel bit, the walk
+  remainder, the weave prefixes, the NM mirror with a determinism anchor
+  — each only if the fresh profile still names it).
