@@ -2851,3 +2851,91 @@ sandbox carries none); the gate flight still rides the session with the token
   -> the b7 round reads the fresh walls (the AP_FD kernel bit, the walk
   remainder, the weave prefixes, the NM mirror with a determinism anchor
   — each only if the fresh profile still names it).
+
+---
+Task ID: 29 addendum 15 — the FULL LOCAL PARITY SWEEP on the restored B26 head
+in THIS sandbox: 4/4 pairs BIT-IDENTICAL (12/12 snapshot gates) with the module
+ARMED (CE_WVERD=1) + the fresh armed despawn JFR profile on the B26 head names
+the post-B26 walls: sitStepsEmpty and ubsEmpty LEFT the top frames (B25/B26
+live), the remaining module frames are the documented floors/parked + one
+marginal belt-mirror sketch (SIT_N) parked on the addStep census; the ratios
+ride the gate flight (NO ratio claims)
+
+- The sweep (the CI parity.yml shape, the exact knob set: PARITY_SEED=4242,
+  FILL 200 / WARMUP 100 / MEASURE 600, EXTRA_JVM -XX:+UnlockExperimentalVMOptions
+  -XX:hashCode=5, CE_ITEM_TICK=1 CE_MOB_AI=0 CE_MERGE=1 CE_COLLIDE=1
+  CE_MERGE_MIRROR=1, the module legs CE_WVERD=1 ARMED): the stack was rebuilt
+  from scratch in the recycled sandbox (rustup cargo 1.100.0, maven 3.9.9,
+  the CRUSSTY runtime from work/../CRUSSTY, ce-baseline.jar, the paperclip
+  bootstrap 26.3 build 263 via fetch-paper.sh, ViaVersion 5.12.3 + ViaBackwards,
+  mineflayer). The sandbox carries ~4 GB RAM: the legs ran XMS=1G XMX=2G
+  (the CI keeps XMX=4G — wallclock is irrelevant for the parity state, the
+  snapshot SHA carries).
+    mobs-2500    T382 / T632 / final  PARITY-GATE PASS bit-identical (n 2509)
+    items-20000  T389 / T639 / final  PARITY-GATE PASS bit-identical (n 16498
+                 — the same n and the same T389/T639 tags the addendum 12
+                 sweep recorded)
+    mixed-15000  T389 / T639 / final  PARITY-GATE PASS bit-identical (n 13851)
+    spread-10000 T389 / T639 / final  PARITY-GATE PASS bit-identical (n 9901)
+  The module counters on the armed items ON leg (hooks@): sv=3,613,953 skips /
+  19,999 real reads (99.4% of the consume reads served with NO entity touch),
+  dm=2,980,516 hits / 14,678 fills, sitD=0/0/1/16... the despawn-leg diag
+  sitD=2936617/0/1/16 (ALL 2.9M SIT visits ride the B26 direct U.getInt,
+  sitCast=0 — the helper left the per-tick path), wv=418 consult walks,
+  arenaMiss=0 stale=0 susp=0, refused=- (the disarm doors all closed).
+  This is the FRESH IN-SANDBOX proof of the B25+B26 content — the addendum
+  12/13 proofs transfer AND reproduce locally on a different JVM boot.
+- The fresh armed despawn profile on the B26 head (prof-despawn-10k-on, this
+  sandbox, the despawn bench shape: SCALE=10000 AREA=700 DESPAWN=1
+  CE_NATIVE_MOB=1 CE_WVERD=1, bot-present via ViaVersion 5.12.3 + mineflayer,
+  JFR settings=profile, 4576 ExecutionSamples, XMS=1G XMX=2G — heap-tight vs
+  the CI 8G, the runner noise share inflates accordingly):
+  WatchdogThread 23.4% + bzip2/commons-compress ~2.8% + the craft-logger 0.7%
+  — the 2-vCPU sandbox noise (both-leg by construction); the moonrise
+  chunk-gen floor family (WorldGenRegion/ChunkHolderManager/StaticCache2D/
+  PalettedContainer/starlight ~6% aggregated — the AREA=700 shape churns
+  chunk-gen, both-leg ratio-dead).
+  THE MODULE FRAMES (the fresh read, depth-2..5 callers aggregated):
+    U.getInt 1.55% — newTrackerTick$ (the weave prefix, kernel domain) +
+    ttlCachedPath ~0.9% (the B26 direct SIT size read itself — see the
+    SIT_N sketch below) + nativeMobBoundary/itemTickFlush small
+    U.getDouble 1.09% — ALL nativeMobBoundary <- itemTickFlush (the NM
+    applier three-Vec3 compare — the addendum 13 T2, the ON/ON determinism
+    proof FAILED, NOT dieted, stands)
+    U.getBoolean 0.74% — the sv consume REAL reads (10012 real of
+    2,926,605 skips — the 0.34% the word table MUST pay by design) + the
+    NM boundary read; irreducible
+    tickListForEach 0.90% — the walk loop body floor
+    spawnerCreateState$ 0.52% — the weave prefix, kernel domain
+  sitStepsEmpty: LEFT the top-60 (the B24 helper + the B26 direct read
+  served every visit — the pre-B26 read was 1.09% + the isEmpty invoke).
+  ubsEmpty: LEFT the top-60 (the B25 one-call fill + the ClassValue store).
+  The B25 te warm-gate hoist: the te U.getObject read left the top-60.
+- The SIT_N belt-mirror sketch (parked, the b7 candidate list): the
+  ttlCachedPath SIT-empty test reads the LIVE ArrayList.size via the B26
+  direct U.getInt (~0.9% despawn ON samples). A belt-keyed SIT_N int mirror
+  written at the fill's TT_SITAL stamp (the fill owns rf[ob+4] and can write
+  steps.size() at stamp time) would drop the entity-header deref, the
+  O_ARR_SIZE guard and the -1 fallback branch from the per-tick test. The
+  LICENSE GAP (why it is parked, not shipped): the stamped list CAN mutate
+  between fills — vanilla addStep grows the list ("a live step: addStep
+  would mutate — vanilla", the branch comment) — and a stale mirror would
+  MISS the live step (the wrong branch, a behavioral change). The mirror
+  needs a COMPLETE size-mutator census (addStep + any other holder of the
+  list ref) with a woven invalidation probe on every true mutator + the
+  disarm contract doors; an incomplete census breaks value-identity for
+  arbitrary callers. NOT dieted this session — the census is a kernel-side
+  javap job riding the next round's budget, and the win is ~0.9% of one
+  scenario's ON leg (the ratio move rides the med-off denominator and the
+  runner variance; the gate flight judges).
+- The push: STILL refused — the recycled sandbox carries no GitHub
+  credentials (git push -> could not read Username). The honest state: the
+  B26 head + this addendum are committed LOCALLY (a44d6dcf -> the b25
+  re-am -> the b26 re-am -> addendum 14 -> addendum 15), proven by the
+  fresh 4/4 sweep above; the ab-paired MOBW=1 gate + the CI profiles fly on
+  the session with the token restored. NO ratio claims.
+- NEXT (with auth, one message): push the head -> dispatch ab-paired
+  (armed, MOBW=1) -> the gate table vs the 0.130/0.118/0.277 standings ->
+  the CI armed profiles (items/spread/despawn) -> the b7 round reads the
+  fresh CI walls (the SIT_N census sketch, the NM determinism anchor, the
+  AP_FD kernel bit — each only if the CI profile still names it).
