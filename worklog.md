@@ -3017,3 +3017,109 @@ the gate flight (NO ratio claims); the push STILL refused (no credentials)
   the CI armed profiles -> the b7 reads the fresh CI walls (the NM
   determinism anchor, the AP_FD kernel bit — each only if the CI profile
   still names it; the SIT_N wall is now DIETED on the local read).
+
+---
+Task ID: 29 addendum 17 — the B28 round (the NM applier position mirror, the
+addendum-13 T2 diet riding the B27 poison-probe license — NO ON/ON determinism
+proof needed, the value-identity is structural): the token restored ONE
+message did everything — the 5-commit chain re-am'd from the patch exports
+(a44d6dcf -> b25 -> b26 -> add 14 -> add 15 -> b27+add 16), PUSHED
+(a44d6dcf..005097e5 -> main), the ab-paired armed gate + the three fresh CI
+profiles dispatched on the B27 head, the fresh CI reads pulled (despawn
+2061 + spread samples on 8G CI heaps), the census GREEN, the B28 implemented,
+compiled, swept, and the armed-despawn diag leg proves the mirror OWNS the
+applier compare path; the ratios ride the flights (NO ratio claims)
+
+- THE ONE-SHOT (the user's token, silent use only): the recycled sandbox was
+  rebuilt from the download/ patch exports (git am: 75090b21 b25, bc3f70cc
+  b26, 53bd33ed add 14, 595584e0 add 15, 005097e5 b27 — the jdk-25 javac
+  compile proof clean on the restored head, EXIT=0). The push landed:
+  a44d6dcf..005097e5 -> main. Dispatched: ab-paired (45888376224, the armed
+  MOBW=1 gate) + profile spread-100k (45888385388) + items-100k (45888388597)
+  + mobs-despawn-10k (45888392410) on the B27 head. The push-triggered
+  module.yml build came back SUCCESS (the CI compile proof of the head).
+- THE FRESH CI READS (the B27 head, CI 8G heaps — per-flight honest, NO
+  cross-flight comparison): despawn-10k 2061 samples: Unsafe.getDouble 1.80%
+  (#3 leaf, ALL nativeMobBoundary line 13879 1.65% caller — the three-Vec3
+  compare, the #1 module wall; the B27 mirror did NOT touch it by design),
+  ttlCachedPath 1.02% (the belt-read remainder — the SIT wall dieted),
+  newTrackerTick$ 0.44% / spawnerCreateState$ 0.34% (the weave prefixes,
+  kernel domain), probeBox 0.39%, tickListForEach 0.29% (the walk floor).
+  spread-100k: tickListForEach 6.83%+0.89% (the per-item walk floor — the
+  module's core dispatch service, ratio-advantageous vs the vanilla per-item
+  tick it replaced), itemTickFlush 4.33%+1.20%+0.23% (the merge-candidate
+  scan — the documented items-wall floor, L162 already dieted its #1 line),
+  spawnerCreateState$ 1.59%, ttlCachedPath 1.28%+0.57%, standMirror ~1.1%+2.0%
+  caller, the NM compare 0.94%+1.02%, Unsafe.getObject 3.16% / getByte 2.16%
+  (the sv word table's own reads). The b7 candidate list resolved: the ONLY
+  dietable top module wall on the fresh CI read = the NM three-Vec3 compare
+  (the despawn 0.118 wall's #1 module frame) — the walk floor, the merge
+  scan, the weave prefixes and the sv reads stand as documented floors.
+- THE CENSUS (scripts/pos_census.py, the B27 sit_census shape): the
+  raw-byte constant-pool walk of ALL 10768 classes of the mojang-mapped
+  paper-26.3.jar — Entity.position (Lnet/minecraft/world/phys/Vec3;) has
+  EXACTLY ONE fieldref entry in the whole jar (Entity.class itself — every
+  GETFIELD/PUTFIELD site shares it); javap -c pins the putfield sites:
+  (1) the Entity CONSTRUCTOR (pre-registration — monotonic never-recycled
+  ids, a fresh row carries no stamp: no probe needed), (2) Entity.setPosRaw
+  (DDDZ) — the chokepoint the 3-arg overload forwards into (javap-verified)
+  and setPos*/absSnapTo*/moveTo/reapplyPosition delegate through (NO putfield
+  anywhere else). ONE prefix probe owns the COMPLETE mutation surface.
+- THE B28 IMPLEMENTATION: the kernel weaves probePosMutate on setPosRaw(DDDZ)
+  (patch::insert_static_call_at_start, slot-0 receiver, SOFT probe — a
+  refusal re-zeroes nmPosMirrorScheme and keeps the box/delta/markHurt chain
+  exactly as before; CE_NM_MIRROR=0 never weaves); the raise is the B27
+  VERIFIER discipline (the arm-time attempt + the verifier's one-shot — the
+  in-callback JNI static call fails silently). The Java side: belt-keyed
+  NM_STAMP_X/Y/Z (double[ARENA.length]) + NM_STAMP_B (byte[ARENA.length],
+  bit 0 = the stamp live) allocated lazily at the first SCHEME=1 applier
+  pass; the per-tick MIRROR-FIRST branch (the fresh native truth ==
+  the stamped triple && the bit live -> java == native PROVEN — the same
+  verdict the compare produces, without the ref load + the three U.getDouble
+  loads); the else branch is the EXACT pre-B28 shape (the lazy NaN-guarded
+  loads, the same compare order) + the restamp after a proven verdict
+  (setPos landed the truth, or the compare passed); the poison probe clears
+  the bit on EVERY position write (the applier's own setPos restamps right
+  after the call — the mover self-heals, the parked population never
+  probes); the drain clears the stamp row with the id's removal (the
+  NM_RES hygiene); the diag rides hooks@ as nmp=<belt verdicts>/<poisons>/
+  <scheme>. Kill switches: -Dcentities.nmPosMirror=false (the Java door)
+  and CE_NM_MIRROR=0 (the kernel, no weave). Fail-closed by construction:
+  scheme 0 keeps the exact pre-B28 compare shape.
+- THE LOCAL PROOFS on this sandbox: (1) jdk-25 javac EXIT=0, 0 errors (the
+  101 pre-existing Unsafe deprecation warnings only); (2) cargo build
+  --release clean (the 5 pre-existing centities-core warnings only — none
+  from the B28 code); (3) the FULL LOCAL PARITY SWEEP on the B28 head, the
+  exact CI parity.yml shape (PARITY_SEED=4242, FILL 200 / WARMUP 100 /
+  MEASURE 600, EXTRA_JVM -XX:+UnlockExperimentalVMOptions -XX:hashCode=5,
+  CE_ITEM_TICK=1 CE_MOB_AI=0 CE_MERGE=1 CE_COLLIDE=1 CE_MERGE_MIRROR=1,
+  the module legs CE_WVERD=1 ARMED, XMS=1G XMX=2G): 4/4 pairs BIT-IDENTICAL,
+  12/12 snapshot gates:
+    mobs-2500    T382 / T632 / final  PARITY-GATE PASS bit-identical (n 2509)
+    items-20000  T389 / T639 / final  PARITY-GATE PASS bit-identical (n 16498)
+    mixed-15000  T389 / T639 / final  PARITY-GATE PASS bit-identical (n 13851)
+    spread-10000 T389 / T639 / final  PARITY-GATE PASS bit-identical (n 9901)
+  (the same n's and the same tags the addendum-12/15/16 sweeps recorded);
+  (4) the ARMED DESPAWN DIAG LEG (SCALE=2500 AREA=150 DESPAWN=1
+  CE_NATIVE_MOB=1 CE_WVERD=1, bot-present, ~1m33s): the weave logs "B28
+  setPosRaw probe woven — position mirror licensed" + "B28
+  nmPosMirrorScheme=1 raised (arm)", the hooks@ readout nmp=1,649,488 /
+  321,376 / 1 — the mirror OWNS the applier compare path (1.65M belt
+  verdicts; the poisons are the movers self-healing: the probe clears, the
+  applier re-compares and re-stamps — the census predicted the convergence),
+  desync=0, active=true, lastErr= empty, refused=- (the disarm doors all
+  closed), zero patch failures. The parity legs keep nmp=0/0/1 (no native
+  mobs there — the wire is idle, the scheme raise proves the weave landed).
+- THE STACK (rebuilt from scratch in the recycled sandbox, everything
+  foreground under the 10-min tool-call cap): rustup cargo 1.100.0, maven
+  3.9.9, CRUSSTY runtime 36.3s, ce-baseline maven build, the paperclip
+  26.3 boot (build 949a1b05, the mapped jar), ViaVersion 5.12.3 +
+  ViaBackwards 5.12.3, mineflayer. The B27+patch-export recovery anchor
+  discipline held (the download/ exports restored the full chain verbatim).
+- NEXT: the B28 head commit+push -> the ab-paired armed gate + the three
+  fresh armed profiles dispatched on the B28 head -> the gate table reads
+  the B28 per-flight rows (vs the B27 flight's own rows — per-flight
+  honest, NO cross-flight comparison) -> the b9 round reads the fresh CI
+  walls (the walk floor, the merge scan, the weave prefixes, the sv reads
+  — each only if the fresh profile still names it and a license path
+  exists).

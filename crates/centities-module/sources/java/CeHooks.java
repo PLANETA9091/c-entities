@@ -1930,6 +1930,8 @@ public final class CeHooks {
                 // B27: the SIT_N belt mirror — reads / poisons / the scheme
                 // (0=off, 1=the kernel-raised probes-woven license).
                 + "/" + sitN + "/" + sitNpoison + "/" + SIT_MIRROR_SCHEME
+                // B28: the NM position mirror — belt verdicts / poisons / scheme.
+                + " nmp=" + nmpN + "/" + nmpPoison + "/" + NM_MIRROR_SCHEME
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
@@ -13797,6 +13799,15 @@ public final class CeHooks {
                 System.out.println("[c-entities] N2 boundary: first read-back n=" + n);
             }
             NM_DEAD_N = 0;
+            // B28: the lazy stamp-row allocation (the first SCHEME=1 pass;
+            // the byte carries the mirror-valid bit, the doubles the stamped
+            // native truth). ARENA.length = the NM_RES row count.
+            if (NM_MIRROR_SCHEME == 1 && NM_STAMP_B == null) {
+                NM_STAMP_B = new byte[ARENA.length];
+                NM_STAMP_X = new double[ARENA.length];
+                NM_STAMP_Y = new double[ARENA.length];
+                NM_STAMP_Z = new double[ARENA.length];
+            }
             for (int i = 0; i < n; i++) {
                 int eid = (int) NM_IDS[2 * i];
                 net.minecraft.world.entity.Mob m = NM_BYID.get(eid);
@@ -13874,12 +13885,42 @@ public final class CeHooks {
                 // mover whose x already differs never pays the y/z loads,
                 // a parked mob pays all three and skips the setPos. The
                 // predicate is unchanged (same compares, same order).
-                Object po = O_ENT_POS >= 0 ? U.getObject(m, O_ENT_POS) : null;
-                if (po != null && Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
-                        && (px != U.getDouble(po, O_VEC_X)
-                            || py != U.getDouble(po, O_VEC_Y)
-                            || pz != U.getDouble(po, O_VEC_Z))) {
-                    m.setPos(px, py, pz);
+                // B28: the mirror-first branch — the belt owns the verdict
+                // when (a) the probe-woven license is live (scheme=1, the
+                // setPosRaw probe owns the census's ONLY non-constructor
+                // writer), (b) the row's stamp is unpoisoned, and (c) the
+                // fresh native truth equals the stamp (the native side did
+                // not move the mob this batch). Then java == native is
+                // PROVEN — the same verdict the compare would produce,
+                // without the ref load and the three double loads (the
+                // fresh CI despawn read put Unsafe.getDouble 1.80% on this
+                // exact site: the #1 module leaf, ALL nativeMobBoundary).
+                byte[] nb0 = NM_MIRROR_SCHEME == 1 ? NM_STAMP_B : null;
+                int ms = eid & AMASK;
+                if (nb0 != null && (nb0[ms] & 1) != 0
+                        && NM_STAMP_X[ms] == px && NM_STAMP_Y[ms] == py
+                        && NM_STAMP_Z[ms] == pz) {
+                    nmpN++; // the belt owns the verdict: java == native
+                } else {
+                    Object po = O_ENT_POS >= 0 ? U.getObject(m, O_ENT_POS) : null;
+                    boolean proven = po != null && Double.isFinite(px)
+                            && Double.isFinite(py) && Double.isFinite(pz);
+                    if (proven
+                            && (px != U.getDouble(po, O_VEC_X)
+                                || py != U.getDouble(po, O_VEC_Y)
+                                || pz != U.getDouble(po, O_VEC_Z))) {
+                        m.setPos(px, py, pz); // the probe clears the bit inside
+                    }
+                    // the restamp: setPos landed the native truth, or the
+                    // compare passed (java == native, proven by po+finite+equal).
+                    // po==null / non-finite keeps the row unstamped — the
+                    // exact pre-B28 shape serves it forever.
+                    if (nb0 != null && proven) {
+                        NM_STAMP_X[ms] = px;
+                        NM_STAMP_Y[ms] = py;
+                        NM_STAMP_Z[ms] = pz;
+                        nb0[ms] = 1;
+                    }
                 }
                 nmApplies++;
             }
@@ -13888,6 +13929,13 @@ public final class CeHooks {
                 NM_BYID.remove(NM_DEAD[i]);
                 if (NM_RES != null) {
                     NM_RES[NM_DEAD[i] & AMASK] = 0;
+                }
+                // B28: the stamp row dies with the id's removal (the byte
+                // carries the mirror-valid bit — a resurrected id must never
+                // inherit a stale position stamp).
+                byte[] nb0 = NM_STAMP_B;
+                if (nb0 != null) {
+                    nb0[NM_DEAD[i] & AMASK] = 0;
                 }
                 nmRemoves++;
             }
@@ -15396,6 +15444,67 @@ public final class CeHooks {
     public static void sitMirrorScheme(int v) {
         if (v == 1 && !SIT_MIRROR_ON) return;
         SIT_MIRROR_SCHEME = v;
+    }
+
+    // B28 — the NM applier position mirror (the T2 diet, the B27 license
+    // shape): belt-keyed (x,y,z) stamps for the native mobs' JAVA position
+    // verdict. The census (scripts/pos_census.py, the raw-byte walk of all
+    // 10768 classes) pins the COMPLETE mutation surface of Entity.position:
+    // exactly TWO putfield sites in the whole jar — the Entity CONSTRUCTOR
+    // (pre-registration: monotonic never-recycled ids, the fresh row carries
+    // no stamp) and Entity.setPosRaw(DDDZ) (the chokepoint the 3-arg
+    // overload forwards into, javap-verified; setPos*/absSnapTo*/moveTo/
+    // reapplyPosition carry NO putfield — they delegate). ONE prefix probe
+    // on setPosRaw owns the surface. Kill switches: -Dcentities.nmPosMirror
+    // =false (the Java door) and CE_NM_MIRROR=0 (the kernel, no weave).
+    // Fail-closed by construction: scheme 0 keeps the exact pre-B28 compare
+    // shape (the three U.getDouble loads).
+    private static volatile int NM_MIRROR_SCHEME = 0; // kernel-raised: 1 = the setPosRaw probe woven
+    public static final boolean NM_MIRROR_ON =
+            !"false".equals(System.getProperty("centities.nmPosMirror", "true"));
+    public static long nmpN = 0, nmpPoison = 0;
+    // The stamp rows (eid & AMASK keyed, the NM_RES shape): bit 0 of the
+    // byte = the (x,y,z) stamp is live; the doubles carry the stamped
+    // native truth the applier last PROVED the java position equals.
+    // Lazy allocation at the first SCHEME=1 applier pass; null = the exact
+    // pre-B28 shape (the compare serves every verdict).
+    private static volatile double[] NM_STAMP_X, NM_STAMP_Y, NM_STAMP_Z;
+    private static volatile byte[] NM_STAMP_B;
+
+    /** Kernel handoff (the svWordScheme convention — the field-named setter
+     *  the kernel's set_java_int passes). The property door wins. */
+    public static void nmPosMirrorScheme(int v) {
+        if (v == 1 && !NM_MIRROR_ON) return;
+        NM_MIRROR_SCHEME = v;
+    }
+
+    /** B28 prefix of Entity.setPosRaw(DDDZ) (slot 0 = this). Fires on EVERY
+     *  position write server-wide — including the constructor's? NO: the
+     *  constructor writes the field directly (the census's first putfield),
+     *  no setPosRaw call, so the probe never sees it; the monotonic
+     *  never-recycled ids keep a newborn entity off every live stamp row.
+     *  Poison-only, monotone-safe: the bit clears, the next boundary serves
+     *  the exact pre-B28 compare, the applier's own setPos restamps right
+     *  after the call (the mover self-heals — one probe+stamp per mover per
+     *  tick, the parked population never probes at all). A throw disarms
+     *  the module (the house fail-closed rule). */
+    public static void probePosMutate(Entity e) {
+        if (!ACTIVE) return;
+        try {
+            if (NM_MIRROR_SCHEME != 1) return;
+            byte[] nb0 = NM_STAMP_B;
+            if (nb0 == null) return;
+            int ms = entId(e) & AMASK;
+            if ((nb0[ms] & 1) != 0) {
+                nb0[ms] = 0;
+                nmpPoison++;
+            }
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probePosMutate: " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
     }
 
     /** B24/T1: the SIT-empty test as its OWN tiny method — the giant

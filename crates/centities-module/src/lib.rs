@@ -967,6 +967,18 @@ fn arm_module() {
         cplug_sdk::log::info("[c-entities] B27 sitMirrorScheme=1 raised (arm)");
     }
 
+    // B28: the scheme raise attempt at arm (the same discipline as the B27
+    // block above: the verifier's one-shot raise below covers the post-arm
+    // Entity weave; failure is silent — the verifier retries until the
+    // server thread answers).
+    if NM_WOVEN.load(Ordering::Acquire)
+        && !NM_RAISED.load(Ordering::Acquire)
+        && set_java_int("nmPosMirrorScheme", 1)
+    {
+        NM_RAISED.store(true, Ordering::Release);
+        cplug_sdk::log::info("[c-entities] B28 nmPosMirrorScheme=1 raised (arm)");
+    }
+
     // B23/T1: arm the word table. The pre-arm probe classes (Entity.markHurt
     // via entity_probes, CraftEntity.setVelocity via the fd probe chain) are
     // woven above; the lazy census classes (TNT/Ravager/HoglinBase/
@@ -1037,6 +1049,23 @@ fn arm_module() {
                 } else if attempt % 10 == 0 {
                     cplug_sdk::log::info(&format!(
                         "[c-entities] B27 raise diag: set_java_int false (attempt {attempt})"
+                    ));
+                }
+            }
+            // B28: the one-shot nmPosMirrorScheme raise — the post-arm Entity
+            // load (the byte hook) cannot raise from inside the callback; the
+            // verifier runs OUTSIDE callbacks, NM_WOVEN pins the weave. Until
+            // the raise lands the applier keeps the exact pre-B28 compare
+            // shape (fail-closed by default).
+            if NM_WOVEN.load(Ordering::Acquire)
+                && !NM_RAISED.load(Ordering::Acquire)
+            {
+                if set_java_int_diag("nmPosMirrorScheme", 1) {
+                    NM_RAISED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] B28 nmPosMirrorScheme=1 raised (verifier)");
+                } else if attempt % 10 == 0 {
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] B28 raise diag: set_java_int false (attempt {attempt})"
                     ));
                 }
             }
@@ -1649,6 +1678,18 @@ static SIT_DECLINED: AtomicBool = AtomicBool::new(false);
 /// silently, observed live on the parity-mobs-on leg: the weave logged
 /// licensed, the diag kept sitMirrorScheme=0, the mirror never stamped).
 static SIT_RAISED: AtomicBool = AtomicBool::new(false);
+/// B28: the NM applier position mirror (the setPosRaw probe). The census
+/// (scripts/pos_census.py: exactly TWO putfield sites on Entity.position in
+/// the whole 10768-class jar — the constructor (pre-registration, monotonic
+/// never-recycled ids) and setPosRaw(DDDZ), the chokepoint the 3-arg
+/// overload forwards into; setPos*/absSnapTo*/moveTo/reapplyPosition carry
+/// NO putfield — they delegate) gives ONE prefix probe the COMPLETE
+/// mutation surface. The stamps ride NM_MIRROR_SCHEME — raised ONLY after
+/// the probe landed; a refusal re-zeroes it (fail-closed to the exact
+/// pre-B28 three-load compare shape).
+static NM_WOVEN: AtomicBool = AtomicBool::new(false);
+/// B28: the one-shot scheme raise — the same VERIFIER discipline as B27.
+static NM_RAISED: AtomicBool = AtomicBool::new(false);
 /// L33: the LivingEntity.tickEffects empty-map early-out weave state.
 static EFF_WOVEN: AtomicBool = AtomicBool::new(false);
 static COLLIDE_WOVEN: AtomicBool = AtomicBool::new(false);
@@ -5280,6 +5321,14 @@ fn sit_mirror_wanted() -> bool {
     std::env::var("CE_SIT_MIRROR").map(|v| v != "0").unwrap_or(true)
 }
 
+/// B28 kill switch: CE_NM_MIRROR=0 never weaves the setPosRaw probe (the
+/// Java-side -Dcentities.nmPosMirror=false door is checked by
+/// nmPosMirrorScheme). Fail-closed: no weave -> no raise -> scheme 0 -> the
+/// exact pre-B28 three-load compare shape.
+fn nm_mirror_wanted() -> bool {
+    std::env::var("CE_NM_MIRROR").map(|v| v != "0").unwrap_or(true)
+}
+
 fn patch_sit_tracker(bytes: &[u8]) -> Option<Vec<u8>> {
     std::panic::catch_unwind(|| patch_sit_tracker_inner(bytes))
         .ok()
@@ -5641,6 +5690,48 @@ fn entity_probes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
                     "[c-entities] Entity.markHurt sv probe refused: {e} — word table disarmed, box/delta probes kept"
                 ));
                 Ok(d2)
+            }
+        }
+    })
+    // B28: the setPosRaw prefix — the census's ONLY non-constructor
+    // position writer (pos_census.py: one Entity.position fieldref entry in
+    // the whole jar, the javap putfield sites are the constructor + this
+    // method; the 3-arg overload forwards here). SOFT probe: a refusal
+    // re-zeroes nmPosMirrorScheme and keeps the bytes WITHOUT the weave —
+    // the box/delta/markHurt probes stay load-bearing exactly as before.
+    // The probe poisons the belt stamp row on EVERY position write; the
+    // applier's own setPos restamps right after the call (the mover
+    // self-heals), the parked population never probes at all.
+    .and_then(|d3| {
+        if !nm_mirror_wanted() {
+            set_java_int("nmPosMirrorScheme", 0);
+            cplug_sdk::log::info(
+                "[c-entities] B28 setPosRaw probe disabled (CE_NM_MIRROR=0) — compare shape kept",
+            );
+            return Ok(d3);
+        }
+        match patch::insert_static_call_at_start(
+            d3.clone(),
+            "setPosRaw",
+            "(DDDZ)V",
+            HOOKS_CLASS,
+            "probePosMutate",
+            "(Lnet/minecraft/world/entity/Entity;)V",
+            &[(0, b'L')],
+        ) {
+            Ok(b) => {
+                NM_WOVEN.store(true, Ordering::Release);
+                cplug_sdk::log::info(
+                    "[c-entities] B28 setPosRaw probe woven — position mirror licensed (scheme raise rides the verifier)",
+                );
+                Ok(b)
+            }
+            Err(e) => {
+                set_java_int("nmPosMirrorScheme", 0);
+                cplug_sdk::log::info(&format!(
+                    "[c-entities] Entity.setPosRaw pos-mirror probe refused: {e} — compare shape kept"
+                ));
+                Ok(d3)
             }
         }
     })
