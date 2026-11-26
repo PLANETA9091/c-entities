@@ -3123,3 +3123,30 @@ applier compare path; the ratios ride the flights (NO ratio claims)
   walls (the walk floor, the merge scan, the weave prefixes, the sv reads
   — each only if the fresh profile still names it and a license path
   exists).
+
+---
+Task ID: 29 addendum 18 — the B28 gate flight (45893578228) FAILED on the
+mixed-150k OFF leg r1: "FATAL: no baseline.json (timeout or crash)" — the
+vanilla side's wait budget (RUN_TIMEOUT=1800s) expired before the leg's
+boot + fill + warmup + measure finished on a slow runner (the workflow's
+own comment documents the ~27m fill+warmup estimate against the 30m budget
+— the margin was ~1 runner-minute). NOT a module red light: no
+PARITY-GATE / ORDER-MISMATCH / TLO-MISMATCH fired, no parity divergence
+row exists; the 8 legs that completed before the abort are HEALTHY in
+every hooks@ readout (active=true, desync=0, lastErr= empty, refused=-,
+nmp=0/0/1 on the item legs — the NM wire idle where no native mobs ride).
+The fresh B28 CI reads pulled BEFORE the abort: despawn 3752 samples —
+Unsafe.getDouble GONE from the top module frames (the B27-head read had it
+#3 leaf 1.80% + nativeMobBoundary 1.65% caller; the B28 read has NO
+getDouble row above 0.27% — the mirror owns the compare path on CI
+hardware too); the top module leaf is now ttlCachedPath 0.80% (the SIT
+belt read); spread: the walk floor 7.67%+0.99% and the merge scan
+3.90%+1.31% stand as the documented floors, nativeMobBoundary rows now
+0.46%+0.35%. The B27-head gate table (45888376224, AB-PAIRED-GATE PASS,
+all five): items 95.06/20.95 = 0.220, mobs-25k 609.35/390.23 = 0.640,
+mixed 3457.19/72.72 = 0.021, spread 414.64/59.35 = 0.143, despawn
+80.89/9.71 = 0.120 (pop delta=6 OK) — per-flight honest, no cross-flight
+comparison. THE FIX (harness, not module): ab-paired.yml RUN_TIMEOUT
+1800 -> 3000 (the wait-loop bound only — the measurement semantics are
+untouched; a fast runner exits the loop the moment baseline.json lands).
+The B28 gate re-dispatches on this commit's head.
