@@ -60,6 +60,13 @@ const ZOMBIE_VILLAGER_CLASS: &str = "net/minecraft/world/entity/monster/zombie/Z
 /// the check short-circuits to `true` through a pure NmMap probe.
 const ACTIVATION_CLASS: &str = "io/papermc/paper/entity/activation/ActivationRange";
 const CONVERSION_TRACKER_CLASS: &str = "net/minecraft/world/entity/ConversionTracker";
+// B27: the SIT_N belt-mirror probe class — the COMPLETE size-mutator census
+// (the raw-byte scan of all 10768 classes of the mojang-mapped 26.3 jar)
+// pinned EVERY trackedSteps mutation to this class: List.add @ addStep and
+// List.clear @ clear, no escape, no subclass, no reflection-by-name. The
+// two prefix probes poison the row's SITAL+SITN stamp on any mutation —
+// the Java mirror read is sound exactly while these probes own the class.
+const SIT_TRACKER_CLASS: &str = "net/minecraft/world/entity/SteppedInterpolationTracker";
 // B23/T1: the syncVelocity true-writer census classes (the javap putfield
 // audit of the shipped paper-26.3 build 262 — every putfield syncVelocity
 // in the jar, paper patches and the CraftBukkit API layer included). Each
@@ -551,6 +558,11 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::hooks::register_bytes(CRAFT_PLAYER_CLASS, |_n, b| {
         patch_craft_player(b)
     });
+    // B27: the SIT_N belt-mirror probes — the poison prefixes on the
+    // tracker's ONLY two size mutators (the census: addStep + clear).
+    cplug_sdk::hooks::register_bytes(SIT_TRACKER_CLASS, |_n, b| {
+        patch_sit_tracker(b)
+    });
     cplug_sdk::hooks::register_bytes(SENSING_CLASS, |_n, b| patch_sensing(b));
     cplug_sdk::hooks::register_bytes(NAVIGATION_CLASS, |_n, b| patch_navigation(b));
     cplug_sdk::hooks::register_bytes(MOVE_CONTROL_CLASS, |_n, b| patch_movecontrol(b));
@@ -927,6 +939,34 @@ fn arm_module() {
         }
     }
 
+    // B27: the SIT_N probe class' retransform pass — the same discipline as
+    // the sv census classes: a pre-arm stashed SteppedInterpolationTracker
+    // re-fires the hook with BRIDGE_READY up and weaves inline (raising
+    // sitMirrorScheme only on BOTH lands). A class that never loaded fails
+    // the retransform benignly — its first load is owned by the byte hook.
+    // The Java stamp side is fail-closed regardless: scheme stays 0 until
+    // the weave itself calls setSitMirrorScheme(1).
+    if sit_mirror_wanted() && !SIT_WOVEN.load(Ordering::Acquire) {
+        let rc = cplug_sdk::retransform_class(SIT_TRACKER_CLASS);
+        cplug_sdk::log::info(&format!(
+            "[c-entities] retransform {} (b27 sit mirror): rc={rc}",
+            SIT_TRACKER_CLASS
+        ));
+    }
+
+    // B27: the scheme raise attempt at arm (the pre-arm-load case: the
+    // retransform above may have woven the probes; if the class never
+    // loaded, the verifier's one-shot raise below covers the post-arm
+    // weave within its first 2s pass). Failure is silent — the verifier
+    // retries until the server thread answers.
+    if SIT_WOVEN.load(Ordering::Acquire)
+        && !SIT_RAISED.load(Ordering::Acquire)
+        && set_java_int("sitMirrorScheme", 1)
+    {
+        SIT_RAISED.store(true, Ordering::Release);
+        cplug_sdk::log::info("[c-entities] B27 sitMirrorScheme=1 raised (arm)");
+    }
+
     // B23/T1: arm the word table. The pre-arm probe classes (Entity.markHurt
     // via entity_probes, CraftEntity.setVelocity via the fd probe chain) are
     // woven above; the lazy census classes (TNT/Ravager/HoglinBase/
@@ -981,6 +1021,25 @@ fn arm_module() {
             // their bytes, redo the precompute OUTSIDE any ClassFileLoadHook
             // callback (the ASM helper's loadClass deadlocks inside one) and
             // retransform to apply.
+            // B27: the one-shot sitMirrorScheme raise — the post-arm-load
+            // weave (the byte hook) canNOT raise the scheme from inside the
+            // ClassFileLoadHook callback (the JNI static call fails
+            // silently — observed on the 2026-11-27 parity-mobs-on leg).
+            // The verifier runs OUTSIDE callbacks; SIT_WOVEN pins the
+            // weave. Until the raise lands the fills keep the exact
+            // pre-B27 shape (fail-closed by default).
+            if SIT_WOVEN.load(Ordering::Acquire)
+                && !SIT_RAISED.load(Ordering::Acquire)
+            {
+                if set_java_int_diag("sitMirrorScheme", 1) {
+                    SIT_RAISED.store(true, Ordering::Release);
+                    cplug_sdk::log::info("[c-entities] B27 sitMirrorScheme=1 raised (verifier)");
+                } else if attempt % 10 == 0 {
+                    cplug_sdk::log::info(&format!(
+                        "[c-entities] B27 raise diag: set_java_int false (attempt {attempt})"
+                    ));
+                }
+            }
             let loader = LOADER.load(Ordering::Acquire);
             if loader != 0 {
                 if !SE_WOVEN.load(Ordering::Acquire)
@@ -1580,6 +1639,16 @@ static TT_ARMED: AtomicBool = AtomicBool::new(false);
 static TTL_WOVEN: AtomicBool = AtomicBool::new(false);
 static TTL_DECLINED: AtomicBool = AtomicBool::new(false);
 static TTL_ARMED: AtomicBool = AtomicBool::new(false);
+/// B27: the SIT_N belt-mirror probe weave state (SteppedInterpolationTracker
+/// addStep + clear). The Java stamp side rides SIT_MIRROR_SCHEME — raised
+/// ONLY after BOTH probes landed; any refusal re-zeroes it (fail-closed).
+static SIT_WOVEN: AtomicBool = AtomicBool::new(false);
+static SIT_DECLINED: AtomicBool = AtomicBool::new(false);
+/// B27: the scheme raise is ONE-SHOT and rides the VERIFIER (outside any
+/// ClassFileLoadHook callback — the in-callback JNI static call fails
+/// silently, observed live on the parity-mobs-on leg: the weave logged
+/// licensed, the diag kept sitMirrorScheme=0, the mirror never stamped).
+static SIT_RAISED: AtomicBool = AtomicBool::new(false);
 /// L33: the LivingEntity.tickEffects empty-map early-out weave state.
 static EFF_WOVEN: AtomicBool = AtomicBool::new(false);
 static COLLIDE_WOVEN: AtomicBool = AtomicBool::new(false);
@@ -2964,6 +3033,41 @@ fn set_java_int(setter: &str, value: i32) -> bool {
         true
     })
     .unwrap_or(false)
+}
+
+/// B27: the raise with the failing step named. The verifier's plain
+/// set_java_int failed silently on the 2026-11-27 parity-mobs-on leg
+/// (the AI-floor/frozen-gate set_java_bool calls from the SAME thread
+/// worked — the difference is this exact method, so the diag names the
+/// step: the global, the lookup, the call, the attach).
+fn set_java_int_diag(setter: &str, value: i32) -> bool {
+    let r = cplug_sdk::jni_util::with_attached(|env| -> bool {
+        let hooks_cls = HOOKS_CLASS_GLOBAL.load(Ordering::Acquire);
+        if hooks_cls == 0 {
+            cplug_sdk::log::info("[c-entities] B27 raise diag: HOOKS_CLASS_GLOBAL==0");
+            return false;
+        }
+        let cls = hooks_cls as jni::jclass;
+        let Some(mid) = env.get_static_method_id(cls, setter, "(I)V") else {
+            cplug_sdk::log::info("[c-entities] B27 raise diag: method lookup failed");
+            return false;
+        };
+        env.call_static_void_method(cls, mid, &[jni::jvalue { i: value }]);
+        if env.exception_check() {
+            env.exception_describe();
+            env.exception_clear();
+            cplug_sdk::log::info("[c-entities] B27 raise diag: the setter threw");
+            return false;
+        }
+        true
+    });
+    match r {
+        Some(v) => v,
+        None => {
+            cplug_sdk::log::info("[c-entities] B27 raise diag: with_attached failed");
+            false
+        }
+    }
 }
 
 fn goal_tick_spec() -> cplug_sdk::asm::ReplaceBody<'static> {
@@ -5160,6 +5264,97 @@ fn sv_census_wanted() -> bool {
 fn sv_disarm() {
     SV_DISARMED.store(true, Ordering::Release);
     set_java_int("svWordScheme", 0);
+}
+
+// B27 — the SIT_N belt-mirror probes. The census (scripts/sit_census.py:
+// the raw-byte scan of every class in the mojang-mapped 26.3 jar) proved
+// the ONLY size mutators of the fill-stamped ArrayList live on
+// SteppedInterpolationTracker: List.add @ addStep+23 and List.clear @
+// clear+4. The prefix probes poison the row's SITAL+SITN stamp — the Java
+// per-tick mirror read is sound exactly while these probes own the class.
+// License chain: BOTH weaves must land (any refusal re-zeroes
+// sitMirrorScheme — the Java stamps never ride, fail-closed to the exact
+// B24 live-read shape). Kill switch CE_SIT_MIRROR=0 (the Java-side
+// -Dcentities.sitMirror=false door is checked by setSitMirrorScheme).
+fn sit_mirror_wanted() -> bool {
+    std::env::var("CE_SIT_MIRROR").map(|v| v != "0").unwrap_or(true)
+}
+
+fn patch_sit_tracker(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| patch_sit_tracker_inner(bytes))
+        .ok()
+        .flatten()
+}
+
+fn patch_sit_tracker_inner(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !sit_mirror_wanted() {
+        SIT_DECLINED.store(true, Ordering::Release);
+        set_java_int("sitMirrorScheme", 0);
+        return None;
+    }
+    if !BRIDGE_READY.load(Ordering::Acquire) {
+        // Pre-arm load: stash (the arm's retransform pass re-fires this
+        // hook with BRIDGE_READY up — the same discipline as the sv
+        // census classes).
+        let mut st = STASH.lock().ok()?;
+        st.entry(SIT_TRACKER_CLASS)
+            .or_insert_with(|| bytes.to_vec());
+        return None;
+    }
+    // addStep is PRIVATE with exactly two in-class callers (updateTracking
+    // L66, getPositionPath L0) — the concrete-method prefix covers every
+    // List.add in the jar. Slot 0 = the receiver (the tracker).
+    let b1 = match patch::insert_static_call_at_start(
+        bytes.to_vec(),
+        "addStep",
+        "(Lnet/minecraft/world/phys/Vec3;)V",
+        HOOKS_CLASS,
+        "probeSitAdd",
+        "(Ljava/lang/Object;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] SteppedInterpolationTracker.addStep probe refused: {e} — SIT_N mirror disarmed"
+            ));
+            SIT_DECLINED.store(true, Ordering::Release);
+            set_java_int("sitMirrorScheme", 0);
+            return None;
+        }
+    };
+    let b2 = match patch::insert_static_call_at_start(
+        b1,
+        "clear",
+        "()V",
+        HOOKS_CLASS,
+        "probeSitClear",
+        "(Ljava/lang/Object;)V",
+        &[(0, b'L')],
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            PATCHES_FAIL.fetch_add(1, Ordering::AcqRel);
+            cplug_sdk::log::info(&format!(
+                "[c-entities] SteppedInterpolationTracker.clear probe refused: {e} — SIT_N mirror disarmed"
+            ));
+            SIT_DECLINED.store(true, Ordering::Release);
+            set_java_int("sitMirrorScheme", 0);
+            return None;
+        }
+    };
+    PATCHES_OK.fetch_add(1, Ordering::AcqRel);
+    SIT_WOVEN.store(true, Ordering::Release);
+    // NOTE: NO set_java_int here — the in-callback JNI static call fails
+    // silently (the parity-mobs-on leg of the 2026-11-27 sweep proved it:
+    // the weave log landed, the diag kept scheme=0). The VERIFIER raises
+    // sitMirrorScheme=1 on its next 2s pass (B27 raise block) — until then
+    // the fills keep the exact pre-B27 shape (fail-closed by default).
+    cplug_sdk::log::info(
+        "[c-entities] B27 SIT_N probes woven (addStep+clear) — belt mirror licensed (scheme raise rides the verifier)",
+    );
+    Some(b2)
 }
 
 /// The census probe weave for one spec. Pre-arm loads stash (the arm's

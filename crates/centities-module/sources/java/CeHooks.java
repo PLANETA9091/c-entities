@@ -1927,6 +1927,9 @@ public final class CeHooks {
                 + "/" + svWordScheme
                 + " dm=" + despMirHits + "/" + despMirFills
                 + " sitD=" + sitDirect + "/" + sitCast + "/" + (SIT_SIZE_ON ? 1 : 0) + "/" + O_ARR_SIZE
+                // B27: the SIT_N belt mirror — reads / poisons / the scheme
+                // (0=off, 1=the kernel-raised probes-woven license).
+                + "/" + sitN + "/" + sitNpoison + "/" + SIT_MIRROR_SCHEME
                 + " ttlQ=" + ttlQuiet + "/" + ttlQuietBumps + "/" + (TTL_QUIET_ON ? 1 : 0)
                 + "/i0c=" + ttlQuietI0C
                 + " ttlA=" + ttlArena + "/" + AR_N + "/" + (ARENA_TRACKER_ON ? 1 : 0)
@@ -15355,6 +15358,46 @@ public final class CeHooks {
             !"false".equals(System.getProperty("centities.sitSize", "true"));
     public static long sitDirect = 0, sitCast = 0;
 
+    // B27: the SIT_N belt mirror — the fill-stamped trackedSteps size, kept
+    // sound by the COMPLETE size-mutator census (the raw-byte scan of all
+    // 10768 classes of the mojang-mapped 26.3 jar: the ONLY size mutators
+    // of the stamped ArrayList are List.add @ addStep+23 and List.clear @
+    // clear+4, both INSIDE SteppedInterpolationTracker — the list ref never
+    // escapes the class (getPositionPath hands out List.copyOf, a read-only
+    // copy), no subclass exists, and the field name string appears in NO
+    // other class (no reflection-by-name path). The kernel weaves prefix
+    // probes on addStep + clear; a mutation poisons the row's SITAL+SITN
+    // bits — the per-tick falls to the exact instanceof+isEmpty shape and
+    // the next full fill re-stamps. Over-fire is safe (poison only
+    // re-routes to the exact live read); under-fire is the census's job to
+    // make impossible. The mirror read drops the entity-header deref
+    // (rf[ob+4]) + the U.getInt on the list + the O_ARR_SIZE guard from
+    // the per-tick test (~0.9% of the despawn ON samples, addendum 15).
+    // Stamp license: SIT_MIRROR_SCHEME==1 (set by the kernel ONLY after
+    // BOTH probes landed — scheme 0 keeps the exact B24 shape; fail-closed
+    // by construction). Kill switch -Dcentities.sitMirror=false (Java,
+    // no stamp) and CE_SIT_MIRROR=0 (kernel, no weave).
+    private static volatile RefField VH_SIT_ENT;      // SteppedInterpolationTracker.entity
+    private static volatile long O_SIT_ENT = -1;      // the tracker.entity offset (the poison hop)
+    private static volatile int[] SITN_ARR;           // belt-keyed stamped sizes
+    private static final long TT_SITN = 16L;          // the mirror stamp bit (1/2/4/8 taken)
+    private static volatile int SIT_MIRROR_SCHEME = 0; // kernel-raised: 1 = probes woven
+    public static final boolean SIT_MIRROR_ON =
+            !"false".equals(System.getProperty("centities.sitMirror", "true"));
+    public static long sitN = 0, sitNpoison = 0;
+
+    /** Kernel handoff (set_java_int from the verifier/native, OUTSIDE any
+     *  ClassFileLoadHook callback — the in-callback static call fails
+     *  silently, observed live 2026-11-27): the addStep+clear probes ARE
+     *  woven — the fill may stamp TT_SITN. The property door wins (a
+     *  -Dcentities.sitMirror=false JVM never arms the mirror even with
+     *  the probes woven). Named after the field (the svWordScheme
+     *  convention — the kernel's set_java_int passes THIS name). */
+    public static void sitMirrorScheme(int v) {
+        if (v == 1 && !SIT_MIRROR_ON) return;
+        SIT_MIRROR_SCHEME = v;
+    }
+
     /** B24/T1: the SIT-empty test as its OWN tiny method — the giant
      *  ttlCachedPath exhausted C2's inline budget and the ArrayList.isEmpty
      *  call stayed a real invoke (3.87% of the spread-100k ON profile self
@@ -15368,6 +15411,57 @@ public final class CeHooks {
      *  -Dcentities.sitSize=false. */
     private static boolean sitStepsEmpty(Object steps) {
         return ((java.util.ArrayList) steps).isEmpty();
+    }
+
+    /** B27 prefix of SteppedInterpolationTracker.addStep (slot 0 = this).
+    *  Fires on EVERY addStep CALL — including the ticksSinceLastStep<=0
+    *  guard-blocked no-ops (the guard lives INSIDE the body, the prefix
+    *  cannot see it): over-fire = poison of an unchanged row = the exact
+    *  live shape serves one pass = SAFE. addStep is PRIVATE with exactly
+    *  two in-class callers (updateTracking L66, getPositionPath L0) —
+    *  the weave on the concrete method covers every List.add in the jar
+    *  (the census's only add site). */
+    public static void probeSitAdd(Object tracker) {
+        probeSitMutate(tracker, "add");
+    }
+
+    /** B27 prefix of SteppedInterpolationTracker.clear (slot 0 = this).
+    *  The census's only List.clear site; a mutation to EMPTY poisons —
+    *  the stale-nonzero direction was already safe, this keeps the row
+    *  from living on the slow shape until the next full fill. */
+    public static void probeSitClear(Object tracker) {
+        probeSitMutate(tracker, "clear");
+    }
+
+    /** B27: the poison — tracker -> entity -> belt slot -> SITAL+SITN
+    *  cleared. Poison-only writes are monotone-safe (no thread gate: a
+    *  cross-thread clear() just poisons conservatively). The identity
+    *  check (rf[ob+3] == tracker) refuses a stale slot reuse. A throw
+    *  disarms the module (the house fail-closed rule). */
+    private static void probeSitMutate(Object tracker, String tag) {
+        if (!ACTIVE) return;
+        try {
+            if (SIT_MIRROR_SCHEME != 1 || O_SIT_ENT < 0 || U == null) return;
+            if (!(tracker instanceof
+                            net.minecraft.world.entity.SteppedInterpolationTracker)) {
+                return;
+            }
+            Object ent = U.getObject(tracker, O_SIT_ENT);
+            if (!(ent instanceof Entity)) return;
+            int m = entId((Entity) ent) & AMASK;
+            Object[] rf0 = TT_REF;
+            if (rf0 == null) return;
+            int ob = m * 5;
+            if (rf0[ob + 3] != tracker) return; // not the stamped row
+            long[] fl0 = TT_FLAT;
+            if (fl0 != null) fl0[m * 2] &= ~(TT_SITAL | TT_SITN);
+            sitNpoison++;
+        } catch (Throwable t) {
+            lastError = System.nanoTime();
+            lastErrorText = "probeSit" + tag + ": " + t;
+            t.printStackTrace();
+            ACTIVE = false;
+        }
     }
     private static long O_ENT_SYNC_POS = -1;          // Entity.syncPosition (boolean)
     // L182: Entity.syncVelocity (volatile boolean) — the tracker's cached
@@ -15600,6 +15694,11 @@ public final class CeHooks {
             VH_SIT_STEPS = new RefField(sit, "trackedSteps");
             VH_SIT_DELTA = new RefField(sit, "predictedDelta");
             VH_SIT_TICKS = new RefField(sit, "ticksSinceLastStep");
+            // B27: the tracker's entity backref — the poison probe's
+            // tracker -> entity -> slot hop (javap 26.3: private final
+            // Entity entity). A refusal keeps -1: the probes return early
+            // and the fill never stamps the mirror bit (fail-closed).
+            VH_SIT_ENT = new RefField(sit, "entity");
             // B24/T1: the ArrayList.size offset for the direct SIT-empty read.
             // B26/T1: the resolver drops setAccessible (java.base is not open
             // on the paperclip JVM — the old resolve ALWAYS refused here and
@@ -15701,6 +15800,7 @@ public final class CeHooks {
             if (TT_REF == null) {
                 TT_REF = new Object[ARENA.length * 5];
                 TT_FLAT = new long[ARENA.length * 2];
+                SITN_ARR = new int[ARENA.length];
                 TT_QUIET = new long[(ARENA.length + 63) >> 6];
                 // L174: the coverage counter starts clean with the tables.
                 AR_N = 0;
@@ -15725,6 +15825,11 @@ public final class CeHooks {
                 O_SIT_STEPS = VH_SIT_STEPS.off;
                 O_SIT_DELTA = VH_SIT_DELTA.off;
                 O_SIT_TICKS = VH_SIT_TICKS.off;
+            }
+            // B27: the entity backref offset (declared with the SIT block;
+            // resolution failure keeps -1 and the mirror stays unstamped).
+            if (VH_SIT_ENT != null && VH_SIT_ENT.off >= 0) {
+                O_SIT_ENT = VH_SIT_ENT.off;
             }
             TTL_HANDLES_OK = VH_CM_TRACKERS.off >= 0 && VH_CM_ITERATING.off >= 0
                     && O_TE_SE >= 0;
@@ -16295,6 +16400,24 @@ public final class CeHooks {
                 if (sitObj == null) {
                     return false; // L67: the type was fill-proven
                 }
+                // B27: the mirror-first test — the fill-stamped size serves
+                // the empty verdict WITHOUT the entity-header deref
+                // (rf[ob+4]) and the U.getInt on the list header. TT_SITN
+                // implies TT_SITAL (the stamp only rides a proven ArrayList
+                // AND the woven probes — SIT_MIRROR_SCHEME==1 at fill
+                // time); the poison (probeSitMutate) clears BOTH bits, so
+                // a mirror verdict is sound exactly while the probes own
+                // the mutation surface. TT_SITAL without TT_SITN keeps the
+                // exact B24 live read (the pre-B27 shape); no SITAL keeps
+                // the exact instanceof shape. Value-identical by the
+                // census: between the stamp and the poison NO size
+                // mutation can fire (every mutator passes a probe).
+                if ((sh & TT_SITN) != 0) {
+                    sitN++;
+                    if (SITN_ARR[m] != 0) {
+                        return false; // a stamped live step: vanilla
+                    }
+                } else {
                 Object steps = rf[ob + 4];
                 if ((sh & TT_SITAL) != 0) {
                     // L183/L185: the fill proved the steps list is a
@@ -16326,6 +16449,7 @@ public final class CeHooks {
                 } else if (!(steps instanceof java.util.List<?> sl) || !sl.isEmpty()) {
                     return false; // a live step: addStep would mutate — vanilla
                 }
+                } // B27: the non-mirror else — the exact pre-B27 chain
                 if (U.getByte(ent, O_ENT_SYNC_POS) != 0) {
                     return false; // the syncPosition branch is live: addStep
                 }
@@ -16702,9 +16826,29 @@ public final class CeHooks {
                                 // megamorphic dispatch per tracked row per
                                 // tick; the non-ArrayList rows keep the
                                 // exact old shape).
+                                // B27: the SIT_N mirror stamp — the stamped
+                                // size rides ONLY when the probes ARE woven
+                                // (SIT_MIRROR_SCHEME==1, the kernel set it
+                                // after BOTH addStep+clear weaves landed),
+                                // the array exists, the entity-backref
+                                // offset resolved (the poison's hop) and the
+                                // B24 offset is live. The write precedes the
+                                // shape stamp (same thread — the tracker
+                                // pass; the per-tick reads ride the bit).
+                                final boolean sital0 =
+                                        steps0 instanceof java.util.ArrayList;
+                                final boolean sitn0 = sital0
+                                        && SIT_MIRROR_SCHEME == 1
+                                        && SITN_ARR != null
+                                        && O_SIT_ENT >= 0
+                                        && O_ARR_SIZE >= 0 && U != null;
+                                if (sitn0) {
+                                    SITN_ARR[sid] =
+                                            U.getInt(steps0, O_ARR_SIZE);
+                                }
                                 flf[sid * 2] = TT_OK | TT_SIT
-                                        | (steps0 instanceof java.util.ArrayList
-                                           ? TT_SITAL : 0L)
+                                        | (sital0 ? TT_SITAL : 0L)
+                                        | (sitn0 ? TT_SITN : 0L)
                                         | (ubs ? TT_UBS : 0);
                             }
                             ttlFill++;
@@ -16828,11 +16972,25 @@ public final class CeHooks {
                                     && O_SIT_STEPS >= 0 && O_SIT_DELTA >= 0
                                     && O_SIT_TICKS >= 0 && O_ENT_SYNC_POS >= 0) {
                                 rff[ob + 3] = interp;
-                                rff[ob + 4] = U.getObject(interp, O_SIT_STEPS);
+                                Object steps1 = U.getObject(interp, O_SIT_STEPS);
+                                rff[ob + 4] = steps1;
+                                // B27: the SIT_N mirror stamp — the raw-loop
+                                // twin of the sweep fill above (the same
+                                // license: scheme==1 pins the woven probes).
+                                final boolean sital1 =
+                                        steps1 instanceof java.util.ArrayList;
+                                final boolean sitn1 = sital1
+                                        && SIT_MIRROR_SCHEME == 1
+                                        && SITN_ARR != null
+                                        && O_SIT_ENT >= 0
+                                        && O_ARR_SIZE >= 0 && U != null;
+                                if (sitn1) {
+                                    SITN_ARR[m] =
+                                            U.getInt(steps1, O_ARR_SIZE);
+                                }
                                 flf[m * 2] = TT_OK | TT_SIT
-                                        | (U.getObject(interp, O_SIT_STEPS)
-                                           instanceof java.util.ArrayList
-                                           ? TT_SITAL : 0L);
+                                        | (sital1 ? TT_SITAL : 0L)
+                                        | (sitn1 ? TT_SITN : 0L);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {

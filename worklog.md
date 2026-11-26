@@ -2939,3 +2939,81 @@ ride the gate flight (NO ratio claims)
   the CI armed profiles (items/spread/despawn) -> the b7 round reads the
   fresh CI walls (the SIT_N census sketch, the NM determinism anchor, the
   AP_FD kernel bit — each only if the CI profile still names it).
+
+---
+Task ID: 29 addendum 16 — the SIT_N belt-mirror LICENSE CENSUS (GREEN) + the
+full B27 implementation + the local armed parity sweep 4/4 pairs BIT-IDENTICAL
+(12/12 snapshot gates) in THIS sandbox, with the mirror OWNING the per-tick
+SIT-empty test (sitN=2,060,814 mobs / 3,720,175 mixed / 3,276,173 spread, the
+B24 direct read and the cast shape at ZERO visits, scheme=1); the ratios ride
+the gate flight (NO ratio claims); the push STILL refused (no credentials)
+
+- THE CENSUS (the parked b7 candidate's license job, done in-sandbox): the
+  raw-byte scan of ALL 10768 classes of the mojang-mapped 26.3 jar
+  (scripts/sit_census.py: every class entry scanned for
+  'SteppedInterpolationTracker' AND 'trackedSteps') names exactly TWO
+  referencing classes — the tracker itself and SteppedInterpolationHandler
+  (the CLASS name only, not the field). javap -p -c of the tracker: the
+  trackedSteps list NEVER escapes the class — the complete size-mutator set
+  is List.add @ addStep+23 (private, exactly two in-class callers:
+  updateTracking L66 + getPositionPath L0) and List.clear @ clear+4;
+  getPositionPath hands out List.copyOf (read-only copy), updateTracking's
+  replaceAll is SIZE-NEUTRAL, no subclass exists, no reflection-by-name
+  outside the class. A second census (syncPosition writers, 3 classes):
+  the only TRUE setter is Entity.restituteMovementAfterCollisions (the
+  bounce path) — addStep fires ~never in the bench shapes, so the poison
+  probes cost ~zero hot-path time.
+- THE B27 IMPLEMENTATION: the kernel weaves prefix probes on addStep +
+  clear (patch::insert_static_call_at_start, slot-0 receiver, graceful
+  refusal); a mutation poisons the row's SITAL+SITN bits (probeSitMutate:
+  tracker -> entity (the new O_SIT_ENT backref offset) -> belt slot ->
+  fl[m*2] &= ~(TT_SITAL|TT_SITN), the rf[ob+3] identity check refuses a
+  stale slot reuse) — the per-tick falls to the exact instanceof+isEmpty
+  shape and the next full fill re-stamps. The fill stamps TT_SITN (16L,
+  the mirror bit) ONLY when the ArrayList proof holds AND the probes ARE
+  woven (SIT_MIRROR_SCHEME==1) AND O_SIT_ENT/O_ARR_SIZE resolved; the
+  stamped size rides a belt-keyed SITN_ARR[m]. The per-tick mirror-first
+  branch reads SITN_ARR[m] and SKIPS the rf[ob+4] load + the U.getInt +
+  the O_ARR_SIZE guard entirely. Kill switches: -Dcentities.sitMirror=false
+  (Java, the setter ignores the raise) and CE_SIT_MIRROR=0 (kernel, no
+  weave). Fail-closed by construction: scheme 0 keeps the exact pre-B27
+  B24 shape.
+- THE LIVE-BUILT LESSONS (two silent-fail rounds, both caught by the diag
+  counters before any parity claim): (1) the set_java_int raise does NOT
+  work from inside the JVMTI ClassFileLoadHook callback (the weave logged
+  licensed, the diag kept scheme=0 — the AI-floor/frozen-gate
+  set_java_bool calls from the verifier thread work, so the raise moved to
+  the verifier's one-shot + an arm-time attempt, OUTSIDE any callback);
+  (2) the setter name must match the field-named convention
+  (sitMirrorScheme(int), like svWordScheme(int)) — the first build's
+  setSitMirrorScheme failed the JNI method lookup ("method lookup failed",
+  the diag named it). The diag reads: sitD=direct/cast/sizeOn/arrSize/
+  sitN/poison/scheme.
+- THE SWEEP (the exact CI parity.yml shape, PARITY_SEED=4242, FILL 200 /
+  WARMUP 100 / MEASURE 600, hashCode=5, CE_ITEM_TICK=1 CE_MOB_AI=0
+  CE_MERGE=1 CE_COLLIDE=1 CE_MERGE_MIRROR=1, the module legs CE_WVERD=1
+  ARMED, XMS=1G XMX=2G on the ~3GB sandbox; the paperclip 26.3 build 263
+  fetched fresh; ce-baseline maven-built under jdk-25 — paper-api 26.3 is
+  class v69, the jdk-21 javac refuses it; the stack rebuilt from scratch:
+  rustup cargo 1.100.0 + CRUSSTY runtime 36.7s + centities-module):
+    mobs-2500    T382 / T632 / final  BIT-IDENTICAL (n 2509)
+    items-20000  T389 / T639 / final  BIT-IDENTICAL (n 16498)
+    mixed-15000  T389 / T639 / final  BIT-IDENTICAL (n 13851)
+    spread-10000 T389 / T639 / final  BIT-IDENTICAL (n 9901)
+  PARITY-GATE PASS 12/12. The armed on-leg diags (the last readout per
+  leg): scheme=1, sitN as above, sitDirect=0, sitCast=0, sitNpoison=0 —
+  the mirror carried EVERY SIT-empty verdict with zero poison fires
+  (bounce never happens in the void/flat bench shapes — the census
+  predicted it, the legs confirm).
+- The push: STILL refused — the recycled sandbox carries no GitHub
+  credentials (git push -> could not read Username; the .env carries only
+  DATABASE_URL). The honest state: the B27 head is committed LOCALLY on
+  the restored chain (a44d6dcf -> b25 -> b26 -> add 14 -> add 15 -> add
+  16), proven by the fresh 4/4 sweep above; the ab-paired MOBW=1 gate +
+  the CI profiles fly on the session with the token restored. NO ratio
+  claims.
+- NEXT (with auth, one message): push the head -> dispatch ab-paired
+  (armed, MOBW=1) -> the gate table vs the 0.130/0.118/0.277 standings ->
+  the CI armed profiles -> the b7 reads the fresh CI walls (the NM
+  determinism anchor, the AP_FD kernel bit — each only if the CI profile
+  still names it; the SIT_N wall is now DIETED on the local read).
