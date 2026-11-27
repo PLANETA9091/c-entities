@@ -3150,3 +3150,58 @@ comparison. THE FIX (harness, not module): ab-paired.yml RUN_TIMEOUT
 1800 -> 3000 (the wait-loop bound only — the measurement semantics are
 untouched; a fast runner exits the loop the moment baseline.json lands).
 The B28 gate re-dispatches on this commit's head.
+
+---
+Task ID: 29 addendum 19 — the B28 GATE (45906826403, the 6cf5cb33 head with
+the RUN_TIMEOUT=3000 harness fix): AB-PAIRED-GATE PASS all five; the fresh
+B28 CI profiles (despawn 3752 samples, spread, items) read the post-B28
+walls; the b8 round is CLOSED (the one-shot held: push -> dispatch -> gate
+table -> fresh profiles -> census -> B28 -> proofs -> push -> re-dispatch ->
+gate, all in ONE message)
+
+- THE GATE TABLE (per-flight honest, medians of the paired reps, no
+  cross-flight comparison):
+    items-100k      off [68.8, 66.4, 78.4]  on [18.2, 22.5, 21.4]  68.83/21.43 = 0.311  PASS
+    mobs-25k        off [753.9]             on [393.5]             753.89/393.45 = 0.522  PASS
+    mixed-150k      off [3386.1]            on [66.8]              3386.05/66.77 = 0.020  PASS
+    spread-100k     off [455.7, 454.9, 472.7] on [54.8, 51.5, 53.5] 455.74/53.53 = 0.117  PASS
+    mobs-despawn-10k off [86.2, 92.6, 92.2] on [9.0, 9.3, 10.3]    92.19/9.27 = 0.101  PASS pop off=10010 on=10015 delta=5 OK
+  The reads: mixed 0.020 certified again; spread 0.117 and despawn 0.101 —
+  the LOWEST paired readings of the task era (the 45504249032-era standings
+  0.130/0.118; the B27-head flight read 0.143/0.120) — the despawn row sits
+  AT the 0.100 target edge and the ON medians moved the honest direction
+  (despawn ON 9.71 -> 9.27, spread ON 59.35 -> 53.53 — the module side
+  LIGHTER with the B28 mirror live). The items row: the vanilla OFF
+  denominator swung to 68.83 (the previous flight read 95.06; the L185
+  documented runner swing — the ON median stable 20.95 -> 21.43), so the
+  0.311 read is the denominator's flight, not the module's (no cross-flight
+  claims — the items wall stands as the structural record, its ON side
+  unchanged). mobs-25k the same single-rep denominator swing (609.35 ->
+  753.89, ON stable 390.23 -> 393.45).
+- THE FRESH B28 PROFILE READS (the 4aff7e49 module tree — identical code on
+  the rebase; the reports/baseline commits only touched reports/):
+  despawn-10k 3752 samples: Unsafe.getDouble GONE from the top module
+  frames (the B27-head read: #3 leaf 1.80%, caller nativeMobBoundary 1.65%
+  — the three-Vec3 compare; the B28 read: NO getDouble row above 0.27%);
+  the applier loop's remaining rows are the noAction/tickCount floor
+  (nativeMobBoundary 0.43-0.85%); the top module leaf is ttlCachedPath
+  0.80% (the SIT belt read); newTrackerTick$ 0.48% / spawnerCreateState$
+  0.27% (the weave prefixes); tickListForEach 0.27% (the walk floor);
+  probeBox 0.39%. spread-100k: the walk floor 7.67%+0.99% and the merge
+  scan 3.90%+1.31% stand as the documented floors; nativeMobBoundary rows
+  0.46%+0.35% (was 0.94%+1.02% on the B27-head read). items-100k: the
+  BasicEntityList.indexOf 7.83% moonrise floor (both-leg), the sv reads,
+  the walk/flush/merge floors — the items wall's structural record.
+- THE ROUND VERDICT: the b8 candidate list resolved exactly as the fresh
+  profiles named it — the ONLY dietable top module wall (the NM three-Vec3
+  compare) is DIETED (the mirror owns the path: nmp=1.65M belt verdicts
+  local, the CI getDouble row gone); the walk floor, the merge scan, the
+  weave prefixes and the sv reads stand as documented floors (kernel domain
+  / the module's core dispatch service / ratio-dead); the AP_FD kernel bit
+  was NOT named by the fresh profiles (retired this round — no profile row
+  pins a fallDistance share above the noise); the b9 list carries nothing
+  new until the next flight names a fresh wall.
+- NEXT: the ratios ride the flights (NO claims outside them); the next
+  round reads a fresh dispatch only if the user asks for the next push;
+  the despawn 0.101 edge is the honest position (one runner-tick from the
+  0.100 target; the ON median's own read is the evidence).
