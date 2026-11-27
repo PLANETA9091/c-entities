@@ -3433,3 +3433,48 @@ The honest wall reads:
   0.132/0.120, no cross-flight claims) -> the fresh B31-head profiles
   read whether :9312 collapsed; the 10824 quiet floor (the counter
   semantics) rides the b12 native-walk decision.
+
+Task ID: 29 addendum 23 — the B31 CI-PARITY proof + the B31 GATE (46061414180,
+the a66ad93c b31 head, dispatched 20:07:15Z, ~1h37m) PASS all five. The parity
+push flight 46061414850 ran the shipped-config deterministic replay: 12/12
+PARITY-GATE: PASS (bit-identical state) — the fd-same skip preserves the
+replay exactly; e2e + module + baseline push flights all green on the same
+head. The B31 GATE honest per-flight reads (margin 1.05, NO cross-flight
+claims — the vanilla denominator swings flight-to-flight):
+  items-100k       off [83.5, 86.0, 85.9]  on [20.9, 20.5, 21.3]
+                   med 85.88/20.89 = 0.243 PASS
+  mobs-25k         off [586.5] on [381.0] med 586.47/381.03 = 0.650 PASS
+  mixed-150k       off [2073.4] on [75.0] med 2073.39/75.04 = 0.036 PASS
+  spread-100k      off [400.1, 412.0, 410.8] on [42.1, 40.8, 41.7]
+                   med 410.79/41.67 = 0.101 PASS — ONE TICK from the 0.100
+                   target
+  mobs-despawn-10k off [81.2, 79.2, 78.5]  on [9.2, 9.4, 8.6]
+                   med 79.22/9.21 = 0.116 PASS pop off=10015 on=10016
+                   delta=1 OK
+  AB-PAIRED-GATE: PASS. The leg counters: active=true, refused=-, lastErr
+  EMPTY, desync=0. The module-side ON medians moved the honest direction
+  with the B31 live (spread ON 41.67 — the era low vs the 59.12 read, despawn
+  ON 9.21, items ON 20.89 — the per-flight swings forbid causal claims, the
+  ratios ride the flights).
+- The fresh B31-head armed profiles (4 dispatched 20:26Z, all success):
+  spread 46063594786 (6276 samples), items 46063597496 (4118), despawn
+  46063600292 (3965), mobs 46063602539 (13247). THE READ: the AP_FD mirror
+  line (the addendum-21 read had it at 2.46% spread #6 / 1.28% items) is
+  GONE from the spread top-14 at a LARGER sample count — the named wall
+  collapsed under the fd-same skip; the quiet fuse call site (now :10843)
+  7.38% #1 unchanged — the b12 target; itemTickFlush :9635 1.96% + :9286
+  0.97% (spread) and 1.82% + 1.41% (items — the merge-scanner attribution
+  + the delta region, the same inlined-shape reads as addendum 20); items
+  indexOf 6.39% + AABB 3.38% + SynchedEntityData 2.50% — the structural
+  vanilla floors unchanged; despawn vanilla-dominated (the Watchdog sampler
+  noise 16.9% on the small leg, the module leaves ~2-3% total); mobs
+  fastQuery 3.76% + the vanilla AI machinery floor unchanged.
+- NEXT: the b12 round reads the quiet floor — the counter semantics
+  (tickCount/totalEntityAge/age + the despawn-rate gate + the 1/4-visit
+  delta clause + the 1/256 belt) moving INTO the native walk's row visit
+  (the n_prep refs-lane surface — the walk already touches every row for
+  the verdict stamps; the refs lane + the cached field offsets carry the
+  three writes natively, the Java quiet consult shrinks to the wv read +
+  branch). The spread 0.101 read makes the quiet floor the only remaining
+  module-side wall of scale on the hunt rows; the mobs/items/despawn
+  vanilla denominators stand (the addendum-22 reads).
