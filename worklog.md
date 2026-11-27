@@ -3281,3 +3281,66 @@ environment; push + dispatch ride the next session with the token)
   (armed, MOBW=1) -> the gate table (the honest per-flight reads vs the
   0.117/0.101/0.311/0.522 standings, no cross-flight claims) + the fresh
   armed profiles -> the b10 round reads the fresh walls.
+
+Task ID: 29 addendum 20 — the B29 GATE (46016428231, the 4acda40d b29 head,
+dispatched 14:29:44Z) PASS all five, the honest per-flight reads vs the
+0.117/0.101/0.311/0.522 standings (NO cross-flight claims, the vanilla
+denominator swings flight-to-flight per the L185 documented runner swing):
+  items-100k       off [114.75, 112.06, 107.58] on [23.86, 27.31, 26.36]
+                   med 112.06/26.36 = 0.235 PASS
+  mobs-25k         off [711.00] on [438.18] med 711.00/438.18 = 0.616 PASS
+  mixed-150k       off [4480.06] on [86.19] med 4480.06/86.19 = 0.019 PASS
+  spread-100k      off [450.82, 431.03, 444.36] on [60.25, 66.92, 67.52]
+                   med 444.36/66.92 = 0.151 PASS
+  mobs-despawn-10k off [86.08, 89.48, 85.40] on [11.15, 12.05, 10.89]
+                   med 86.08/11.14 = 0.129 PASS pop off=10013 on=10009
+                   delta=4 OK
+  AB-PAIRED-GATE: PASS (margin 1.05). The gate leg counters: active=true
+  indexing=true lastErr EMPTY refused=- on all 150 prints, sitD mirror
+  owns (scheme=1, sitDirect=0 sitCast=0), nmp=0/0/1 idle, desync=0.
+  The artifact ab-paired-results (15215777971, 5.10 GB) pulled via the
+  HTTP-range selective extractor (art_pull.py) — the per-leg
+  baseline.jsons reproduce the gate table EXACTLY.
+- The fresh armed profiles (profile.yml on the b29 code, the abb279a0
+  results commit carried NO code): despawn 46036017859 (4186 samples),
+  spread 46036028249 (6097), items 46036038310 (2829). The walls named:
+  spread tickListForEach:10791 6.86% (the #1 JVM leaf — the
+  quietFuseBump CALL SITE), itemTickFlush:9583 3.58% + :9279 1.03% +
+  :9251 0.85% (the applier region), spawnerCreateState$ 1.51%,
+  ttlCachedPath 1.25+0.98%; items ChunkEntitySlices$BasicEntityList
+  .indexOf 6.12% + AABB.intersects 3.82% + playerTouch 2.72% +
+  SynchedEntityData.getItem 2.51% (the VANILLA chunk entity list and
+  collision floors the module calls into), itemTickFlush:9583 2.26% +
+  :9279 1.73%, quietFuseBump:1029 1.59% + :1030 0.88% (the body),
+  newTrackerTick$ 0.99%; despawn nativeMobBoundary 1.53% (the L185
+  floor) + ttlCachedPath 0.84% — everything else chunk-system, bzip2
+  and watchdog noise. The bzip2 CRC/compress ~2.4% on every leg is the
+  paperclip checksum artifact, not module code.
+- The 9583 attribution read: the perf legs keep
+  ItemMergeEvent.getRegisteredListeners() EMPTY (the plugin's L166
+  contract — the listener registers on parity legs only; ViaVersion
+  grepped class-by-class: ZERO ItemMergeEvent references), MERGE_INCR
+  defaults armed (CE_MERGE_INCR unset), so the pure-Java read makes the
+  post-merge Unsafe refresh unreachable — the 9583/9279/9251 samples
+  ride the kernel-woven applier bytecode attributing to the surrounding
+  source lines (the weaver inserts the mirror branches without
+  renumbering). The honest diet of THAT is Rust-side and rides the
+  stack rebuild.
+- b10 = B30, the quietFuseBump SPLIT: the per-tick hot prefix ends at
+  the three increments (tickCount/totalEntityAge/age — the semantic
+  floor that keeps the vanilla-identical despawn/merge behavior) plus
+  the three cheap gates; the rare bodies move verbatim behind method
+  boundaries (quietFuseDelta the 1/4-visit clause, quietFuseDespawn the
+  despawn tail, quietFuseBelt the 1/256 belt clear). Statement order is
+  byte-for-byte the pre-B30 shape — value- and order-identical by
+  construction; the wv counters decode wvPreps/wvQuiet/wvFast/wvOvf and
+  show wvQuiet=14.6M (spread) vs 24.1M (items) — the SAME per-item-tick
+  quiet rate, so the 10791 spread excess is the JIT call mood, and the
+  ~50-bytecode Unsafe-free prefix (no try/catch, no Vec3) inlines at
+  any compilation mood. Local proof: jdk-25 javac EXIT=0 (the mapped
+  26.3 jar + the 107-jar libraries walk) in this recycled sandbox; the
+  FULL local parity sweep rides the rust stack rebuild (rustup/maven/
+  CRUSSTY/paperclip absent from this recycle), then the B30 gate.
+- NEXT: rebuild the local stack -> the FULL parity sweep 4/4 on the B30
+  head -> commit+push -> dispatch ab-paired (armed, MOBW=1) -> the gate
+  table vs the fresh standings -> the b11 round reads the walls again.

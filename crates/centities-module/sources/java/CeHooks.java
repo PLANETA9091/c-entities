@@ -1036,44 +1036,77 @@ public final class CeHooks {
         // across the field load + the belt read and kept the IDIV. The
         // clause runs per quiet item per tick (quietFuseBump 2.5% of the
         // spread-100k ON profile).
+        // B30: the per-tick hot prefix ENDS at the three increments plus
+        // the three cheap gates — the fresh B29-head spread-100k armed
+        // profile (flight 46036017859, 6097 samples) put the CALL-SITE
+        // line at 6.86% (the walk's #1 JVM leaf, tickListForEach line
+        // 10791) while the body lines sat at only 1.59+0.88% on
+        // items-100k: the JIT mood on the 60k-item leg kept the bump a
+        // real call (wvQuiet=14.6M per leg, the same per-item-tick rate
+        // as the 24.1M on items-100k — the excess is the call entry, not
+        // the semantics), and every quiet item paid the entry for bodies
+        // that run 1/4 (the delta clause), ~1/6000 (the despawn tail) and
+        // 1/256 (the belt clear) of visits. The statement order is
+        // VERBATIM the pre-B30 shape — only the rare bodies moved behind
+        // method boundaries, so the fused shape is value- and
+        // order-identical, with a hot prefix (~50 bytecodes, no Unsafe,
+        // no try/catch, no Vec3) the JIT inlines at any compilation mood.
         if (((tc + eid) & 3) == 0 && QUIET_FR != null
                 && O_ENT_DELTA > 0 && U != null) {
-            float qf = QUIET_FR[q];
-            if (qf != 1.0f) {
-                Object dv = U.getObject(e, O_ENT_DELTA);
-                if (dv instanceof net.minecraft.world.phys.Vec3 v3) {
-                    double ndx = v3.x * qf;
-                    double ndz = v3.z * qf;
-                    if (ndx != v3.x || ndz != v3.z) {
-                        U.putObject(e, O_ENT_DELTA, vec3Cached(q, ndx, v3.y, ndz));
-                    }
-                }
-            }
+            quietFuseDelta(e, q);
         }
         if (VH_READY && O_DESPAWN_RATE >= 0
                 && ag >= despawnRateMirror(e, q)) {
-            try {
-                despawnTail(e);
-                quietDespawns++;
-                long[] dq0 = DS_QUIET;
-                if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
-            } catch (Throwable tf) {
-                // event/discard trouble: stay quiet, the next visit retries
-                // (vanilla's failure mode is the same throw)
-            }
+            quietFuseDespawn(e, q);
             return;
         }
         if ((tc & 255) == 0) {
+            quietFuseBelt(q, eid);
+        }
+    }
+
+    /** B30: the cold 1/4-visit delta clause — verbatim the pre-B30 body
+     *  (the gate that guards it stays in the hot prefix). */
+    private static void quietFuseDelta(ItemEntity e, int q) {
+        float qf = QUIET_FR[q];
+        if (qf != 1.0f) {
+            Object dv = U.getObject(e, O_ENT_DELTA);
+            if (dv instanceof net.minecraft.world.phys.Vec3 v3) {
+                double ndx = v3.x * qf;
+                double ndz = v3.z * qf;
+                if (ndx != v3.x || ndz != v3.z) {
+                    U.putObject(e, O_ENT_DELTA, vec3Cached(q, ndx, v3.y, ndz));
+                }
+            }
+        }
+    }
+
+    /** B30: the cold despawn tail — verbatim the pre-B30 body; the caller
+     *  returns right after the call, exactly the pre-B30 shape (the belt
+     *  clear below is skipped on the despawn path, as before). */
+    private static void quietFuseDespawn(ItemEntity e, int q) {
+        try {
+            despawnTail(e);
+            quietDespawns++;
             long[] dq0 = DS_QUIET;
             if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
-            quietBelt++;
-            // B21: the mirror CLR — the item re-verifies via the exact chain
-            // next tick (the bump served THIS visit; the verdict array is
-            // rebuilt by the next prep anyway). The walk-born event rides
-            // the walk's own wid.
-            if (WV_ON) {
-                wvBelt(WV_WALK_WID, eid, true);
-            }
+        } catch (Throwable tf) {
+            // event/discard trouble: stay quiet, the next visit retries
+            // (vanilla's failure mode is the same throw)
+        }
+    }
+
+    /** B30: the cold 1/256-visit belt clear — verbatim the pre-B30 body. */
+    private static void quietFuseBelt(int q, int eid) {
+        long[] dq0 = DS_QUIET;
+        if (dq0 != null) dq0[q >> 6] &= ~(1L << (q & 63));
+        quietBelt++;
+        // B21: the mirror CLR — the item re-verifies via the exact chain
+        // next tick (the bump served THIS visit; the verdict array is
+        // rebuilt by the next prep anyway). The walk-born event rides
+        // the walk's own wid.
+        if (WV_ON) {
+            wvBelt(WV_WALK_WID, eid, true);
         }
     }
 
