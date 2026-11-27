@@ -2700,16 +2700,19 @@ public final class CeHooks {
                 // its old order until the next dirty republish).
                 AABB oldBox = e.getBoundingBox();
                 int curSy = e.moonrise$getSectionY();
-                boolean syMoved = LAST_SY[entId(e) & AMASK] != curSy;
-                LAST_SY[entId(e) & AMASK] = curSy;
+                // B29: pbSlot == pbId & AMASK (computed at the L174 block)
+                // — the redundant entId(e) re-reads leave the probe (the
+                // id field is write-once at registration; the value cannot
+                // drift inside one probe call).
+                boolean syMoved = LAST_SY[pbSlot] != curSy;
+                LAST_SY[pbSlot] = curSy;
                 boolean rowNeutral = !syMoved && oldBox != null
                         && cellOfBox(oldBox) == cellOfBox(newBox);
                 // L119 POSITIONAL DRAIN: a box change from THIS flush's batch
                 // member carries its dispatch-loop position — flushUpTo at the
                 // merge scans holds it until vanilla's loop reaches the owner.
-                int posSlot = entId(e) & AMASK;
-                int pos = BATCH_GEN[posSlot] == batchGenCur ? BATCH_POS[posSlot] : -1;
-                batchUpsert(entId(e), worldId(e.level()), e, newBox, rowNeutral, pos);
+                int pos = BATCH_GEN[pbSlot] == batchGenCur ? BATCH_POS[pbSlot] : -1;
+                batchUpsert(pbId, worldId(e.level()), e, newBox, rowNeutral, pos);
             }
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -15429,6 +15432,7 @@ public final class CeHooks {
     private static volatile long O_SIT_ENT = -1;      // the tracker.entity offset (the poison hop)
     private static volatile int[] SITN_ARR;           // belt-keyed stamped sizes
     private static final long TT_SITN = 16L;          // the mirror stamp bit (1/2/4/8 taken)
+    private static final long TT_SITLIVE = 32L;       // the stamped size != 0 (the B29 verdict fold)
     private static volatile int SIT_MIRROR_SCHEME = 0; // kernel-raised: 1 = probes woven
     public static final boolean SIT_MIRROR_ON =
             !"false".equals(System.getProperty("centities.sitMirror", "true"));
@@ -15563,7 +15567,7 @@ public final class CeHooks {
             int ob = m * 5;
             if (rf0[ob + 3] != tracker) return; // not the stamped row
             long[] fl0 = TT_FLAT;
-            if (fl0 != null) fl0[m * 2] &= ~(TT_SITAL | TT_SITN);
+            if (fl0 != null) fl0[m * 2] &= ~(TT_SITAL | TT_SITN | TT_SITLIVE);
             sitNpoison++;
         } catch (Throwable t) {
             lastError = System.nanoTime();
@@ -16523,7 +16527,16 @@ public final class CeHooks {
                 // mutation can fire (every mutator passes a probe).
                 if ((sh & TT_SITN) != 0) {
                     sitN++;
-                    if (SITN_ARR[m] != 0) {
+                    // B29: the LIVE verdict folded into the flag word sh —
+                    // TT_SITLIVE == (the stamped SITN_ARR[m] != 0) exactly
+                    // while TT_SITN stands: the fill writes the bit from the
+                    // SAME size read that stamps SITN_ARR (one store pair,
+                    // same thread), every size mutator passes the poison
+                    // probes (the B27 census) and the poison clears BOTH.
+                    // The SITN_ARR load leaves the per-tick path (the sh
+                    // word is already in hand); the array stays the fill/
+                    // poison row, its license untouched.
+                    if ((sh & TT_SITLIVE) != 0) {
                         return false; // a stamped live step: vanilla
                     }
                 } else {
@@ -16951,13 +16964,17 @@ public final class CeHooks {
                                         && SITN_ARR != null
                                         && O_SIT_ENT >= 0
                                         && O_ARR_SIZE >= 0 && U != null;
+                                // B29: ONE size read serves the row AND the
+                                // verdict bit (the TT_SITLIVE fold).
+                                final int sitSize0 = sitn0
+                                        ? U.getInt(steps0, O_ARR_SIZE) : 0;
                                 if (sitn0) {
-                                    SITN_ARR[sid] =
-                                            U.getInt(steps0, O_ARR_SIZE);
+                                    SITN_ARR[sid] = sitSize0;
                                 }
                                 flf[sid * 2] = TT_OK | TT_SIT
                                         | (sital0 ? TT_SITAL : 0L)
                                         | (sitn0 ? TT_SITN : 0L)
+                                        | (sitSize0 != 0 ? TT_SITLIVE : 0L)
                                         | (ubs ? TT_UBS : 0);
                             }
                             ttlFill++;
@@ -17093,13 +17110,17 @@ public final class CeHooks {
                                         && SITN_ARR != null
                                         && O_SIT_ENT >= 0
                                         && O_ARR_SIZE >= 0 && U != null;
+                                // B29: the raw-loop twin — ONE size read
+                                // serves the row AND the verdict bit.
+                                final int sitSize1 = sitn1
+                                        ? U.getInt(steps1, O_ARR_SIZE) : 0;
                                 if (sitn1) {
-                                    SITN_ARR[m] =
-                                            U.getInt(steps1, O_ARR_SIZE);
+                                    SITN_ARR[m] = sitSize1;
                                 }
                                 flf[m * 2] = TT_OK | TT_SIT
                                         | (sital1 ? TT_SITAL : 0L)
-                                        | (sitn1 ? TT_SITN : 0L);
+                                        | (sitn1 ? TT_SITN : 0L)
+                                        | (sitSize1 != 0 ? TT_SITLIVE : 0L);
                             }
                             ttlFill++;
                         } catch (Throwable fillFail) {

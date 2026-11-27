@@ -3205,3 +3205,79 @@ gate, all in ONE message)
   round reads a fresh dispatch only if the user asks for the next push;
   the despawn 0.101 edge is the honest position (one runner-tick from the
   0.100 target; the ON median's own read is the evidence).
+
+---
+Task ID: 29 addendum 20 — the B29 round (the SITLIVE verdict fold + the
+probeBox entId reuse) riding the fresh B28 profile walls: the FULL LOCAL
+PARITY SWEEP 4/4 pairs BIT-IDENTICAL (12/12 gates, the SAME n's and tags
+as the addendum-15/16 sweeps) in THIS sandbox on the rebuilt 26.3-263
+stack; the gate flight NOT dispatched — the recycled sandbox carries NO
+GitHub credentials (the session-scoped token was wiped with the old
+environment; push + dispatch ride the next session with the token)
+
+- THE WALLS THIS ROUND TARGETS (the fresh B28 profile reads, addendum 19):
+  despawn the ttlCachedPath 0.80% top module leaf (the SIT belt read) +
+  probeBox 0.39%; spread the same fold feeds the SIT rows. The despawn
+  0.101 standing sits one runner-tick from the 0.100 target; the shave
+  rides the named rows (the ratios stay flight-owned, NO claims).
+- B29-1 THE SITLIVE VERDICT FOLD (CeHooks.java, the B27 license verbatim):
+  TT_SITLIVE=32L (the bit map 1/2/4/8/16 taken, 32 free) — the fill stamps
+  the LIVE verdict INTO the TT_FLAT flag word from the SAME size read that
+  stamps SITN_ARR (one store pair: the array row precedes the word store,
+  same thread — the B27 discipline); the per-tick SITN mirror branch reads
+  the verdict from the ALREADY-LOADED sh word ((sh & TT_SITLIVE) != 0 ->
+  vanilla) and the SITN_ARR[m] load LEAVES the per-tick path. Value-
+  identity is structural: while TT_SITN stands, no probeSitMutate ran and
+  the census pins every size mutator behind the probes, so
+  TT_SITLIVE == (the stamped SITN_ARR[m] != 0) exactly; the poison clears
+  BOTH bits in one mask op (the row falls to the pre-B27 shape together);
+  the re-fill restamps both. Both fill sites (the sweep fill + the
+  raw-loop twin) carry the fold; the kill-switch doors unchanged
+  (-Dcentities.sitMirror=false / CE_SIT_MIRROR=0 keep the exact pre-B29
+  shapes — sitn0/1 false -> the bit never stamps).
+- B29-2 THE PROBEBOX ENTID REUSE: the four redundant entId(e) re-reads
+  inside probeBox (the LAST_SY classify x2, the positional-drain slot, the
+  batchUpsert id arg) leave the probe — pbId/pbSlot are computed once at
+  the L174 registration block and reused (the Entity id field is
+  write-once at registration, monotonic never-recycled; the value cannot
+  drift inside one probe call). Pure local-arithmetic substitution, no
+  behavioral surface.
+- THE PROOFS on this sandbox (the stack rebuilt from scratch AGAIN after
+  the recycle: rustup cargo 1.100.0, maven 3.9.9, the CRUSSTY runtime
+  from ../CRUSSTY HEAD, the paperclip bootstrap 26.3 build 263 via
+  fetch-paper.sh sha256 949a1b05..., ce-baseline.jar): the jdk-25 javac
+  compile PROOF clean on the B29 head (EXIT=0, the known
+  Unsafe.objectFieldOffset deprecation warnings only; the classpath =
+  the paperboot2 versions/26.3/paper-26.3.jar mapped jar + the 105-jar
+  libraries walk) + the cargo build.rs javac re-proof against the SAME
+  mapped 26.3-263 jar (the cdylib carries the B29 source).
+- THE SWEEP (the CI parity.yml shape, the addendum-15 knob set verbatim:
+  PARITY_SEED=4242, FILL 200 / WARMUP 100 / MEASURE 600, EXTRA_JVM
+  -XX:+UnlockExperimentalVMOptions -XX:hashCode=5, CE_ITEM_TICK=1
+  CE_MOB_AI=0 CE_MERGE=1 CE_COLLIDE=1 CE_MERGE_MIRROR=1, the module legs
+  CE_WVERD=1 ARMED, XMS=1G XMX=2G):
+    mobs-2500    T382 / T632 / final  PARITY-GATE PASS bit-identical
+                 (n 2509 = 2509, zero drift)
+    items-20000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+                 (n 16498 — the addendum-12/15/16 n)
+    mixed-15000  T389 / T639 / final  PARITY-GATE PASS bit-identical
+                 (n 13851)
+    spread-10000 T389 / T639 / final  PARITY-GATE PASS bit-identical
+                 (n 9901)
+  The armed counters (the mobs-on leg hooks@T1058): ttlc=2060814/2509/0,
+  sitD=0/0/1/16/2060814/0/1 (the mirror owns the SIT path, sitDirect=0,
+  sitCast=0, scheme=1), sv=2058305/2509/0/1 (99.88% of the consume reads
+  no-touch), wv=762, nmp=0/0/1 (the NM boundary idle on the parity shape
+  — CE_NATIVE_MOB is not a parity knob), refused=- (the disarm doors all
+  closed), active=true indexing=true lastErr EMPTY. The counter values
+  REPRODUCE the addendum-16 reads (ttlCache 2060814 EXACTLY — the
+  deterministic replay is stable across the B27 -> B29 rounds).
+- The push: REFUSED — no credentials in this recycled sandbox (`git push`
+  -> could not read Username; the token rides the session, the session
+  was recycled). The B29 head is committed LOCALLY on the 3cf29bc (the
+  addendum-19) head + the format-patch export rides the deliverable dir
+  (the addendum-14 re-am anchor pattern).
+- NEXT (with auth, one message): push the B29 head -> dispatch ab-paired
+  (armed, MOBW=1) -> the gate table (the honest per-flight reads vs the
+  0.117/0.101/0.311/0.522 standings, no cross-flight claims) + the fresh
+  armed profiles -> the b10 round reads the fresh walls.
