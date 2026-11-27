@@ -3372,3 +3372,64 @@ The B30 GATE honest per-flight reads (margin 1.05, NO cross-flight claims):
 - NEXT: the b11 round pulls the B30-head armed profiles (profile.yml)
   and reads whether the 10791 call-site collapsed; the Rust stack
   rebuild unlocks the woven-applier diet; the ratios ride the flights.
+
+Task ID: 29 addendum 22 — the b11 round. The four fresh B30-head armed
+profiles (profile.yml on the 4f8be6a0 b30 code, dispatched 19:40Z, all four
+completed success): spread 46058317446 (4887 samples), despawn
+46058320175 (1925), items 46058323233 (2727), mobs 46058326119 (10673).
+The honest wall reads:
+  spread: tickListForEach:10824 7.02% (the #1 JVM leaf — the quietFuseBump
+          CALL SITE after the B30 split: NOT collapsed; the bump body
+          inlines at the call site and the three increments + the
+          despawn-rate gate ARE the vanilla per-quiet-tick semantics —
+          the wall is real and semantic), the Unsafe trio 8.43%
+          (getObject 4.13 + getByte 3.07 + putObject 1.23 — the mirror
+          data-access floor), itemTickFlush:9616 3.81% + :9312 2.46%
+          (the applier region; :9312 IS the AP_FD mirror line — the
+          fresh profile NAMES the AP_FD wall, un-retiring the L186
+          candidate), ttlCachedPath 1.90+1.47%.
+  items:  ChunkEntitySlices$BasicEntityList.indexOf 7.00% (the structural
+          vanilla chunk-entity-list floor, unchanged), Unsafe.getObject
+          3.41%, SynchedEntityData.getItem 3.23%, itemTickFlush:9616
+          2.53% + :9312 1.28%, quietFuseBump:1029 0.92%.
+  despawn: the module leaves are tiny (newTrackerTick$ 0.88%,
+          ttlCachedPath 0.78%) — the leg is vanilla chunk-system
+          dominated; the 0.120 ratio's denominator is vanilla cost.
+  mobs:   fastQuery:4125 3.72% + goalSelectorTick 1.23+1.21% +
+          tickRunningImpl 0.96% + mobBlockEffectsNoOp 0.95+0.82% (the
+          module frames total ~7%) vs the VANILLA AI machinery floor
+          (AttributeMap.getValue 2.49% + AttributeInstance 2.00%, the
+          goal maps 3.11%, OptimizedSmallEnumSet 1.60%, DataItem 1.34%)
+          — the 0.616 ratio's denominator is vanilla AI.
+- b11 = B31, the AP_FD core-proven fd-same skip (bit 26): the two-leg
+  proof — (a) the fdSnap gate: the dispatcher snapshots FD_PROBE_CNT
+  into nativeItemTick (+fdSnap); the core stamps the verdict ONLY when
+  the counter equals its last-seen (any probeFallDistWrite between
+  dispatches bumps the counter and the WHOLE batch goes untrusted,
+  riding the exact L186 mirror which restores the store-owned fd over
+  the external write; the MIN sentinel keeps the first dispatch ever
+  untrusted), and (b) the pfall compare: st.fall_dist equals the
+  pre-tick snapshot (the store-hydrated last committed fd — entry.
+  fall_dist IS the last emitted fd per the phase-3 commit) and no
+  vanilla body ran (NATIVE_OK only — VANILLA_NEXT/inactive rows never
+  reach the fd mirror region; the resync arm stamps against the
+  pre-persist store value with a has_cd belt). Both legs prove
+  field == fd at apply time, so the skip is value-exact by
+  construction; the NaN-poison + probe restore semantics are preserved
+  verbatim (the probe keeps the AP_FD[slot]=NaN write and adds the
+  counter bump).
+- Local proofs (the recycled sandbox stack rebuild): rustup 1.100.1,
+  CRUSSTY pinned c315a1b (the guard-API revision), the paperclip
+  bootstrap 263 sha256 949a1b05 — EXACTLY the b29-recorded hash —
+  producing versions/26.3/paper-26.3.jar + the libraries walk;
+  cargo test: centities-core 38+1+1, centities-module 8+1+1 (the
+  natives_parity keeper CAUGHT the nativeItemTick descriptor drift and
+  the keep-in-sync table moved with the signature — the test worked as
+  designed), cargo build --release EXIT=0; jdk-25 javac ran inside
+  build.rs against the mapped jar (the CE_HOOKS_CLASS the parity test
+  parsed).
+- NEXT: commit+push the B31 head -> dispatch ab-paired (armed, MOBW=1)
+  -> the gate table vs the addendum-21 standings (0.262/0.616/0.023/
+  0.132/0.120, no cross-flight claims) -> the fresh B31-head profiles
+  read whether :9312 collapsed; the 10824 quiet floor (the counter
+  semantics) rides the b12 native-walk decision.

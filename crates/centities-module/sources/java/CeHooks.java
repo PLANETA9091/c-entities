@@ -1236,6 +1236,12 @@ public final class CeHooks {
             !"false".equals(System.getProperty("centities.apFd", "true"));
     private static final float[] AP_FD = fillFd();
     public static volatile int FD_MIRROR_ARM = 1;
+    /** B31: the probe generation counter — probeFallDistWrite bumps it;
+     *  the dispatcher snapshots it into nativeItemTick (fdSnap) and the
+     *  core stamps the fd-same verdicts ONLY when the counter is
+     *  unchanged since its last dispatch (any bump = the whole batch
+     *  rides the exact L186 mirror below). */
+    public static volatile int FD_PROBE_CNT = 0;
 
     private static float[] fillFd() {
         if (!AP_FD_ON) return null;
@@ -7146,6 +7152,7 @@ public final class CeHooks {
         if (AP_FD != null && ACTIVE && ce != null) {
             try {
                 AP_FD[entId(ce.getHandle()) & AMASK] = Float.NaN;
+                FD_PROBE_CNT++; // B31: the fdSnap gate sees the invalidation
             } catch (Throwable ignored) {
                 // the mirror is an optimization only
             }
@@ -8716,9 +8723,10 @@ public final class CeHooks {
                 }
                 System.out.println("[ce-baseline] " + bb2);
             }
+            int fdSnap = FD_PROBE_CNT; // B31: the fd-same gate snapshot
             int rc = nativeItemTick(wid, n, IB_IDS, IB_FLAGS, IB_CD, cdN, IB_I,
                     envD, envI, outD, outI, IB_ATI,
-                    fn, FAST_ROW_KEY, FAST_ROW_PD);
+                    fn, FAST_ROW_KEY, FAST_ROW_PD, fdSnap);
             if (rc != 0) {
                 return; // core not ready: everything stays vanilla this tick
             }
@@ -9305,14 +9313,25 @@ public final class CeHooks {
                 }
                 float fd = (float) outD[o + 6];
                 if (AP_FD != null && FD_MIRROR_ARM != 0) {
-                    // L186 AP-FD MIRROR: the dense slot float carries the
-                    // last writeback; NaN = the first apply reads the real
-                    // field once (the pre-wire double honored exactly).
-                    float m = AP_FD[idSlot];
-                    double cur = Float.isNaN(m) ? e.fallDistance : (double) m;
-                    if (fd != cur) {
-                        setFallDist(e, fd);
-                        AP_FD[idSlot] = fd;
+                    if ((bits & (1 << 26)) != 0) {
+                        // B31: the core-proven fd-same skip — the field
+                        // provably holds fd (the store's pre-tick fd
+                        // survived the tick unchanged, no vanilla body ran
+                        // for the row, and the fdSnap gate proves no
+                        // probeFallDistWrite since the last dispatch). The
+                        // load + compare + writeback below would all leave
+                        // the exact current state; the untrusted batches
+                        // never carry the bit.
+                    } else {
+                        // L186 AP-FD MIRROR: the dense slot float carries the
+                        // last writeback; NaN = the first apply reads the real
+                        // field once (the pre-wire double honored exactly).
+                        float m = AP_FD[idSlot];
+                        double cur = Float.isNaN(m) ? e.fallDistance : (double) m;
+                        if (fd != cur) {
+                            setFallDist(e, fd);
+                            AP_FD[idSlot] = fd;
+                        }
                     }
                 } else if (fd != e.fallDistance) { // same-value skip (resting items)
                     setFallDist(e, fd);
@@ -10074,7 +10093,7 @@ public final class CeHooks {
             int wid, int n, long[] ids, int[] flags,
             double[] cd, int cdN, int[] inI, double[] envD, int[] envI,
             double[] outD, int[] outI, int[] at,
-            int fastN, long[] frKey, int[] frPd);
+            int fastN, long[] frKey, int[] frPd, int fdSnap);
     public static native int nativeMergeScan(
             int wid, double x, double y, double z, double r, double yinf,
             long selfId, long[] out);

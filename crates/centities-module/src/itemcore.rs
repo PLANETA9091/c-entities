@@ -315,12 +315,17 @@ impl ItemWorld {
 /// kind of resident overhead).
 pub struct ItemCore {
     pub worlds: Vec<Option<ItemWorld>>,
+    /// B31: the last FD_PROBE_CNT this core saw (the fdSnap gate). The
+    /// MIN sentinel makes the first dispatch untrusted — the mirror path
+    /// establishes the store/field invariant first.
+    pub fd_probe_seen: i32,
 }
 
 impl ItemCore {
     pub fn new() -> ItemCore {
         ItemCore {
             worlds: (0..8).map(|_| None).collect(),
+            fd_probe_seen: i32::MIN,
         }
     }
 
@@ -571,6 +576,21 @@ const B_TAIL_NONE: i32 = 1 << 16;
 /// refuses these (see TickOutcome::SPEED_FACTOR). Diagnostic/kill path:
 /// the applier checks this bit before stamping.
 const B_SPD: i32 = 1 << 22;
+/// B31: the AP_FD core-proven fd-same verdict — the applier skips the
+/// mirror slot load + compare when the core proved the field already
+/// holds the emitted fd. The proof is two-legged: (a) the dispatch
+/// chain is probe-clean (the fdSnap counter the dispatcher passes equals
+/// the core's last-seen — any probeFallDistWrite between dispatches
+/// bumps the counter and the WHOLE batch goes untrusted, riding the
+/// exact L186 mirror which restores the store-owned fd over the
+/// external write), and (b) st.fall_dist equals the pre-tick fd (pfall —
+/// the store-hydrated last committed fd for the store rows, the live
+/// field for the batch-carried rows) and no vanilla body ran for the
+/// row (NATIVE_OK only — the VANILLA_NEXT/inactive rows never reach the
+/// fd mirror region). Both legs together prove field == fd at apply
+/// time, so the skip is value-exact by construction; the first dispatch
+/// ever is untrusted (the seen sentinel starts MIN).
+const B_FD_SAME: i32 = 1 << 26;
 
 // B22 (doc 67): the kernel-owned fast rows — read-back bits. The verdict
 // cohort's rows are synthesized from the store + the walk lane at phase 1;
@@ -836,13 +856,14 @@ pub extern "system" fn n_item_tick(
     fast_n: i32,
     fr_key: jni::jlongArray,
     fr_pd: jni::jintArray,
+    fd_snap: i32,
 ) -> i32 { let _site_guard = centities_core::SiteGuard::enter(6); 
     // SAFETY: the JVM passes a live env; every raw JNI call below mirrors the
     // vtable pattern proven in lib.rs.
     return unsafe {
         n_item_tick_impl(
             env, _cls, wid, n, ids, flags, in_d, cdn, in_i, env_d, env_i, out_d, out_i, at,
-            fast_n, fr_key, fr_pd,
+            fast_n, fr_key, fr_pd, fd_snap,
         )
     };
 }
@@ -866,6 +887,7 @@ unsafe fn n_item_tick_impl(
     fast_n: i32,
     fr_key: jni::jlongArray,
     fr_pd: jni::jintArray,
+    fd_snap: i32,
 ) -> i32 {
     let n = n.max(0) as usize;
     if n == 0 || wid < 0 || wid >= 8 {
@@ -879,6 +901,12 @@ unsafe fn n_item_tick_impl(
         cst.items = Some(ItemCore::new());
     }
     let core = cst.items.as_mut().unwrap();
+    // B31: the fdSnap gate — any probeFallDistWrite since THIS core's last
+    // dispatch puts the whole batch on the exact L186 mirror (the probe's
+    // NaN slot is restored there); a clean counter proves the store/field
+    // invariant the fd-same stamps rely on.
+    let fd_trusted = fd_snap == core.fd_probe_seen;
+    core.fd_probe_seen = fd_snap;
     let e = JniEnv::from_raw(env);
     let raw = e.raw();
     let vt = *raw;
@@ -1217,6 +1245,10 @@ unsafe fn n_item_tick_impl(
                                     entry.pickup_delay = iv[k * 4 + 2];
                                     entry.tick_count = iv[k * 4];
                                     entry.despawn_rate = iv[k * 4 + 3];
+                                    // B31: the pre-persist fd — the last committed
+                                    // value the store held; the fd-same stamp compares
+                                    // against it (the persist below overwrites the entry).
+                                    let fd_prev_resync = entry.fall_dist;
                                     entry.fall_dist = st.fall_dist;
                                     entry.on_ground = (f & F_ON_GROUND) != 0;
                                     entry.aborts = 0;
@@ -1237,6 +1269,15 @@ unsafe fn n_item_tick_impl(
                                         bits |= B_NATIVE_OK;
                                     } else {
                                         bits |= B_VANILLA_NEXT;
+                                    }
+                                    // B31: the resync arm's fd-same verdict — the
+                                    // emitted od fd IS the dispatch-time live field
+                                    // (the vanilla body already ran), so a probe-clean
+                                    // chain + fd == the pre-persist store value proves
+                                    // the field holds fd at apply time. The has_cd belt
+                                    // keeps the degenerate no-lane row on the mirror.
+                                    if has_cd && fd_trusted && st.fall_dist == fd_prev_resync {
+                                        bits |= B_FD_SAME;
                                     }
                                     od[k * 9] = st.dx;
                                     od[k * 9 + 1] = st.dy;
@@ -1477,6 +1518,12 @@ unsafe fn n_item_tick_impl(
                                                 if outcome.has(TickOutcome::HAS_IMPULSE) { ob |= B_IMPULSE; }
                                                 if st.dx == pdx && st.dy == pdy && st.dz == pdz {
                                                     ob |= B_DELTA_SAME;
+                                                }
+                                                // B31: the fd-same verdict rides the same
+                                                // pre-tick snapshot the REST fixed-point test
+                                                // uses (pfall) — see the B_FD_SAME contract.
+                                                if fd_trusted && st.fall_dist == pfall {
+                                                    ob |= B_FD_SAME;
                                                 }
                                                 if outcome.has(TickOutcome::MERGE) { ob |= B_MERGE; }
                                                 if outcome.has(TickOutcome::MERGE2) { ob |= B_MERGE2; }
