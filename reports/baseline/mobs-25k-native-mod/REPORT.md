@@ -6,31 +6,31 @@ Server: `26.3-263-894b2e1 (MC: 26.3)`
 
 | metric | value |
 |---|---|
-| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25065 -> 25015) |
+| entities spawned | 25000 (items 0 / stands 0 / zombies 25000) (merge shrink: 25055 -> 25037) |
 | block entities | 0 (hoppers 0 / furnaces 0) |
-| MSPT p50 / p90 / p99 / max, ms | 20.059 / 43.322 / 117.904 / 140.156 |
-| MSPT mean, ms | 28.507 |
+| MSPT p50 / p90 / p99 / max, ms | 22.566 / 39.427 / 118.177 / 175.901 |
+| MSPT mean, ms | 30.896 |
 | TPS estimate (1000/p50) | 20.0 |
-| heap used / max, MB | 1335.1 / 4096.0 |
+| heap used / max, MB | 1396.9 / 4096.0 |
 | measured ticks | 600 |
 
 ## What burns the time (JFR, top-15 self-time)
 
 | # | % | method |
 |---:|---:|---|
-| 1 | 4.48% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int, boolean) line: 16571` |
-| 2 | 3.27% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 13915` |
-| 3 | 2.35% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
-| 4 | 1.83% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
-| 5 | 1.77% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
-| 6 | 1.34% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
-| 7 | 1.34% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 15291` |
-| 8 | 1.31% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThread() line: 122` |
-| 9 | 1.24% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 10761` |
-| 10 | 1.21% | `net.minecraft.world.entity.Mob.isPersistenceRequired() line: 1308` |
-| 11 | 1.08% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
-| 12 | 1.08% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
-| 13 | 0.88% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
-| 14 | 0.88% | `net.minecraft.world.entity.Entity.getPassengers() line: 4812` |
-| 15 | 0.88% | `sun.misc.Unsafe.getInt(Object, long) line: 180` |
+| 1 | 4.87% | `dev.planeta9091.centities.CeHooks.ttlCachedPath(Entity, int, boolean) line: 16623` |
+| 2 | 4.75% | `dev.planeta9091.centities.CeHooks.nativeMobBoundary(Level) line: 13967` |
+| 3 | 2.58% | `dev.planeta9091.centities.CeHooks.newTrackerTick$(Object) line: 16901` |
+| 4 | 2.17% | `net.minecraft.world.phys.AABB.intersects(double, double, double, double, double, double) line: 235` |
+| 5 | 2.08% | `dev.planeta9091.centities.CeHooks.spawnerCreateState$(int, Object, Object, Object, boolean) line: 15343` |
+| 6 | 2.02% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.CRC.updateCRC(int) line: 119` |
+| 7 | 1.88% | `dev.planeta9091.centities.CeHooks.tickListForEach(EntityTickList, Consumer) line: 10813` |
+| 8 | 1.73% | `sun.misc.Unsafe.getByte(Object, long) line: 279` |
+| 9 | 1.70% | `paperclip.libs.org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream.getAndMoveToFrontDecode() line: 742` |
+| 10 | 1.47% | `ca.spottedleaf.moonrise.common.util.TickThread.isTickThread() line: 122` |
+| 11 | 1.44% | `sun.misc.Unsafe.getBoolean(Object, long) line: 253` |
+| 12 | 0.88% | `net.minecraft.world.entity.Entity.isRemoved() line: 5334` |
+| 13 | 0.82% | `net.minecraft.network.syncher.SynchedEntityData$DataItem.getValue() line: 216` |
+| 14 | 0.79% | `net.minecraft.world.entity.Entity.getPassengers() line: 4812` |
+| 15 | 0.70% | `net.minecraft.network.syncher.SynchedEntityData.getItem(EntityDataAccessor) line: 49` |
 
