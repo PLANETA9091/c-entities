@@ -3344,3 +3344,31 @@ denominator swings flight-to-flight per the L185 documented runner swing):
 - NEXT: rebuild the local stack -> the FULL parity sweep 4/4 on the B30
   head -> commit+push -> dispatch ab-paired (armed, MOBW=1) -> the gate
   table vs the fresh standings -> the b11 round reads the walls again.
+
+Task ID: 29 addendum 21 — the B30 CI-PARITY proof + the B30 GATE (46040650016,
+the 4f8be6a0 b30 head, dispatched 17:17:45Z, ~1h45m) PASS all five. The
+parity flight 46038782670 (workflow_dispatch, the shipped config, PARITY=1
+deterministic replay) ran the mobs/items/mixed/spread off/on pairs on CI:
+12/12 PARITY-GATE: PASS (bit-identical state) — the CI-grade parity proof
+replaces the local sweep in this recycled sandbox (rustup/maven/CRUSSTY/
+paperclip absent; the local-bench stack rebuild rides the next session).
+The B30 GATE honest per-flight reads (margin 1.05, NO cross-flight claims):
+  items-100k       off [89.8, 87.2, 86.8] on [23.3, 22.9, 22.3]
+                   med 87.21/22.89 = 0.262 PASS
+  mobs-25k         off [599.70] on [369.67] med 599.69/369.67 = 0.616 PASS
+  mixed-150k       off [2889.12] on [65.06] med 2889.12/65.06 = 0.023 PASS
+  spread-100k      off [487.3, 415.4, 447.5] on [63.3, 58.6, 59.1]
+                   med 447.48/59.12 = 0.132 PASS
+  mobs-despawn-10k off [80.5, 81.4, 81.2] on [8.7, 9.7, 10.6]
+                   med 81.17/9.72 = 0.120 PASS pop off=10010 on=10015
+                   delta=5 OK
+  AB-PAIRED-GATE: PASS. The leg counters: active=true on 149/150 prints
+  (the OFF leg carries the one false), refused=- everywhere, lastErr
+  EMPTY. The module-side ON medians moved the honest direction with the
+  B30 live (despawn ON 9.72, spread ON 59.12 — per-flight swings forbid
+  causal claims). The 0.100 target stands unreached (despawn 0.120 the
+  closest); the fresh profile walls (the vanilla chunk entity list, the
+  kernel-woven applier attribution) ride the b11 round per addendum 20.
+- NEXT: the b11 round pulls the B30-head armed profiles (profile.yml)
+  and reads whether the 10791 call-site collapsed; the Rust stack
+  rebuild unlocks the woven-applier diet; the ratios ride the flights.
