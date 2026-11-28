@@ -3524,3 +3524,90 @@ Task ID: 29 addendum 24 — the b12 round: the walk-body quiet prefix inline.
   0.116, no cross-flight claims) -> the fresh B12-head profiles read
   whether the :10843 call-site leaf collapsed (the frame kill) — the walk
   line residual is the honest read of the prefix bytecodes themselves.
+
+Task ID: 29 addendum 25 — the B12 GATE (46130851629, the f09af3b3 b12 head,
+dispatched 09:31:16Z, ~2h19m) PASS all five — AB-PAIRED-GATE: PASS.
+- The honest per-flight reads (margin 1.05, NO cross-flight claims — the
+  vanilla denominators swung hard this flight):
+    items-100k        off [95.2, 98.3, 98.3]  on [30.1, 24.0, 22.8]
+                      med 98.30/24.04 = 0.245 PASS
+    mobs-25k          off [797.1] on [568.7]  med 797.13/568.65 = 0.713 PASS
+    mixed-150k        off [3582.9] on [71.1]  med 3582.92/71.08 = 0.020 PASS
+    spread-100k       off [480.4, 579.6, 516.9] on [50.3, 47.6, 47.1]
+                      med 516.92/47.64 = 0.092 PASS — THE ERA'S FIRST
+                      SUB-0.100 PAIRED SPREAD READ
+    mobs-despawn-10k  off [101.0, 102.6, 102.0] on [10.2, 10.9, 10.9]
+                      med 101.96/10.93 = 0.107 PASS pop off=10017 on=10011
+                      delta=6 OK
+  The leg counters: armed on every leg (the ARMED grep + the active=true
+  tail check + the desync=0 tail check — 144 counter lines all desync=0),
+  refused=-, lastErr EMPTY. The honest swing note: the ON medians rode
+  UP this flight (spread 47.64 vs the addendum-23 41.67, despawn 10.93 vs
+  9.21) while the vanilla denominators swung UP harder (spread off 516.92
+  vs 410.79, despawn off 101.96 vs 79.22) — the RATIO crossed 0.100 on
+  this flight's swing; the per-flight rule stands, no causal claim rides
+  the dip; the ON-medians-moved-up read is recorded as-is.
+- The push flights on the same head: parity 46130756247 12/12 PARITY-GATE
+  PASS bit-identical (the tags reproduce the addendum-15/16 populations:
+  mobs n2509/n2509, mixed n13851, items n16498, spread n9901, seed 4242,
+  tags T382/T632/T389/T639) — the inline preserves the deterministic
+  replay exactly; e2e 46130755900 OK (armed, patches, probes + fast path
+  live); module 46130755931 success (the natives_parity keeper parsed the
+  embedded class, no descriptor drift).
+- The fresh B12-head armed profiles (4 dispatched 09:31Z, all success):
+  spread 46130859992 (4714 samples), despawn 46130863610 (3960), items
+  46130861796 (3808), mobs 46130865541 (13919). THE READ (per-flight
+  attribution only): the quietFuseBump CALL FRAME is GONE from the spread
+  table (the helper unnamed; the quietFuseDelta cold frames ride their own
+  lines at 0.30+0.28% as before). The prefix cost rides the walk arm's own
+  lines: :10856 (the cast+region attribution) 7.64% #1 spread, the write
+  lines :10859/:10861/:10862 at 0.28/0.68/0.70%, the despawn-gate region
+  :10881 0.47% + the caller read :10866 0.83% — the items leg carries the
+  same shape lighter (:10856 2.70% #3, :10861 1.16%, :10862 0.42%,
+  :10881 0.39%); the despawn leg keeps the walk arm off the top (vanilla
+  dominated, :10813 0.38%); the mobs leg unaffected (fastQuery :4131
+  0.84%, the walk arm unnamed — 60 items). The bootstrap noise (bzip2/
+  paperclip/crypto, the Watchdog sampler 6.3-15.6% on the small legs)
+  rides the shared denominator on every flight.
+- The b13 candidates CULLED (the honest ledger — none clears the bar):
+  (1) the syncPos mirror REJECTED — the full-jar putfield census
+  (scripts/syncpos_census.sh, the mapped 26.3 tree): Entity.syncPosition
+  has EXACTLY THREE writers (Entity.restituteMovementAfterCollisions —
+  the iconst_1 collision branch; SteppedInterpolationTracker.updateTracking
+  and ServerEntity.sendChanges — both conditional FALSE consumes). A
+  method-level probe fires per COLLIDING move-tick: the crammed mobs pile
+  collides every tick, ~25k probes/tick on mobs-25k against a ~38ns-per-
+  mob-per-tick budget — up to +13% on the mobs ON median for a ~2.74%
+  spread win (the Unsafe.getByte leaf #4 IS the syncPos read, the 2.65%
+  caller share at :16684). The honest direction forbids the trade. The
+  TT_SITN mirror itself is healthy (sitD=0/0/1/16/14208115/84754/1 —
+  14.2M mirror answers, ZERO fallback reads).
+  (2) B_DELTA_FINITE REJECTED as cost-motion — the core must run
+  is_finite to stamp the bit, the same test the Java side already runs;
+  nothing is removed.
+  (3) the quiet-counters fold (the kernel counts the v==3 rows, the
+  return carries the count, the Java batch-adds) — 0-0.3% best case
+  (the static increments are register-promotion candidates); below the
+  churn bar. (4) the ty fold (~0.15%, a walk-shape reorder) — below the
+  bar.
+- The remaining module-side walls, named: the quiet-arm region (the
+  counter writes are semantics-bound — the javap merge audit stands:
+  lambda$mergeWithNeighbours$0 + isMergable() read other.age/
+  other.despawnRate/other.pickupDelay mid-walk, the prep-time write is
+  dead), the merge scanner (L162/L163/L166 harvested to the floor —
+  merge=0 on the legs, the scan is the candidate loop itself), the
+  tracker ttlCachedPath own lines (~3% spread), the vanilla floors
+  (items indexOf/AABB/SynchedEntityData, the mobs AI machinery, the
+  despawn vanilla dominance). The despawn 0.107 stands one tick from the
+  target with the module share ~1-3% — the vanilla denominator owns the
+  row.
+- The infra note: the push-baseline flight (46130755927) FAILED on the
+  maven-central 429 flake (the mixed-150k job, 5 mvn retries; 12 sibling
+  jobs zero errors); a full-matrix baseline re-dispatch on the same head
+  (46133284171) completed GREEN (11/11 jobs) and a redundant second
+  dispatch was cancelled — the flake was infra, never the code.
+- NEXT: the spread 0.100 target is MET on this flight's read (0.092) —
+  the hunt continues per the standing rules: the next round reads the
+  fresh walls again (the quiet-arm region's structural floor, the
+  despawn 0.107 tick) or proves the wall; no speculative cuts, the
+  profiles name the work.
