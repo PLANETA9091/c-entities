@@ -10840,7 +10840,39 @@ public final class CeHooks {
                                                 wvQuiet++;
                                                 dispDiag(e, "quiet");
                                                 if (CE_QUIET_FUSE) {
-                                                    quietFuseBump((ItemEntity) e, eid & AMASK, eid);
+                                                    // b12: the B30 hot prefix INLINE at the
+                                                    // walk's wv quiet arm — the B31-head spread
+                                                    // armed profile kept the quietFuseBump CALL
+                                                    // SITE the #1 JVM leaf (:10843, 7.38%) while
+                                                    // the body lines sat at 1.59+0.88% on
+                                                    // items-100k: the walk mood pays the frame per
+                                                    // quiet visit and the prefix itself is cheap.
+                                                    // The statements are VERBATIM the pre-B30 order
+                                                    // (value- and order-identical by construction;
+                                                    // the cold bodies stay behind the exact B30
+                                                    // gates as calls, the despawn tail skipping the
+                                                    // belt clear exactly as the helper's return).
+                                                    // The helper keeps the quietPass path.
+                                                    ItemEntity ie = (ItemEntity) e;
+                                                    int q = eid & AMASK;
+                                                    quietFuse++;
+                                                    int tc = ie.tickCount + 1;
+                                                    ie.tickCount = tc;
+                                                    ie.totalEntityAge = ie.totalEntityAge + 1;
+                                                    int ag = ie.age + 1;
+                                                    ie.age = ag;
+                                                    if (((tc + eid) & 3) == 0 && QUIET_FR != null
+                                                            && O_ENT_DELTA > 0 && U != null) {
+                                                        quietFuseDelta(ie, q);
+                                                    }
+                                                    if (VH_READY && O_DESPAWN_RATE >= 0
+                                                            && ag >= despawnRateMirror(ie, q)) {
+                                                        quietFuseDespawn(ie, q);
+                                                        continue; // the despawn tail owns the visit (the belt clear skipped, as before)
+                                                    }
+                                                    if ((tc & 255) == 0) {
+                                                        quietFuseBelt(q, eid);
+                                                    }
                                                 }
                                                 continue; // the quiet pass owns this item's tick
                                             }
@@ -10883,7 +10915,32 @@ public final class CeHooks {
                                                     quietSkips++;
                                                     dispDiag(e, "quiet");
                                                     if (CE_QUIET_FUSE) {
-                                                        quietFuseBump((ItemEntity) e, q, eid);
+                                                        // b12: the same prefix INLINE at the retry
+                                                        // walk's quiet arm (the L173 shape's twin of
+                                                        // the wv arm above) — verbatim the helper
+                                                        // order, the cold bodies behind the exact
+                                                        // gates, the despawn tail skipping the belt
+                                                        // clear exactly as the helper's return. The
+                                                        // q local is the arm's own eid & AMASK.
+                                                        ItemEntity ie = (ItemEntity) e;
+                                                        quietFuse++;
+                                                        int tc = ie.tickCount + 1;
+                                                        ie.tickCount = tc;
+                                                        ie.totalEntityAge = ie.totalEntityAge + 1;
+                                                        int ag = ie.age + 1;
+                                                        ie.age = ag;
+                                                        if (((tc + eid) & 3) == 0 && QUIET_FR != null
+                                                                && O_ENT_DELTA > 0 && U != null) {
+                                                            quietFuseDelta(ie, q);
+                                                        }
+                                                        if (VH_READY && O_DESPAWN_RATE >= 0
+                                                                && ag >= despawnRateMirror(ie, q)) {
+                                                            quietFuseDespawn(ie, q);
+                                                            continue; // the despawn tail owns the visit (the belt clear skipped, as before)
+                                                        }
+                                                        if ((tc & 255) == 0) {
+                                                            quietFuseBelt(q, eid);
+                                                        }
                                                     }
                                                     continue; // the quiet pass owns this item's tick
                                                 }

@@ -3478,3 +3478,49 @@ claims — the vanilla denominator swings flight-to-flight):
   branch). The spread 0.101 read makes the quiet floor the only remaining
   module-side wall of scale on the hunt rows; the mobs/items/despawn
   vanilla denominators stand (the addendum-22 reads).
+
+Task ID: 29 addendum 24 — the b12 round: the walk-body quiet prefix inline.
+- The read that named it (the addendum-23 B31-head spread armed profile):
+  the quietFuseBump CALL SITE stayed the #1 JVM leaf (:10843, 7.38%) while
+  the body lines sat at 1.59+0.88% on items-100k — the B30 split moved the
+  rare bodies behind methods but the WALK MOOD still pays the call frame
+  per quiet visit, and the quiet visits are ~all of them (wvQuiet 14.6M per
+  spread leg). The frame kill rides the walk body itself.
+- The b12 change (CeHooks.tickListForEach, BOTH walk quiet arms — the wv
+  verdict arm :10843 and the retry-walk arm :10886): the B30 hot prefix
+  INLINED verbatim — quietFuse++, tc = tickCount+1 write, totalEntityAge+1
+  write, ag = age+1 write (statement order byte-for-byte the pre-B30
+  shape), then the three gates EXACT: the 1/4 delta clause
+  ((tc+eid)&3==0 with the QUIET_FR/O_ENT_DELTA/U guards), the despawn gate
+  (VH_READY && O_DESPAWN_RATE>=0 && ag>=despawnRateMirror(ie,q)), the 1/256
+  belt ((tc&255)==0). The cold bodies quietFuseDelta/quietFuseDespawn/
+  quietFuseBelt stay gated calls; the despawn tail CONTINUES without the
+  belt clear exactly as the helper's early return did; the walk's
+  unconditional quiet continue follows as before. The quietFuseBump helper
+  keeps the quietPass dispatch path (:1007) untouched — the walk consult
+  now reads ONE verdict int and branches, no frame per quiet visit.
+- The n_prep refs-lane surface (the addendum-23 NEXT candidate) analyzed
+  and DEFERRED with the reasons: (1) the kernel store holds NO entity refs
+  — the applier's refs ride the per-flush IB_ lanes and quiet rows never
+  enter the flush; a prep-time lane costs GetObjectArrayElement + 3x
+  GetIntField + 3x SetIntField + DeleteLocalRef per quiet row = 7 JNI ops
+  x ~60k rows/tick, a floor the killed Java frame must exceed to win —
+  unproven at the 7ns/op scale; (2) the parity hazard: n_prep stamps ALL
+  verdicts before ANY visit, so a prep-time counter write moves the +1
+  visibility EARLIER in list order — vanilla neighbor reads (the ItemEntity
+  merge candidates read other.age/other.tickCount) could see a different
+  value mid-walk than the at-visit write order; the gate for that surface
+  is a javap read-visibility audit of the mapped merge bodies. The b12
+  inline rides first because it is value- and order-identical BY
+  CONSTRUCTION (the same statements in the same scope order — the frame
+  was the only delta).
+- Local proof: jdk-25 javac EXIT=0 against the paperclip-mapped
+  paper-boot/paper-26.3.jar + mojang_26.3.jar + the libraries walk in the
+  recycled sandbox (the mapped-jar classpath lesson recorded: paper-26.3.jar
+  alone is the paperclip INPUT, the mapped server classes ride the
+  paper-boot output jar).
+- NEXT: commit+push the B12 head -> dispatch ab-paired (armed, MOBW=1) ->
+  the gate table vs the addendum-23 standings (0.243/0.650/0.036/0.101/
+  0.116, no cross-flight claims) -> the fresh B12-head profiles read
+  whether the :10843 call-site leaf collapsed (the frame kill) — the walk
+  line residual is the honest read of the prefix bytecodes themselves.
